@@ -1,0 +1,835 @@
+import type { SubscriptionItem } from "@/api";
+import type {
+  InboundApiItem,
+  InboundRelayApiItem,
+  KernelApiItem,
+  NodeApiItem,
+} from "@/api/types";
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
+import {
+  ChevronRight,
+  CircleAlert,
+  Globe,
+  Link2,
+  Rss,
+  Server,
+  TriangleAlert,
+} from "lucide-react";
+
+import {
+  getInboundList,
+  getInboundRelays,
+  getKernelList,
+  getNodeList,
+  getSubscriptions,
+} from "@/api";
+import { AnimatedPage } from "@/components/animated-page";
+import { PageLoadingState } from "@/components/page-state";
+import { formatTraffic } from "@/utils/traffic";
+
+const DAY = 86400000;
+const SOON = 3 * DAY;
+
+function daysLeft(ms: number): string {
+  const d = Math.ceil((ms - Date.now()) / DAY);
+
+  return d <= 0 ? "已到期" : `剩 ${d} 天`;
+}
+
+/** One problem; problems of the same kind are shown as one group. */
+interface Issue {
+  kind: IssueKind;
+  level: "danger" | "warning";
+  /** What the problem is about, shown as a chip, e.g. a node's name. */
+  name: string;
+  /** Extra detail on the chip's tooltip. */
+  detail: string;
+}
+
+type IssueKind =
+  | "offline"
+  | "expired"
+  | "expiring"
+  | "kernel"
+  | "inbound"
+  | "probe"
+  | "relaygone"
+  | "subflow"
+  | "subexpire";
+
+const KINDS: Record<
+  IssueKind,
+  { label: (n: number) => string; hint: string; path: string }
+> = {
+  offline: {
+    label: (n) => `${n} 个节点离线`,
+    hint: "agent 没有连接面板，检查服务器上的 agent 是否在运行",
+    path: "/node",
+  },
+  expired: {
+    label: (n) => `${n} 个节点已到期`,
+    hint: "续费后在节点里更新到期时间",
+    path: "/node",
+  },
+  expiring: {
+    label: (n) => `${n} 个节点即将到期`,
+    hint: "3 天内到期",
+    path: "/node",
+  },
+  kernel: {
+    label: (n) => `${n} 个内核出错`,
+    hint: "在节点 → 内核里查看日志",
+    path: "/node",
+  },
+  inbound: {
+    label: (n) => `${n} 个落地未运行`,
+    hint: "内核已停止或等待下发，节点上线后会自动补上",
+    path: "/inbound",
+  },
+  probe: {
+    label: (n) => `${n} 个节点连不上`,
+    hint: "从面板服务器检测",
+    path: "/inbound",
+  },
+  relaygone: {
+    label: (n) => `${n} 条中转线路已损坏`,
+    hint: "对应的转发已不存在、线路已失效，删除或重建",
+    path: "/relay",
+  },
+  subflow: {
+    label: (n) => `${n} 个分享订阅流量快用完`,
+    hint: "用到 90% 以上；用完后下发断开",
+    path: "/subscription",
+  },
+  subexpire: {
+    label: (n) => `${n} 个分享订阅即将到期`,
+    hint: "3 天内到期或已到期",
+    path: "/subscription",
+  },
+};
+
+const TONES = {
+  blue: [
+    "bg-primary-100",
+    "text-blue-600",
+    "bg-primary-500",
+  ],
+  green: [
+    "bg-green-100",
+    "text-green-600",
+    "bg-green-500",
+  ],
+  purple: [
+    "bg-secondary-100",
+    "text-purple-600",
+    "bg-secondary-500",
+  ],
+  orange: [
+    "bg-orange-100",
+    "text-orange-600",
+    "bg-orange-500",
+  ],
+} as const;
+
+/** A headline figure, in the upstream metric card style. */
+function Metric({
+  label,
+  icon: Icon,
+  tone,
+  value,
+  total,
+  foot,
+  footTone,
+  footRight,
+  onPress,
+}: {
+  label: string;
+  icon: typeof Server;
+  tone: keyof typeof TONES;
+  value: number;
+  /** Shown as "value / total" with a bar, when set. */
+  total?: number;
+  foot: string;
+  footTone?: "danger" | "warning" | "success";
+  footRight?: string;
+  onPress: () => void;
+}) {
+  const [chip, iconColor, bar] = TONES[tone];
+  const pct = total ? Math.round((value / total) * 100) : 0;
+
+  return (
+    <button
+      className="glass-card rounded-2xl p-4 text-left shadow-sm transition-shadow hover:shadow-md lg:p-5"
+      type="button"
+      onClick={onPress}
+    >
+      {/* Headline metric cell of the hairline strip: content sits
+          directly on the glass surface; only the icon chip is a tray. */}
+      <div className="flex items-center justify-between gap-2">
+        <span className="truncate text-sm text-foreground">{label}</span>
+        <span className={`flex-shrink-0 rounded-xl p-2 ${chip}`}>
+          <Icon className={`h-4 w-4 lg:h-5 lg:w-5 ${iconColor}`} />
+        </span>
+      </div>
+      <div className="mt-2 text-2xl font-bold lg:text-3xl">
+        {value}
+        {total !== undefined && (
+          <span className="ml-1 text-base font-normal text-foreground">
+            / {total}
+          </span>
+        )}
+      </div>
+      <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-default-100">
+        {total !== undefined && total > 0 && (
+          <div
+            className={`h-full rounded-full ${bar}`}
+            style={{ width: `${pct}%` }}
+          />
+        )}
+      </div>
+      <div className="mt-1.5 flex items-center justify-between gap-2 text-xs font-semibold">
+        <span
+          className={`truncate ${
+            footTone === "danger"
+              ? "tray-danger rounded-full px-1.5 py-0.5"
+              : footTone === "warning"
+                ? "tray-warning rounded-full px-1.5 py-0.5"
+                : footTone === "success"
+                  ? "tray-success rounded-full px-1.5 py-0.5"
+                  : "text-foreground"
+          }`}
+        >
+          {foot}
+        </span>
+        {footRight && (
+          <span className="shrink-0 text-foreground">{footRight}</span>
+        )}
+      </div>
+    </button>
+  );
+}
+
+function Panel({
+  title,
+  badge,
+  action,
+  children,
+}: {
+  title: string;
+  badge?: React.ReactNode;
+  action?: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className="glass-card rounded-2xl p-4 shadow-sm lg:p-5">
+      <div className="mb-3 flex items-center gap-2">
+        <h2 className="text-sm font-semibold lg:text-base">{title}</h2>
+        {badge}
+        {action && <div className="ml-auto">{action}</div>}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+/** The admin's overview: health of nodes → landings → relays → subscriptions. */
+export function AdminOverview() {
+  const navigate = useNavigate();
+  const [loading, setLoading] = useState(true);
+  const [nodes, setNodes] = useState<NodeApiItem[]>([]);
+  const [kernels, setKernels] = useState<KernelApiItem[]>([]);
+  const [inbounds, setInbounds] = useState<InboundApiItem[]>([]);
+  const [relays, setRelays] = useState<InboundRelayApiItem[]>([]);
+  const [subs, setSubs] = useState<SubscriptionItem[]>([]);
+  // 任一路加载失败置位：失败前保留旧数据，但页面必须明示数据不完整，
+  // 绝不能渲染成「空数据 + 一切正常」的假绿（A10-02）。
+  const [loadError, setLoadError] = useState(false);
+
+  // 在途守卫：五接口聚合慢于轮询间隔时不得叠加（与普通用户侧同范式）
+  const loadInFlightRef = useRef(false);
+
+  const load = useCallback(async () => {
+    if (loadInFlightRef.current) {
+      return;
+    }
+    loadInFlightRef.current = true;
+    try {
+      const [n, k, i, r, s] = await Promise.all([
+        getNodeList(),
+        getKernelList(),
+        getInboundList(),
+        getInboundRelays(0),
+        getSubscriptions(),
+      ]);
+
+      if (n.code === 0) setNodes(n.data ?? []);
+      if (k.code === 0) setKernels(k.data ?? []);
+      if (i.code === 0) setInbounds(i.data ?? []);
+      if (r.code === 0) setRelays(r.data ?? []);
+      if (s.code === 0) setSubs(s.data?.items ?? []);
+      setLoadError([n, k, i, r, s].some((res) => res.code !== 0));
+    } finally {
+      loadInFlightRef.current = false;
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+    const timer = window.setInterval(() => {
+      // 后台标签暂停轮询，切回前台立即补一轮
+      if (document.hidden) {
+        return;
+      }
+      void load();
+    }, 30000);
+
+    const handleVisibilityChange = () => {
+      if (!document.hidden) {
+        void load();
+      }
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [load]);
+
+  if (loading) return <PageLoadingState message="正在加载..." />;
+
+  const now = Date.now();
+  const online = nodes.filter((n) => n.status === 1).length;
+  const enabledInbounds = inbounds.filter((i) => i.enabled);
+  const kernelDown = (i: InboundApiItem) =>
+    i.enabled && !i.external && i.kernelStatus !== "running";
+  // 导入（external）入站看面板探测结果，内建入站看内核状态（沿用既有口径）
+  const probeDown = (i: InboundApiItem) =>
+    i.enabled &&
+    i.external &&
+    Boolean(i.probe && !i.probe.skipped && !i.probe.ok);
+  const badInbound = (i: InboundApiItem) => kernelDown(i) || probeDown(i);
+  const runningInbounds = enabledInbounds.filter((i) => !badInbound(i));
+  const relaysUp = relays.filter(
+    (r) => r.forwardExists && r.forwardStatus === 1,
+  );
+  // AP-9：未计入「正常」的两类必须分开——转发已不存在（线路损坏）
+  // 与转发被停用，此前一律并作「未启用」误导管理员。
+  const relaysMissing = relays.filter((r) => !r.forwardExists);
+  const relaysDisabled = relays.filter(
+    (r) => r.forwardExists && r.forwardStatus !== 1,
+  );
+  const shares = subs.filter((s) => s.kind === "share");
+  const activeSubs = subs.filter((s) => s.active);
+
+  const issues: Issue[] = [];
+
+  for (const n of nodes) {
+    if (n.status !== 1) {
+      issues.push({
+        kind: "offline",
+        level: "danger",
+        name: n.name,
+        detail: "agent 没有连接面板",
+      });
+    }
+    if (
+      n.expiryTime &&
+      n.expiryTime - now <= SOON &&
+      !n.expiryReminderDismissed
+    ) {
+      const expired = n.expiryTime <= now;
+
+      issues.push({
+        kind: expired ? "expired" : "expiring",
+        level: expired ? "danger" : "warning",
+        name: n.name,
+        detail: daysLeft(n.expiryTime),
+      });
+    }
+  }
+  for (const k of kernels) {
+    if (k.status === "error") {
+      issues.push({
+        kind: "kernel",
+        level: "danger",
+        name: `${k.nodeName} · ${k.kernelType}`,
+        detail: k.lastError || "查看内核日志",
+      });
+    }
+  }
+  const kernelStateText: Record<string, string> = {
+    pending: "等待下发，节点上线后自动补上",
+    stopped: "内核已停止",
+  };
+
+  for (const i of inbounds) {
+    // Kernel errors are listed per kernel above.
+    if (kernelDown(i) && i.kernelStatus !== "error") {
+      issues.push({
+        kind: "inbound",
+        level: "warning",
+        name: i.name,
+        detail: `${i.nodeName} · ${kernelStateText[i.kernelStatus] ?? i.kernelStatus}`,
+      });
+    }
+    if (probeDown(i)) {
+      issues.push({
+        kind: "probe",
+        level: "warning",
+        name: i.name,
+        detail: i.probe?.error || "连不上",
+      });
+    }
+  }
+  for (const r of relaysMissing) {
+    // AP-9：损坏线路（底层转发已删）必须进「需要处理」点名，
+    // 不能只沉在指标差集里冒充「未启用」。
+    issues.push({
+      kind: "relaygone",
+      level: "warning",
+      name: r.name,
+      detail: "对应的转发已不存在",
+    });
+  }
+  for (const s of shares) {
+    const used = s.uploadBytes + s.downloadBytes;
+
+    if (s.enabled && s.trafficLimit && used >= s.trafficLimit * 0.9) {
+      issues.push({
+        kind: "subflow",
+        level: s.overQuota ? "danger" : "warning",
+        name: s.name,
+        detail: `${formatTraffic(used)} / ${formatTraffic(s.trafficLimit)}`,
+      });
+    }
+    if (s.enabled && s.expireTime && s.expireTime - now <= SOON) {
+      issues.push({
+        kind: "subexpire",
+        level: s.expireTime <= now ? "danger" : "warning",
+        name: s.name,
+        detail: daysLeft(s.expireTime),
+      });
+    }
+  }
+  const groups = (Object.keys(KINDS) as IssueKind[])
+    .map((kind) => {
+      const items = issues.filter((i) => i.kind === kind);
+
+      return {
+        kind,
+        items,
+        level: items.some((i) => i.level === "danger")
+          ? ("danger" as const)
+          : ("warning" as const),
+      };
+    })
+    .filter((g) => g.items.length > 0)
+    .sort((a, b) => (a.level === b.level ? 0 : a.level === "danger" ? -1 : 1));
+
+  const up = inbounds.reduce((t, i) => t + i.uploadBytes, 0);
+  const down = inbounds.reduce((t, i) => t + i.downloadBytes, 0);
+  const top = [...inbounds]
+    .filter((i) => !i.external && i.uploadBytes + i.downloadBytes > 0)
+    .sort(
+      (a, b) =>
+        b.uploadBytes + b.downloadBytes - (a.uploadBytes + a.downloadBytes),
+    )
+    .slice(0, 4);
+  const topMax = top[0] ? top[0].uploadBytes + top[0].downloadBytes : 1;
+
+  const expiring = [
+    ...nodes
+      .filter(
+        (n) =>
+          n.expiryTime &&
+          n.expiryTime - now <= 30 * DAY &&
+          !n.expiryReminderDismissed,
+      )
+      .map((n) => ({
+        key: `n${n.id}`,
+        kind: "节点",
+        name: n.name,
+        at: n.expiryTime ?? 0,
+        path: "/node",
+      })),
+    ...shares
+      .filter(
+        (s) => s.enabled && s.expireTime && s.expireTime - now <= 30 * DAY,
+      )
+      .map((s) => ({
+        key: `s${s.id}`,
+        kind: "订阅",
+        name: s.name,
+        at: s.expireTime,
+        path: "/subscription",
+      })),
+  ]
+    .sort((a, b) => a.at - b.at)
+    .slice(0, 5);
+
+  const shownNodes = [...nodes].sort((a, b) => a.status - b.status).slice(0, 6);
+
+  return (
+    <AnimatedPage className="space-y-4 px-3 py-6 lg:px-6">
+      <div>
+        <h1 className="text-lg font-semibold">概览</h1>
+        <p className="text-xs font-semibold text-foreground">
+          {new Date().toLocaleDateString("zh-CN", {
+            month: "long",
+            day: "numeric",
+            weekday: "long",
+          })}
+          {" · 每 30 秒自动刷新"}
+        </p>
+      </div>
+
+      {loadError && (
+        <div className="flex items-center justify-between gap-3 rounded-xl border border-warning-500/25 bg-warning-500/10 px-4 py-3 text-sm font-medium text-warning-700">
+          <span>
+            部分数据加载失败，当前显示可能不完整，请勿据此判断系统状态。
+          </span>
+          <button
+            className="shrink-0 font-medium underline underline-offset-2"
+            type="button"
+            onClick={() => void load()}
+          >
+            点击重试
+          </button>
+        </div>
+      )}
+
+      <div className="grid grid-cols-2 gap-px overflow-hidden rounded-lg border border-divider bg-divider lg:grid-cols-4">
+        <Metric
+          foot={
+            nodes.length === 0
+              ? "还没有节点"
+              : online === nodes.length
+                ? "全部在线"
+                : `${nodes.length - online} 个离线`
+          }
+          footRight={
+            nodes.length
+              ? `${Math.round((online / nodes.length) * 100)}%`
+              : undefined
+          }
+          footTone={
+            nodes.length > online
+              ? "danger"
+              : nodes.length
+                ? "success"
+                : undefined
+          }
+          icon={Server}
+          label="节点在线"
+          tone="blue"
+          total={nodes.length}
+          value={online}
+          onPress={() => navigate("/node")}
+        />
+        <Metric
+          foot={
+            enabledInbounds.length === 0
+              ? inbounds.length === 0
+                ? "还没有落地"
+                : "全部停用"
+              : runningInbounds.length === enabledInbounds.length
+                ? "全部正常"
+                : `${enabledInbounds.length - runningInbounds.length} 个异常`
+          }
+          footRight={
+            inbounds.length > enabledInbounds.length
+              ? `${inbounds.length - enabledInbounds.length} 个停用`
+              : undefined
+          }
+          footTone={
+            runningInbounds.length < enabledInbounds.length
+              ? "warning"
+              : enabledInbounds.length
+                ? "success"
+                : undefined
+          }
+          icon={Globe}
+          label="落地运行"
+          tone="green"
+          total={enabledInbounds.length}
+          value={runningInbounds.length}
+          onPress={() => navigate("/inbound")}
+        />
+        <Metric
+          foot={
+            relays.length === 0
+              ? "还没有中转"
+              : relaysUp.length === relays.length
+                ? "全部正常"
+                : [
+                    relaysMissing.length > 0
+                      ? `转发已不存在 ${relaysMissing.length} 条`
+                      : null,
+                    relaysDisabled.length > 0
+                      ? `已停用 ${relaysDisabled.length} 条`
+                      : null,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")
+          }
+          footTone={
+            relays.length > relaysUp.length
+              ? "warning"
+              : relays.length
+                ? "success"
+                : undefined
+          }
+          icon={Link2}
+          label="中转线路"
+          tone="purple"
+          total={relays.length || undefined}
+          value={relaysUp.length}
+          onPress={() => navigate("/relay")}
+        />
+        <Metric
+          foot={
+            subs.length === 0
+              ? "还没有订阅"
+              : activeSubs.length === subs.length
+                ? "全部有效"
+                : `${subs.length - activeSubs.length} 个失效`
+          }
+          footRight={shares.length ? `分享 ${shares.length} 个` : undefined}
+          footTone={
+            activeSubs.length < subs.length
+              ? "warning"
+              : subs.length
+                ? "success"
+                : undefined
+          }
+          icon={Rss}
+          label="有效订阅"
+          tone="orange"
+          total={subs.length}
+          value={activeSubs.length}
+          onPress={() => navigate("/subscription")}
+        />
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1.55fr)_minmax(0,1fr)]">
+        <div className="space-y-4">
+          <Panel
+            badge={
+              issues.length > 0 && (
+                <span className="rounded-full tray-danger px-2 py-0.5 text-xs font-semibold">
+                  {issues.length}
+                </span>
+              )
+            }
+            title="需要处理"
+          >
+            {groups.length === 0 ? (
+              loadError ? (
+                <p className="py-3 text-center text-sm text-warning-700">
+                  数据加载失败，暂时无法判断
+                </p>
+              ) : (
+                <p className="py-3 text-center text-sm text-success-700">
+                  一切正常
+                </p>
+              )
+            ) : (
+              <div className="space-y-2.5">
+                {groups.map((g) => {
+                  const danger = g.level === "danger";
+                  const meta = KINDS[g.kind];
+                  const Icon = danger ? CircleAlert : TriangleAlert;
+                  const hint =
+                    g.kind === "probe" && g.items[0].detail
+                      ? `${meta.hint}：${g.items[0].detail}`
+                      : meta.hint;
+
+                  return (
+                    <button
+                      key={g.kind}
+                      className={`flex w-full items-start gap-3 rounded-xl border p-3 text-left transition-colors ${
+                        danger
+                          ? "border-danger-300 bg-danger-500/10 hover:bg-danger-500/20"
+                          : "border-warning-300 bg-warning-500/10 hover:bg-warning-500/20"
+                      }`}
+                      type="button"
+                      onClick={() => navigate(meta.path)}
+                    >
+                      <span
+                        className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-white ${danger ? "bg-danger" : "bg-warning"}`}
+                      >
+                        <Icon className="h-4 w-4" />
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span className="block text-sm font-semibold">
+                          {meta.label(g.items.length)}
+                        </span>
+                        <span className="block truncate text-xs font-semibold text-foreground">
+                          {hint}
+                        </span>
+                        <span className="mt-1.5 flex flex-wrap gap-1.5">
+                          {g.items.slice(0, 6).map((it) => (
+                            <span
+                              key={it.name}
+                              className="max-w-[12rem] truncate rounded-full border border-divider bg-tray px-2 py-0.5 text-xs font-semibold text-default-700"
+                              title={it.detail}
+                            >
+                              {it.name}
+                            </span>
+                          ))}
+                          {g.items.length > 6 && (
+                            <span className="rounded-full border border-divider bg-tray px-2 py-0.5 text-xs font-semibold text-foreground">
+                              +{g.items.length - 6}
+                            </span>
+                          )}
+                        </span>
+                      </span>
+                      <span className="hidden shrink-0 items-center self-center text-xs font-semibold text-foreground sm:flex">
+                        去处理
+                        <ChevronRight className="h-3.5 w-3.5" />
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </Panel>
+
+          {nodes.length > 0 && (
+            <Panel
+              action={
+                <button
+                  className="flex items-center text-xs font-semibold text-primary-700"
+                  type="button"
+                  onClick={() => navigate("/node")}
+                >
+                  查看全部
+                  <ChevronRight className="h-3.5 w-3.5" />
+                </button>
+              }
+              title="节点状态"
+            >
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
+                {shownNodes.map((n) => {
+                  const up = n.status === 1;
+                  const ip = String(n.serverIpV4 || n.serverIp || "");
+
+                  return (
+                    <button
+                      key={n.id}
+                      className="flex items-center gap-2.5 rounded-xl border border-divider px-3 py-2 text-left transition-colors hover:bg-white/40"
+                      type="button"
+                      onClick={() => navigate("/node")}
+                    >
+                      <span
+                        className={`h-2 w-2 shrink-0 rounded-full ${up ? "bg-success" : "bg-danger"}`}
+                      />
+                      <span className="min-w-0">
+                        <span className="block truncate text-sm font-medium">
+                          {n.name}
+                        </span>
+                        <span className="block truncate font-mono text-xs font-semibold text-foreground">
+                          {up ? "在线" : "离线"}
+                          {ip ? ` · ${ip}` : ""}
+                        </span>
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            </Panel>
+          )}
+        </div>
+
+        <div className="space-y-4">
+          <Panel
+            action={<span className="text-xs font-semibold text-foreground">累计</span>}
+            title="落地流量"
+          >
+            <div className="mb-3 grid grid-cols-2 gap-2">
+              {(
+                [
+                  ["↑ 上传", up],
+                  ["↓ 下载", down],
+                ] as Array<[string, number]>
+              ).map(([label, bytes]) => (
+                <div key={label} className="rounded-xl glass-inset px-3 py-2">
+                  <div className="text-xs font-semibold text-foreground">{label}</div>
+                  <div className="font-mono text-base font-semibold">
+                    {formatTraffic(bytes)}
+                  </div>
+                </div>
+              ))}
+            </div>
+            {top.length === 0 ? (
+              <p className="py-1 text-center text-xs font-semibold text-foreground">
+                还没有流量数据（导入的节点不统计流量）
+              </p>
+            ) : (
+              <div className="space-y-2.5">
+                {top.map((i) => {
+                  const total = i.uploadBytes + i.downloadBytes;
+
+                  return (
+                    <div key={i.id}>
+                      <div className="mb-1 flex items-center justify-between gap-2 text-xs font-semibold">
+                        <span className="truncate">{i.name}</span>
+                        <span className="shrink-0 font-mono text-foreground">
+                          {formatTraffic(total)}
+                        </span>
+                      </div>
+                      <div className="h-1.5 overflow-hidden rounded-full bg-default-100">
+                        <div
+                          className="h-full rounded-full bg-primary"
+                          style={{
+                            width: `${Math.max(4, (total / topMax) * 100)}%`,
+                          }}
+                        />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </Panel>
+
+          {expiring.length > 0 && (
+            <Panel title="即将到期">
+              <div className="divide-y divide-divider">
+                {expiring.map((e) => {
+                  const days = Math.ceil((e.at - now) / DAY);
+
+                  return (
+                    <button
+                      key={e.key}
+                      className="flex w-full items-center gap-2.5 py-2 text-left text-sm"
+                      type="button"
+                      onClick={() => navigate(e.path)}
+                    >
+                      <span
+                        className={`shrink-0 rounded-full px-2 py-0.5 text-xs font-semibold ${e.kind === "节点" ? "tray-warning" : "bg-orange-500/10 text-orange-700"}`}
+                      >
+                        {e.kind}
+                      </span>
+                      <span className="min-w-0 flex-1 truncate">{e.name}</span>
+                      <span
+                        className={`shrink-0 text-xs font-semibold ${days <= 3 ? "text-warning-700" : "text-foreground"}`}
+                      >
+                        {daysLeft(e.at)}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            </Panel>
+          )}
+        </div>
+      </div>
+    </AnimatedPage>
+  );
+}

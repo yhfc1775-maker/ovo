@@ -1,0 +1,777 @@
+package handler
+
+import (
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"net"
+	"strconv"
+	"strings"
+	"time"
+
+	"go-backend/internal/kernel"
+	runtimenft "go-backend/internal/runtime/nftables"
+	"go-backend/internal/store/model"
+	"go-backend/internal/store/repo"
+	"gorm.io/gorm"
+)
+
+// Tunnels whose engine is realm run their forwards with realm on the entry
+// nodes instead of the agent's forwarder. realm is installed and supervised
+// like a kernel (one per node, config = every realm forward on the node), so
+// a forward change re-renders its nodes' realm config.
+
+const tunnelEngineRealm = kernel.TypeRealm
+
+func tunnelIsRealm(t *tunnelRecord) bool { return t != nil && t.Engine == tunnelEngineRealm }
+
+// normalizeTunnelEngine checks a requested engine: "" or "realm".
+func normalizeTunnelEngine(raw string) (string, error) {
+	switch e := strings.ToLower(strings.TrimSpace(raw)); e {
+	case "", "gost":
+		return "", nil
+	case tunnelEngineRealm:
+		return e, nil
+	default:
+		return "", fmt.Errorf("不支持的转发引擎 %s", raw)
+	}
+}
+
+// validateRealmTunnelTx: realm runs port forwards on the panel's own agents.
+// realmTunnelValidationError 是 validateRealmTunnelTx 的定型校
+// 验失败（R3-GEN-03）：文案由请求态（隧道类型/节点模式）唯一确
+// 定、不含仓储原文。调用方以 errors.As 分流后以 msg 字段原样回
+// 执；仓储错在 helper 内已标记、由调用方守卫泛化。
+type realmTunnelValidationError struct{ msg string }
+
+func (e *realmTunnelValidationError) Error() string { return e.msg }
+
+func (h *Handler) validateRealmTunnelTx(tx *gorm.DB, typeVal int, entryNodeIDs []int64) error {
+	if typeVal != 1 {
+		return &realmTunnelValidationError{msg: "realm 引擎仅支持端口转发隧道"}
+	}
+	for _, nodeID := range entryNodeIDs {
+		node, err := h.repo.GetNodeRecordTx(tx, nodeID)
+		if err != nil {
+			// R2-F4-01：仓储直通，标记后由调用方守卫泛化。
+			return markRepoError(err)
+		}
+		if node == nil {
+			return &realmTunnelValidationError{msg: "节点不存在"}
+		}
+		if isNftablesForwardMode(node.ForwardMode) {
+			return &realmTunnelValidationError{msg: fmt.Sprintf("节点 %s 是 nftables 模式，不能使用 realm 引擎", node.Name)}
+		}
+	}
+	return nil
+}
+
+// realmIPHash maps the forward strategy: realm only balances by round robin
+// or IP hash.
+func realmIPHash(strategy string) bool { return strings.TrimSpace(strategy) == "hash" }
+
+// validateRealmForwardStrategy（A4-004 / BC-26）：realm 渲染多目标时非
+// iphash 一律 roundrobin——fifo（主备）/rand（随机）曾被静默改写为轮询，
+// 备目标在主目标健康时持续收到生产流量且用户无感知。改为明确拒绝：
+// 仅当隧道为 realm、有效目标 ≥2 且策略 ∉ {round, hash} 时报错（单目标
+// 无负载语义、策略不参与渲染，不拦，避免误伤存量默认 fifo 的单目标
+// 转发）。
+func validateRealmForwardStrategy(tunnel *tunnelRecord, remoteAddr, strategy string) error {
+	if !tunnelIsRealm(tunnel) {
+		return nil
+	}
+	// 终审 L1-F-06：realm 隧道经手 forward 目标 host，同口径补语法层
+	// 空标签判（只判语法、不做 DNS）；非 realm 隧道由调用方覆盖。
+	if err := validateNoEmptyLabelAddr(remoteAddr); err != nil {
+		return fmt.Errorf("转发目标地址主机名格式无效：%w", err)
+	}
+	switch strings.TrimSpace(strategy) {
+	case "", "round", "hash":
+		return nil
+	}
+	// R8-06（H-F3-01 同族）：目标切分走校验/消费共用的 splitRemoteParts
+	// （逗号/换行/CR）——此前只切逗号，换行分隔的双目标被误计为单目标、
+	// fifo 等策略绕过本门后仍被 realm 按双目标 roundrobin 渲染。
+	// R2-F4-02：计数再按归一后有效段口径（remotePartHasEffectiveTarget，
+	// 与零目标判 validateRemoteAddrHasTargets、消费侧 splitRemoteTargets
+	// 同一判据）——"1.2.3.4:80,#"、"http://" 等归一后无实质内容的段实际
+	// 只渲染 1 个目标，按原始段数计数会把 fifo 等策略误拒，与 forward.md
+	// 「归一后为空的段不算一个目标」矛盾。
+	effectiveTargets := 0
+	for _, part := range splitRemoteParts(remoteAddr) {
+		if remotePartHasEffectiveTarget(part) {
+			effectiveTargets++
+		}
+	}
+	if effectiveTargets < 2 {
+		return nil
+	}
+	return fmt.Errorf("realm 引擎仅支持轮询（round）与 IP 哈希（hash）负载策略，多目标转发不能使用 %s 策略", strings.TrimSpace(strategy))
+}
+
+// validateForwardStrategy（R4-F4-02）：转发负载策略的写面合法集
+// 校验——合法集本体是 kernel.ForwardStrategyLegal 单点（恢复面 repo
+// 共用同一判）。create/update 对最终落库值（含合并回填值）无条件
+// 校验：集外值落库后 agent 解析一律 roundrobin，声明与生效静默不
+// 一致；存量坏策略行同零目标/段数帽口径，任何编辑须先补正策略。
+func validateForwardStrategy(strategy string) error {
+	if kernel.ForwardStrategyLegal(strategy) {
+		return nil
+	}
+	return fmt.Errorf("不支持的负载策略 %q，合法值为 fifo、round、rand、hash", strings.TrimSpace(strategy))
+}
+
+// normalizeChainStrategy（R1-03-M1）：隧道链路策略写面归一＋合法
+// 集校验——合法集本体是 kernel.ChainStrategyLegal 单点（恢复面
+// repo、联邦 ApplyRole 面共用同一判，分段口径：跳行不含 best）。
+// 空串是「未提供」形态，按链路统一缺省 round 解析；非空值先
+// TrimSpace 再判、落库归一值。集外值在此点名拒绝、不得原文落
+// 库：agent selector 对未知策略一律 default 轮询，声明与生效静
+// 默不一致（与 validateForwardStrategy 的 R4-F4-02 同族口径）。
+func normalizeChainStrategy(chainType int, raw string) (string, error) {
+	strategy := strings.TrimSpace(raw)
+	if strategy == "" {
+		strategy = "round"
+	}
+	if !kernel.ChainStrategyLegal(chainType, strategy) {
+		return "", fmt.Errorf("不支持的链路负载策略 %q，合法值为 %s", strategy, kernel.ChainStrategyLegalValues(chainType))
+	}
+	return strategy, nil
+}
+
+// validateRealmEngineSwitchForwards（R2-F4-01）：引擎切换 gost→realm
+// 此前是 A4-004 策略门的第四写面漏网——switchTunnelEngine 径直删除
+// gost 服务并以 realm 重渲染，多目标 fifo/rand 被静默改写为轮询、备
+// 目标在主目标健康时分到生产流量且无任何回执。现与 create/update/
+// 批量换隧道三面同口径：隧道下全部既有转发逐条以 realm 形态跑
+// validateRealmForwardStrategy，命中即点名该转发整单拒绝。落点两处：
+// tunnelUpdate 验证段在落库前整单拒绝；switchTunnelEngine 的
+// gost→realm 入口再以同一谓词兜底，防绕过更新面直调时静默转换。
+func validateRealmEngineSwitchForwards(forwards []forwardRecord) error {
+	realmTunnel := &tunnelRecord{Engine: tunnelEngineRealm}
+	for i := range forwards {
+		f := &forwards[i]
+		if err := validateRealmForwardStrategy(realmTunnel, f.RemoteAddr, f.Strategy); err != nil {
+			return fmt.Errorf("转发「%s」：%w", f.Name, err)
+		}
+	}
+	return nil
+}
+
+func realmListenAddr(node *nodeRecord, port int, bindIP string) string {
+	if bindIP = strings.TrimSpace(bindIP); bindIP != "" {
+		if _, _, err := net.SplitHostPort(bindIP); err == nil {
+			return processServerAddress(bindIP)
+		}
+		return processServerAddress(net.JoinHostPort(strings.Trim(bindIP, "[]"), strconv.Itoa(port)))
+	}
+	// R32-FIX-F01：监听地址先剥离 :port 再与服务端口拼接——含端口
+	// 的 TCPListenAddr（如 "203.0.113.7:9999"）否则产出
+	// "203.0.113.7:9999:443" 畸形地址。须用 JoinHostPort 而非
+	// "%s:%d" 直拼：裸 IPv6 监听地址拼端口后形如 "2001:db8::1:443"，
+	// 会被 processServerAddress 误读成另一个合法 IPv6 地址
+	// （"[2001:db8::1:443]"）。bindIP 分支（D-01「端口胜出」）不动。
+	return processServerAddress(net.JoinHostPort(strings.Trim(stripListenAddrPort(node.TCPListenAddr), "[]"), strconv.Itoa(port)))
+}
+
+// realmNodeEndpoints lists the realm forwards to run on a node. override
+// forces a forward on or off: pause, resume and delete re-render before the
+// forward's status changes in the database.
+func (h *Handler) realmNodeEndpoints(nodeID int64, override map[int64]bool) ([]kernel.RealmEndpoint, []map[string]interface{}, error) {
+	node, err := h.getNodeRecord(nodeID)
+	if err != nil {
+		return nil, nil, err
+	}
+	forwards, err := h.repo.ListRealmForwardsByNode(nodeID)
+	if err != nil {
+		// R3-GEN-02④：仓储直通先标记——syncRealmNodes 的回执面恢复
+		// 原文后（tunnelUpdate），靠各调用方守卫把仓储原文挡在回执外。
+		return nil, nil, markRepoError(err)
+	}
+	var endpoints []kernel.RealmEndpoint
+	var ports []map[string]interface{}
+	tunnels := map[int64]*tunnelRecord{}
+	for i := range forwards {
+		f := &forwards[i]
+		tunnel, ok := tunnels[f.TunnelID]
+		if !ok {
+			var terr error
+			tunnel, terr = h.repo.GetTunnelRecord(f.TunnelID)
+			if terr != nil {
+				// R3-MR-01（机械复推新增点）：隧道读失败不得以 nil
+				// 隧道把在役转发判为未运行而从 realm 渲染中静默
+				// 剔除——与下方 listForwardPorts 失败同口径回错。
+				// 注：GetTunnelRecord 对「行不存在」回 (nil, nil)，
+				// 只有真存储错误才进本分支，不误伤已删隧道。
+				return nil, nil, terr
+			}
+			tunnels[f.TunnelID] = tunnel
+		}
+		run := f.Status == 1 && tunnel != nil && tunnel.Status == 1
+		if v, ok := override[f.ID]; ok {
+			run = v
+		}
+		if !run {
+			continue
+		}
+		publicOnly, err := h.forwardTargetPublicOnly(f)
+		if err != nil {
+			return nil, nil, err
+		}
+		remotes := splitRemoteTargets(f.RemoteAddr)
+		if publicOnly {
+			remotes, err = pinPublicForwardTargets(remotes)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		fps, err := h.listForwardPorts(f.ID)
+		if err != nil {
+			return nil, nil, err
+		}
+		receive, send := normalizeForwardProxyProtocol(f.ProxyProtocol, f.ProxyProtocolReceive, f.ProxyProtocolSend)
+		for _, fp := range fps {
+			if fp.NodeID != nodeID || fp.Port <= 0 {
+				continue
+			}
+			e := kernel.RealmEndpoint{
+				ForwardID:   f.ID,
+				Listen:      realmListenAddr(node, fp.Port, fp.InIP),
+				Remotes:     remotes,
+				IPHash:      realmIPHash(f.Strategy),
+				Interface:   strings.TrimSpace(node.InterfaceName),
+				AcceptProxy: receive > 0,
+				SendProxy:   send,
+			}
+			endpoints = append(endpoints, e)
+			ports = append(ports, map[string]interface{}{
+				"inboundId": kernel.RealmCounterID(f.ID), "port": fp.Port, "network": "tcp,udp",
+			})
+		}
+	}
+	return endpoints, ports, nil
+}
+
+// buildRealmApplyPayload renders a node's realm kernel.
+func (h *Handler) buildRealmApplyPayload(k *model.NodeKernel, info kernel.Info, override map[int64]bool) (map[string]interface{}, string, error) {
+	endpoints, ports, err := h.realmNodeEndpoints(k.NodeID, override)
+	if err != nil {
+		return nil, "", err
+	}
+	rendered, err := kernel.RenderRealm(endpoints)
+	if err != nil {
+		return nil, "", err
+	}
+	// 1.7.7（KU5）：同 kernel 下发口径——不再带面板配置代理，proxy
+	// 恒为空，下载路线由 agent 侧内置候选自行测速直选（KU4）。
+	proxy := ""
+	download, err := kernel.ResolveDownload(info, k.Version, proxy)
+	if err != nil {
+		return nil, "", err
+	}
+	if ports == nil {
+		ports = []map[string]interface{}{}
+	}
+	return map[string]interface{}{
+		"type":     k.KernelType,
+		"version":  k.Version,
+		"download": download,
+		"files":    rendered.Files,
+		"args":     rendered.Args,
+		"hash":     rendered.Hash,
+		"enabled":  k.Enabled == 1 && !rendered.Idle,
+		"ports":    ports,
+	}, rendered.Hash, nil
+}
+
+// ensureRealmKernel returns the node's realm kernel, registering it when the
+// node needs one (create false only looks it up).
+func (h *Handler) ensureRealmKernel(nodeID int64, create bool) (*model.NodeKernel, error) {
+	// R3-GEN-02④：本函数三处仓储直通统一先标记（读/建/改），与
+	// realmNodeEndpoints 同口径——syncRealmNodes 回执面恢复原文后
+	// 靠守卫泛化仓储原文。
+	k, err := h.repo.GetNodeKernelByType(nodeID, kernel.TypeRealm)
+	if err != nil || (k == nil && !create) {
+		if err != nil {
+			err = markRepoError(err)
+		}
+		return k, err
+	}
+	now := time.Now().UnixMilli()
+	if k == nil {
+		k = &model.NodeKernel{
+			NodeID: nodeID, KernelType: kernel.TypeRealm, Version: kernel.RealmVersion,
+			Status: kernelStatusPending, Enabled: 1, CreatedTime: now, UpdatedTime: now,
+		}
+		if err := h.repo.CreateNodeKernel(k); err != nil {
+			return k, markRepoError(err)
+		}
+		return k, nil
+	}
+	if k.Version != kernel.RealmVersion {
+		// A panel upgrade moved to a newer realm.
+		if err := h.repo.UpdateNodeKernelFields(k.ID, map[string]interface{}{"version": kernel.RealmVersion, "updated_time": now}); err != nil {
+			return nil, markRepoError(err)
+		}
+		k.Version = kernel.RealmVersion
+	}
+	return k, nil
+}
+
+// syncRealmNodes re-renders realm on the nodes. Offline nodes are skipped
+// with a warning; they catch up when the agent reconnects.
+// realmSyncError 是 syncRealmNodes 的定型回执失败（R3-GEN-02④）：
+// 同步失败细节（哪个节点、哪一步）对用户可行动，文案在
+// syncRealmNodes 边界由 realmSyncFailure 拼入；已标记仓储错不进
+// 本型。回执以 msg 字段原样回（管理员面 raw-error 门口径：可能
+// 携带仓储原文的值不经 err.Error() 呈现）。
+type realmSyncError struct{ msg string }
+
+func (e *realmSyncError) Error() string { return e.msg }
+
+// realmSyncFailure 是 syncRealmNodes 返回点的分类器：已标记仓储
+// 错原样上抛（回执守卫泛化），其余失败（渲染定型错、apply 数据
+// 面错、节点名前缀包装）拼入 realmSyncError。
+func realmSyncFailure(err error) error {
+	if err == nil || isRepoError(err) {
+		return err
+	}
+	return &realmSyncError{msg: err.Error()}
+}
+
+func (h *Handler) syncRealmNodes(nodeIDs []int64, override map[int64]bool) ([]string, error) {
+	var warnings []string
+	for _, nodeID := range uniqueInt64s(nodeIDs) {
+		if nodeID <= 0 {
+			continue
+		}
+		endpoints, _, err := h.realmNodeEndpoints(nodeID, override)
+		if err != nil {
+			return warnings, realmSyncFailure(err)
+		}
+		k, err := h.ensureRealmKernel(nodeID, len(endpoints) > 0)
+		if err != nil {
+			return warnings, realmSyncFailure(err)
+		}
+		if k == nil {
+			continue
+		}
+		install := k.InstalledVersion == ""
+		if err := h.applyKernelWith(k.ID, install, override); err != nil {
+			// F2-APPLY-01：确认待定不是失败也不是离线——先于离线/超时
+			// 归类分流，警告只说「已发出、正在确认」，下次 poll 收敛。
+			if errors.Is(err, errApplyConfirmPending) {
+				warnings = append(warnings, fmt.Sprintf("节点 %s 下发已发出，正在确认生效状态", h.nodeLabel(nodeID)))
+				continue
+			}
+			if isNodeOfflineOrTimeoutError(err) {
+				warnings = append(warnings, fmt.Sprintf("节点 %s 不在线，realm 配置待节点上线后下发", h.nodeLabel(nodeID)))
+				continue
+			}
+			if strings.Contains(err.Error(), "不支持的内核类型") {
+				return warnings, realmSyncFailure(fmt.Errorf("节点 %s 的 agent 版本过旧，不支持 realm，请先升级节点", h.nodeLabel(nodeID)))
+			}
+			return warnings, realmSyncFailure(fmt.Errorf("节点 %s realm 下发失败: %w", h.nodeLabel(nodeID), err))
+		}
+	}
+	return warnings, nil
+}
+
+// syncRealmForward re-renders the realm nodes of one forward.
+func (h *Handler) syncRealmForward(forward *forwardRecord, override map[int64]bool) ([]string, error) {
+	ports, err := h.listForwardPorts(forward.ID)
+	if err != nil {
+		return nil, err
+	}
+	warnings, err := h.syncRealmNodes(forwardPortNodeIDs(ports), override)
+	if err != nil {
+		return warnings, err
+	}
+	hasIneffectiveLimit, err := h.forwardHasIneffectiveLimits(forward)
+	if err != nil {
+		return warnings, err
+	}
+	if hasIneffectiveLimit {
+		warnings = append(warnings, "realm 引擎不支持限速和连接数限制，这些设置不生效")
+	}
+	return warnings, nil
+}
+
+// forwardHasIneffectiveLimits 是「该转发存在有效但当前数据面不执法
+// 的限速/连接数设置」的共用谓词（realm 与 nftables 两面同口径，
+// R3X-019 起 nft 复用本谓词，禁止两面再分叉）：
+//   - 转发级 SpeedID/IPSpeedID（R2X-034）：经 GetSpeedLimitSpeed
+//     （status=1 过滤）成功且 speed>0 才算有效；引用已禁用/零速
+//     规则时限速本就不生效，不得误报。
+//   - MaxConn/IPMaxConn 是转发自有字段、无 status 维度，保持裸值。
+//   - UT 级限速（X-P3-10）：复用 ResolveUserTunnelAndLimiter 的
+//     有效性谓词（status=1 且 speed>0）；已禁用或 speed=0 的 UT
+//     规则解析为空，不产生警告。
+func (h *Handler) forwardHasIneffectiveLimits(forward *forwardRecord) (bool, error) {
+	forwardSpeedIneffective := false
+	for _, id := range []sql.NullInt64{forward.SpeedID, forward.IPSpeedID} {
+		if !id.Valid {
+			continue
+		}
+		if speed, err := h.repo.GetSpeedLimitSpeed(id.Int64); err == nil && speed > 0 {
+			forwardSpeedIneffective = true
+			break
+		}
+	}
+	if forwardSpeedIneffective || forward.MaxConn > 0 || forward.IPMaxConn > 0 {
+		return true, nil
+	}
+	_, utLimiterID, utSpeed, err := h.resolveUserTunnelAndLimiter(forward.UserID, forward.TunnelID)
+	if err != nil {
+		return false, err
+	}
+	return utLimiterID != nil && utSpeed != nil, nil
+}
+
+// controlRealmForward pauses, resumes or removes a realm forward.
+func (h *Handler) controlRealmForward(forward *forwardRecord, commandType string) error {
+	run := strings.EqualFold(strings.TrimSpace(commandType), "ResumeService")
+	_, err := h.syncRealmForward(forward, map[int64]bool{forward.ID: run})
+	return err
+}
+
+// switchTunnelEngine moves a tunnel's forwards between realm and the agent's
+// forwarder on its old and new entry nodes.
+//
+// A4-003：原实现全程吞错恒报成功——realm 下发硬失败（agent 版本过旧等）
+// 或旧引擎服务删除硬失败时 DB 已切引擎、数据面未切，用户无感知且长期
+// 分叉。现在聚合硬失败返回给调用方呈现；节点离线/超时属既有自愈语义
+// （重连后对账收敛），仍只记日志不算失败，与 syncRealmNodes 的
+// warnings 口径一致。
+func (h *Handler) switchTunnelEngine(tunnelID int64, fromRealm bool, oldEntryNodeIDs, newEntryNodeIDs []int64) error {
+	forwards, err := h.listForwardsByTunnel(tunnelID)
+	if err != nil {
+		return err
+	}
+	nodes := append(append([]int64{}, oldEntryNodeIDs...), newEntryNodeIDs...)
+	var hardErrs []error
+	collect := func(op string, err error) {
+		if err == nil {
+			return
+		}
+		if isNodeOfflineOrTimeoutError(err) {
+			log.Printf("realm engine switch tunnel_id=%d op=%s deferred (node offline, converges on reconnect): %v", tunnelID, op, err)
+			return
+		}
+		hardErrs = append(hardErrs, fmt.Errorf("%s: %w", op, err))
+	}
+	if fromRealm {
+		// R3-01：拆除 realm 前先结算最终计数——拆除后 agent nft 表
+		// 重建、realm 端口计数消失，此刻不结算的增量永久漏计
+		// （A4-010 的 realm 侧窗口）。轮询失败（离线）不阻塞切换，
+		// 与离线自愈口径一致。
+		h.settleRealmCountersAtSwitch(nodes)
+		// FIX2-A（V2-04）：settle 对离线节点是静默跳过——DB 引擎已
+		// 切 gost、切换照常报成功，但自上次成功轮询以来的 realm 增
+		// 量还只存在于 agent 侧。给离线节点打待结算标记，节点重连
+		// 时 onNodeOnline 先结算再放行对账/重下发（见 upgrade.go），
+		// 否则重连后 redeploy 先让 agent 弃 realm 计数、增量永久
+		// 漏计且无任何日志。
+		for _, nodeID := range uniqueInt64s(nodes) {
+			if nodeID > 0 && (h.wsServer == nil || !h.wsServer.IsNodeOnline(nodeID)) {
+				h.markPendingRealmSettle(nodeID)
+				log.Printf("realm engine switch tunnel_id=%d node_id=%d offline: settle deferred to reconnect (pending marker set)", tunnelID, nodeID)
+			}
+		}
+		// Free the ports first, then start the agent's services.
+		if _, err := h.syncRealmNodes(nodes, nil); err != nil {
+			collect("realm 收敛", err)
+		}
+		for i := range forwards {
+			collect("gost 服务同步", h.syncForwardServices(&forwards[i], "UpdateService", true))
+		}
+		return errors.Join(hardErrs...)
+	}
+	// R2-F4-01 兜底：正常路径已由 tunnelUpdate 验证段以同一谓词整单
+	// 拒绝；此处在删任何 gost 服务之前复检，防绕过更新面直调本函数
+	// 时多目标 fifo/rand 被静默改写为 realm 轮询。
+	if err := validateRealmEngineSwitchForwards(forwards); err != nil {
+		return err
+	}
+	for i := range forwards {
+		for _, nodeID := range uniqueInt64s(nodes) {
+			// R21-X-01（F-01）：gost→realm 切换时旧引擎服务删后须清掉
+			// 该转发的 rule_conn_limit_<id>。deleteForwardServicesOnNode
+			// 只发 DeleteService；此前切换是唯一一条“服务已删、limiter
+			// 未删”的产品路径，limiter 成无引用孤儿（F-04 重启/SIGHUP
+			// 可兜底剪除，故 P3）。清理复用 deleteForwardConnLimiterOnNode
+			// 的按 ID 兜底（与删转发漏斗同口径：从未带过限流的转发多发
+			// 一次亦无害，agent 侧删不存在者为 noop），且只在
+			// DeleteService 成功后发（先删服务、后清 limiter；离线节
+			// 点的删除失败由 collect 按既有口径记 deferred，不清
+			// limiter，与服务删除的命运一致）。
+			// 清理只落在本切换点，不进 deleteForwardServicesOnNode
+			// 本身：它的另两个调用方是“删旧服务后立即重建同一服务”
+			// 的重建路径（sync 回退、默认监听回退），重建服务仍引用
+			// 原 limiter，helper 内清会让重建服务挂上已删的 limiter。
+			if err := h.deleteForwardServicesOnNode(&forwards[i], nodeID); err != nil {
+				collect("旧引擎服务删除", err)
+				continue
+			}
+			h.deleteForwardConnLimiterOnNode(&forwards[i], nodeID)
+		}
+	}
+	if _, err := h.syncRealmNodes(nodes, nil); err != nil {
+		collect("realm 下发", err)
+	}
+	// R3-01：realm 起来后立即拉一次状态：新引擎计数基线钉在切换点，
+	// 切换后立即产生的流量从下一轮询起即可差分入账；不再等 60s 轮询
+	// 首采样才建基线（真机 T10 观察到切换后计数 ≥8 分钟不动、仅迟到
+	// 部分入账）。
+	h.settleRealmCountersAtSwitch(nodes)
+	return errors.Join(hardErrs...)
+}
+
+// markPendingRealmSettle / consumePendingRealmSettle /
+// hasPendingRealmSettle 是 V2-04 的待结算标记（upgradeMu 保护，与
+// pendingUpgradeRedeploy 同族）：realm→gost 切换时节点离线、settle
+// 轮询静默跳过，则给节点打标记；节点重连（onNodeOnline）在放行
+// 异步对账与 redeploy 之前先消费标记做一次同步结算，保证「先结算
+// 后下发」的顺序，增量不随 agent 弃 realm 计数丢失。
+// X-P3-34（V-09）：pendingRealmSettle 标记落库（config KV）——面板重启
+// 后未消费的标记不得丢失。键 pending_realm_settle:<nodeID>，值 JSON
+// {nodeId, markedAt(毫秒), direction}；方向恒为 realm->gost（标记只由
+// realm→gost 离线切换路径产生）。内存 map 保留为一级缓存，has 未命中
+// 时回查 DB 并回填（等价于启动恢复：New() 无启动钩子，惰性恢复保证
+// 重连对账路径 onNodeOnline 先结算后 redeploy 的顺序不变）。
+func pendingRealmSettleKey(nodeID int64) string {
+	return fmt.Sprintf("pending_realm_settle:%d", nodeID)
+}
+
+type pendingRealmSettleRecord struct {
+	NodeID    int64  `json:"nodeId"`
+	MarkedAt  int64  `json:"markedAt"`
+	Direction string `json:"direction"`
+}
+
+func (h *Handler) persistPendingRealmSettle(nodeID int64) {
+	if h == nil || h.repo == nil {
+		return
+	}
+	rec := pendingRealmSettleRecord{NodeID: nodeID, MarkedAt: time.Now().UnixMilli(), Direction: "realm->gost"}
+	raw, err := json.Marshal(rec)
+	if err != nil {
+		return
+	}
+	if err := h.repo.UpsertConfig(pendingRealmSettleKey(nodeID), string(raw), rec.MarkedAt); err != nil {
+		log.Printf("pending realm settle persist failed node=%d: %v", nodeID, err)
+	}
+}
+
+func (h *Handler) loadPendingRealmSettle(nodeID int64) bool {
+	if h == nil || h.repo == nil {
+		return false
+	}
+	cfg, err := h.repo.GetConfigByName(pendingRealmSettleKey(nodeID))
+	if err != nil || cfg == nil || strings.TrimSpace(cfg.Value) == "" {
+		return false
+	}
+	return true
+}
+
+func (h *Handler) clearPendingRealmSettle(nodeID int64) {
+	if h == nil || h.repo == nil {
+		return
+	}
+	if err := h.repo.DeleteConfig(pendingRealmSettleKey(nodeID)); err != nil {
+		log.Printf("pending realm settle clear failed node=%d: %v", nodeID, err)
+	}
+}
+
+func (h *Handler) markPendingRealmSettle(nodeID int64) {
+	if h == nil || nodeID <= 0 {
+		return
+	}
+	h.upgradeMu.Lock()
+	if h.pendingRealmSettle == nil {
+		h.pendingRealmSettle = make(map[int64]struct{})
+	}
+	h.pendingRealmSettle[nodeID] = struct{}{}
+	h.upgradeMu.Unlock()
+	h.persistPendingRealmSettle(nodeID)
+}
+
+func (h *Handler) consumePendingRealmSettle(nodeID int64) bool {
+	if h == nil || nodeID <= 0 {
+		return false
+	}
+	h.upgradeMu.Lock()
+	_, inMem := h.pendingRealmSettle[nodeID]
+	if inMem {
+		delete(h.pendingRealmSettle, nodeID)
+	}
+	h.upgradeMu.Unlock()
+	inDB := h.loadPendingRealmSettle(nodeID)
+	if inDB {
+		h.clearPendingRealmSettle(nodeID)
+	}
+	return inMem || inDB
+}
+
+func (h *Handler) hasPendingRealmSettle(nodeID int64) bool {
+	if h == nil || nodeID <= 0 {
+		return false
+	}
+	h.upgradeMu.Lock()
+	_, ok := h.pendingRealmSettle[nodeID]
+	h.upgradeMu.Unlock()
+	if ok {
+		return true
+	}
+	// 内存未命中回查落库标记（重启恢复），命中则回填内存。
+	if h.loadPendingRealmSettle(nodeID) {
+		h.upgradeMu.Lock()
+		if h.pendingRealmSettle == nil {
+			h.pendingRealmSettle = make(map[int64]struct{})
+		}
+		h.pendingRealmSettle[nodeID] = struct{}{}
+		h.upgradeMu.Unlock()
+		return true
+	}
+	return false
+}
+
+// settleRealmCountersAtSwitch 主动拉一次各节点的内核状态，把 realm
+// 计数结算/建基线到当前时刻。refreshNodeKernelStatus 内部对离线节点
+// 静默跳过，失败不影响切换本身。
+func (h *Handler) settleRealmCountersAtSwitch(nodeIDs []int64) {
+	for _, nodeID := range uniqueInt64s(nodeIDs) {
+		if nodeID > 0 {
+			h.refreshNodeKernelStatus(nodeID)
+		}
+	}
+}
+
+// applyRealmCounters credits realm forwards with the traffic the agent
+// counted on their ports, the same way nftables forwards are accounted.
+func (h *Handler) applyRealmCounters(nodeID int64, epoch string, counters []agentKernelCounter, now time.Time) {
+	h.applyRealmCountersMode(nodeID, epoch, counters, now, true)
+}
+
+// applyRealmCountersMode 是 applyRealmCounters 的实现；enforce=false
+// 为下发后 settle 口径：只入账、不执行执法尾（指标/配额强制/流量
+// 策略）——settle 在 per-kernel apply 锁内执行，执法尾的暂停面可
+// 回头取同一 kernel 的 apply 锁（不可重入）必自锁；执法由 ≤60s
+// 后的周期轮询全量面按已入账累计补做（与 nftables drain/settle
+// 的同口径分工一致）。
+// realmPayloadHeaderBytes is the per-packet IP+transport header the
+// FIX-029 conversion strips from realm nft counters (IPv4-typical:
+// TCP 20 IP + 32 TCP with timestamps, UDP 20 IP + 8 UDP).
+//
+// Why: realm-phase forward traffic is counted by nft counters, which
+// count whole IP packets (headers included), while gost-phase traffic
+// is counted by gost itself at the payload layer. The same user bytes
+// therefore billed +16%/+11% on realm for one 2000-byte connection
+// (audit: 2320/2216 bytes over 6/4 packets) and ~+3.5% in bulk, versus
+// exactly 2000/2000 on gost. nft totals cannot yield payload bytes
+// exactly, but with the packet count the header part is
+// packets*header: 2320-6*52=2008 and 2216-4*52=2008 against the true
+// 2000 (+0.4%, the two SYN packets' extra 8 header bytes each), versus
+// +16%/+11% unconverted. The conversion runs on the cumulative sample
+// (before the baseline/delta math in accountForwardCounterSamples),
+// so baselines, epoch resets and settle rounds all stay consistent.
+// Residuals, documented not hidden: IPv6 headers are 20 bytes larger
+// (under-corrected by 20/packet on v6 realm flows), and retransmitted
+// segments are counted on the wire twice by any wire-level counter.
+// A sample with packets==0 (pre-fix agent) passes through unconverted.
+func realmPayloadHeaderBytes(proto string) int64 {
+	if strings.EqualFold(strings.TrimSpace(proto), "udp") {
+		return 28
+	}
+	return 52
+}
+
+// realmCounterPayload converts one cumulative realm nft counter sample
+// from the IP layer to the payload layer (FIX-029).
+func realmCounterPayload(c agentKernelCounter) int64 {
+	if c.Bytes <= 0 || c.Packets <= 0 {
+		return c.Bytes
+	}
+	if payload := c.Bytes - c.Packets*realmPayloadHeaderBytes(c.Proto); payload > 0 {
+		return payload
+	}
+	return 0
+}
+
+// accountRealmCounters 把 realm 转发的内核计数样本换算并入账（纯记账，
+// 不执行执法尾），返回执法尾所需的入账结果。B-NEW（入站行计数器
+// epoch/基线时序丢增量）：ingestKernelCountersMode 的 Phase A 在
+// per-node 入账锁内只做记账（入站/realm/用户三面），执法尾与
+// syncSubscriptions 一并移到 Phase B；如此任一面的样本都在重建
+// 前对旧基线结算，不会被同次摄入内触发的 KernelApply 换代吞掉。
+func (h *Handler) accountRealmCounters(nodeID int64, epoch string, counters []agentKernelCounter, now time.Time) (*flowUploadBatch, map[int64]repo.FlowUploadForwardMeta, int64, map[int64]*model.UserQuotaView, error) {
+	samples := make([]runtimenft.CounterSample, 0, len(counters))
+	hashes := map[int64]string{}
+	// R2A-5：负值／非法方向样本此前静默 continue，与入站面
+	// applyInboundCounterChunk 同口径按转发聚合 warn，绝不静默。
+	// !ok（非 realm 入站）是正常过滤，不计入。
+	negative := map[int64]int64{}
+	badDirection := map[int64]int64{}
+	for _, c := range counters {
+		fid, ok := kernel.RealmForwardID(c.InboundID)
+		if !ok {
+			continue
+		}
+		if c.Bytes < 0 {
+			negative[fid]++
+			continue
+		}
+		dir := runtimenft.CounterDirectionToTarget
+		if c.Dir == "out" {
+			dir = runtimenft.CounterDirectionFromTarget
+		} else if c.Dir != "in" {
+			badDirection[fid]++
+			continue
+		}
+		samples = append(samples, runtimenft.CounterSample{ForwardID: fid, Direction: dir, Protocol: c.Proto, Bytes: uint64(realmCounterPayload(c))})
+		// The agent's counters restart with its epoch.
+		hashes[fid] = "realm:" + epoch
+	}
+	for fid, n := range negative {
+		log.Printf("realm counter sample negative op=negative_bytes node_id=%d forward_id=%d samples=%d action=dropped", nodeID, fid, n)
+	}
+	for fid, n := range badDirection {
+		log.Printf("realm counter sample bad_direction op=illegal_direction node_id=%d forward_id=%d samples=%d action=dropped", nodeID, fid, n)
+	}
+	if len(samples) == 0 {
+		return nil, nil, 0, nil, nil
+	}
+	return h.accountForwardCounterSamples(nodeID, samples, hashes, now)
+}
+
+// enforceRealmCounters 是 realm 计数入账后的执法尾：指标、配额强制
+// 与流量策略在入账落库后同批执行，与采集路径
+// （collectNftablesNodeTraffic）同口径。
+func (h *Handler) enforceRealmCounters(nodeID int64, batch *flowUploadBatch, metas map[int64]repo.FlowUploadForwardMeta, nowMs int64, quotaViews map[int64]*model.UserQuotaView) {
+	if batch == nil {
+		return
+	}
+	h.recordTunnelMetricsFromForwardBatch(nodeID, batch.forwardTraffic, metas, nowMs)
+	for userID, quota := range quotaViews {
+		h.enforceUserQuotaIfNeeded(userID, quota)
+	}
+	for _, target := range batch.policyTargets {
+		if target.UserID <= 0 || target.UserTunnelID <= 0 {
+			continue
+		}
+		h.enforceFlowPolicies(target.UserID, target.UserTunnelID)
+	}
+}
+
+func (h *Handler) applyRealmCountersMode(nodeID int64, epoch string, counters []agentKernelCounter, now time.Time, enforce bool) {
+	batch, metas, nowMs, quotaViews, err := h.accountRealmCounters(nodeID, epoch, counters, now)
+	if err != nil || batch == nil {
+		return
+	}
+	if !enforce {
+		return
+	}
+	h.enforceRealmCounters(nodeID, batch, metas, nowMs, quotaViews)
+}

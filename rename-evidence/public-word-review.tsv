@@ -1,0 +1,511 @@
+path	line	context
+.github/workflows/ci-build.yml	93	      # selftest, mirroring the check-private-ranges pair.
+.github/workflows/ci-build.yml	128	  # BG-01 (R2-026): the timeout-budgets and private-ranges gates run in
+.github/workflows/ci-build.yml	139	  # The private-ranges script needs only bash + python3, but the
+.github/workflows/ci-build.yml	150	    name: Gate Mutation Selftests (timeout budgets + private ranges + hist metering)
+.github/workflows/ci-build.yml	169	          bash scripts/check-private-ranges-selftest.sh
+AUDIT-REPORT-2.1.30.md	156	公开 Apply/Control/Restore/手动刷新与停止使用同一生命周期读写门；内部 restore/apply 和周期更新保留私有入口，避免嵌套 RLock 在等待 writer 时死锁。后台 Geo/rule-set swap 仍走 applyMu，因此必须先 join 后取 applyMu，不能倒序。显式复用同一个已关闭 Manager 的 Apply/Control-start 可重建任务代际，原 API 能力没有被静默取消。正常服务配置、周期频率、下载 UR
+AUDIT-REPORT-2.1.30.md	261	处置理由及原报告行仍在逐条清单；缺少仓外原始细节的仅承接注册，不能从一个旧 ID 猜测当前缺陷。已接受的公开 GitHub 镜像代理、私有仓库第二锚单锚口径未作为新发现或修复目标。
+AUDIT-REPORT-2.1.31.md	533	- 公共 GitHub 镜像代理和私有仓库第二锚单锚是已接受项，保持原样；取消的 443 复用不恢复。
+LICENSE	95	computer or modifying a private copy.  Propagation includes copying,
+doc/audit/O2-forward.md	104	7. **remoteAddr SSRF 防护**：非管理员走 `IsSafeRemoteAddr`（DNS 解析 + 拒绝 loopback/private）
+doc/audit/U1-panel-upgrade-backend.md	90	- 证据：代理地址来自管理员配置（`getGithubProxyConfig`，upgrade.go:88-110，仅补 scheme 前缀、无形态校验）。若用户填内网代理（如 `http://192.168.x.x:8080` 或解析到内网的主机名），资产下载会在 `validateFetchIP`（secure_fetch.go:128-143）以 `private network not allowlisted` 被拒，除非部署时另设 `FLVX_FETCH_ALLOW
+doc/package.json	3	  "private": true,
+docs/superpowers/plans/2026-04-26-allow-local-remote-addr.md	5	**Goal:** Add a global settings toggle that allows non-admin forward rules to target local/private addresses when explicitly enabled.
+docs/superpowers/plans/2026-04-26-allow-local-remote-addr.md	72	Expected: FAIL because backend still rejects local/private addresses unconditionally.
+docs/superpowers/plans/2026-05-30-nftables-forwarding.md	116	  AuthType:   "private_key",
+docs/superpowers/plans/2026-05-30-nftables-forwarding.md	117	  PrivateKey: "encrypted-private-key",
+docs/superpowers/plans/2026-05-30-nftables-forwarding.md	209	 PrivateKey  sql.NullString `gorm:"column:private_key;type:text"`
+docs/superpowers/plans/2026-05-30-nftables-forwarding.md	365	  authType = "private_key"
+docs/superpowers/plans/2026-05-30-nftables-forwarding.md	1066	 case "private_key", "":
+docs/superpowers/plans/2026-05-30-nftables-forwarding.md	1801	  authType: "password" | "private_key";
+docs/superpowers/plans/2026-05-30-nftables-forwarding.md	1803	  privateKey?: string;
+docs/superpowers/plans/2026-05-30-nftables-forwarding.md	1825	  sshAuthType: "password" | "private_key";
+docs/superpowers/plans/2026-05-30-nftables-forwarding.md	1839	      sshAuthType: "private_key",
+docs/superpowers/plans/2026-05-30-nftables-forwarding.md	1863	        node.sshConfig?.authType === "password" ? "password" : "private_key",
+docs/superpowers/plans/2026-05-30-nftables-forwarding.md	1890	        form.sshAuthType === "private_key" &&
+docs/superpowers/plans/2026-05-30-nftables-forwarding.md	1915	              privateKey:
+docs/superpowers/plans/2026-05-30-nftables-forwarding.md	1916	                form.sshAuthType === "private_key"
+docs/superpowers/plans/2026-05-30-nftables-forwarding.md	1989	                            value === "password" ? "password" : "private_key",
+docs/superpowers/plans/2026-05-30-nftables-forwarding.md	1993	                      <SelectItem key="private_key">私钥</SelectItem>
+docs/superpowers/specs/2026-05-30-nftables-forwarding-design.md	83	| `auth_type` | `password` 或 `private_key` |
+docs/superpowers/specs/2026-05-30-nftables-forwarding-design.md	85	| `private_key` | 加密后私钥，可为空 |
+docs/superpowers/specs/2026-05-30-nftables-forwarding-design.md	128	    "authType": "private_key",
+docs/superpowers/specs/2026-05-30-nftables-forwarding-design.md	129	    "privateKey": "-----BEGIN OPENSSH PRIVATE KEY-----...",
+go-backend/internal/clientip/clientip_c401_test.go	15	   t.Fatalf("peer %s: unconfigured private peer must not be trusted, got %v want %s", peer, got, want)
+go-backend/internal/config/tunnel_tls_ca.go	27	// installation and issues one certificate + private key per node. The
+go-backend/internal/config/tunnel_tls_ca.go	32	//   - tunnel_tls_ca.key (0600, private — never logged, never shipped
+go-backend/internal/config/tunnel_tls_ca_test.go	54	  t.Fatalf("error must name the missing private key, got: %v", err)
+go-backend/internal/health/monitor_ssrf.go	203	  // 覆盖；loopback/私网/CGNAT 的 allow_private 放行维持
+go-backend/internal/health/monitor_ssrf_test.go	30	  "private.example":  {net.ParseIP("10.0.0.5")},
+go-backend/internal/health/monitor_ssrf_test.go	43	  {"私网域名拒绝", "private.example:80", true},
+go-backend/internal/health/monitor_ssrf_test.go	57	  {"IPv6 私有拒绝", "[fc00::1]:80", true},
+go-backend/internal/health/netguard_r2_b1_test.go	6	// NAT64 按内嵌地址判定。红态（修复前）：allow_private 下元数据/未指定被
+go-backend/internal/health/netguard_r2_b1_test.go	16	   t.Fatalf("ValidateMonitorTCPTarget(%q) must be hard-denied even with allow_private", target)
+go-backend/internal/health/netguard_r2_b1_test.go	19	 // allow_private 下普通私网维持可放行（内网监控是该通道设立目的）。
+go-backend/internal/health/netguard_r2_b1_test.go	21	  t.Fatalf("10.0.0.1 with allow_private must stay allowed: %v", err)
+go-backend/internal/http/handler/auth_snapshot_audit_test.go	141	 privateKey, credential := auditCredential(t)
+go-backend/internal/http/handler/auth_snapshot_audit_test.go	162	 signature, err := ecdsa.SignASN1(rand.Reader, privateKey, messageHash[:])
+go-backend/internal/http/handler/c02_github_fetch_ssrf_test.go	58	  t.Fatalf("fetchGitHubReleasesPage must not follow 302 to private target, got %+v", releases)
+go-backend/internal/http/handler/c02_github_fetch_ssrf_test.go	61	  t.Fatalf("fetchKernelReleaseVersionsPage must not follow 302 to private target, got %+v", releases)
+go-backend/internal/http/handler/c02_github_fetch_ssrf_test.go	64	  t.Fatalf("private target must never be hit, hits=%d", got)
+go-backend/internal/http/handler/c02_github_fetch_ssrf_test.go	88	  t.Fatalf("fetchSystemUpgradeReleases must not follow 302 to private target, got %+v", releases)
+go-backend/internal/http/handler/c02_github_fetch_ssrf_test.go	91	  t.Fatalf("private target must never be hit, hits=%d", got)
+go-backend/internal/http/handler/c02_github_fetch_ssrf_test.go	107	  t.Fatalf("private fetch target must be blocked without allowlist, got %+v", releases)
+go-backend/internal/http/handler/c02_github_fetch_ssrf_test.go	110	  t.Fatalf("blocked private target must never be hit, hits=%d", got)
+go-backend/internal/http/handler/c02_github_fetch_ssrf_test.go	124	  t.Fatalf("allowlisted private redirect must still work: %v", err)
+go-backend/internal/http/handler/c02_github_fetch_ssrf_test.go	142	  t.Fatalf("allowlisted direct private fetch must work: %v", err)
+go-backend/internal/http/handler/c02_github_fetch_ssrf_test.go	155	  t.Fatalf("direct private URL must be blocked without allowlist, got %+v", releases)
+go-backend/internal/http/handler/c02_github_fetch_ssrf_test.go	158	  t.Fatalf("blocked private target must never be hit, hits=%d", got)
+go-backend/internal/http/handler/control_plane.go	2487	   service["bypass"] = "ovo-no-private"
+go-backend/internal/http/handler/f01_f11_docker_ghcr_test.go	13	// GHCR 镜像已私有，节点机未登录时隐式拉取即 401，且面板对此失败
+go-backend/internal/http/handler/forward_target_policy_retarget_test.go	225	 // (c) Mixed multi-target with one private literal heals as well.
+go-backend/internal/http/handler/gh_mirror.go	623	// 接受（094 实测：带 token HEAD 亦 404），私有仓的取法只能是 API；
+go-backend/internal/http/handler/github_token_gh_mirror_test.go	13	// GitHub：API 面无 Authorization: Bearer test-pat 一律 401；
+go-backend/internal/http/handler/github_token_upgrade_test.go	13	// 本仓库路径无 Authorization: Bearer test-pat 一律 401。
+go-backend/internal/http/handler/kernel.go	214	// kernelSecurityView hides the self-signed private material and DNS API
+go-backend/internal/http/handler/kernel.go	763	 // no built-in private-range block; name that on the success
+go-backend/internal/http/handler/kernel_external.go	696	  // loopback/private literal comes out "any".
+go-backend/internal/http/handler/kernel_external_h15_test.go	34	   t.Errorf("expected %q to be classified private", ipStr)
+go-backend/internal/http/handler/kernel_external_h15_test.go	51	 // 私有 IP 应被识别
+go-backend/internal/http/handler/kernel_external_h15_test.go	52	 privateIPs := []string{"127.0.0.1", "192.168.1.1", "10.0.0.1", "172.16.0.1", "169.254.169.254"}
+go-backend/internal/http/handler/kernel_external_h15_test.go	53	 for _, ipStr := range privateIPs {
+go-backend/internal/http/handler/kernel_external_h15_test.go	56	   t.Errorf("expected %s to be private", ipStr)
+go-backend/internal/http/handler/mutations.go	1811	 privateKey := asString(cfgMap["privateKey"])
+go-backend/internal/http/handler/mutations.go	1837	   if strings.TrimSpace(privateKey) == "" && existing.PrivateKey.Valid {
+go-backend/internal/http/handler/mutations.go	1838	    privateKey = existing.PrivateKey.String
+go-backend/internal/http/handler/mutations.go	1869	  privateKey = ""
+go-backend/internal/http/handler/mutations.go	1870	 case "private_key", "":
+go-backend/internal/http/handler/mutations.go	1871	  authType = "private_key"
+go-backend/internal/http/handler/mutations.go	1872	  if strings.TrimSpace(privateKey) == "" {
+go-backend/internal/http/handler/mutations.go	1894	  PrivateKey: privateKey,
+go-backend/internal/http/handler/mutations.go	2723	 // 令执行前恢复，且运维可在节点机预置 ~/.ovo-token 走 API
+go-backend/internal/http/handler/netguard_r2_b1_test.go	59	// allow_private 下整段仍拒，普通私网抓取维持放行。
+go-backend/internal/http/handler/netguard_r2_b1_test.go	64	   t.Fatalf("validateFetchIP(%s) must be hard-denied even with allow_private", s)
+go-backend/internal/http/handler/netguard_r2_b1_test.go	71	  t.Fatalf("private fetch with allow_private must stay allowed: %v", err)
+go-backend/internal/http/handler/netguard_r2_b1_test.go	74	  t.Fatalf("private notify target must stay allowed (only hard deny applies): %v", err)
+go-backend/internal/http/handler/nftables_runtime_test.go	471	   "authType":   "private_key",
+go-backend/internal/http/handler/nftables_runtime_test.go	472	   "privateKey": "TEST-PRIVATE-KEY",
+go-backend/internal/http/handler/nftables_runtime_test.go	509	 if cfg.Host != "203.0.113.21" || cfg.Port != 2222 || cfg.Username != "root" || cfg.AuthType != "private_key" {
+go-backend/internal/http/handler/nftables_runtime_test.go	513	  t.Fatalf("expected private key to persist, got %+v", cfg)
+go-backend/internal/http/handler/node_latency_r171_b5_test.go	65	  {"allow-private", `[{"name":"x","host":"10.0.0.1","port":443,"enabled":true}]`, false},
+go-backend/internal/http/handler/node_tune.go	39	// NO private-target exception here. A legitimate private probe
+go-backend/internal/http/handler/node_tune.go	43	// which does not exist yet; until it does, private probe targets
+go-backend/internal/http/handler/node_tune_probe_ssrf_r7_test.go	5	// node — hard-deny layer always, private ranges rejected by
+go-backend/internal/http/handler/notify_bot_test.go	55	    {"update_id":100,"message":{"message_id":1,"chat":{"id":42,"type":"private"},"text":"/nodes"}},
+go-backend/internal/http/handler/notify_bot_test.go	56	    {"update_id":101,"message":{"message_id":2,"chat":{"id":999,"type":"private"},"text":"/nodes"}},
+go-backend/internal/http/handler/notify_bot_test.go	57	    {"update_id":102,"callback_query":{"id":"cq-1","from":{"id":42},"message":{"message_id":3,"chat":{"id":42,"type":"private"},"text":"menu"},"data":"nodes"}},
+go-backend/internal/http/handler/passkey_login_revocation_race_reaudit_test.go	47	 privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+go-backend/internal/http/handler/passkey_login_revocation_race_reaudit_test.go	53	  XCoord: privateKey.X.FillBytes(make([]byte, 32)), YCoord: privateKey.Y.FillBytes(make([]byte, 32)),
+go-backend/internal/http/handler/passkey_login_revocation_race_reaudit_test.go	89	 signature, err := ecdsa.SignASN1(rand.Reader, privateKey, messageHash[:])
+go-backend/internal/http/handler/r2_b6_presence_test.go	151	  t.Fatal("regenerate must still rotate the reality private key")
+go-backend/internal/http/handler/r2_f2_22_instance_warning_test.go	9	// 不含面板镜像腿、私有仓下必失败”；wss 地址能派生前缀，不告警；
+go-backend/internal/http/handler/r30_fix_f03_test.go	31	   "authType": "private_key", "privateKey": "test-key",
+go-backend/internal/http/handler/r30_fix_f03_test.go	59	   "authType": "private_key", "privateKey": "test-key",
+go-backend/internal/http/handler/r6_l8f04_rate_limit_key_test.go	34	  {name: "private peer without xff", remoteAddr: "10.0.0.9:8080", want: "10.0.0.9"},
+go-backend/internal/http/handler/r6_l8f04_rate_limit_key_test.go	37	  {name: "unregistered private peer ignores xff", remoteAddr: "172.30.0.1:8080", xff: "203.0.113.7", hopsEnv: "1", want: "172.30.0.1"},
+go-backend/internal/http/handler/r8_privnet_xray_warning_test.go	11	// so private destinations pass silently. The fix names the risk at
+go-backend/internal/http/handler/r8_privnet_xray_warning_test.go	22	   t.Fatalf("Xray %s must carry the private-block warning naming 26.5.9, got %q", v, msg)
+go-backend/internal/http/handler/remediation_audit_test.go	113	    if (cfg["bypass"] == "ovo-no-private") != (policy == "public") {
+go-backend/internal/http/handler/secure_fetch.go	146	   auditFetchLog("reject", rawURL, ipStr, "private_not_allowlisted")
+go-backend/internal/http/handler/secure_fetch.go	147	   return fmt.Errorf("private network not allowlisted: %s", ipStr)
+go-backend/internal/http/handler/secure_fetch.go	150	  auditFetchLog("allow_private", rawURL, ipStr, "allowlisted")
+go-backend/internal/http/handler/secure_fetch.go	214	   return nil, fmt.Errorf("private IP blocked at dial: %s", ip)
+go-backend/internal/http/handler/secure_fetch_d17_test.go	39	  t.Error("private http without allowlist should be rejected")
+go-backend/internal/http/handler/secure_fetch_d17_test.go	46	  t.Errorf("private http with allowlist should pass validation: %v", err)
+go-backend/internal/http/handler/secure_fetch_d17_test.go	82	  t.Error("private without allowlist should be rejected")
+go-backend/internal/http/handler/secure_fetch_d17_test.go	105	  t.Error("public http should be rejected even with private allowlist")
+go-backend/internal/http/handler/secure_fetch_r1b5_test.go	51	  t.Fatal("validateFetchIP(NAT64-embedded 10.0.0.1) must reject when private not allowlisted")
+go-backend/internal/http/handler/system_upgrade.go	4163	// （private network not allowlisted）对运维无指引，这里追加可操作说明。
+go-backend/internal/http/handler/system_upgrade.go	4168	 if strings.Contains(err.Error(), "private network not allowlisted") {
+go-backend/internal/http/handler/system_upgrade_api_route_test.go	14	// 2.1.26：面板自升级下载本私有仓资产改走 GitHub API。
+go-backend/internal/http/handler/system_upgrade_api_route_test.go	16	// 也被 GitHub 直连下载端点 404 拒，代理匿名拉私有仓同样 404，
+go-backend/internal/http/handler/system_upgrade_api_route_test.go	29	 authSeen   atomic.Int64 // 收到 Authorization: Bearer 的 API 调用次数
+go-backend/internal/http/handler/system_upgrade_api_route_test.go	80	// deadRouteStubServer 对一切路径回 404：模拟私有仓下直连（细粒度
+go-backend/internal/http/handler/system_upgrade_api_route_test.go	120	// 红证：私有仓下直连 + 代理全 404 时，API 路线必须 200 且 sha 对上；
+go-backend/internal/http/handler/system_upgrade_api_route_test.go	183	// 无 token 时不得调 API（私有仓匿名调 API 是 404）：直连后备仍走通，
+go-backend/internal/http/handler/system_upgrade_test.go	969	func (errPrivateForTest) Error() string { return "private network not allowlisted: 192.168.1.1" }
+go-backend/internal/http/handler/uninstall_read_guard_audit_test.go	26	   tx.AddError(errors.New("private-database-path read outage"))
+go-backend/internal/http/handler/uninstall_read_guard_audit_test.go	53	   if strings.Contains(strings.Join(warnings, " "), "private-database-path") {
+go-backend/internal/http/handler/uninstall_read_guard_audit_test.go	101	   tx.AddError(errors.New("private-list-database-path read outage"))
+go-backend/internal/http/handler/uninstall_read_guard_audit_test.go	118	  if strings.Contains(asString(item["uninstallReason"]), "private-list") {
+go-backend/internal/http/handler/version_reported_fix3_test.go	8	// 面板内 agent 升级/批量升级被 fail-closed 全拒、ovo-no-private
+go-backend/internal/kernel/chain_test.go	69	 // R7-001: the private-range reject guard precedes the chain rules.
+go-backend/internal/kernel/chain_test.go	125	 // R7-001: rules[0] is the private-range guard; the chain-blocked
+go-backend/internal/kernel/combo_ss2022_socks_test.go	67	 // The private-range reject guard precedes the chain rules, and
+go-backend/internal/kernel/credentials.go	235	func RealityKeyPair() (privateKey, publicKey string, err error) {
+go-backend/internal/kernel/credentials.go	244	// RealityPublicKey derives the public key from a stored private key so a
+go-backend/internal/kernel/credentials.go	245	// user-supplied private key still produces correct share links.
+go-backend/internal/kernel/credentials.go	246	func RealityPublicKey(privateKey string) (string, error) {
+go-backend/internal/kernel/credentials.go	247	 raw, err := base64.RawURLEncoding.DecodeString(privateKey)
+go-backend/internal/kernel/egress.go	291	 // The sing-box private-range guard (R7-001) is a preprocess rule
+go-backend/internal/kernel/egress.go	294	 // rule steer private destinations past it.
+go-backend/internal/kernel/egress_test.go	29	    // R7-001: the private-range guard precedes the family block.
+go-backend/internal/kernel/egress_test.go	33	     t.Fatalf("private guard must stay first: %v", guard)
+go-backend/internal/kernel/egress_test.go	128	    // R7-001: the private-range guard precedes both family blocks.
+go-backend/internal/kernel/egress_test.go	250	 // R7-001: rules[0] is the private-range guard (no inbound tag); the
+go-backend/internal/kernel/egress_test.go	356	     // R7-001: the sing-box private-range guard is a
+go-backend/internal/kernel/egress_test.go	357	     // private-range reject, not a family preference
+go-backend/internal/kernel/private_ranges.go	11	// (the ovo-no-private definition). Two kernels enforce it — Xray via
+go-backend/internal/kernel/private_ranges.go	16	// segment list embedded in scripts/check-private-ranges.sh, wired
+go-backend/internal/kernel/private_ranges.go	21	// instead of sing-box's ip_is_private predicate (R8-004 / R8-022):
+go-backend/internal/kernel/private_ranges.go	37	// scripts/check-private-ranges.sh pins it mechanically; do not
+go-backend/internal/kernel/r7_g1_matrix_test.go	7	// R7-001 full-set gate: the private guard invariant — the
+go-backend/internal/kernel/r7_g1_matrix_test.go	15	//   - forms per protocol: plain, chained, split (a private-CIDR
+go-backend/internal/kernel/r7_g1_matrix_test.go	39	  t.Fatalf("%s: private guard not at the first non-sniff position %d: %v", label, head, rules)
+go-backend/internal/kernel/r7_g1_matrix_test.go	79	 privateSplit := []SplitRule{{IPs: []string{"10.0.0.0/8"}, Action: SplitDirect}}
+go-backend/internal/kernel/r7_g1_matrix_test.go	99	  split.Split = privateSplit
+go-backend/internal/kernel/r7_g1_matrix_test.go	100	  assertGuardDominates(t, label+" split-private-direct", render(label, []Inbound{split}))
+go-backend/internal/kernel/r7_g1_private_block_test.go	8	// R7-001: sing-box renders must reject private destinations like the
+go-backend/internal/kernel/r7_g1_private_block_test.go	13	// private_ranges.go — instead of the ip_is_private predicate, whose
+go-backend/internal/kernel/r7_g1_private_block_test.go	17	// private-range guard: a reject carrying exactly the canonical
+go-backend/internal/kernel/r7_g1_private_block_test.go	47	  t.Fatalf("sing-box render must always carry a route with the private guard: %v", cfg)
+go-backend/internal/kernel/r7_g1_private_block_test.go	55	func privateGuardIndex(rules []interface{}) int {
+go-backend/internal/kernel/r7_g1_private_block_test.go	90	 // A split rule matching a private CIDR directly, plus one sending
+go-backend/internal/kernel/r7_g1_private_block_test.go	97	 guard := privateGuardIndex(rules)
+go-backend/internal/kernel/r7_g1_private_block_test.go	113	   t.Fatalf("rule %d precedes the guard and could steer private traffic: %v", i, m)
+go-backend/internal/kernel/r7_g1_private_block_test.go	116	 // The private-CIDR split rule itself is still rendered (the panel
+go-backend/internal/kernel/r7_g1_private_block_test.go	117	 // keeps user configuration); it is simply unreachable for private
+go-backend/internal/kernel/r7_g1_private_block_test.go	134	  t.Fatalf("the user's private split rule should still be rendered: %v", rules)
+go-backend/internal/kernel/r7_g1_private_block_test.go	145	 if guard := privateGuardIndex(rules); guard != 0 {
+go-backend/internal/kernel/r7_g1_private_block_test.go	159	 if guard := privateGuardIndex(rules); guard != 0 {
+go-backend/internal/kernel/r7_g1_private_block_test.go	167	 guard := privateGuardIndex(rules)
+go-backend/internal/kernel/r7_g1_private_block_test.go	180	 // Xray blocks private destinations inside freedom itself; its
+go-backend/internal/kernel/r7_g1_private_block_test.go	181	 // render must not gain the sing-box rule (an ip_is_private field,
+go-backend/internal/kernel/r7_g1_private_block_test.go	191	  if strings.Contains(r.Files[0].Content, "ip_is_private") || strings.Contains(r.Files[0].Content, "100.64.0.0/10") {
+go-backend/internal/kernel/r7_s1b_domain_guard_test.go	11	// private addresses slipped past it to the direct exit. The render
+go-backend/internal/kernel/r7_s1b_domain_guard_test.go	12	// now pairs a route "resolve" action with the same private-range
+go-backend/internal/kernel/r7_s1b_domain_guard_test.go	17	// the sing-box 1.14.4 runtime behavior behind it (any private address
+go-backend/internal/kernel/r7_s1b_domain_guard_test.go	177	  t.Fatalf("rule %d: direct exit %v not preceded by the private reject: %v", i, anchor, rules)
+go-backend/internal/kernel/r8_privnet_ranges_test.go	10	// canonical non-public range set (private_ranges.go) exactly — the
+go-backend/internal/kernel/r8_privnet_ranges_test.go	11	// ip_is_private predicate it replaced silently judged the CGNAT and
+go-backend/internal/kernel/r8_privnet_ranges_test.go	43	 // including the two ranges the ip_is_private predicate missed
+go-backend/internal/kernel/r8_privnet_ranges_test.go	74	 // Public space must stay reachable: the guard is a private-range
+go-backend/internal/kernel/r8_privnet_ranges_test.go	148	  if _, hasPredicate := guard["ip_is_private"]; hasPredicate {
+go-backend/internal/kernel/r8_privnet_ranges_test.go	149	   t.Fatalf("rule %d: guard must not fall back to the ip_is_private predicate", idx)
+go-backend/internal/kernel/render_singbox.go	76	 // or counted user still needs the private-range guard below.
+go-backend/internal/kernel/render_singbox.go	129	// singboxPrivateRejectRule is the node-side private-range guard
+go-backend/internal/kernel/render_singbox.go	132	// could reach the node's private addresses and the cloud metadata
+go-backend/internal/kernel/render_singbox.go	134	// canonical non-public range set (private_ranges.go) spelled out as
+go-backend/internal/kernel/render_singbox.go	136	// deliberately does not use sing-box's ip_is_private predicate: that
+go-backend/internal/kernel/render_singbox.go	185	// singboxGuardRules returns the route rules with the private-range
+go-backend/internal/kernel/render_singbox.go	186	// guard in force. Xray blocks private destinations inside the freedom
+go-backend/internal/kernel/render_singbox.go	188	// per-user — can steer a private destination anywhere; the sing-box
+go-backend/internal/kernel/render_singbox.go	190	// features emit (a user split rule pointing at a private target loses
+go-backend/internal/kernel/render_singbox.go	194	// rule precedes the private-range rule.
+go-backend/internal/kernel/render_singbox.go	216	// reached private and metadata addresses through nip.io names while
+go-backend/internal/kernel/render_singbox.go	224	// guardSingboxDomainExits extends the private-range guard to domain
+go-backend/internal/kernel/render_singbox.go	241	// resolved address is private — a mixed A/AAAA answer with one
+go-backend/internal/kernel/render_singbox.go	242	// private address is rejected as a whole, as is an answer that mixes
+go-backend/internal/kernel/render_singbox.go	243	// public and private addresses. One unconditional pair closes the
+go-backend/internal/kernel/render_singbox.go	282	// the ip_is_private predicate used to express via its own key. With
+go-backend/internal/kernel/render_singbox.go	291	// pair is emitted at all; a private destination that somehow reaches
+go-backend/internal/kernel/render_singbox.go	535	    "private_key": sec.RealityPrivateKey,
+go-backend/internal/kernel/render_xray.go	374	   "privateKey":  sec.RealityPrivateKey,
+go-backend/internal/kernel/share.go	856	    map[string]interface{}{"ip_is_private": true, "outbound": "direct"},
+go-backend/internal/kernel/split_test.go	94	  "reject",                     // R7-001: the private-range guard, right after sniff
+go-backend/internal/kernel/sub_plain_format_test.go	53	  cfg.Route.Rules[2]["ip_is_private"] != true || cfg.Route.Rules[2]["outbound"] != "direct" {
+go-backend/internal/kernel/sub_template_builder.go	57	 all := []TemplateRuleCategory{{Key: "private", Name: "私有网络", Target: "DIRECT",
+go-backend/internal/kernel/sub_template_builder.go	58	  set: ruleSet{sites: []string{"private"}, ips: []string{"private"}, lists: []string{"Lan"}}}}
+go-backend/internal/kernel/sub_template_builder.go	83	 order := strings.Fields("private ads ai github youtube netflix spotify abema media telegram google microsoft apple bilibili games pixiv scholar cn noncn")
+go-backend/internal/kernel/sub_template_builder.go	89	 minimal := toSet([]string{"private", "cn", "noncn"})
+go-backend/internal/kernel/sub_template_builder.go	90	 balanced := toSet([]string{"private", "ai", "youtube", "google", "telegram", "github", "cn", "noncn"})
+go-backend/internal/kernel/testdata/share-phase3.golden.txt	213	        "ip_is_private": true,
+go-backend/internal/kernel/testdata/singbox-server.golden.json	124	          "private_key": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA",
+go-backend/internal/kernel/testdata/singbox.golden.json	162	        "ip_is_private": true,
+go-backend/internal/kernel/testdata/xray.golden.json	29	          "privateKey": "[synthetic fixture: see source location]",
+go-backend/internal/kernel/w3_import_fix_test.go	32	  "endpoints":[{"type":"wireguard","tag":"wg-home","address":["10.0.0.2/32"],"private_key":"abc"}]}`
+go-backend/internal/netguard/netguard.go	6	// 同步义务（镜像）：agent 侧 go-gost/x/bypass/ovo_no_private.go 是
+go-backend/internal/netguard/netguard.go	11	// scripts/check-private-ranges.sh 第二部分机械对账钉死。
+go-backend/internal/netguard/netguard.go	14	// （internal/kernel/private_ranges.go）额外含 4 个文档段
+go-backend/internal/netguard/netguard.go	48	  return "private"
+go-backend/internal/netguard/netguard.go	215	 // （SecureFetch、联邦传输/角色目标、监控 allow_private 通道）。
+go-backend/internal/netguard/netguard.go	229	 Reason  string // "public" / "private_allowed" / "hard_deny" / "non_public" / "loopback"
+go-backend/internal/netguard/netguard.go	252	   d.Allowed, d.Reason = true, "private_allowed"
+go-backend/internal/netguard/netguard_r3_b1_test.go	37	  "2001:db8::1", "192.0.2.10", // 文档段在分类器口径下为 public（既有矩阵在位；与规范集的差集为 R3-C2-01 已裁定登记，由 scripts/check-private-ranges.sh 钉死）
+go-backend/internal/runtime/nftables/runner.go	372	 case "private_key":
+go-backend/internal/runtime/nftables/runner.go	386	func parsePrivateKey(privateKey, passphrase string) (ssh.Signer, error) {
+go-backend/internal/runtime/nftables/runner.go	388	  signer, err := ssh.ParsePrivateKeyWithPassphrase([]byte(privateKey), []byte(passphrase))
+go-backend/internal/runtime/nftables/runner.go	394	 signer, err := ssh.ParsePrivateKey([]byte(privateKey))
+go-backend/internal/runtime/nftables/runner_test.go	233	 privateKey := mustGeneratePrivateKey(t)
+go-backend/internal/runtime/nftables/runner_test.go	234	 methods, err := authMethods(SSHConfig{PrivateKey: privateKey})
+go-backend/internal/runtime/nftables/runner_test.go	246	  t.Fatalf("expected private key required error, got %v", err)
+go-backend/internal/store/model/model.go	292	 PrivateKey sql.NullString `gorm:"column:private_key;type:text"`
+go-backend/internal/store/model/model.go	608	 PrivateKey  string `json:"privateKey,omitempty"`
+go-backend/internal/store/repo/backup_r171_b5_latency_targets_test.go	148	  {"allow-private", `[{"name":"x","host":"10.0.0.1","port":443,"enabled":true}]`, false},
+go-backend/internal/store/repo/config_policy.go	48	 // api_base can point at a private bot-API proxy, so neither may leak
+go-backend/internal/store/repo/repository.go	1277	// 解析，见 go-gost/x/bypass/ovo_no_private.go）。节点版本串仍由
+go-backend/internal/store/repo/repository.go	4137	    "host", "port", "username", "auth_type", "password", "private_key",
+go-backend/internal/store/repo/repository_nft_counter.go	52	  PrivateKey string `gorm:"column:private_key"`
+go-backend/internal/store/repo/repository_nft_counter.go	65	  Select("node.id AS node_id, node_ssh_config.id AS config_id, node_ssh_config.host, node_ssh_config.port, node_ssh_config.username, node_ssh_config.auth_type, node_ssh_config.password, node_ssh_config.private_key, node_ssh_config.passphras
+go-backend/internal/store/repo/repository_nft_counter_test.go	238	  AuthType: "private_key",
+go-backend/internal/store/repo/repository_nft_counter_test.go	266	 if nodes[0].Config.AuthType != "private_key" || nodes[0].Config.SudoMode != "sudo" {
+go-backend/internal/store/repo/repository_nft_counter_test.go	299	  AuthType:           "private_key",
+go-backend/internal/store/repo/repository_nftables.go	50	  authType = "private_key"
+go-backend/internal/store/repo/repository_nftables.go	75	  "private_key":  row.PrivateKey,
+go-backend/internal/store/repo/repository_nftables_test.go	60	  AuthType:   "private_key",
+go-backend/internal/store/repo/repository_nftables_test.go	61	  PrivateKey: "encrypted-private-key",
+go-backend/internal/store/repo/repository_nftables_test.go	188	   name: "private-key",
+go-backend/internal/store/repo/repository_nftables_test.go	193	    AuthType:   "private_key",
+go-backend/internal/store/repo/repository_nftables_test.go	265	    t.Fatalf("expected private key to persist after reopen, got %+v", loaded.PrivateKey)
+go-backend/internal/ws/tunnel_tls_commands.go	6	// private key per node (SAN: node-<id>.ovo.internal); distribution
+go-backend/internal/ws/tunnel_tls_commands.go	10	//     certificate and private key; the agent verifies the material and
+go-backend/tests/contract/kernel_inbound_contract_test.go	230	   t.Fatal("list must not expose the certificate private key")
+go-backend/tests/contract/passkey_contract_test.go	110	 privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+go-backend/tests/contract/passkey_contract_test.go	118	 registerResponse := makeRegistrationResponse(t, privateKey, credentialID, passkeyChallenge(t, begin), passkeyTestOrigin)
+go-backend/tests/contract/passkey_contract_test.go	142	 assertion := makeAssertionResponseWithHandle(t, privateKey, credentialID, passkeyChallenge(t, loginBegin), passkeyTestOrigin, "panel.example.test", true, 1, aliceHandle)
+go-backend/tests/contract/passkey_contract_test.go	159	 newResponse := makeRegistrationResponse(t, privateKey, newID, passkeyChallenge(t, rebind), passkeyTestOrigin)
+go-backend/tests/contract/passkey_contract_test.go	174	 privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+go-backend/tests/contract/passkey_contract_test.go	183	 registration := makeRegistrationResponse(t, privateKey, credentialID, passkeyChallenge(t, register), passkeyTestOrigin)
+go-backend/tests/contract/passkey_contract_test.go	204	  return makeAssertionResponseWithHandle(t, privateKey, credentialID, passkeyChallenge(t, session), origin, rpID, uv, count, handle)
+go-backend/tests/contract/passkey_contract_test.go	285	func makeRegistrationResponse(t *testing.T, privateKey *ecdsa.PrivateKey, id []byte, challenge, origin string) map[string]interface{} {
+go-backend/tests/contract/passkey_contract_test.go	287	 pub := privateKey.PublicKey
+go-backend/tests/contract/passkey_contract_test.go	309	func makeAssertionResponse(t *testing.T, privateKey *ecdsa.PrivateKey, id []byte, challenge, origin, rpID string, verified bool, count uint32) map[string]interface{} {
+go-backend/tests/contract/passkey_contract_test.go	310	 return makeAssertionResponseWithHandle(t, privateKey, id, challenge, origin, rpID, verified, count, nil)
+go-backend/tests/contract/passkey_contract_test.go	313	func makeAssertionResponseWithHandle(t *testing.T, privateKey *ecdsa.PrivateKey, id []byte, challenge, origin, rpID string, verified bool, count uint32, handle []byte) map[string]interface{} {
+go-backend/tests/contract/passkey_contract_test.go	327	 signature, err := ecdsa.SignASN1(rand.Reader, privateKey, hash[:])
+go-gost/x/bypass/bypass_group_pin_test.go	55	  t.Fatal("BypassGroup wrapping ovo-no-private must implement DialTargetPinner; " +
+go-gost/x/bypass/bypass_group_pin_test.go	197	  t.Fatal("private literal must be rejected even with inert members around the pinner")
+go-gost/x/bypass/ovo_no_private.go	20	// "bypass": "ovo-no-private" to federation exit role services; the
+go-gost/x/bypass/ovo_no_private.go	26	const NoPrivateBypassName = "ovo-no-private"
+go-gost/x/bypass/ovo_no_private.go	60	// NewNoPrivateBypass creates the built-in ovo-no-private bypass:
+go-gost/x/bypass/ovo_no_private.go	126	// isNonPublicIP reports whether ip is loopback, private, link-local,
+go-gost/x/bypass/ovo_no_private.go	214	// (first answer public, second answer private) walked straight past
+go-gost/x/bypass/ovo_no_private.go	223	// PinDialTarget implements DialTargetPinner for the no-private bypass.
+go-gost/x/bypass/ovo_no_private.go	229	// a service guarded by ovo-no-private and returns the address to
+go-gost/x/bypass/ovo_no_private.go	250	   return "", fmt.Errorf("ovo-no-private: dial target %s is a non-public address", addr)
+go-gost/x/bypass/ovo_no_private.go	256	  return "", fmt.Errorf("ovo-no-private: cannot verify dial target %s: %w", host, err)
+go-gost/x/bypass/ovo_no_private.go	259	  return "", fmt.Errorf("ovo-no-private: cannot verify dial target %s: no addresses", host)
+go-gost/x/bypass/ovo_no_private.go	263	   return "", fmt.Errorf("ovo-no-private: dial target %s resolves to a non-public address", addr)
+go-gost/x/bypass/ovo_no_private_pin_test.go	66	  t.Fatal("answer set containing a private IP must be rejected")
+go-gost/x/bypass/ovo_no_private_test.go	10	// FIX2-C #8（FIX-I 未竟项）：内置 bypass ovo-no-private 供联邦 exit
+go-gost/x/bypass/ovo_no_private_test.go	35	  t.Fatal("no-private bypass must be blacklist semantics (Contains=true blocks)")
+go-gost/x/bypass/ovo_no_private_test.go	55	  t.Fatal("hostname resolving (partly) to a private address must be blocked")
+go-gost/x/chain/router.go	29	// so a rebinding DNS could pass the check and land on a private
+go-gost/x/config/loader/loader.go	192	 // FIX2-C #8: built-in bypasses (ovo-no-private) must survive the
+go-gost/x/config/parsing/bypass/fix2c_builtin_test.go	10	// FIX2-C #8：服务配置引用 bypass 名 ovo-no-private 时，解析层必须
+go-gost/x/config/parsing/bypass/fix2c_builtin_test.go	21	  t.Fatal("builtin bypass must block private targets")
+go-gost/x/config/parsing/bypass/fix2c_register_test.go	42	  t.Fatal("registered builtin must block private targets")
+go-gost/x/config/parsing/bypass/group_pin_production_test.go	27	  t.Fatal("BypassGroup(List(\"ovo-no-private\")) must implement DialTargetPinner: " +
+go-gost/x/config/parsing/bypass/group_pin_production_test.go	74	  t.Fatal("private literal must be rejected through a mixed production group")
+go-gost/x/config/parsing/bypass/group_pin_production_test.go	82	  t.Fatal("production group must still intercept private literals via Contains")
+go-gost/x/config/parsing/bypass/parse.go	93	  // FIX2-C #8: the built-in ovo-no-private bypass is claimed
+go-gost/x/config/parsing/service/a02_001_guard_test.go	9	// A02-001 回归（解析层）：ovo-no-private 的识别必须精确——只有
+go-gost/x/config/parsing/service/a02_001_guard_test.go	20	  {"primary bypass hit", &config.ServiceConfig{Bypass: "ovo-no-private"}, true},
+go-gost/x/config/parsing/service/a02_001_guard_test.go	21	  {"secondary bypass hit", &config.ServiceConfig{Bypasses: []string{"other", "ovo-no-private"}}, true},
+go-gost/x/config/parsing/service/a02_001_guard_test.go	22	  {"similar name is not a hit", &config.ServiceConfig{Bypass: "ovo-no-private-2"}, false},
+go-gost/x/config/parsing/service/parse.go	211	 // A02-001: a service guarded by ovo-no-private gets the dial-point
+go-gost/x/config/parsing/service/parse.go	217	 // private address at dial time. The guard re-validates the final
+go-gost/x/config/parsing/service/parse.go	483	// the built-in ovo-no-private bypass. Name-based detection is exact
+go-gost/x/dialer/ssh/metadata.go	27	  privateKeyFile        = "privateKeyFile"
+go-gost/x/dialer/ssh/metadata.go	32	 if key := mdutil.GetString(md, privateKeyFile); key != "" {
+go-gost/x/dialer/sshd/metadata.go	27	  privateKeyFile   = "privateKeyFile"
+go-gost/x/dialer/sshd/metadata.go	31	 if key := mdutil.GetString(md, privateKeyFile); key != "" {
+go-gost/x/handler/forward/local/handler.go	67	 if h.md.certificate != nil && h.md.privateKey != nil {
+go-gost/x/handler/forward/local/handler.go	159	   PrivateKey:          h.md.privateKey,
+go-gost/x/handler/forward/local/metadata.go	26	 privateKey  crypto.PrivateKey
+go-gost/x/handler/forward/local/metadata.go	69	  h.md.privateKey = tlsCert.PrivateKey
+go-gost/x/handler/forward/remote/handler.go	69	 if h.md.certificate != nil && h.md.privateKey != nil {
+go-gost/x/handler/forward/remote/handler.go	178	   PrivateKey:          h.md.privateKey,
+go-gost/x/handler/forward/remote/metadata.go	26	 privateKey  crypto.PrivateKey
+go-gost/x/handler/forward/remote/metadata.go	62	  h.md.privateKey = tlsCert.PrivateKey
+go-gost/x/handler/http/handler.go	122	 if h.md.certificate != nil && h.md.privateKey != nil {
+go-gost/x/handler/http/handler.go	409	   PrivateKey:          h.md.privateKey,
+go-gost/x/handler/http/metadata.go	42	 privateKey  crypto.PrivateKey
+go-gost/x/handler/http/metadata.go	111	  h.md.privateKey = tlsCert.PrivateKey
+go-gost/x/handler/redirect/tcp/handler.go	65	 if h.md.certificate != nil && h.md.privateKey != nil {
+go-gost/x/handler/redirect/tcp/handler.go	194	   PrivateKey:          h.md.privateKey,
+go-gost/x/handler/redirect/tcp/metadata.go	26	 privateKey  crypto.PrivateKey
+go-gost/x/handler/redirect/tcp/metadata.go	55	  h.md.privateKey = tlsCert.PrivateKey
+go-gost/x/handler/relay/connect.go	196	   PrivateKey:          h.md.privateKey,
+go-gost/x/handler/relay/handler.go	101	 if h.md.certificate != nil && h.md.privateKey != nil {
+go-gost/x/handler/relay/metadata.go	45	 privateKey  crypto.PrivateKey
+go-gost/x/handler/relay/metadata.go	101	  h.md.privateKey = tlsCert.PrivateKey
+go-gost/x/handler/sni/handler.go	63	 if h.md.certificate != nil && h.md.privateKey != nil {
+go-gost/x/handler/sni/handler.go	152	  PrivateKey:          h.md.privateKey,
+go-gost/x/handler/sni/metadata.go	23	 privateKey  crypto.PrivateKey
+go-gost/x/handler/sni/metadata.go	49	  h.md.privateKey = tlsCert.PrivateKey
+go-gost/x/handler/socks/v4/handler.go	94	 if h.md.certificate != nil && h.md.privateKey != nil {
+go-gost/x/handler/socks/v4/handler.go	289	   PrivateKey:          h.md.privateKey,
+go-gost/x/handler/socks/v4/metadata.go	28	 privateKey  crypto.PrivateKey
+go-gost/x/handler/socks/v4/metadata.go	70	  h.md.privateKey = tlsCert.PrivateKey
+go-gost/x/handler/socks/v5/connect.go	111	   PrivateKey:          h.md.privateKey,
+go-gost/x/handler/socks/v5/handler.go	95	 if h.md.certificate != nil && h.md.privateKey != nil {
+go-gost/x/handler/socks/v5/metadata.go	34	 privateKey  crypto.PrivateKey
+go-gost/x/handler/socks/v5/metadata.go	90	  h.md.privateKey = tlsCert.PrivateKey
+go-gost/x/handler/ss/handler.go	82	 if h.md.certificate != nil && h.md.privateKey != nil {
+go-gost/x/handler/ss/handler.go	210	   PrivateKey:          h.md.privateKey,
+go-gost/x/handler/ss/metadata.go	26	 privateKey  crypto.PrivateKey
+go-gost/x/handler/ss/metadata.go	56	  h.md.privateKey = tlsCert.PrivateKey
+go-gost/x/handler/ss/udp/r3_k1_production_pin_test.go	16	// List("ovo-no-private"))，不得再用裸 bypass/stub pinner 充当
+go-gost/x/handler/sshd/handler.go	74	 if h.md.certificate != nil && h.md.privateKey != nil {
+go-gost/x/handler/sshd/handler.go	190	   PrivateKey:          h.md.privateKey,
+go-gost/x/handler/sshd/metadata.go	24	 privateKey  crypto.PrivateKey
+go-gost/x/handler/sshd/metadata.go	51	  h.md.privateKey = tlsCert.PrivateKey
+go-gost/x/handler/tunnel/connect.go	56	   err := fmt.Errorf("tunnel %s is private for host %s", tid, host)
+go-gost/x/handler/tunnel/entrypoint.go	149	  return nil, fmt.Errorf("%w: tunnel %s is private for host %s", ErrPrivateTunnel, tunnelID, addr)
+go-gost/x/handler/tunnel/handler.go	40	 ErrPrivateTunnel      = errors.New("private tunnel")
+go-gost/x/handler/tunnel/tunnel.go	383	 private := false
+go-gost/x/handler/tunnel/tunnel.go	385	  private = true
+go-gost/x/handler/tunnel/tunnel.go	390	 if private {
+go-gost/x/handler/unix/handler.go	64	 if h.md.certificate != nil && h.md.privateKey != nil {
+go-gost/x/handler/unix/handler.go	166	   PrivateKey:         h.md.privateKey,
+go-gost/x/handler/unix/metadata.go	22	 privateKey  crypto.PrivateKey
+go-gost/x/handler/unix/metadata.go	47	  h.md.privateKey = tlsCert.PrivateKey
+go-gost/x/internal/net/udp/listener.go	85	// summary wordings the private aggregator used; Flush on Close
+go-gost/x/internal/net/udp/listener_bytes_test.go	241	// short (40ms) window instead of the deleted private eventLog: the
+go-gost/x/internal/net/udp/r3_k1_production_pin_test.go	13	// 必须是生产接线原样组装的 BypassGroup(List("ovo-no-private")),
+go-gost/x/internal/util/download/priority_route_test.go	13	// B-1（2.1.26）：面板源线路升第一优先。私有仓下直连与 9 个公共
+go-gost/x/internal/util/download/routes.go	299	// the agent self-upgrade against the private repo, where direct
+go-gost/x/internal/util/download/routes.go	363	 // for a private-repo self-upgrade the panel-source route is
+go-gost/x/internal/util/tls/tls.go	572	 pk, ok := caKey.(privateKey)
+go-gost/x/internal/util/tls/tls.go	574	  return nil, errors.New("invalid private key type")
+go-gost/x/internal/util/tls/tls.go	586	type privateKey interface {
+go-gost/x/kernel/install.go	102	//     under the full judgment a privately addressed panel (LAN /
+go-gost/x/kernel/install.go	118	//     swap in a metadata OR private target between the hop check
+go-gost/x/kernel/install.go	233	   // for every privately addressed panel (GATE F2).
+go-gost/x/kernel/install_r5_test.go	33	// If the second answer rebinds to a private address, the dial
+go-gost/x/kernel/install_r5_test.go	35	// hard-deny only and dial the private address).
+go-gost/x/kernel/install_r5_test.go	58	  // Dial: the name has been rebound to a private address.
+go-gost/x/kernel/install_r5_test.go	73	  t.Fatalf("rebound private dial must be rejected, got content %q", buf.String())
+go-gost/x/kernel/nft.go	101	// namespace is private in the normal case, but a host-network
+go-gost/x/kernel/panel_source_fetch_test.go	6	// addressed by a private IP (LAN / tailnet) could never serve a
+go-gost/x/kernel/panel_source_fetch_test.go	44	  t.Fatalf("same-origin 301 from a private panel origin must succeed: %v", err)
+go-gost/x/kernel/panel_source_fetch_test.go	51	// A redirect away from the entry origin to a private target stays
+go-gost/x/kernel/panel_source_fetch_test.go	77	  t.Fatalf("cross-host redirect to a private target must be rejected, got content %q", buf.String())
+go-gost/x/kernel/panel_source_fetch_test.go	83	  t.Fatalf("private cross-host target contacted %d times, want 0", targetHits.Load())
+go-gost/x/kernel/panel_source_fetch_test.go	88	// private hop passes on the entry layer; same hostname with a
+go-gost/x/kernel/panel_source_fetch_test.go	102	  t.Errorf("same-origin private hop must pass (entry layer), got %v", err)
+go-gost/x/kernel/panel_source_fetch_test.go	105	  t.Error("same hostname but different port is cross-origin: private hop must be rejected")
+go-gost/x/kernel/panel_source_fetch_test.go	108	  t.Error("cross-host private hop must be rejected")
+go-gost/x/kernel/r7_g1_guard_localize_test.go	10	// R7-001 (agent side of the gate): the panel renders a private-range
+go-gost/x/kernel/r7_g1_guard_localize_test.go	11	// guard ({"ip_is_private": true, "action": "reject"}) as the first
+go-gost/x/kernel/r7_g1_guard_localize_test.go	16	// rewrite change cannot silently drop the node's private-range
+go-gost/x/kernel/r7_g1_guard_localize_test.go	32	 guard := map[string]interface{}{"ip_is_private": true, "action": "reject"}
+go-gost/x/kernel/r7_g1_guard_localize_test.go	60	 if len(first) != 2 || first["ip_is_private"] != true || first["action"] != "reject" {
+go-gost/x/kernel/r7_g1_guard_localize_test.go	61	  t.Fatalf("private guard must survive localization verbatim and first: %v", first)
+go-gost/x/listener/ssh/metadata.go	27	  privateKeyFile = "privateKeyFile"
+go-gost/x/listener/ssh/metadata.go	32	 if key := mdutil.GetString(md, privateKeyFile); key != "" {
+go-gost/x/listener/sshd/metadata.go	29	  privateKeyFile = "privateKeyFile"
+go-gost/x/listener/sshd/metadata.go	34	 if key := mdutil.GetString(md, privateKeyFile); key != "" {
+go-gost/x/socket/outbound_guard.go	21	// NO private-target exception in this change. A deployment that
+go-gost/x/socket/outbound_guard.go	22	// legitimately probes against a private target needs a new explicit
+go-gost/x/socket/outbound_guard.go	26	// Until such a channel exists, private probe targets are rejected.
+go-gost/x/socket/outbound_guard.go	29	// reachable only at a private address now yields panelRttMs
+go-gost/x/socket/r5_fb_test.go	122	 // judgment: a private answer is refused before any dial.
+go-gost/x/socket/r5_fb_test.go	128	 // The entry layer (no marker) judges hard-deny only: a private
+go-gost/x/socket/r5_fb_test.go	135	  t.Fatalf("入口层拨号不得以判定拒绝私有地址（面板源形态）, got: %v", err)
+go-gost/x/socket/remediation_audit_test.go	82	   cfg.Bypass = "ovo-no-private"
+go-gost/x/socket/remediation_audit_test.go	106	   t.Fatal("guarded TCP reached private target")
+go-gost/x/socket/remediation_audit_test.go	130	   cfg.Bypass = "ovo-no-private"
+go-gost/x/socket/remediation_audit_test.go	152	   t.Fatal("guarded UDP reached private target")
+go-gost/x/socket/tuning_probe.go	417	 // live WebSocket (a private/intranet address), and the
+go-gost/x/socket/tuning_probe_r7_test.go	4	// target before any dial — hard-deny always, private ranges
+go-gost/x/socket/tuning_probe_r7_test.go	37	  t.Fatal("private reference host must be rejected")
+go-gost/x/socket/tuning_probe_test.go	178	  return probeSeriesStats{}, errors.New("reference host is a private address")
+go-gost/x/socket/tunnel_tls.go	6	// certificate + private key per node (SAN: node-<id>.ovo.internal).
+go-gost/x/socket/tunnel_tls.go	61	// private key field is named nodePrivateKeyPem on purpose: the command
+go-gost/x/socket/tunnel_tls.go	62	// log redactor masks values under keys matching private_?key, so the
+go-gost/x/socket/tunnel_tls.go	112	// certificate must parse and match its private key, chain to the CA
+go-gost/x/socket/tunnel_tls_test.go	174	  t.Fatal("issue with a non-matching private key must fail")
+go-gost/x/socket/tunnel_tls_test.go	239	  t.Fatalf("status error = %q, want it to name the missing private key", status.Error)
+go-gost/x/socket/tunnel_tls_test.go	257	  t.Fatal("redacted command log still contains the node private key PEM")
+go-gost/x/socket/websocket_reporter.go	797	 sensitiveJSONKeyRe = regexp.MustCompile(`(?i)secret|password|passwd|token|auth|private_?key`)
+go-gost/x/socket/websocket_reporter.go	3566	// resolve or redirect to a private address and be dialed).
+go-gost/x/socket/websocket_reporter.go	3620	// (hard-deny only, so the privately addressed panel route's own
+go-gost/x/socket/websocket_reporter.go	4266	 // 面板源二期（B-1）：私有仓下直连与 9 个公共代理匿名拉全
+scripts/check-doc-consistency.sh	88	#       scripts/check-private-ranges.sh，私网拦截正本段集两处拷贝
+scripts/check-doc-consistency.sh	543	# ── 12. 私网段集常设门（R8-004 / R8-022）：转跑 check-private-ranges.sh
+scripts/check-doc-consistency.sh	544	if bash scripts/check-private-ranges.sh > /tmp/.private-ranges.out 2>&1; then
+scripts/check-doc-consistency.sh	545	  note_ok "私网拦截正本段集两处拷贝逐段一致（$(grep -oP 'private-ranges: \K[0-9]+' /tmp/.private-ranges.out) 段）"
+scripts/check-doc-consistency.sh	548	  sed 's/^/    /' /tmp/.private-ranges.out
+scripts/check-doc-consistency.sh	550	rm -f /tmp/.private-ranges.out
+scripts/check-private-ranges-selftest.sh	2	# check-private-ranges-selftest.sh — 私网段集门禁的变体自检
+scripts/check-private-ranges-selftest.sh	11	# 用法：check-private-ranges-selftest.sh（无参数，作用于本仓库）。
+scripts/check-private-ranges-selftest.sh	16	GATE="$ROOT/scripts/check-private-ranges.sh"
+scripts/check-private-ranges-selftest.sh	23	cp "$ROOT/go-backend/internal/kernel/private_ranges.go" "$MIR/go-backend/internal/kernel/"
+scripts/check-private-ranges-selftest.sh	25	cp "$ROOT/go-gost/x/bypass/ovo_no_private.go" "$MIR/go-gost/x/bypass/"
+scripts/check-private-ranges-selftest.sh	36	sed -i 's|"100.64.0.0/10"|"100.64.0.0/11"|' "$MIR/go-backend/internal/kernel/private_ranges.go"
+scripts/check-private-ranges-selftest.sh	45	cp "$ROOT/go-backend/internal/kernel/private_ranges.go" "$MIR/go-backend/internal/kernel/"
+scripts/check-private-ranges-selftest.sh	48	sed -i 's|"2001:db8::/32"|"2001:db8::/33"|' "$MIR/go-backend/internal/kernel/private_ranges.go"
+scripts/check-private-ranges-selftest.sh	57	cp "$ROOT/go-backend/internal/kernel/private_ranges.go" "$MIR/go-backend/internal/kernel/"
+scripts/check-private-ranges-selftest.sh	60	sed -i 's|^\t"198.18.0.0/15",|\t// "198.18.0.0/15",|' "$MIR/go-backend/internal/kernel/private_ranges.go"
+scripts/check-private-ranges-selftest.sh	69	cp "$ROOT/go-backend/internal/kernel/private_ranges.go" "$MIR/go-backend/internal/kernel/"
+scripts/check-private-ranges-selftest.sh	72	sed -i 's|fmt.Sprintf("::ffff:%s/%d"|fmt.Sprintf("%s/%d"|' "$MIR/go-backend/internal/kernel/private_ranges.go"
+scripts/check-private-ranges-selftest.sh	83	cp "$ROOT/go-backend/internal/kernel/private_ranges.go" "$MIR/go-backend/internal/kernel/private_ranges.go"
+scripts/check-private-ranges-selftest.sh	84	sed -i 's|"198.18.0.0/15",|`"198.18.0.0/15"`,|' "$MIR/go-backend/internal/kernel/private_ranges.go"
+scripts/check-private-ranges-selftest.sh	93	cp "$ROOT/go-backend/internal/kernel/private_ranges.go" "$MIR/go-backend/internal/kernel/private_ranges.go"
+scripts/check-private-ranges-selftest.sh	108	sed -i '/"192.0.2.0\/24"/d' "$MIR/go-backend/internal/kernel/private_ranges.go"
+scripts/check-private-ranges-selftest.sh	117	cp "$ROOT/go-backend/internal/kernel/private_ranges.go" "$MIR/go-backend/internal/kernel/"
+scripts/check-private-ranges-selftest.sh	132	sed -i 's|"2002::/16"|"2002::/17"|' "$MIR/go-gost/x/bypass/ovo_no_private.go"
+scripts/check-private-ranges-selftest.sh	141	cp "$ROOT/go-gost/x/bypass/ovo_no_private.go" "$MIR/go-gost/x/bypass/"
+scripts/check-private-ranges.sh	2	# check-private-ranges.sh — 私网拦截正本段集跨模块对账（R8-004 / R8-022
+scripts/check-private-ranges.sh	6	# 产品正本段集（ovo-no-private：节点侧出口守卫必须拦截的非公网段）
+scripts/check-private-ranges.sh	9	#   - go-backend/internal/kernel/private_ranges.go
+scripts/check-private-ranges.sh	16	# scripts/check-private-ranges-selftest.sh。
+scripts/check-private-ranges.sh	29	# 背景：sing-box 守卫曾用 ip_is_private 谓词，其 netip 段集缺 CGNAT
+scripts/check-private-ranges.sh	35	# go-gost/x/bypass/ovo_no_private.go（agent 镜像）、
+scripts/check-private-ranges.sh	57	# 三处登记同文：本节、netguard.go 文件头、private_ranges.go 文件头。
+scripts/check-private-ranges.sh	59	# 用法：check-private-ranges.sh [REPO_ROOT]（默认脚本所在仓库根）。
+scripts/check-private-ranges.sh	64	BE="$ROOT/go-backend/internal/kernel/private_ranges.go"
+scripts/check-private-ranges.sh	164	# 金标准段集（独立金标准：与规范集的定义同源于 ovo-no-private 裁定，
+scripts/check-private-ranges.sh	219	BP="$ROOT/go-gost/x/bypass/ovo_no_private.go"
+scripts/check-private-ranges.sh	441	echo "private-ranges: $((n4 + n6)) segments (v4 $n4 + v6 $n6; mapped forms derived from the v4 set)"
+scripts/verify-ovo-access.sh	5	printf '%s' "$metadata" | python3 -c 'import json,sys; assert json.load(sys.stdin)["private"] is False'
+skills/ovo-api/SKILL.md	301	1. ⚠️ **NO "Bearer" prefix** - `Authorization: <token>`, NOT `Authorization: Bearer <token>`
+skills/ovo-api/references/auth.md	118	❌ Incorrect: Authorization: Bearer eyJhbGciOiJIUzI1NiIs...
+skills/ovo-api/references/backup.md	34	  WebAuthn private keys never leave the authenticator). Rows whose
+skills/ovo-api/references/examples/http-client.md	279	  private baseUrl: string;
+skills/ovo-api/references/examples/http-client.md	280	  private username: string;
+skills/ovo-api/references/examples/http-client.md	281	  private password: string;
+skills/ovo-api/references/examples/http-client.md	282	  private token?: string;
+skills/ovo-api/references/examples/http-client.md	298	  private async login(): Promise<void> {
+skills/ovo-api/references/examples/http-client.md	316	  private async request<T>(endpoint: string, data?: object): Promise<T> {
+skills/ovo-api/references/forwards.md	80	> panel's SSRF guard (`IsSafeRemoteAddr`) rejects private/loopback/
+skills/ovo-api/references/inbounds.md	23	> (encryption secret, Reality private key / short IDs, listen address, UUID and
+skills/ovo-api/references/inbounds.md	78	panel's SSRF-protected fetcher (public https only, private-IP allowlist via
+skills/ovo-api/references/types.md	260	  private baseUrl: string;
+skills/ovo-api/references/types.md	261	  private username: string;
+skills/ovo-api/references/types.md	262	  private password: string;
+skills/ovo-api/references/types.md	263	  private token?: string;
+skills/ovo-api/references/types.md	271	  private async ensureToken(): Promise<void> {
+test-install-scripts-proxy.sh	768	# Authorization: Bearer；代理前缀与无 token 时一律不带。
+test-install-scripts-proxy.sh	787	  assert_equals "0" "$(grep -c -- 'Authorization: Bearer test-pat' "$log" || true)" "PAT: only the direct fetch carries the token"
+test-install-scripts-proxy.sh	792	# PAT（2.1.21）：load_github_token 按序读 ~/.ovo-token → 环境变量，
+test-install-scripts-proxy.sh	825	  assert_equals "0" "$(grep -c -- 'Authorization: Bearer test-pat' "$log" || true)" "PAT: only the direct probe carries the token"
+test-install-scripts-proxy.sh	886	  assert_equals "0" "$(grep -c -- 'Authorization: Bearer test-pat' "$log" || true)" "PAT/API: all three API legs (release JSON + body + .sha256 asset) must carry the token on direct"
+test-install-scripts-proxy.sh	997	  assert_equals "0" "$(grep -c -- 'Authorization: Bearer test-pat' "$log" || true)" "API: all three API legs (release JSON + body + .sha256 asset) must carry the token"
+vite-frontend/package.json	3	  "private": true,
+vite-frontend/pnpm-lock.yaml	376	  '@babel/plugin-proposal-private-property-in-object@7.21.0-placeholder-for-preset-env.2':
+vite-frontend/pnpm-lock.yaml	616	  '@babel/plugin-transform-private-methods@7.28.6':
+vite-frontend/pnpm-lock.yaml	622	  '@babel/plugin-transform-private-property-in-object@7.28.6':
+vite-frontend/pnpm-lock.yaml	4242	  '@babel/plugin-proposal-private-property-in-object@7.21.0-placeholder-for-preset-env.2(@babel/core@7.29.0)':
+vite-frontend/pnpm-lock.yaml	4506	  '@babel/plugin-transform-private-methods@7.28.6(@babel/core@7.29.0)':
+vite-frontend/pnpm-lock.yaml	4514	  '@babel/plugin-transform-private-property-in-object@7.28.6(@babel/core@7.29.0)':
+vite-frontend/pnpm-lock.yaml	4617	      '@babel/plugin-proposal-private-property-in-object': 7.21.0-placeholder-for-preset-env.2(@babel/core@7.29.0)
+vite-frontend/pnpm-lock.yaml	4657	      '@babel/plugin-transform-private-methods': 7.28.6(@babel/core@7.29.0)
+vite-frontend/pnpm-lock.yaml	4658	      '@babel/plugin-transform-private-property-in-object': 7.28.6(@babel/core@7.29.0)
+vite-frontend/scripts/check-secret-material.mjs	7	// JWT_SECRET= 赋值行、Xray 配置快照里的 Reality privateKey 与
+vite-frontend/scripts/check-secret-material.mjs	17	//  2. PRIVATE_KEY_FIELD：JSON 形态 "privateKey": "<≥40 字符的
+vite-frontend/scripts/check-secret-material.mjs	96	  const re = /"privateKey"\s*:\s*"([A-Za-z0-9+/=_-]{40,})"/g;
+vite-frontend/scripts/check-secret-material.mjs	163	      text: `"privateKey": "-----BEGIN OPENSSH PRIVATE KEY-----...",`,
+vite-frontend/scripts/check-secret-material.mjs	169	      text: `"privateKey": "${b64.slice(0, 44)}"`,
+vite-frontend/scripts/check-secret-material.mjs	175	      text: `"privateKey": "${b64.slice(0, 44)}"`,
+vite-frontend/src/api/types.ts	397	  authType?: "password" | "private_key";
+vite-frontend/src/api/types.ts	399	  privateKey?: string;
+vite-frontend/src/api/types.ts	423	  authType?: "password" | "private_key";
+vite-frontend/src/api/types.ts	425	  privateKey?: string;
+vite-frontend/src/demo/fixtures.json	1	{"recordedAt":1792877739132,"admin":{"config/list":[{"res":{"code":0,"msg":"操作成功","ts":1792877628293,"data":{"app_name":"OVO 演示","hide_footer_brand":"false","latency_targets":"[{\"name\":\"北京电信\",\"host\":\"bj-ct.example.com\",\"port\":80,\
+vite-frontend/src/pages/inbound/kernel-panel.tsx	183	        // built-in private-range block) must be surfaced, never
+vite-frontend/src/pages/inbound/presets.ts	402	 * (ValidateEncryptionSecret: x25519 = 32-byte private key, mlkem768 =
+vite-frontend/src/pages/node.tsx	335	    sshAuthType: "private_key",
+vite-frontend/src/pages/node.tsx	1100	      sshAuthType: node.sshConfig?.authType || "private_key",
+vite-frontend/src/pages/node.tsx	1102	      sshPrivateKey: node.sshConfig?.privateKey || "",
+vite-frontend/src/pages/node.tsx	1806	              privateKey:
+vite-frontend/src/pages/node.tsx	1807	                form.sshAuthType === "private_key"
+vite-frontend/src/pages/node/node-form-modal.tsx	404	                              | "private_key"
+vite-frontend/src/pages/node/node-form-modal.tsx	409	                              sshAuthType: selected || "private_key",
+vite-frontend/src/pages/node/node-form-modal.tsx	413	                          <SelectItem key="private_key" textValue="private_key">
+vite-frontend/src/pages/node/types.ts	110	    authType?: "password" | "private_key";
+vite-frontend/src/pages/node/types.ts	112	    privateKey?: string;
+vite-frontend/src/pages/node/types.ts	145	  sshAuthType: "password" | "private_key";

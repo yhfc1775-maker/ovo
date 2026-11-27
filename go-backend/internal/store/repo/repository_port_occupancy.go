@@ -1,0 +1,391 @@
+package repo
+
+import (
+	"errors"
+
+	"go-backend/internal/kernel"
+	"go-backend/internal/store/model"
+
+	"gorm.io/gorm"
+)
+
+// P01-001（Round 2 K9）：节点端口占用知识的唯一实现。
+//
+// 节点端口空间由三张表共享（forward_port、node_inbound、
+// chain_tunnel）加一个派生源：伴生 Clash API 口（41000–41999，
+// 按节点 secret 由 ClashAPIPortForSecret 派生，DB 无行）。
+//
+// 现在全部选口/判重点位一律走本文件的入口：
+//   - 点判重：NodePortOccupantTx / NodePortOccupiedTx
+//   - 已用集：UsedPortsOnNodeTx
+//   - 区间占用：NodePortRangeOccupancyTx
+//
+// 新增占用源只改这里。port_occupancy_sentinel_test.go 以枚举清单锁定
+// 每个点位必须引用本文件函数，防同族再漏。
+
+// 端口占用来源标识（与 FindOtherForwardOnNodePortTx 的
+// ForwardPortConflict.Source 取值一致，勿改字符串）。
+const (
+	PortSourceForward   = "forward"
+	PortSourceInbound   = "inbound"
+	PortSourceChain     = "chain_tunnel"
+	PortSourceCompanion = "companion"
+)
+
+// PortExclusions 描述判重时要排除的「自己人」行：转发按 forward_id、
+// 链路按 tunnel_id、入站按入站 id 排除（可多值，备份预检按整单排除）。
+type PortExclusions struct {
+	ForwardIDs []int64
+	TunnelIDs  []int64
+	InboundIDs []int64
+}
+
+// —— K8/X01-001（吸收 X01-OPT-01）：排除集的安全消费口径 ——
+//
+// 排除集的规模取决于调用方：单实体判重只传个位数 id；备份预检则
+// 传整单备份的全部 forward/tunnel/inbound id（无上界）。旧形态把
+// 排除集整体塞进单个 NOT IN ?：超 SQLite 32766 / PG 65535 变量
+// 上限后预检整体失败；且预检按 claim 条数逐条全量携带整单集合，
+// 参数传输随 claim 数 × 排除集规模增长（OPT-01 的平方级浪费）。
+// 两个助手统一收口：
+//   - 小集合（≤ inListChunkSize）保持单条 NOT IN 的既有 SQL 形态；
+//   - 大集合改走候选反连接：按基础条件（node/port[/区间]）命中的
+//     候选行 id 分页取出、在 Go 侧用集合查表判定排除——每条 SQL
+//     的变量数只由基础条件决定（恒定），不随排除集规模增长，
+//     判定语义与 NOT IN 完全等价（排除列均为非空 id 列）。
+// base 以工厂函数传入：GORM 链式查询对象执行后不可靠复用，
+// 每条实际查询都从工厂现取。
+
+// existsOccupantNotExcludedTx 判断 base 限定的行中是否存在
+// idColumn ∉ exclIDs 的行（占用存在性判定）。
+func existsOccupantNotExcludedTx(base func() *gorm.DB, idColumn string, exclIDs []int64) (bool, error) {
+	if len(exclIDs) == 0 {
+		var count int64
+		if err := base().Count(&count).Error; err != nil {
+			return false, err
+		}
+		return count > 0, nil
+	}
+	if len(exclIDs) <= inListChunkSize {
+		var count int64
+		if err := base().Where(idColumn+" NOT IN ?", exclIDs).Count(&count).Error; err != nil {
+			return false, err
+		}
+		return count > 0, nil
+	}
+	exclSet := make(map[int64]struct{}, len(exclIDs))
+	for _, id := range exclIDs {
+		exclSet[id] = struct{}{}
+	}
+	for offset := 0; ; offset += inListChunkSize {
+		var candidateIDs []int64
+		if err := base().Order(idColumn+" ASC").Limit(inListChunkSize).Offset(offset).Pluck(idColumn, &candidateIDs).Error; err != nil {
+			return false, err
+		}
+		for _, id := range candidateIDs {
+			if _, excluded := exclSet[id]; !excluded {
+				return true, nil
+			}
+		}
+		if len(candidateIDs) < inListChunkSize {
+			return false, nil
+		}
+	}
+}
+
+type portExclPair struct {
+	ExclID int64 `gorm:"column:excl_id"`
+	Port   int   `gorm:"column:port"`
+}
+
+// pluckPortsNotExcludedTx 取 base 限定行的 port 列，剔除
+// idColumn ∈ exclIDs 的行（已用口清单判定）。
+func pluckPortsNotExcludedTx(base func() *gorm.DB, idColumn string, exclIDs []int64) ([]int, error) {
+	if len(exclIDs) <= inListChunkSize {
+		q := base()
+		if len(exclIDs) > 0 {
+			q = q.Where(idColumn+" NOT IN ?", exclIDs)
+		}
+		var ports []int
+		if err := q.Pluck("port", &ports).Error; err != nil {
+			return nil, err
+		}
+		return ports, nil
+	}
+	exclSet := make(map[int64]struct{}, len(exclIDs))
+	for _, id := range exclIDs {
+		exclSet[id] = struct{}{}
+	}
+	var ports []int
+	for offset := 0; ; offset += inListChunkSize {
+		var pairs []portExclPair
+		if err := base().Select(idColumn + " AS excl_id, port").Order(idColumn + " ASC, port ASC").
+			Limit(inListChunkSize).Offset(offset).Scan(&pairs).Error; err != nil {
+			return nil, err
+		}
+		for _, p := range pairs {
+			if _, excluded := exclSet[p.ExclID]; !excluded {
+				ports = append(ports, p.Port)
+			}
+		}
+		if len(pairs) < inListChunkSize {
+			return ports, nil
+		}
+	}
+}
+
+// NodePortOccupantTx 返回占用 (nodeID, port) 的来源（"" 表示空闲）。
+// 检查顺序 forward → inbound → chain → companion，与
+// FindOtherForwardOnNodePortTx 的报告优先级一致；多源同占（降级态）
+// 时按此序报第一源。
+func (r *Repository) NodePortOccupantTx(tx *gorm.DB, nodeID int64, port int, excl PortExclusions) (string, error) {
+	if tx == nil {
+		return "", errors.New("database unavailable")
+	}
+	if nodeID <= 0 || port <= 0 {
+		return "", nil
+	}
+
+	occupied, err := existsOccupantNotExcludedTx(func() *gorm.DB {
+		return tx.Model(&model.ForwardPort{}).Where("node_id = ? AND port = ?", nodeID, port)
+	}, "forward_id", excl.ForwardIDs)
+	if err != nil {
+		return "", err
+	}
+	if occupied {
+		return PortSourceForward, nil
+	}
+
+	occupied, err = existsOccupantNotExcludedTx(func() *gorm.DB {
+		return tx.Model(&model.NodeInbound{}).Where("node_id = ? AND port = ?", nodeID, port)
+	}, "id", excl.InboundIDs)
+	if err != nil {
+		return "", err
+	}
+	if occupied {
+		return PortSourceInbound, nil
+	}
+
+	occupied, err = existsOccupantNotExcludedTx(func() *gorm.DB {
+		return tx.Model(&model.ChainTunnel{}).Where("node_id = ? AND port = ? AND port > 0", nodeID, port)
+	}, "tunnel_id", excl.TunnelIDs)
+	if err != nil {
+		return "", err
+	}
+	if occupied {
+		return PortSourceChain, nil
+	}
+
+	// P1-01（PortAlloc Fix A）：伴生 Clash API 口（第四源，DB 无行）
+	// ——按节点 secret 派生的 41000–41999 段内一口，agent 侧常驻监听。
+	// 此前统一谓词看不到它，自动选口会抽中它、下发 bind 失败。
+	// 派生口是面板的唯一认知：agent 重启漂移后的实际口由 live 探针
+	// （转发/中转创建）兜底。
+	if companionClashAPIPortTx(tx, nodeID) == port {
+		return PortSourceCompanion, nil
+	}
+
+	return "", nil
+}
+
+// companionClashAPIPortTx 取节点伴生 Clash API 的派生口：
+// ClashAPIPortForSecret(node.EffectiveSecretHash())（F03：派生输入
+// 为存储哈希，未迁移行现场哈希，同值）。secret 为空或节点不存在
+// 时回 0（无派生口，不占）。只读 secret_hash/secret 两列；查不到
+// 不报错——调用方的节点存在性校验在别处。
+func companionClashAPIPortTx(tx *gorm.DB, nodeID int64) int {
+	if tx == nil || nodeID <= 0 {
+		return 0
+	}
+	var node model.Node
+	if err := tx.Select("secret", "secret_hash").Where("id = ?", nodeID).First(&node).Error; err != nil {
+		return 0
+	}
+	return kernel.ClashAPIPortForSecret(node.EffectiveSecretHash())
+}
+
+// NodePortOccupiedTx 是 NodePortOccupantTx 的布尔形。
+func (r *Repository) NodePortOccupiedTx(tx *gorm.DB, nodeID int64, port int, excl PortExclusions) (bool, error) {
+	source, err := r.NodePortOccupantTx(tx, nodeID, port, excl)
+	if err != nil {
+		return false, err
+	}
+	return source != "", nil
+}
+
+// UsedPortsOnNodeTx 返回节点上全部已占用端口的集合（四源，含排除）。
+// 全部自动选口（隧道 pick、转发 pick）都以本集合为判重
+// 依据，不再各自拼装。
+// ListUsedPortsOnNode 返回节点上已被四源占用的端口清单
+// （UsedPortsOnNodeTx 的列表形）。原寄居于已删的联邦 repo 文件，
+// 因属统一占用谓词的消费面而随 DEV-RM-SHARE 迁回本文件，实现未动。
+func (r *Repository) ListUsedPortsOnNode(nodeID int64) ([]int, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	used, err := r.UsedPortsOnNodeTx(r.db, nodeID, PortExclusions{})
+	if err != nil {
+		return nil, err
+	}
+	result := make([]int, 0, len(used))
+	for p := range used {
+		result = append(result, p)
+	}
+	return result, nil
+}
+
+func (r *Repository) UsedPortsOnNodeTx(tx *gorm.DB, nodeID int64, excl PortExclusions) (map[int]struct{}, error) {
+	if tx == nil {
+		return nil, errors.New("database unavailable")
+	}
+	used := make(map[int]struct{})
+	add := func(ports []int) {
+		for _, p := range ports {
+			if p > 0 {
+				used[p] = struct{}{}
+			}
+		}
+	}
+
+	forwardPorts, err := pluckPortsNotExcludedTx(func() *gorm.DB {
+		return tx.Model(&model.ForwardPort{}).Where("node_id = ? AND port > 0", nodeID)
+	}, "forward_id", excl.ForwardIDs)
+	if err != nil {
+		return nil, err
+	}
+	add(forwardPorts)
+
+	inboundPorts, err := listNodeInboundPortsExclTx(tx, nodeID, excl.InboundIDs)
+	if err != nil {
+		return nil, err
+	}
+	add(inboundPorts)
+
+	chainPorts, err := pluckPortsNotExcludedTx(func() *gorm.DB {
+		return tx.Model(&model.ChainTunnel{}).Where("node_id = ? AND port > 0", nodeID)
+	}, "tunnel_id", excl.TunnelIDs)
+	if err != nil {
+		return nil, err
+	}
+	add(chainPorts)
+
+	// P1-01：伴生 Clash API 派生口（第四源，无行可排除）——常驻监听，
+	// 选口须避开。
+	if cp := companionClashAPIPortTx(tx, nodeID); cp > 0 {
+		used[cp] = struct{}{}
+	}
+
+	return used, nil
+}
+
+// listNodeInboundPortsExclTx 是已用集/判重共用的入站口清单（多值
+// 排除形）；单值版 listNodeInboundPortsTx 在 repository_kernel.go
+// 转调本函数。排除集消费走 pluckPortsNotExcludedTx（整单规模时
+// 反连接，见其注记）。
+func listNodeInboundPortsExclTx(tx *gorm.DB, nodeID int64, excludeInboundIDs []int64) ([]int, error) {
+	return pluckPortsNotExcludedTx(func() *gorm.DB {
+		return tx.Model(&model.NodeInbound{}).Where("node_id = ? AND port > 0", nodeID)
+	}, "id", excludeInboundIDs)
+}
+
+// PortRangeOccupancy 汇总 [lo, hi] 区间内的占用来源集合。
+type PortRangeOccupancy struct {
+	Sources map[string]bool
+	// InboundCompanion 表示区间内存在订阅计量伴生入站
+	// （companion_of > 0）——它不在任何用户列表里，occupant 命名
+	// 须单独点名（F7/B-05 口径）。
+	InboundCompanion bool
+}
+
+// NodePortRangeOccupancyTx 返回区间内各来源的占用情况（四源）。
+func (r *Repository) NodePortRangeOccupancyTx(tx *gorm.DB, nodeID int64, lo, hi int, excl PortExclusions) (*PortRangeOccupancy, error) {
+	if tx == nil {
+		return nil, errors.New("database unavailable")
+	}
+	occ := &PortRangeOccupancy{Sources: map[string]bool{}}
+
+	inboundOccupied, err := existsOccupantNotExcludedTx(func() *gorm.DB {
+		return tx.Model(&model.NodeInbound{}).Where("node_id = ? AND port BETWEEN ? AND ?", nodeID, lo, hi)
+	}, "id", excl.InboundIDs)
+	if err != nil {
+		return nil, err
+	}
+	if inboundOccupied {
+		occ.Sources[PortSourceInbound] = true
+		// F7 (B-05)：伴生入站命名需要单独确认；原实现对该查询的
+		// 错误是吞掉的（err == nil 才采信），保持同口径。
+		companionOccupied, compErr := existsOccupantNotExcludedTx(func() *gorm.DB {
+			return tx.Model(&model.NodeInbound{}).Where("node_id = ? AND port BETWEEN ? AND ? AND companion_of > 0", nodeID, lo, hi)
+		}, "id", excl.InboundIDs)
+		if compErr == nil && companionOccupied {
+			occ.InboundCompanion = true
+		}
+	}
+
+	forwardOccupied, err := existsOccupantNotExcludedTx(func() *gorm.DB {
+		return tx.Model(&model.ForwardPort{}).Where("node_id = ? AND port BETWEEN ? AND ?", nodeID, lo, hi)
+	}, "forward_id", excl.ForwardIDs)
+	if err != nil {
+		return nil, err
+	}
+	if forwardOccupied {
+		occ.Sources[PortSourceForward] = true
+	}
+
+	chainOccupied, err := existsOccupantNotExcludedTx(func() *gorm.DB {
+		return tx.Model(&model.ChainTunnel{}).Where("node_id = ? AND port BETWEEN ? AND ?", nodeID, lo, hi)
+	}, "tunnel_id", excl.TunnelIDs)
+	if err != nil {
+		return nil, err
+	}
+	if chainOccupied {
+		occ.Sources[PortSourceChain] = true
+	}
+
+	// P1-01：伴生 Clash API 派生口落入区间即第四源占用。
+	if cp := companionClashAPIPortTx(tx, nodeID); cp > 0 && cp >= lo && cp <= hi {
+		occ.Sources[PortSourceCompanion] = true
+	}
+
+	return occ, nil
+}
+
+// TunnelChainPortReusableTx 判断隧道现有非入口段口在更新时能否沿用
+// （P01-002）：口仍落在节点端口规格内（与 pickNodePortTx 的候选集
+// 同口径），且统一四源判重（排除本隧道自身链路行）下未被他人占用。
+// 节点不存在按不可沿用处理（后续流程会以「节点不存在」报错）。
+func (r *Repository) TunnelChainPortReusableTx(tx *gorm.DB, nodeID int64, port int, tunnelID int64) (bool, error) {
+	if tx == nil {
+		return false, errors.New("database unavailable")
+	}
+	if nodeID <= 0 || port <= 0 {
+		return false, nil
+	}
+	var node model.Node
+	err := tx.Select("port").Where("id = ?", nodeID).First(&node).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	inSpec := false
+	for _, candidate := range parsePortRangeSpec(node.Port) {
+		if candidate == port {
+			inSpec = true
+			break
+		}
+	}
+	if !inSpec {
+		return false, nil
+	}
+	var excl PortExclusions
+	if tunnelID > 0 {
+		excl.TunnelIDs = []int64{tunnelID}
+	}
+	occupied, err := r.NodePortOccupiedTx(tx, nodeID, port, excl)
+	if err != nil {
+		return false, err
+	}
+	return !occupied, nil
+}

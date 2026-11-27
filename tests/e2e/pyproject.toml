@@ -1,0 +1,59 @@
+[project]
+name = "ovo-e2e-tests"
+version = "0.1.0"
+description = "E2E tests for OVO Panel"
+requires-python = ">=3.11"
+# A4-08: 直接依赖以 == 钉版、全集（含传递依赖）锁在
+# requirements.lock，CI 按 lock 安装——此前全是无界 >= 且无
+# lockfile，Python 是本仓唯一浮动安装的生态。两处版本须一致，
+# 升级时按 requirements.lock 文件头流程同步重解析。
+dependencies = [
+    "pytest==9.2.0",
+    "pytest-playwright==0.10.0",
+    "playwright==1.64.1",
+    # utils/api_client.py is built on requests; it was previously only
+    # present transitively, which broke clean installs of this suite.
+    "requests==2.34.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest-asyncio==1.4.1.post1",
+    "pytest-timeout==2.4.0",
+    "pytest-html==4.2.0",
+]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+pythonpath = ["."]
+testpaths = ["."]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+markers = [
+    "e2e: End-to-end test requiring running servers",
+    "auth: Test requires authentication",
+    "slow: Slow running test",
+    "api: API-only test (no browser needed)",
+    "reuse_login: Reuse one logged-in browser session for the class (storage state)",
+]
+addopts = "-v --tb=short"
+timeout = 60
+log_cli = true
+log_cli_level = "INFO"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+[build-system]
+# A4-08: 构建后端同样钉版，避免隔离构建环境浮动拉取。
+requires = ["setuptools==84.2.1"]
+build-backend = "setuptools.build_meta"
+
+# Test-only project: pip installs must not try to package the test tree
+# (flat-layout discovery fails on the pages/ and fixtures/ directories).
+[tool.setuptools]
+packages = []

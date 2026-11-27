@@ -1,0 +1,1618 @@
+// Package model defines GORM model structs for all database tables,
+// providing a single source of truth for the schema that works
+// transparently with both SQLite and PostgreSQL.
+package model
+
+import (
+	"database/sql"
+	"encoding/json"
+
+	"go-backend/internal/security"
+)
+
+// ─── Core Business Tables ────────────────────────────────────────────
+
+// User maps to the "user" table. PostgreSQL treats "user" as a reserved
+// word, so TableName() is required for correct quoting.
+type User struct {
+	ID                int64         `gorm:"primaryKey;autoIncrement"`
+	User              string        `gorm:"column:user;type:varchar(100);not null"`
+	Pwd               string        `gorm:"type:varchar(100);not null"`
+	RoleID            int           `gorm:"column:role_id;not null"`
+	ExpTime           int64         `gorm:"column:exp_time;not null"`
+	Flow              int64         `gorm:"not null"`
+	FlowMiB           int64         `gorm:"column:flow_mib;not null;default:0"`
+	InFlow            int64         `gorm:"column:in_flow;not null;default:0"`
+	OutFlow           int64         `gorm:"column:out_flow;not null;default:0"`
+	FlowResetTime     int64         `gorm:"column:flow_reset_time;not null"`
+	Num               int           `gorm:"not null"`
+	CreatedTime       int64         `gorm:"column:created_time;not null"`
+	UpdatedTime       sql.NullInt64 `gorm:"column:updated_time"`
+	Status            int           `gorm:"not null"`
+	PasswordChangedAt int64         `gorm:"column:password_changed_at;not null;default:0"`
+	// TokensRevokedBefore 是服务端登出的吊销水位（unix 毫秒，E1-02）：
+	// 登出时推进到当前时刻，此前签发的全部 JWT 随即失效（复核侧以
+	// RevocationWatermark = max(PasswordChangedAt, TokensRevokedBefore)
+	// 判定）。与改密分开记账：登出不动密码语义，重新登录不受影响。
+	TokensRevokedBefore int64 `gorm:"column:tokens_revoked_before;not null;default:0"`
+	MaxConn             int   `gorm:"column:max_conn;not null;default:0"`
+	// FlowLastResetTime is the unix-ms moment of the last monthly flow
+	// reset actually performed by the daily job (R11X-005 due-type
+	// catch-up marker). 0 = never recorded (stock/pre-column rows and
+	// raw inserts); the reset job resolves 0 via its documented
+	// stock-row baseline (see repo.monthlyFlowDue).
+	FlowLastResetTime int64 `gorm:"column:flow_last_reset_time;not null;default:0"`
+}
+
+func (User) TableName() string { return "user" }
+
+// Forward maps to the "forward" table.
+type Forward struct {
+	ID                   int64         `gorm:"primaryKey;autoIncrement"`
+	UserID               int64         `gorm:"column:user_id;not null"`
+	UserName             string        `gorm:"column:user_name;type:varchar(100);not null"`
+	Name                 string        `gorm:"type:varchar(100);not null"`
+	TunnelID             int64         `gorm:"column:tunnel_id;not null"`
+	RemoteAddr           string        `gorm:"column:remote_addr;type:text;not null"`
+	TargetPolicy         string        `gorm:"column:target_policy;type:varchar(16);not null;default:''"`
+	Strategy             string        `gorm:"type:varchar(100);not null;default:'fifo'"`
+	InFlow               int64         `gorm:"not null;default:0"`
+	OutFlow              int64         `gorm:"column:out_flow;not null;default:0"`
+	CreatedTime          int64         `gorm:"column:created_time;not null"`
+	UpdatedTime          int64         `gorm:"column:updated_time;not null"`
+	Status               int           `gorm:"not null"`
+	Inx                  int           `gorm:"not null;default:0"`
+	SpeedID              sql.NullInt64 `gorm:"column:speed_id"`
+	MaxConn              int           `gorm:"column:max_conn;not null;default:0"`
+	IPMaxConn            int           `gorm:"column:ip_max_conn;not null;default:0"`
+	IPSpeedID            sql.NullInt64 `gorm:"column:ip_speed_id"`
+	ProxyProtocol        int           `gorm:"column:proxy_protocol;not null;default:0"`
+	ProxyProtocolReceive int           `gorm:"column:proxy_protocol_receive;not null;default:0"`
+	ProxyProtocolSend    int           `gorm:"column:proxy_protocol_send;not null;default:0"`
+}
+
+func (Forward) TableName() string { return "forward" }
+
+type ForwardPort struct {
+	ID        int64          `gorm:"primaryKey;autoIncrement"`
+	ForwardID int64          `gorm:"column:forward_id;not null"`
+	NodeID    int64          `gorm:"column:node_id;not null"`
+	Port      int            `gorm:"not null"`
+	InIP      sql.NullString `gorm:"column:in_ip;type:text"`
+	// BindWarning B08-005：显式监听 IP 在同步时被回退为默认监听后，
+	// 回退事件持久记录在此（回退同时会清空 InIP，若不另存则事件无痕）。
+	// 转发列表以 bindWarnings 字段透出；显式绑定再次同步成功时清除。
+	BindWarning sql.NullString `gorm:"column:bind_warning;type:text"`
+}
+
+func (ForwardPort) TableName() string { return "forward_port" }
+
+type Node struct {
+	ID           int64          `gorm:"primaryKey;autoIncrement"`
+	Name         string         `gorm:"type:varchar(100);not null"`
+	Remark       sql.NullString `gorm:"column:remark;type:text"`
+	ExpiryTime   sql.NullInt64  `gorm:"column:expiry_time"`
+	RenewalCycle sql.NullString `gorm:"column:renewal_cycle;type:varchar(20)"`
+	// Secret 是节点 secret 的 legacy 明文列（F03 前写入）：迁移后恒
+	// 为空串，仅作回退读取（未迁移行）与回滚兼容；新写一律只写
+	// SecretHash，永不写明文。列本身保留——AutoMigrate 不删列，
+	// 直接改 tag 会静默失效。
+	Secret string `gorm:"type:varchar(100);not null"`
+	// SecretHash 是节点 secret 的唯一存储形态（F03）：HashNodeSecret
+	//（域分隔 SHA-256，64 位 hex）。认证时对出示值哈希比对。
+	SecretHash              string         `gorm:"column:secret_hash;type:varchar(100)"`
+	ServerIP                string         `gorm:"column:server_ip;type:varchar(100);not null"`
+	ServerIPV4              sql.NullString `gorm:"column:server_ip_v4;type:varchar(100)"`
+	ServerIPV6              sql.NullString `gorm:"column:server_ip_v6;type:varchar(100)"`
+	ExtraIPs                sql.NullString `gorm:"column:extra_ips;type:text"`
+	Port                    string         `gorm:"type:text;not null"`
+	InterfaceName           sql.NullString `gorm:"column:interface_name;type:varchar(200)"`
+	Version                 sql.NullString `gorm:"type:varchar(100)"`
+	// BinarySHA 是当前在线 agent 进程运行中二进制的 SHA-256（NU-07）：
+	// 握手 query 的 binSha 落库，供升级落地核验在 ExpectedSHA 非空时
+	// 与期望哈希双条件比对。会话绑定——握手未带 binSha 时清为空串，
+	// 旧会话的残留哈希不得用来核验新一轮落地（老 agent 不带该参数）。
+	BinarySHA               string         `gorm:"column:binary_sha;type:varchar(128);not null;default:''"`
+	HTTP                    int            `gorm:"column:http;not null;default:0"`
+	TLS                     int            `gorm:"column:tls;not null;default:0"`
+	Socks                   int            `gorm:"not null;default:0"`
+	CreatedTime             int64          `gorm:"column:created_time;not null"`
+	UpdatedTime             sql.NullInt64  `gorm:"column:updated_time"`
+	Status                  int            `gorm:"not null"`
+	TCPListenAddr           string         `gorm:"column:tcp_listen_addr;type:varchar(100);not null;default:'[::]'"`
+	UDPListenAddr           string         `gorm:"column:udp_listen_addr;type:varchar(100);not null;default:'[::]'"`
+	Inx                     int            `gorm:"not null;default:0"`
+	ForwardMode             string         `gorm:"column:forward_mode;type:varchar(20);not null;default:'agent'"`
+	ExpiryReminderDismissed int            `gorm:"column:expiry_reminder_dismissed;not null;default:0"`
+	// 节点自选的延迟测试点（JSON），空则跟随全局默认。
+	LatencyTargets string `gorm:"column:latency_targets;type:text;not null;default:''"`
+	// 节点页展示分组标签（纯展示功能，用户 2026-11-09 拍板）：一
+	// 个节点至多一个自由文本标签，空＝未分组。只影响节点页双视
+	// 图的分段展示与段序，段序名单存 vite_config 的
+	// node_display_group_order 键；不参与订阅/隧道/转发/选线，
+	// agent 不感知、不下发。
+	DisplayGroup string `gorm:"column:display_group;type:varchar(100);not null;default:''"`
+	// 定时重启 agent 服务（保险丝，默认关）：面板是权威源，agent 侧
+	// 落成 systemd timer 持久化执行，面板离线照常触发。RestartTime
+	// 为节点本机时间的 "HH:MM"；RestartJitterMinutes 为随机抖动窗
+	// 口（分钟，实际触发时刻在设定时刻后 0..jitter 内均匀随机）。
+	RestartEnabled       int    `gorm:"column:restart_enabled;not null;default:0"`
+	RestartTime          string `gorm:"column:restart_time;type:varchar(5);not null;default:'04:00'"`
+	RestartJitterMinutes int    `gorm:"column:restart_jitter_minutes;not null;default:30"`
+	// 重启模式（fix/restart-interval）：daily＝每天 RestartTime
+	// 触发（存量行为，默认）；interval＝每 RestartIntervalMinutes
+	// 分钟触发一次（小内存节点攒积保险丝，用户 2026-11-12 令）。
+	// RestartMode 空串按 daily 读（存量行与旧备份的缺省）。
+	RestartMode            string `gorm:"column:restart_mode;type:varchar(10);not null;default:'daily'"`
+	RestartIntervalMinutes int    `gorm:"column:restart_interval_minutes;not null;default:60"`
+	// 定时重启下发结果（W8-R-C601 持久字段）：设置保存后下发
+	// agent 的实际结果，刷新列表行可见——此前失败只在当次回执
+	// 带 pushError，刷新即失。RestartPushStatus 取 pending（已保
+	// 存未下发，离线保存）/applied（agent 已确认）/failed（下发
+	// 失败，原因见 RestartPushError）；RestartPushedAt 为最近一次
+	// 下发尝试的 UnixMilli。运行态，不进备份。
+	RestartPushStatus string `gorm:"column:restart_push_status;type:varchar(16);not null;default:''"`
+	RestartPushError  string `gorm:"column:restart_push_error;type:varchar(500);not null;default:''"`
+	RestartPushedAt   int64  `gorm:"column:restart_pushed_at;not null;default:0"`
+	// 转发面会话无进展拆除阈值（秒，保险丝，默认关）：0＝不拆；
+	// >0 时 agent 只拆双向零字节满该秒数的 gost 会话（任一方向有
+	// 字节即不拆）。面板是权威源，随服务配置 metadata 下发、服务
+	// 重建时生效。与内核面 connIdle（Xray per-inbound）是两套
+	// 口径，故意不共用（同 FIX-1 transport 注释的既有裁定）。
+	IdleTimeoutSeconds int `gorm:"column:idle_timeout_seconds;not null;default:0"`
+	// 僵尸会话根治两档（秒，默认全关，随 IdleTimeoutSeconds 同一条
+	// metadata 通道下发）：EdgeIdleTimeoutSeconds＝入口判死窗口——
+	// 转发面会话在客户端方向零字节满该秒数、且入口腿 TCP_INFO 证
+	// 明数据无人签收（unacked/notsent/零窗口且 Bytes_acked 冻结）
+	// 时才拆；BackstopIdleTimeoutSeconds＝中途兜底窗口——源头沉默
+	// 满该秒数且服务器方向仅低速滴流（速率低于 BackstopTrickleBps）
+	// 时拆。BackstopTrickleBps＝兜底滴流速率上限（字节/秒，0＝用
+	// agent 内置默认 256）。三者均为保险丝，0＝关闭。
+	EdgeIdleTimeoutSeconds     int `gorm:"column:edge_idle_timeout_seconds;not null;default:0"`
+	BackstopIdleTimeoutSeconds int `gorm:"column:backstop_idle_timeout_seconds;not null;default:0"`
+	BackstopTrickleBps         int `gorm:"column:backstop_trickle_bps;not null;default:0"`
+	// 节点级连接日志采集开关（默认关）：面板总开关开 AND 本开关
+	// 开，agent 才采集该节点的连接（直连入站的内核日志形态与
+	// 中转入口标记同受此门控）；只控采集，不删历史行。逐入站
+	// 开关已随按入站弹窗一并撤掉，本字段是唯一的采集门控。
+	ConnLogEnabled int `gorm:"column:conn_log_enabled;not null;default:0"`
+	// 节点级入站白名单开关＋附加名单（默认关）：开时该节点全部
+	// 入站的生效白名单为本名单（覆盖逐入站设置，逐入站存量字
+	// 段不动）；关时逐入站设置照旧。WhitelistExtra 为 IP/CIDR
+	// 逗号分隔串，写面经 kernel.ParseAllowList 校验并归一。
+	WhitelistEnabled int    `gorm:"column:whitelist_enabled;not null;default:0"`
+	WhitelistExtra   string `gorm:"column:whitelist_extra;type:text;not null;default:''"`
+	// nftables 状态（agent 上报的运行态，不进备份）：""＝未知／
+	// 未尝试、installed＝已安装、auto_installed＝本 agent 进程
+	// 自动装上、failed＝自动安装失败（原因见 NftablesError）、
+	// missing＝agent 已确认本机无 nftables（仅 nftables 模式节点；
+	// gost 模式无 nft 是正常形态，不记此态——见
+	// ingestNodeNftablesStatus）。
+	NftablesStatus string `gorm:"column:nftables_status;type:varchar(20);not null;default:''"`
+	NftablesError  string `gorm:"column:nftables_error;type:text;not null;default:''"`
+	// nft 采集健康（A-中-2，面板周期 SSH 采集的失败态，不进备份）：
+	// State ""＝未采集过、"ok"＝最近一次采集成功、"failing"＝连续
+	// 失败已达阈值（nftCollectFailAlertThreshold）；FailCount 为
+	// 连续失败次数、LastError 为最近一次失败原因原文、LastOKAt 为
+	// 最近一次成功采集的 UnixMilli。SshFailCount/WsFailCount 为
+	// 当前 streak 内 SSH 路／WS 路各自尚未恢复的失败轮数
+	// （R4C-01，分路计数）：SSH 路（30 秒轮）与 WS 路（60 秒
+	// 轮）是独立信号、共用一条 streak；任一路成功只清该路计数，
+	// streak 在两路计数均归零时才整体清除。只凭 LastError 前缀
+	// 判来源会丢混合 streak 的组成（最后一次失败是哪路、前面的
+	// 就是哪路），WS 成功即误清 SSH 的失败、误报恢复。存量行
+	// 升级时两计数为 0：首个成功即按旧口径整条清除（一次性、仅
+	// 限升级窗口内已在 streak 中的行）；首个失败轮即重建正确组
+	// 成。运行态，不进备份。
+	NftCollectState        string `gorm:"column:nft_collect_state;type:varchar(16);not null;default:''"`
+	NftCollectFailCount    int    `gorm:"column:nft_collect_fail_count;not null;default:0"`
+	NftCollectLastError    string `gorm:"column:nft_collect_last_error;type:varchar(500);not null;default:''"`
+	NftCollectLastOKAt     int64  `gorm:"column:nft_collect_last_ok_at;not null;default:0"`
+	NftCollectSshFailCount int    `gorm:"column:nft_collect_ssh_fail_count;not null;default:0"`
+	NftCollectWsFailCount  int    `gorm:"column:nft_collect_ws_fail_count;not null;default:0"`
+
+	// Last authenticated WS handshake, parsed through the trusted proxy chain.
+	ConnectionID      string `gorm:"column:connection_id;type:varchar(64);not null;default:''"`
+	ConnectionIP      string `gorm:"column:connection_ip;type:varchar(64);not null;default:''"`
+	ConnectedAt       int64  `gorm:"column:connected_at;not null;default:0"`
+	ConnectionVersion string `gorm:"column:connection_version;type:varchar(255);not null;default:''"`
+}
+
+func (Node) TableName() string { return "node" }
+
+// EffectiveSecretHash 返回节点 secret 的派生输入（F03）：已迁移行
+// 用 SecretHash；未迁移的 legacy 明文行现场哈希（与迁移后同值，
+// 派生结果在迁移前后不变）；两者皆空即 ""（调用方按无 secret 处理）。
+// 内核 mark/Clash 端口等面板侧派生一律走本函数，不再直读 Secret。
+func (n *Node) EffectiveSecretHash() string {
+	if n == nil {
+		return ""
+	}
+	if n.SecretHash != "" {
+		return n.SecretHash
+	}
+	if n.Secret != "" {
+		return security.HashNodeSecret(n.Secret)
+	}
+	return ""
+}
+
+// NodeUpgradeVerification 是节点升级/回退的落地核验记录（A4-V-06）。
+// 面板下发 UpgradeAgent / RollbackAgent 成功后按节点落一条待核验
+// 行：面板在下发时握有目标版本（与期望哈希），节点重连时握有新自
+// 报版本——旧实现从不比对，ACK 后静默失败的升级在面板上毫无痕
+// 迹。本表把双边事实落库（不落内存：面板重启不丢待核验项）：重
+// 连自报命中目标即核销 landed；核验窗口内未命中由后台扫描置
+// failed 并发节点级告警事件（node_upgrade_failed）；failed 后节点
+// 又以目标版本回连则翻 landed 并置 Late=1（告警已按时发出、不撤
+// 回，但状态面不得与版本列自相矛盾）。一节点一行，新下发整行覆
+// 盖（同节点升级类操作有 L2-10 在途互斥，覆盖只发生在上一条命令
+// 已回执之后，语义为「以最新下发为准」）。LB-03：无目标回退（老
+// agent 回执无 toVersion）成功下发时，既有未结行置 superseded 结
+// 案并在 CloseReason 记明原因——回退意图已接管该节点的版本走向，
+// 原行若继续挂到截止只会误发「未落地」告警；结案只记「被接管」
+// 事实、绝不伪造 landed（回退回执按 M-0051 只证下发不证落地）。
+type NodeUpgradeVerification struct {
+	ID            int64  `gorm:"primaryKey;autoIncrement"`
+	NodeID        int64  `gorm:"column:node_id;not null;uniqueIndex"`
+	Kind          string `gorm:"type:varchar(20);not null"` // upgrade | rollback
+	TargetVersion string `gorm:"column:target_version;type:varchar(100);not null"`
+	ExpectedSHA   string `gorm:"column:expected_sha;type:varchar(128);not null;default:''"`
+	// SHAAnchor 记录期望哈希的下发形态（F2-12）：空 = 已随命令
+	// 下发；arch-unresolvable = 节点自报版本格式异常、无从辨识
+	// 架构而未附；hash-unavailable = 架构已知但期望哈希未就绪而
+	// 未附。后两态下核验以版本锚（回退锚）为准，须在回执/告警
+	// 面可见，不许静默降级。
+	SHAAnchor       string `gorm:"column:sha_anchor;type:varchar(40);not null;default:''"`
+	FromVersion     string `gorm:"column:from_version;type:varchar(100);not null;default:''"`
+	ObservedVersion string `gorm:"column:observed_version;type:varchar(100);not null;default:''"`
+	Status          string `gorm:"type:varchar(20);not null;default:'pending'"` // pending | landed | failed | superseded
+	CloseReason     string `gorm:"column:close_reason;type:varchar(200);not null;default:''"`
+	Late            int    `gorm:"not null;default:0"`
+	DispatchedAt    int64  `gorm:"column:dispatched_at;not null"`
+	DeadlineAt      int64  `gorm:"column:deadline_at;not null"`
+	ResolvedAt      int64  `gorm:"column:resolved_at;not null;default:0"`
+	CreatedTime     int64  `gorm:"column:created_time;not null"`
+	UpdatedTime     int64  `gorm:"column:updated_time;not null"`
+
+	FromConnectionID string `gorm:"column:from_connection_id;type:varchar(64);not null;default:''"`
+	DispatchStatus   string `gorm:"column:dispatch_status;type:varchar(24);not null;default:'dispatched'"`
+}
+
+func (NodeUpgradeVerification) TableName() string { return "node_upgrade_verification" }
+
+type NodeSSHConfig struct {
+	ID         int64          `gorm:"primaryKey;autoIncrement"`
+	NodeID     int64          `gorm:"column:node_id;not null;uniqueIndex"`
+	Host       string         `gorm:"type:varchar(255);not null"`
+	Port       int            `gorm:"not null;default:22"`
+	Username   string         `gorm:"type:varchar(100);not null"`
+	AuthType   string         `gorm:"column:auth_type;type:varchar(20);not null"`
+	Password   sql.NullString `gorm:"type:text"`
+	PrivateKey sql.NullString `gorm:"column:private_key;type:text"`
+	Passphrase sql.NullString `gorm:"type:text"`
+	SudoMode   string         `gorm:"column:sudo_mode;type:varchar(20);not null;default:'none'"`
+	// HostKeyFingerprint 是已钉入的 SSH 主机密钥指纹（SHA256:…，C3-02）。
+	// 空 = 未钉入：runner 对该节点的一切特权操作 fail-closed，须先经
+	// 节点页测连通 TOFU 钉入（或在端点变更后重新钉入）。
+	HostKeyFingerprint string `gorm:"column:host_key_fingerprint;type:varchar(100);not null;default:''"`
+	CreatedTime        int64  `gorm:"column:created_time;not null"`
+	UpdatedTime        int64  `gorm:"column:updated_time;not null"`
+}
+
+func (NodeSSHConfig) TableName() string { return "node_ssh_config" }
+
+type NftRuleBinding struct {
+	ID          int64  `gorm:"primaryKey;autoIncrement"`
+	ForwardID   int64  `gorm:"column:forward_id;not null;uniqueIndex:idx_nft_rule_binding_forward_node;index"`
+	NodeID      int64  `gorm:"column:node_id;not null;uniqueIndex:idx_nft_rule_binding_forward_node;index"`
+	InPort      int    `gorm:"column:in_port;not null"`
+	Protocols   string `gorm:"type:varchar(20);not null;default:'tcp,udp'"`
+	TargetAddr  string `gorm:"column:target_addr;type:text;not null"`
+	BindIP      string `gorm:"column:bind_ip;type:text;not null;default:''"`
+	RuleHash    string `gorm:"column:rule_hash;type:varchar(128);not null;default:''"`
+	Status      string `gorm:"type:varchar(20);not null;default:'pending'"`
+	LastError   string `gorm:"column:last_error;type:text;not null;default:''"`
+	AppliedTime int64  `gorm:"column:applied_time;not null;default:0"`
+	CreatedTime int64  `gorm:"column:created_time;not null"`
+	UpdatedTime int64  `gorm:"column:updated_time;not null"`
+}
+
+func (NftRuleBinding) TableName() string { return "nft_rule_binding" }
+
+// Forward status values. Do not write bare integers; use these constants.
+// R5-B3 D1-001: ForwardStatusPendingDelete marks a forward whose data-plane
+// rule removal failed (e.g. node offline). The row is hidden from user/admin
+// lists, excluded from plan building (so reconcile removes its rule), but
+// still occupies its (node_id, port) until the retry job or force-delete
+// completes the removal. See the status consumption matrix in the R5-B3 report.
+const (
+	ForwardStatusPaused        = 0
+	ForwardStatusActive        = 1
+	ForwardStatusPendingDelete = 2
+)
+
+// NftPendingDelete tracks retry bookkeeping for forwards stuck in
+// ForwardStatusPendingDelete. The forward row itself (status=2) is the marker;
+// this side table holds the retry schedule and last error for observability
+// (R5-B3 D7 / 补充 E). Rows are removed when the forward is finally deleted
+// (reconcile success or force-delete).
+type NftPendingDelete struct {
+	ForwardID   int64  `gorm:"primaryKey;column:forward_id"`
+	NodeID      int64  `gorm:"column:node_id;not null;index"`
+	RetryCount  int    `gorm:"column:retry_count;not null;default:0"`
+	NextRetryAt int64  `gorm:"column:next_retry_at;not null;index"`
+	LastError   string `gorm:"column:last_error;type:text;not null;default:''"`
+	CreatedAt   int64  `gorm:"column:created_at;not null"`
+	UpdatedAt   int64  `gorm:"column:updated_at;not null"`
+}
+
+func (NftPendingDelete) TableName() string { return "nft_pending_delete" }
+
+type NftCounterState struct {
+	ID            int64  `gorm:"primaryKey;autoIncrement"`
+	NodeID        int64  `gorm:"column:node_id;not null;uniqueIndex:idx_nft_counter_state_key;index"`
+	ForwardID     int64  `gorm:"column:forward_id;not null;uniqueIndex:idx_nft_counter_state_key;index"`
+	Protocol      string `gorm:"type:varchar(10);not null;uniqueIndex:idx_nft_counter_state_key"`
+	Direction     string `gorm:"type:varchar(20);not null;uniqueIndex:idx_nft_counter_state_key"`
+	RuleHash      string `gorm:"column:rule_hash;type:varchar(128);not null;default:''"`
+	Bytes         int64  `gorm:"not null;default:0"`
+	Packets       int64  `gorm:"not null;default:0"`
+	CollectedTime int64  `gorm:"column:collected_time;not null;default:0"`
+	CreatedTime   int64  `gorm:"column:created_time;not null"`
+	UpdatedTime   int64  `gorm:"column:updated_time;not null"`
+}
+
+func (NftCounterState) TableName() string { return "nft_counter_state" }
+
+type SpeedLimit struct {
+	ID          int64          `gorm:"primaryKey;autoIncrement"`
+	Name        string         `gorm:"type:varchar(100);not null"`
+	Speed       int            `gorm:"not null"`
+	TunnelID    sql.NullInt64  `gorm:"column:tunnel_id"`
+	TunnelName  sql.NullString `gorm:"column:tunnel_name;type:varchar(100)"`
+	CreatedTime int64          `gorm:"column:created_time;not null"`
+	UpdatedTime sql.NullInt64  `gorm:"column:updated_time"`
+	Status      int            `gorm:"not null"`
+}
+
+func (SpeedLimit) TableName() string { return "speed_limit" }
+
+type StatisticsFlow struct {
+	ID        int64  `gorm:"primaryKey;autoIncrement" json:"id"`
+	UserID    int64  `gorm:"column:user_id;not null" json:"userId"`
+	Flow      int64  `gorm:"not null" json:"flow"`
+	TotalFlow int64  `gorm:"column:total_flow;not null" json:"totalFlow"`
+	Time      string `gorm:"type:varchar(100);not null" json:"time"`
+	// AP-08：CreatedTime 此前 json:"-"，前端流量图只能按 HH:00
+	// 字符串拼日期（跨日断点错位）；现透出 UnixMilli 毫秒时间戳，
+	// 前端以它定日、Time 只作小时刻度。加字段向后兼容。
+	CreatedTime int64 `gorm:"column:created_time;not null" json:"createdTime"`
+}
+
+func (StatisticsFlow) TableName() string { return "statistics_flow" }
+
+type Tunnel struct {
+	ID              int64          `gorm:"primaryKey;autoIncrement"`
+	Name            string         `gorm:"type:varchar(100);not null"`
+	TrafficRatio    float64        `gorm:"column:traffic_ratio;not null;default:1.0"`
+	Type            int            `gorm:"not null"`
+	Protocol        string         `gorm:"type:varchar(10);not null;default:'tls'"`
+	Flow            int64          `gorm:"not null"`
+	CreatedTime     int64          `gorm:"column:created_time;not null"`
+	UpdatedTime     int64          `gorm:"column:updated_time;not null"`
+	Status          int            `gorm:"not null"`
+	InIP            sql.NullString `gorm:"column:in_ip;type:text"`
+	Inx             int            `gorm:"not null;default:0"`
+	IPPreference    string         `gorm:"column:ip_preference;type:varchar(10);not null;default:''"`
+	ProbeTargetHost string         `gorm:"column:probe_target_host;type:text;not null;default:''"`
+	ProbeTargetPort int            `gorm:"column:probe_target_port;not null;default:0"`
+	// Engine runs the tunnel's forwards: "" = the agent's forwarder,
+	// "realm" = realm on the entry nodes (port forward tunnels only).
+	Engine string `gorm:"column:engine;type:varchar(20);not null;default:''"`
+}
+
+func (Tunnel) TableName() string { return "tunnel" }
+
+type UserQuota struct {
+	UserID int64 `gorm:"column:user_id;primaryKey"`
+	// C-(6)③：限额以 GB 为单位的小数（0.01、1.5 均合法），不再只认
+	// 整数。SQLite 列仍为 INTEGER 亲和类型也能存 REAL 值；PostgreSQL
+	// 侧由 quota_decimal_v1 迁移把列改成 double precision。
+	DailyLimitGB     float64 `gorm:"column:daily_limit_gb;not null;default:0"`
+	MonthlyLimitGB   float64 `gorm:"column:monthly_limit_gb;not null;default:0"`
+	DailyUsedBytes   int64   `gorm:"column:daily_used_bytes;not null;default:0"`
+	MonthlyUsedBytes int64   `gorm:"column:monthly_used_bytes;not null;default:0"`
+	DayKey           int64   `gorm:"column:day_key;not null;default:0"`
+	MonthKey         int64   `gorm:"column:month_key;not null;default:0"`
+	DisabledByQuota  int     `gorm:"column:disabled_by_quota;not null;default:0"`
+	DisabledAt       int64   `gorm:"column:disabled_at;not null;default:0"`
+	PausedForwardIDs string  `gorm:"column:paused_forward_ids;type:text;not null;default:''"`
+	CreatedTime      int64   `gorm:"column:created_time;not null"`
+	UpdatedTime      int64   `gorm:"column:updated_time;not null"`
+}
+
+func (UserQuota) TableName() string { return "user_quota" }
+
+type ChainTunnel struct {
+	ID        int64          `gorm:"primaryKey;autoIncrement"`
+	TunnelID  int64          `gorm:"column:tunnel_id;not null"`
+	ChainType string         `gorm:"column:chain_type;type:varchar(10);not null"`
+	NodeID    int64          `gorm:"column:node_id;not null"`
+	Port      sql.NullInt64  `gorm:"column:port"`
+	Strategy  sql.NullString `gorm:"type:varchar(10)"`
+	Inx       sql.NullInt64  `gorm:"column:inx"`
+	Protocol  sql.NullString `gorm:"type:varchar(10)"`
+	ConnectIP sql.NullString `gorm:"column:connect_ip;type:varchar(45)"`
+}
+
+func (ChainTunnel) TableName() string { return "chain_tunnel" }
+
+type UserTunnel struct {
+	ID            int64         `gorm:"primaryKey;autoIncrement"`
+	UserID        int64         `gorm:"column:user_id;not null;uniqueIndex:idx_user_tunnel_unique"`
+	TunnelID      int64         `gorm:"column:tunnel_id;not null;uniqueIndex:idx_user_tunnel_unique"`
+	SpeedID       sql.NullInt64 `gorm:"column:speed_id"`
+	Num           int           `gorm:"not null"`
+	Flow          int64         `gorm:"not null"`
+	FlowMiB       int64         `gorm:"column:flow_mib;not null;default:0"`
+	InFlow        int64         `gorm:"column:in_flow;not null;default:0"`
+	OutFlow       int64         `gorm:"column:out_flow;not null;default:0"`
+	FlowResetTime int64         `gorm:"column:flow_reset_time;not null"`
+	ExpTime       int64         `gorm:"column:exp_time;not null"`
+	Status        int           `gorm:"not null"`
+	// FlowLastResetTime: see User.FlowLastResetTime (R11X-005 marker).
+	FlowLastResetTime int64 `gorm:"column:flow_last_reset_time;not null;default:0"`
+}
+
+func (UserTunnel) TableName() string { return "user_tunnel" }
+
+// UserInbound grants a user access to a proxy inbound for subscription.
+// RelayID = 0 means the inbound itself (direct endpoints);
+// RelayID > 0 means a specific relay (tunnel forward) of that inbound.
+type UserInbound struct {
+	ID        int64 `gorm:"primaryKey;autoIncrement"`
+	UserID    int64 `gorm:"column:user_id;not null;uniqueIndex:idx_user_inbound_relay_unique"`
+	InboundID int64 `gorm:"column:inbound_id;not null;uniqueIndex:idx_user_inbound_relay_unique"`
+	RelayID   int64 `gorm:"column:relay_id;not null;default:0;uniqueIndex:idx_user_inbound_relay_unique"`
+}
+
+func (UserInbound) TableName() string { return "user_inbound" }
+
+// UserSubscription grants a user access to a managed subscription
+// (1.0.12: "订阅分配" binds users to subscriptions from 订阅管理，
+// so traffic, expiry and deletion are scoped per subscription).
+type UserSubscription struct {
+	ID             int64 `gorm:"primaryKey;autoIncrement"`
+	UserID         int64 `gorm:"column:user_id;not null;uniqueIndex:idx_user_subscription_unique"`
+	SubscriptionID int64 `gorm:"column:subscription_id;not null;uniqueIndex:idx_user_subscription_unique"`
+	CreatedTime    int64 `gorm:"column:created_time;not null"`
+}
+
+func (UserSubscription) TableName() string { return "user_subscription" }
+
+// 分组三件套（隧道分组/用户分组/分组权限）已整套移除（1.9.6）：
+// 六张表（tunnel_group、user_group、tunnel_group_tunnel、
+// user_group_user、group_permission、group_permission_grant）的模型
+// 与 AutoMigrate 注册一并删除。物理表不 DROP（GORM 本就不删表），
+// 以便回滚到 1.9.5 时数据仍在；新版本不再读写这些表。
+
+// MonitorPermission grants a non-admin user access to monitoring endpoints.
+// One row per user_id.
+type MonitorPermission struct {
+	ID          int64 `gorm:"primaryKey;autoIncrement" json:"id"`
+	UserID      int64 `gorm:"column:user_id;not null;uniqueIndex:idx_monitor_permission_user" json:"userId"`
+	CreatedTime int64 `gorm:"column:created_time;not null" json:"createdTime"`
+}
+
+func (MonitorPermission) TableName() string { return "monitor_permission" }
+
+type ViteConfig struct {
+	ID    int64  `gorm:"primaryKey;autoIncrement" json:"id"`
+	Name  string `gorm:"type:varchar(200);not null;uniqueIndex" json:"name"`
+	Value string `gorm:"type:text;not null" json:"value"`
+	Time  int64  `gorm:"not null" json:"time"`
+}
+
+func (ViteConfig) TableName() string { return "vite_config" }
+
+type SchemaVersion struct {
+	Version int `gorm:"not null;default:0"`
+}
+
+func (SchemaVersion) TableName() string { return "schema_version" }
+
+type BackupData struct {
+	Version     string             `json:"version"`
+	ExportedAt  int64              `json:"exportedAt"`
+	Users       []UserBackup       `json:"users,omitempty"`
+	Nodes       []NodeBackup       `json:"nodes,omitempty"`
+	Tunnels     []TunnelBackup     `json:"tunnels,omitempty"`
+	Forwards    []ForwardBackup    `json:"forwards,omitempty"`
+	UserTunnels []UserTunnelBackup `json:"userTunnels,omitempty"`
+	SpeedLimits []SpeedLimitBackup `json:"speedLimits,omitempty"`
+	// 分组三件套备份段（tunnelGroups/userGroups/permissions）已随
+	// 功能移除（1.9.6）：三字段仅作导入兼容壳保留——旧备份解码时
+	// 承接数据，导入侧只计数并在 ImportWarnings 中点名披露已忽略，
+	// 不再落库；导出侧永不填充（段集 18→15，validBackupTypes 与
+	// gistRestoreTypes、前端 BACKUP_TYPE_VALUES 已同步删除三段名）。
+	TunnelGroups []TunnelGroupBackup `json:"tunnelGroups,omitempty"`
+	UserGroups   []UserGroupBackup   `json:"userGroups,omitempty"`
+	Permissions  []PermissionBackup  `json:"permissions,omitempty"`
+	Configs      map[string]string   `json:"configs,omitempty"`
+	UserInbounds []UserInboundBackup `json:"userInbounds,omitempty"`
+	// O7-008：monitor_permission 整表备份（监控权限丢失修复）
+	MonitorPermissions []MonitorPermissionBackup `json:"monitorPermissions,omitempty"`
+	// R2-E3-F02：passkey 整表备份（WebAuthn 公钥凭据，字段核验
+	// 见 PasskeyBackup 注）。此前整表漏列，灾备恢复后全体用户
+	// passkey 静默全失、回执无披露，只能回落密码逐个重注册。
+	Passkeys []PasskeyBackup `json:"passkeys,omitempty"`
+	// B4/F-004：user_subscription 整表备份（1.0.12 订阅分配关系；
+	// 此前整表漏列，恢复后全部分配丢失）
+	UserSubscriptions []UserSubscriptionBackup `json:"userSubscriptions,omitempty"`
+	// B4/F-030：service_monitor 监控定义整表备份（此前只有结果表口径，
+	// 定义未备，恢复后监控项全丢）
+	ServiceMonitors []ServiceMonitorBackup `json:"serviceMonitors,omitempty"`
+	// FIX132-C（A3-05/BC-28）：node_ssh_config 定义进备份（随 nodes
+	// 段导出/导入）。此前恢复出的实例节点在、SSH 凭据不在，子系统
+	// 静默不可用；备份文件因此与节点 secret/订阅 token 同敏感级，
+	// 文档与导出提示须明示。
+	NodeSSHConfigs []NodeSSHConfigBackup `json:"nodeSSHConfigs,omitempty"`
+	// PeerShares 仅作导入兼容壳保留（面板共享/联邦功能已随 2.1.0
+	// 整删）：旧备份解码时承接数据，导入侧只计数并在
+	// ImportWarnings 中点名披露已忽略，不再落库；导出侧永不填充。
+	PeerShares []PeerShareBackup `json:"peerShares,omitempty"`
+	// Themes 仅作导入兼容壳保留（主题包/多主题机制已随 2.1.0 整
+	// 删）：主题选择本只存于浏览器 localStorage、正规备份从不携带
+	// 本段，此壳为异源/构造备份的防御性承接——解码时承接数据，
+	// 导入侧只计数点名披露已忽略，不落库；导出侧永不填充。行形
+	// 不定（主题包格式已删无从校验），以 RawMessage 逐行承接。
+	Themes []json.RawMessage `json:"themes,omitempty"`
+	// Inbounds carries node kernels, their inbounds (imported nodes too),
+	// relay links and traffic counter baselines; restored as one unit.
+	Inbounds *InboundsBackup `json:"inbounds,omitempty"`
+}
+
+// PeerShareBackup 是面板共享（联邦）定义的旧备份结构（字段对照
+// 已删的 model.PeerShare，2.1.0 前随 nodes 段导出/导入）。功能整
+// 删后本结构仅作 BackupData.PeerShares 的解码壳保留：导入侧只计
+// 数点名，不再落库（peer_share 表与模型均已删除）。
+type PeerShareBackup struct {
+	ID             int64  `json:"id"`
+	Name           string `json:"name"`
+	NodeID         int64  `json:"nodeId"`
+	Token          string `json:"token"`
+	MaxBandwidth   int64  `json:"maxBandwidth"`
+	ExpiryTime     int64  `json:"expiryTime"`
+	PortRangeStart int    `json:"portRangeStart"`
+	PortRangeEnd   int    `json:"portRangeEnd"`
+	CurrentFlow    int64  `json:"currentFlow"`
+	IsActive       int    `json:"isActive"`
+	CreatedTime    int64  `json:"createdTime"`
+	UpdatedTime    int64  `json:"updatedTime,omitempty"`
+	AllowedDomains string `json:"allowedDomains,omitempty"`
+	AllowedIPs     string `json:"allowedIps,omitempty"`
+	RelayUsername  string `json:"relayUsername,omitempty"`
+	RelayPassword  string `json:"relayPassword,omitempty"`
+}
+
+// NodeSSHConfigBackup 是 A3-05 补齐的节点 SSH 配置备份结构
+// （字段对照 model.NodeSSHConfig；以 node_id 为业务键恢复）。
+type NodeSSHConfigBackup struct {
+	NodeID      int64  `json:"nodeId"`
+	Host        string `json:"host"`
+	Port        int    `json:"port"`
+	Username    string `json:"username"`
+	AuthType    string `json:"authType"`
+	Password    string `json:"password,omitempty"`
+	PrivateKey  string `json:"privateKey,omitempty"`
+	Passphrase  string `json:"passphrase,omitempty"`
+	SudoMode    string `json:"sudoMode"`
+	CreatedTime int64  `json:"createdTime"`
+	// R2-E1-08：已钉入的 SSH 主机指纹随备份（此前漏列，恢复后指纹
+	// 回未钉入态、特权操作 fail-closed 至重新 TOFU 且回执不点名）。
+	// 旧备份无此字段时导入面保留目标库现有钉入值并回执点名。
+	HostKeyFingerprint string `json:"hostKeyFingerprint,omitempty"`
+}
+
+type InboundsBackup struct {
+	Kernels       []KernelBackup         `json:"kernels"`
+	Inbounds      []InboundBackup        `json:"inbounds"`
+	Relays        []InboundRelayBackup   `json:"relays"`
+	Counters      []InboundCounterBackup `json:"counters,omitempty"`
+	Subscriptions []SubscriptionBackup   `json:"subscriptions,omitempty"`
+	// FIX132-C（A3-04）：订阅计数基线随备份（与入站基线 Counters
+	// 同等待遇）；恢复时订阅 id 经 subRemap 按 token 落位。
+	SubscriptionCounters []SubscriptionCounterBackup `json:"subscriptionCounters,omitempty"`
+	Sources              []RemoteSourceBackup        `json:"sources,omitempty"`
+	// Shields are the remote-source deletion shields (F6-02): they
+	// round-trip with the sources they belong to so a hand-deleted
+	// imported node stays deleted after a restore instead of being
+	// resurrected by the next source sync.
+	Shields []RemoteSourceShieldBackup `json:"shields,omitempty"`
+	// NodeGroups 仅作导入兼容壳保留（节点组功能已移除，1.9.6）：
+	// 旧备份解码时承接数据，导入侧只计数并在 ImportWarnings 中
+	// 点名披露已忽略，不再落库；导出侧永不填充。订阅的 groupIds
+	// 同口径（见 SubscriptionBackup.GroupIDs）。
+	NodeGroups []NodeGroupBackup `json:"nodeGroups,omitempty"`
+	// 订阅模板随入站段备份：订阅 Options 按模板 id 引用模板，恢复时
+	// 先落模板再落订阅，悬空引用在导入订阅时剔除并计数披露。
+	Templates []SubscriptionTemplateBackup `json:"templates,omitempty"`
+	// Users are shared users from 3.0.10 backups; imported as share
+	// subscriptions.
+	Users []SubUserBackup `json:"users,omitempty"`
+}
+
+type SubscriptionBackup struct {
+	ID         int64  `json:"id"`
+	Name       string `json:"name"`
+	Kind       string `json:"kind"`
+	Token      string `json:"token"`
+	UUID       string `json:"uuid"`
+	Password   string `json:"password"`
+	SourceAll  int    `json:"sourceAll"`
+	InboundIDs string `json:"inboundIds"`
+	SourceIDs  string `json:"sourceIds,omitempty"`
+	// GroupIDs 仅作导入兼容壳保留（节点组功能已移除，1.9.6）：
+	// 导入时订阅行不再写入该引用，携带非空 groupIds 的订阅计数
+	// 并在 ImportWarnings 中点名披露；新导出永不填充。
+	GroupIDs    string `json:"groupIds,omitempty"`
+	Options     string `json:"options"`
+	ExpireTime  int64  `json:"expireTime"`
+	Enabled     int    `json:"enabled"`
+	Remark      string `json:"remark"`
+	Inx         int    `json:"inx"`
+	CreatedTime int64  `json:"createdTime"`
+	// FIX2-B（D4-06）：待删墓碑随备份往返，恢复后不得复活成可拉取
+	// 的正常订阅（openSubscription 对 PendingDelete=1 返回 404）。
+	PendingDelete int `json:"pendingDelete,omitempty"`
+	// Traffic (share subscriptions).
+	UploadBytes      int64 `json:"uploadBytes,omitempty"`
+	DownloadBytes    int64 `json:"downloadBytes,omitempty"`
+	TrafficLimit     int64 `json:"trafficLimit,omitempty"`
+	ResetDay         int   `json:"resetDay,omitempty"`
+	TrafficResetTime int64 `json:"trafficResetTime,omitempty"`
+	TrafficSince     int64 `json:"trafficSince,omitempty"`
+}
+
+type NodeGroupBackup struct {
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	SourceAll   int    `json:"sourceAll"`
+	InboundIDs  string `json:"inboundIds"`
+	SourceIDs   string `json:"sourceIds,omitempty"`
+	Options     string `json:"options"`
+	Inx         int    `json:"inx"`
+	CreatedTime int64  `json:"createdTime"`
+}
+
+type SubUserBackup struct {
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	Token       string `json:"token"`
+	UUID        string `json:"uuid"`
+	Password    string `json:"password"`
+	InboundIDs  string `json:"inboundIds"`
+	ExpireTime  int64  `json:"expireTime"`
+	Enabled     int    `json:"enabled"`
+	Remark      string `json:"remark"`
+	CreatedTime int64  `json:"createdTime"`
+}
+
+type KernelBackup struct {
+	ID          int64  `json:"id"`
+	NodeID      int64  `json:"nodeId"`
+	KernelType  string `json:"kernelType"`
+	Version     string `json:"version"`
+	Enabled     int    `json:"enabled"`
+	CreatedTime int64  `json:"createdTime"`
+	// FIX2-B（D4-05/V3-02）：已装版本随备份往返。此前 DTO 无此字段，
+	// 导入 item 恒空而 DoUpdates 含 installed_version——全新恢复丢
+	// 值、同实例重复导入更会把已有值主动清空。
+	InstalledVersion string `json:"installedVersion,omitempty"`
+}
+
+type InboundBackup struct {
+	ID                  int64  `json:"id"`
+	KernelID            int64  `json:"kernelId"`
+	NodeID              int64  `json:"nodeId"`
+	Name                string `json:"name"`
+	Protocol            string `json:"protocol"`
+	Listen              string `json:"listen"`
+	Port                int    `json:"port"`
+	Transport           string `json:"transport"`
+	Security            string `json:"security"`
+	Settings            string `json:"settings"`
+	Extra               string `json:"extra"`
+	ShareAddressMode    string `json:"shareAddressMode,omitempty"`
+	ShareHost           string `json:"shareHost"`
+	Remark              string `json:"remark"`
+	RelayOnly           int    `json:"relayOnly"`
+	AcceptProxyProtocol int    `json:"acceptProxyProtocol"`
+	RelayWhitelist      int    `json:"relayWhitelist"`
+	WhitelistExtra      string `json:"whitelistExtra"`
+	Enabled             int    `json:"enabled"`
+	UploadBytes         int64  `json:"uploadBytes"`
+	DownloadBytes       int64  `json:"downloadBytes"`
+	Inx                 int    `json:"inx"`
+	CreatedTime         int64  `json:"createdTime"`
+	SourceID            int64  `json:"sourceId,omitempty"`
+	OutboundID          int64  `json:"outboundId,omitempty"`
+	SplitRules          string `json:"splitRules,omitempty"`
+	OutboundIPStrategy  string `json:"outboundIpStrategy,omitempty"`
+	// MeteringEnabled is the origin inbound's SS subscription-metering
+	// switch. Companion rows themselves are derived state and are never
+	// exported (restore re-materializes them via reconcile), so there is
+	// deliberately no companion marker here.
+	MeteringEnabled int `json:"meteringEnabled,omitempty"`
+	// SSSubscriptionUsers is the in-place SS metering switch (the
+	// kernel render layer calls it InplaceUsers). Companion rows are
+	// never exported: restore carries only the origin's switch, and
+	// any stale companion rows are removed by the stale-companion
+	// cleanup (no reconcile materializes them anymore).
+	SSSubscriptionUsers int `json:"ssSubscriptionUsers,omitempty"`
+	// ConnIdleSeconds is the per-inbound idle timeout (seconds) for
+	// Xray (policy.levels[].connIdle); 0 = unset (Xray default 300s).
+	ConnIdleSeconds int `json:"connIdleSeconds,omitempty"`
+}
+
+type RemoteSourceBackup struct {
+	ID                 int64  `json:"id"`
+	Name               string `json:"name"`
+	URL                string `json:"url"`
+	IntervalHours      int    `json:"intervalHours"`
+	RelayOnly          int    `json:"relayOnly"`
+	Kind               string `json:"kind,omitempty"`
+	Role               string `json:"role,omitempty"`
+	NameOverrides      string `json:"nameOverrides,omitempty"`
+	ExcludedIdentities string `json:"excludedIdentities,omitempty"`
+	Enabled            int    `json:"enabled"`
+	CreatedTime        int64  `json:"createdTime"`
+	// FIX2-B（D4-04）：机场套餐 Subscription-Userinfo 随备份往返；
+	// file 源无刷新自愈，丢失即永久。
+	Userinfo string `json:"userinfo,omitempty"`
+}
+
+// RemoteSourceShieldBackup 是删除屏蔽登记的备份行（F6-02）：键为
+// （源 ID，身份键）——源按 ID 保号恢复（见 repository_inbound_backup
+// 的 sources 落库），故屏蔽随 inbounds 段往返即可保真。Name 仅作
+// 诊断保留。
+type RemoteSourceShieldBackup struct {
+	SourceID    int64  `json:"sourceId"`
+	IdentityKey string `json:"identityKey"`
+	Name        string `json:"name,omitempty"`
+	CreatedTime int64  `json:"createdTime"`
+}
+
+type SubscriptionTemplateBackup struct {
+	ID            int64  `json:"id"`
+	Name          string `json:"name"`
+	Kind          string `json:"kind"`
+	Content       string `json:"content"`
+	BuilderConfig string `json:"builderConfig,omitempty"`
+	SourceURL     string `json:"sourceUrl,omitempty"`
+	LastFetch     int64  `json:"lastFetch,omitempty"`
+	LastError     string `json:"lastError,omitempty"`
+	CreatedTime   int64  `json:"createdTime"`
+}
+
+type InboundRelayBackup struct {
+	ID          int64  `json:"id"`
+	InboundID   int64  `json:"inboundId"`
+	ForwardID   int64  `json:"forwardId"`
+	Name        string `json:"name"`
+	ShareHost   string `json:"shareHost"`
+	Managed     int    `json:"managed"`
+	CreatedTime int64  `json:"createdTime"`
+}
+
+type InboundCounterBackup struct {
+	InboundID int64  `json:"inboundId"`
+	Protocol  string `json:"protocol"`
+	Direction string `json:"direction"`
+	Epoch     string `json:"epoch"`
+	Bytes     int64  `json:"bytes"`
+}
+
+// SubscriptionCounterBackup 是 A3-04 补齐的订阅计数基线备份结构
+// （字段对照 model.SubscriptionCounter；SubscriptionID 为备份侧 id，
+// 恢复时经 subRemap 按 token 重映射落位）。
+type SubscriptionCounterBackup struct {
+	NodeID         int64  `json:"nodeId"`
+	SubscriptionID int64  `json:"subscriptionId"`
+	Direction      string `json:"direction"`
+	Epoch          string `json:"epoch"`
+	Bytes          int64  `json:"bytes"`
+}
+
+type UserBackup struct {
+	ID            int64  `json:"id"`
+	User          string `json:"user"`
+	Pwd           string `json:"pwd"`
+	RoleID        int    `json:"roleId"`
+	ExpTime       int64  `json:"expTime"`
+	Flow          int64  `json:"flow"`
+	FlowMiB       int64  `json:"flowMiB,omitempty"`
+	InFlow        int64  `json:"inFlow"`
+	OutFlow       int64  `json:"outFlow"`
+	FlowResetTime int64  `json:"flowResetTime"`
+	// C-(6)③：与 UserQuota 同口径的小数 GB；旧备份的整数值照常
+	// 解码为小数（JSON 数字进 float64 字段无损）。
+	DailyQuotaGB    float64 `json:"dailyQuotaGB,omitempty"`
+	MonthlyQuotaGB  float64 `json:"monthlyQuotaGB,omitempty"`
+	DisabledByQuota int     `json:"disabledByQuota,omitempty"`
+	QuotaDisabledAt int64   `json:"quotaDisabledAt,omitempty"`
+	// FIX132-C（D4-01）：配额已用量与暂停清单保真。旧备份无此四字段
+	// 时导入走旧口径（导入日窗口 + 已用量清零）；新备份原样恢复
+	// 窗口键与已用量（跨日恢复由配额视图的滚动归零兜底），暂停清单
+	// 是配额到期解封的唯一依据，丢失即永不自动解封。
+	DailyUsedBytes    int64  `json:"dailyUsedBytes,omitempty"`
+	MonthlyUsedBytes  int64  `json:"monthlyUsedBytes,omitempty"`
+	PausedForwardIDs  string `json:"pausedForwardIds,omitempty"`
+	QuotaDayKey       int64  `json:"quotaDayKey,omitempty"`
+	QuotaMonthKey     int64  `json:"quotaMonthKey,omitempty"`
+	Num               int    `json:"num"`
+	CreatedTime       int64  `json:"createdTime"`
+	UpdatedTime       int64  `json:"updatedTime,omitempty"`
+	Status            int    `json:"status"`
+	PasswordChangedAt int64  `json:"passwordChangedAt,omitempty"`
+	MaxConn           int    `json:"maxConn,omitempty"`
+}
+
+type UserInboundBackup struct {
+	ID        int64 `json:"id"`
+	UserID    int64 `json:"userId"`
+	InboundID int64 `json:"inboundId"`
+	RelayID   int64 `json:"relayId"`
+}
+
+// UserSubscriptionBackup 是 B4/F-004 补齐的订阅分配备份结构
+// （字段对照 model.UserSubscription）。
+type UserSubscriptionBackup struct {
+	ID             int64 `json:"id"`
+	UserID         int64 `json:"userId"`
+	SubscriptionID int64 `json:"subscriptionId"`
+	CreatedTime    int64 `json:"createdTime"`
+}
+
+// ServiceMonitorBackup 是 B4/F-030 补齐的监控定义备份结构
+// （字段对照 model.ServiceMonitor；结果表 service_monitor_result
+// 是遥测时序，不在备份范围）。
+type ServiceMonitorBackup struct {
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	Type        string `json:"type"`
+	Target      string `json:"target"`
+	IntervalSec int    `json:"intervalSec"`
+	TimeoutSec  int    `json:"timeoutSec"`
+	NodeID      int64  `json:"nodeId"`
+	Enabled     int    `json:"enabled"`
+	CreatedTime int64  `json:"createdTime"`
+	UpdatedTime int64  `json:"updatedTime,omitempty"`
+}
+
+// MonitorPermissionBackup 是 O7-008 补齐的监控权限备份结构（字段对照 model.MonitorPermission）。
+type MonitorPermissionBackup struct {
+	ID          int64 `json:"id"`
+	UserID      int64 `json:"userId"`
+	CreatedTime int64 `json:"createdTime"`
+}
+
+// PasskeyBackup 是 R2-E3-F02 补齐的 WebAuthn 凭据备份结构（字段
+// 对照 model.Passkey）。CredentialJSON 是 go-webauthn 的
+// webauthn.Credential 序列化，逐字段核验均为公钥凭据材料：
+// id（凭据 ID）、publicKey（凭据公钥）、attestationType、
+// transport、flags（userPresent/userVerified/backupEligible/
+// backupState 布尔）、authenticator（AAGUID、signCount 签名
+// 计数、cloneWarning、attachment）、attestation（clientDataJSON、
+// clientDataHash、authenticatorData、publicKeyAlgorithm、object
+// ——均为公开仪式数据）。WebAuthn 私钥按协议从不离开认证器，
+// 服务端不存在私钥类字段，本段敏感级不高于 users 段的密码哈希。
+type PasskeyBackup struct {
+	ID             string `json:"id"`
+	UserID         int64  `json:"userId"`
+	Name           string `json:"name"`
+	CredentialJSON string `json:"credentialJson"`
+	CreatedAt      int64  `json:"createdAt"`
+	LastUsedAt     int64  `json:"lastUsedAt"`
+}
+
+type NodeBackup struct {
+	ID           int64  `json:"id"`
+	Name         string `json:"name"`
+	Remark       string `json:"remark,omitempty"`
+	ExpiryTime   int64  `json:"expiryTime,omitempty"`
+	RenewalCycle string `json:"renewalCycle,omitempty"`
+	// Secret 是 legacy 明文备份字段（F03 前的备份）：导出永不填写，
+	// 导入仅作兼容读取（合法明文即哈希入库）；新备份只出 SecretHash。
+	Secret string `json:"secret,omitempty"`
+	// SecretHash 是节点 secret 的存储哈希（F03）：备份导出/恢复均
+	// 只带哈希，不带明文。
+	SecretHash     string `json:"secretHash,omitempty"`
+	ServerIP       string `json:"serverIp"`
+	ServerIPv4     string `json:"serverIpV4,omitempty"`
+	ServerIPv6     string `json:"serverIpV6,omitempty"`
+	ExtraIPs       string `json:"extraIPs,omitempty"`
+	Port           string `json:"port"`
+	InterfaceName  string `json:"interfaceName,omitempty"`
+	Version        string `json:"version,omitempty"`
+	HTTP           int    `json:"http"`
+	TLS            int    `json:"tls"`
+	Socks          int    `json:"socks"`
+	CreatedTime    int64  `json:"createdTime"`
+	UpdatedTime    int64  `json:"updatedTime,omitempty"`
+	Status         int    `json:"status"`
+	TCPListenAddr  string `json:"tcpListenAddr"`
+	UDPListenAddr  string `json:"udpListenAddr"`
+	Inx            int    `json:"inx"`
+	LatencyTargets string `json:"latencyTargets,omitempty"`
+	ForwardMode    string `json:"forwardMode,omitempty"`
+	// 展示分组标签随备份往返（纯展示字段，旧备份无此字段时为空＝
+	// 未分组，与存量未配置形态等价）。
+	DisplayGroup string `json:"displayGroup,omitempty"`
+	// R2-E1-06：节点定时重启三字段随备份（DEV-RESTART 落地时本 DTO
+	// 漏列，恢复后静默回落默认关/04:00/30、节点 timer 与面板认知
+	// 分叉）。旧备份无此三字段时导入面按模型默认回落并保持关闭，
+	// 与存量未配置形态等价。
+	RestartEnabled       int    `json:"restartEnabled"`
+	RestartTime          string `json:"restartTime,omitempty"`
+	RestartJitterMinutes int    `json:"restartJitterMinutes,omitempty"`
+	// 重启模式＋间隔分钟随备份（fix/restart-interval）：旧备份无此
+	// 两字段时导入面按 daily/60 回落，与存量未配置形态等价。
+	RestartMode            string `json:"restartMode,omitempty"`
+	RestartIntervalMinutes int    `json:"restartIntervalMinutes,omitempty"`
+	// 转发面会话无进展拆除阈值（秒）随备份：旧备份无此字段时按
+	// 0（关闭）回落，与存量未配置形态等价（默认值即关闭，不会
+	// 因恢复旧备份而静默开启拆除）。
+	IdleTimeoutSeconds int `json:"idleTimeoutSeconds,omitempty"`
+	// 根治两档窗口与滴流上限随备份：旧备份无此三字段时按 0
+	// （关闭/默认）回落，与存量未配置形态等价，不会因恢复旧
+	// 备份而静默开启拆除。
+	EdgeIdleTimeoutSeconds     int `json:"edgeIdleTimeoutSeconds,omitempty"`
+	BackstopIdleTimeoutSeconds int `json:"backstopIdleTimeoutSeconds,omitempty"`
+	BackstopTrickleBps         int `json:"backstopTrickleBps,omitempty"`
+	// 节点级连接日志采集开关随备份（默认关）：旧备份无此字段时
+	// 按 0 回落，与存量未配置形态等价，不会因恢复旧备份而静默
+	// 开启采集。
+	ConnLogEnabled int `json:"connLogEnabled,omitempty"`
+	// 节点级入站白名单开关＋附加名单随备份（默认关）：旧备份无
+	// 此二字段时按关／空回落，与存量未配置形态等价，不会因恢
+	// 复旧备份而静默开启白名单。
+	WhitelistEnabled int    `json:"whitelistEnabled,omitempty"`
+	WhitelistExtra   string `json:"whitelistExtra,omitempty"`
+	// O7-006：恢复后保留已忽略的到期提醒状态
+	ExpiryReminderDismissed int `json:"expiryReminderDismissed,omitempty"`
+}
+
+type TunnelBackup struct {
+	ID              int64               `json:"id"`
+	Name            string              `json:"name"`
+	TrafficRatio    float64             `json:"trafficRatio"`
+	Type            int                 `json:"type"`
+	Protocol        string              `json:"protocol"`
+	Flow            int64               `json:"flow"`
+	CreatedTime     int64               `json:"createdTime"`
+	UpdatedTime     int64               `json:"updatedTime"`
+	Status          int                 `json:"status"`
+	InIP            string              `json:"inIp,omitempty"`
+	Inx             int                 `json:"inx"`
+	IPPreference    string              `json:"ipPreference,omitempty"`
+	ProbeTargetHost string              `json:"probeTargetHost,omitempty"`
+	ProbeTargetPort int                 `json:"probeTargetPort,omitempty"`
+	Engine          string              `json:"engine,omitempty"`
+	ChainTunnels    []ChainTunnelBackup `json:"chainTunnels,omitempty"`
+}
+
+type ChainTunnelBackup struct {
+	ID        int64  `json:"id"`
+	TunnelID  int64  `json:"tunnelId"`
+	ChainType string `json:"chainType"`
+	NodeID    int64  `json:"nodeId"`
+	// BUG-A2-3：port/strategy/inx/protocol/connect_ip 在 chain_tunnel 中
+	// 均可空，必须以指针携带 NULL 语义。旧实现用普通 int/string +
+	// omitempty 导出，NULL 与零值不可区分，导入时一律写成有效值
+	// （port 写 0），两条同节点 NULL 端口链路即撞 (node_id, port)
+	// 唯一索引导致整单恢复回滚。旧备份的普通数值可正常反序列化为
+	// 指针；旧备份缺失的字段按 NULL 恢复（旧导出已把 NULL 与 0/''
+	// 合并落盘，无法再区分——这些列的 0/'' 本就不是合法业务值，
+	// inx=0 除外，该一位精度损失为旧格式既成事实）。
+	Port      *int    `json:"port,omitempty"`
+	Strategy  *string `json:"strategy,omitempty"`
+	Inx       *int    `json:"inx,omitempty"`
+	Protocol  *string `json:"protocol,omitempty"`
+	ConnectIP *string `json:"connectIp,omitempty"`
+}
+
+type ForwardBackup struct {
+	ID                   int64                `json:"id"`
+	UserID               int64                `json:"userId"`
+	UserName             string               `json:"userName"`
+	Name                 string               `json:"name"`
+	TunnelID             int64                `json:"tunnelId"`
+	RemoteAddr           string               `json:"remoteAddr"`
+	TargetPolicy         string               `json:"targetPolicy,omitempty"`
+	Strategy             string               `json:"strategy"`
+	InFlow               int64                `json:"inFlow"`
+	OutFlow              int64                `json:"outFlow"`
+	CreatedTime          int64                `json:"createdTime"`
+	UpdatedTime          int64                `json:"updatedTime"`
+	Status               int                  `json:"status"`
+	Inx                  int                  `json:"inx"`
+	SpeedID              *int64               `json:"speedId,omitempty"`
+	MaxConn              int                  `json:"maxConn,omitempty"`
+	IPMaxConn            int                  `json:"ipMaxConn,omitempty"`
+	IPSpeedID            *int64               `json:"ipSpeedId,omitempty"`
+	ForwardPorts         *[]ForwardPortBackup `json:"forwardPorts,omitempty"`
+	ProxyProtocol        int                  `json:"proxyProtocol"`
+	ProxyProtocolReceive int                  `json:"proxyProtocolReceive,omitempty"`
+	ProxyProtocolSend    int                  `json:"proxyProtocolSend,omitempty"`
+}
+
+type ForwardPortBackup struct {
+	NodeID int64  `json:"nodeId"`
+	Port   int    `json:"port"`
+	InIP   string `json:"inIp,omitempty"`
+	// R2-E1-14：B08-005 的绑定回退告警随备份（此前漏列，恢复后
+	// 告警丢失、仅影响可观测性）。空串＝无告警（列为 NULL）。
+	BindWarning string `json:"bindWarning,omitempty"`
+}
+
+type UserTunnelBackup struct {
+	ID            int64 `json:"id"`
+	UserID        int64 `json:"userId"`
+	TunnelID      int64 `json:"tunnelId"`
+	SpeedID       int64 `json:"speedId,omitempty"`
+	Num           int   `json:"num"`
+	Flow          int64 `json:"flow"`
+	FlowMiB       int64 `json:"flowMiB,omitempty"`
+	InFlow        int64 `json:"inFlow"`
+	OutFlow       int64 `json:"outFlow"`
+	FlowResetTime int64 `json:"flowResetTime"`
+	ExpTime       int64 `json:"expTime"`
+	Status        int   `json:"status"`
+}
+
+type SpeedLimitBackup struct {
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	Speed       int64  `json:"speed"`
+	TunnelID    *int64 `json:"tunnelId,omitempty"`
+	TunnelName  string `json:"tunnelName,omitempty"`
+	CreatedTime int64  `json:"createdTime"`
+	UpdatedTime int64  `json:"updatedTime,omitempty"`
+	Status      int    `json:"status"`
+}
+
+type TunnelGroupBackup struct {
+	ID          int64   `json:"id"`
+	Name        string  `json:"name"`
+	CreatedTime int64   `json:"createdTime"`
+	UpdatedTime int64   `json:"updatedTime"`
+	Status      int     `json:"status"`
+	Tunnels     []int64 `json:"tunnels,omitempty"`
+}
+
+type UserGroupBackup struct {
+	ID          int64   `json:"id"`
+	Name        string  `json:"name"`
+	CreatedTime int64   `json:"createdTime"`
+	UpdatedTime int64   `json:"updatedTime"`
+	Status      int     `json:"status"`
+	Users       []int64 `json:"users,omitempty"`
+}
+
+type PermissionBackup struct {
+	ID             int64                   `json:"id"`
+	UserGroupID    int64                   `json:"userGroupId"`
+	TunnelGroupID  int64                   `json:"tunnelGroupId"`
+	CreatedTime    int64                   `json:"createdTime"`
+	CreatedByGroup int                     `json:"createdByGroup"`
+	Grants         []PermissionGrantBackup `json:"grants,omitempty"`
+}
+
+type PermissionGrantBackup struct {
+	ID             int64 `json:"id"`
+	UserGroupID    int64 `json:"userGroupId"`
+	TunnelGroupID  int64 `json:"tunnelGroupId"`
+	UserTunnelID   int64 `json:"userTunnelId"`
+	CreatedTime    int64 `json:"createdTime"`
+	CreatedByGroup int   `json:"createdByGroup"`
+}
+
+// RevokedImportPair identifies one user_tunnel revoked during backup
+// import (R3X-005 facet (a)): the handler cleans up the forwards of
+// each returned pair, mirroring the runtime revoke paths.
+type RevokedImportPair struct {
+	UserID   int64 `json:"userId"`
+	TunnelID int64 `json:"tunnelId"`
+}
+
+// ImportResult contains the result of an import operation.
+type ImportResult struct {
+	UsersImported       int `json:"usersImported"`
+	NodesImported       int `json:"nodesImported"`
+	TunnelsImported     int `json:"tunnelsImported"`
+	ForwardsImported    int `json:"forwardsImported"`
+	UserTunnelsImported int `json:"userTunnelsImported"`
+	SpeedLimitsImported int `json:"speedLimitsImported"`
+	// RR-S2-01：分组三件套（隧道分组/用户分组/分组权限）已于
+	// 1.9.6 整套移除，旧备份这三段永不落库——原字段名
+	// TunnelGroupsImported/UserGroupsImported/PermissionsImported
+	// 名实相反且计数器从未累加、恒为 0，与 InboundNodeGroupsIgnored
+	// （R3-S2-01）同病，现整族改名据实计数（与 ImportWarnings 的
+	// 文本披露同数）。前端未消费这三个字段。
+	TunnelGroupsIgnored int `json:"tunnelGroupsIgnored"`
+	UserGroupsIgnored   int `json:"userGroupsIgnored"`
+	PermissionsIgnored  int `json:"permissionsIgnored"`
+	// 2.1.0 四删除面的旧备份披露（与 ImportWarnings 文本同数）：
+	// PeerSharesIgnored＝联邦共享段被忽略条数（整段不落库）；
+	// GistConfigsIgnored＝configs 段中 gist_* 等已删功能键被忽略
+	// 个数（键名随 warning 点名、值不落库）；ThemesIgnored＝主题
+	// 段被忽略条数（整段不落库）。
+	PeerSharesIgnored    int `json:"peerSharesIgnored"`
+	GistConfigsIgnored   int `json:"gistConfigsIgnored"`
+	ThemesIgnored        int `json:"themesIgnored"`
+	ConfigsImported      int `json:"configsImported"`
+	InboundsImported     int `json:"inboundsImported"`
+	UserInboundsImported int `json:"userInboundsImported"`
+	// R13X-004：inbounds 段子段导入计数（与既有 *Imported 字段同形，
+	// 无 omitempty，旧客户端忽略新增字段）。计数口径与
+	// InboundsImported 一致：只计实落行，跳过行走 SkippedRows。
+	InboundKernelsImported              int `json:"inboundKernelsImported"`
+	InboundRelaysImported               int `json:"inboundRelaysImported"`
+	InboundCountersImported             int `json:"inboundCountersImported"`
+	InboundSubscriptionsImported        int `json:"inboundSubscriptionsImported"`
+	InboundSubscriptionCountersImported int `json:"inboundSubscriptionCountersImported"`
+	InboundSourcesImported              int `json:"inboundSourcesImported"`
+	// F6-02：随 inbounds 段恢复的删除屏蔽登记数（屏蔽随源往返，
+	// 恢复后手工删过的导入节点不会被同步复活）。
+	InboundShieldsImported int `json:"inboundShieldsImported"`
+	// R3-S2-01：旧备份 nodeGroups 段的被忽略条数。节点组功能已
+	// 移除（1.9.6），该段永不落库——旧字段名
+	// InboundNodeGroupsImported 名实相反且计数器从未累加、恒为
+	// 0，现改名据实计数（与 ImportWarnings 的文本披露同数）。
+	// 前端未消费此字段（仅消费 inboundShieldsImported）。
+	InboundNodeGroupsIgnored int `json:"inboundNodeGroupsIgnored"`
+	// 入站 Snell 功能已随 2.1.0 整删：旧备份的自建 Snell 内核行
+	// 与内核托管 Snell 入站均按存量迁移 rmsnell_v1 同口径禁用
+	// 恢复（计数 InboundSnellKernelsDisabled /
+	// InboundSnellInboundsDisabled）；导入型 Snell 节点
+	// （kernelId=0）不在此列、照常恢复不计数。
+	InboundSnellKernelsDisabled  int `json:"inboundSnellKernelsDisabled"`
+	InboundSnellInboundsDisabled int `json:"inboundSnellInboundsDisabled"`
+	InboundTemplatesImported     int `json:"inboundTemplatesImported"`
+	InboundLegacyUsersImported   int `json:"inboundLegacyUsersImported"`
+	// O7-008：监控权限导入计数
+	MonitorPermissionsImported int `json:"monitorPermissionsImported"`
+	// R2-E3-F02：passkey 导入计数（用户不存在/凭据坏损的跳过行
+	// 走 SkippedRows["passkeys"] 回执点名计数）。
+	PasskeysImported int `json:"passkeysImported"`
+	// B4/F-004/F-030：订阅分配与监控定义导入计数
+	UserSubscriptionsImported int `json:"userSubscriptionsImported"`
+	// BUG-A2-4：订阅按 token 重建换 id 时分配经 subRemap 重写落位；
+	// 确实无法落位（目标订阅不存在）的分配被跳过并在此如实计数，
+	// 不再混入 UserSubscriptionsImported 假报成功。
+	UserSubscriptionsSkipped int `json:"userSubscriptionsSkipped,omitempty"`
+	ServiceMonitorsImported  int `json:"serviceMonitorsImported"`
+	// FIX132-C（A3-05）：SSH 配置的恢复计数与受影响节点清单——
+	// 恢复后这些节点的数据面待重新校验下发，回执如实披露（降级
+	// 标记），不再静默降级。
+	NodeSSHConfigsImported int     `json:"nodeSSHConfigsImported"`
+	RestoredSSHNodeIDs     []int64 `json:"restoredSSHNodeIds,omitempty"`
+	// FIX132-C（D4-03）：各段因引用不存在被跳过的行数（键为备份段
+	// 名），与 ImportWarnings 一起构成恢复回执的完整披露；订阅段的
+	// 跳过仍走上方 UserSubscriptionsSkipped 既有字段。
+	SkippedRows    map[string]int `json:"skippedRows,omitempty"`
+	ImportWarnings []string       `json:"importWarnings,omitempty"`
+	// R3X-005 facet (a)：导入在分组段成员替换 / 停用收敛中撤销的
+	// 组建授权（user_tunnel 已删行）清单，handler 据此逐对清理
+	// 转发（与运行时全部撤销路径同口径）；无撤销时省略。本批路线
+	// 定死为回传清理，不采「回执明示待清理」的弱路线。
+	RevokedUserTunnels []RevokedImportPair `json:"revokedUserTunnels,omitempty"`
+	// R13X-001：备份导入后的转发重推结果。RepushNodeIDs 为本次实际
+	// 重推的在线节点，RepushFailedNodeIDs 为重推失败的节点（失败不
+	// 静默：导入本身已成功，故失败只披露、不改写导入成功结论；
+	// 失败节点重连时经 onNodeOnline 全量重布再次收敛）。
+	RepushNodeIDs       []int64 `json:"repushNodeIds,omitempty"`
+	RepushFailedNodeIDs []int64 `json:"repushFailedNodeIds,omitempty"`
+	// SEC-01：字段保留仅为 wire 兼容（旧客户端解析时字段缺席即为
+	// 空，omitempty 下不输出），后端永不赋值。导入前全量快照是整库
+	// 导出（含用户密码 hash、节点 secret、配置 token），一旦填入即
+	// 随回执泄露凭据；且 Import 失败时直接返回错误，从不用它回滚。
+	// 如需恢复导入前状态，须另走服务端留存快照 + 下载端点，不得
+	// 再把快照塞进导入回执。
+	AutoBackup *BackupData `json:"autoBackup,omitempty"`
+}
+
+// ─── View Structs (used by Repository, not GORM models) ─────────────
+// These are used for JOIN query results that don't map 1:1 to a table.
+
+// ForwardRecord is a minimal forward view used by control plane and flow policy.
+type ForwardRecord struct {
+	ID                   int64
+	UserID               int64
+	UserName             string
+	Name                 string
+	TunnelID             int64
+	RemoteAddr           string
+	TargetPolicy         string
+	Strategy             string
+	Status               int
+	SpeedID              sql.NullInt64
+	MaxConn              int
+	IPMaxConn            int
+	IPSpeedID            sql.NullInt64
+	ProxyProtocol        int
+	ProxyProtocolReceive int
+	ProxyProtocolSend    int
+}
+
+// TunnelRecord is a minimal tunnel view used by control plane.
+type TunnelRecord struct {
+	ID              int64
+	Type            int
+	Status          int
+	Flow            int64
+	TrafficRatio    float64
+	Protocol        string
+	ProbeTargetHost string
+	ProbeTargetPort int
+	Engine          string
+}
+
+type UserQuotaView struct {
+	UserID           int64
+	DailyLimitGB     float64
+	MonthlyLimitGB   float64
+	DailyUsedBytes   int64
+	MonthlyUsedBytes int64
+	DayKey           int64
+	MonthKey         int64
+	DisabledByQuota  int
+	DisabledAt       int64
+	PausedForwardIDs string
+}
+
+// ForwardPortRecord is a forward port mapping used by control plane.
+type ForwardPortRecord struct {
+	NodeID int64
+	Port   int
+	InIP   string
+}
+
+// NodeRecord is a node view used by control plane.
+type NodeRecord struct {
+	ID            int64
+	Name          string
+	ServerIP      string
+	ServerIPv4    string
+	ServerIPv6    string
+	ExtraIPs      string
+	Status        int
+	PortRange     string
+	TCPListenAddr string
+	UDPListenAddr string
+	InterfaceName string
+	ForwardMode   string
+	// IdleTimeoutSeconds 是节点级无进展拆除阈值（秒，0＝关），
+	// 服务配置生成面据此注入 metadata。
+	IdleTimeoutSeconds int
+	// 根治两档窗口（秒）与兜底滴流上限（字节/秒），0＝关，
+	// 与 IdleTimeoutSeconds 同口径随服务 metadata 注入。
+	EdgeIdleTimeoutSeconds     int
+	BackstopIdleTimeoutSeconds int
+	BackstopTrickleBps         int
+	// ConnLogEnabled 是节点级连接日志采集开关（0＝关，默认关），
+	// 转发入口标记与内核下发面据此门控。
+	ConnLogEnabled int
+	// WhitelistEnabled/WhitelistExtra 是节点级入站白名单开关＋
+	// 附加名单（0＝关，默认关）：开时该节点全部入站的生效白名
+	// 单为本名单，关时逐入站设置照旧。
+	WhitelistEnabled int
+	WhitelistExtra   string
+}
+
+type ChainNodeRecord struct {
+	ChainType int
+	Inx       int64
+	NodeID    int64
+	Port      int
+	NodeName  string
+	Protocol  string
+	Strategy  string
+	ConnectIP string
+}
+
+type UserTunnelLimiterInfo struct {
+	UserTunnelID int64
+	LimiterID    *int64
+	Speed        *int
+}
+
+// UserFlowSnapshot holds a user's current flow counters (used by stats job).
+type UserFlowSnapshot struct {
+	UserID  int64
+	InFlow  int64
+	OutFlow int64
+}
+
+// ExpiredUserTunnel holds minimal info for an expired user_tunnel row.
+type ExpiredUserTunnel struct {
+	ID       int64
+	UserID   int64
+	TunnelID int64
+}
+
+// UserTunnelDetail is a joined view of user_tunnel + tunnel + speed_limit.
+type UserTunnelDetail struct {
+	ID            int64
+	UserID        int64
+	TunnelID      int64
+	TunnelName    string
+	Status        int
+	TunnelFlow    int
+	Flow          int64
+	FlowMiB       int64 `gorm:"column:flow_mib"`
+	InFlow        int64
+	OutFlow       int64
+	Num           int
+	FlowResetTime int64
+	ExpTime       int64
+	SpeedID       sql.NullInt64
+	SpeedLimit    sql.NullString
+	Speed         sql.NullInt64
+}
+
+// UserForwardDetail is a joined view of forward + tunnel.
+type UserForwardDetail struct {
+	ID         int64
+	Name       string
+	TunnelID   int64
+	TunnelName string
+	InIP       string
+	InPort     sql.NullInt64
+	RemoteAddr string
+	InFlow     int64
+	OutFlow    int64
+	Status     int
+	CreatedAt  int64
+}
+
+type NodeMetric struct {
+	ID          int64   `gorm:"primaryKey;autoIncrement" json:"id"`
+	NodeID      int64   `gorm:"column:node_id;not null;index:idx_node_metric_node_time,priority:1" json:"nodeId"`
+	Timestamp   int64   `gorm:"not null;index:idx_node_metric_node_time,priority:2;index:idx_node_metric_time" json:"timestamp"`
+	CPUUsage    float64 `gorm:"column:cpu_usage" json:"cpuUsage"`
+	MemUsage    float64 `gorm:"column:mem_usage" json:"memoryUsage"`
+	DiskUsage   float64 `gorm:"column:disk_usage" json:"diskUsage"`
+	NetInBytes  int64   `gorm:"column:net_in_bytes" json:"netInBytes"`
+	NetOutBytes int64   `gorm:"column:net_out_bytes" json:"netOutBytes"`
+	NetInSpeed  int64   `gorm:"column:net_in_speed" json:"netInSpeed"`
+	NetOutSpeed int64   `gorm:"column:net_out_speed" json:"netOutSpeed"`
+	Load1       float64 `gorm:"column:load1" json:"load1"`
+	Load5       float64 `gorm:"column:load5" json:"load5"`
+	Load15      float64 `gorm:"column:load15" json:"load15"`
+	TCPConns    int64   `gorm:"column:tcp_conns" json:"tcpConns"`
+	UDPConns    int64   `gorm:"column:udp_conns" json:"udpConns"`
+	// ConntrackCount/ConntrackMax 是宿主机连接跟踪表用量（包
+	// K）：0/0 表示该节点无此面（旧 agent 或 nf_conntrack 未加
+	// 载）。历史行同表受 pruneMetrics 保留口径约束，不另设面。
+	ConntrackCount int64 `gorm:"column:conntrack_count" json:"conntrackCount"`
+	ConntrackMax   int64 `gorm:"column:conntrack_max" json:"conntrackMax"`
+	// agent 内存面（包 K 扩围）：RSS/总内存/活跃会话/预算拒
+	// 绝累计。旧 agent 不发时为 0，面板以 MemTotalBytes<=0
+	// 判「无此面」。
+	AgentRSSBytes       int64 `gorm:"column:agent_rss_bytes" json:"agentRssBytes"`
+	MemTotalBytes       int64 `gorm:"column:mem_total_bytes" json:"memTotalBytes"`
+	ActiveSessions      int64 `gorm:"column:active_sessions" json:"activeSessions"`
+	BudgetRejectedTotal int64 `gorm:"column:budget_rejected_total" json:"budgetRejectedTotal"`
+	BudgetEvictedTotal  int64 `gorm:"column:budget_evicted_total" json:"budgetEvictedTotal"`
+	Uptime              int64 `gorm:"column:uptime" json:"uptime"`
+}
+
+func (NodeMetric) TableName() string { return "node_metric" }
+
+// NodeTraffic accumulates a node's whole-machine NIC byte counters into
+// hourly buckets (deltas of the agent-reported cumulative counters).
+// This is node NIC traffic — it includes forwarding, kernel and system
+// traffic of the whole machine and is a different metric from tunnel
+// billing / subscription quota counters; never mix the two. Telemetry
+// time series like NodeMetric: retention is a fixed 400 days and the
+// table is intentionally NOT part of backups (same precedent as
+// node_latency_sample).
+type NodeTraffic struct {
+	ID       int64 `gorm:"primaryKey;autoIncrement" json:"id"`
+	NodeID   int64 `gorm:"column:node_id;not null;uniqueIndex:idx_node_traffic_node_hour,priority:1" json:"nodeId"`
+	Hour     int64 `gorm:"not null;uniqueIndex:idx_node_traffic_node_hour,priority:2" json:"hour"`
+	InBytes  int64 `gorm:"column:in_bytes;not null;default:0" json:"inBytes"`
+	OutBytes int64 `gorm:"column:out_bytes;not null;default:0" json:"outBytes"`
+}
+
+func (NodeTraffic) TableName() string { return "node_traffic" }
+
+// NodeLatencySample is one measurement of a node's latency to a reference
+// point, kept for the latency trend chart. Retention is capped at 7 days
+// (see IngestionService.pruneMetricsAt) so the table cannot grow without
+// bound when many nodes measure many points.
+type NodeLatencySample struct {
+	ID          int64   `gorm:"primaryKey;autoIncrement"`
+	NodeID      int64   `gorm:"column:node_id;not null;index:idx_latency_sample_node_time,priority:1"`
+	CreatedTime int64   `gorm:"column:created_time;not null;index:idx_latency_sample_node_time,priority:2;index"`
+	Point       string  `gorm:"column:point;type:varchar(64);not null"`
+	OK          int     `gorm:"column:ok;not null;default:0"`
+	LatencyMs   int64   `gorm:"column:latency_ms;not null;default:0"`
+	LossPct     float64 `gorm:"column:loss_pct;not null;default:0"`
+}
+
+func (NodeLatencySample) TableName() string { return "node_latency_sample" }
+
+// InboundConnLog is one client connection observed at a node's entry
+// point (inbound connection log feature; design §5.1). The agent on
+// the entry machine reports open/close events; the panel writes rows
+// at ingest time. The collection key (EntryNodeID + ConnID) is the
+// event-level identity taken from the reporting session, never from
+// payload claims; the display keys are the topology attribution
+// resolved at ingest (forward → NodeInboundRelay → target inbound, or
+// the inbound itself for direct kernel entries) and stay 0 when no
+// attribution can be derived — attribution is never guessed from
+// addresses or ports. Telemetry table: retention is
+// connlog_retention_days plus a per-inbound row cap (repo prune), and
+// it is intentionally NOT part of backups (NodeTraffic /
+// NodeLatencySample precedent).
+type InboundConnLog struct {
+	ID               int64  `gorm:"primaryKey;autoIncrement" json:"id"`
+	EntryNodeID      int64  `gorm:"column:entry_node_id;not null;uniqueIndex:idx_connlog_entry_conn,priority:1;index:idx_connlog_node_status,priority:1" json:"entryNodeId"`
+	ConnID           string `gorm:"column:conn_id;type:varchar(64);not null;uniqueIndex:idx_connlog_entry_conn,priority:2" json:"connId"`
+	EntryKind        string `gorm:"column:entry_kind;type:varchar(16);not null;default:''" json:"entryKind"`
+	EntryID          string `gorm:"column:entry_id;type:varchar(100);not null;default:''" json:"entryId"`
+	DisplayNodeID    int64  `gorm:"column:display_node_id;not null;default:0" json:"displayNodeId"`
+	DisplayInboundID int64  `gorm:"column:display_inbound_id;not null;default:0;index:idx_connlog_display_start,priority:1" json:"displayInboundId"`
+	ClientIP         string `gorm:"column:client_ip;type:varchar(45);not null;default:'';index:idx_connlog_client_start,priority:1" json:"clientIp"`
+	PeerIP           string `gorm:"column:peer_ip;type:varchar(45);not null;default:''" json:"peerIp"`
+	ClientPort       int    `gorm:"column:client_port;not null;default:0" json:"clientPort"`
+	Network          string `gorm:"type:varchar(8);not null;default:''" json:"network"`
+	SessionKind      string `gorm:"column:session_kind;type:varchar(16);not null;default:''" json:"sessionKind"`
+	StartTime        int64  `gorm:"column:start_time;not null;default:0;index:idx_connlog_display_start,priority:2;index:idx_connlog_client_start,priority:2" json:"startTime"`
+	// EndTime is 0 while open, the real close moment when closed, and
+	// the last known moment when interrupted (never a fabricated
+	// disconnect time). DurationMs is set only when closed.
+	EndTime     int64  `gorm:"column:end_time;not null;default:0" json:"endTime"`
+	DurationMs  int64  `gorm:"column:duration_ms;not null;default:0" json:"durationMs"`
+	Status      string `gorm:"type:varchar(12);not null;default:'open';index:idx_connlog_node_status,priority:2" json:"status"`
+	CreatedTime int64  `gorm:"column:created_time;not null" json:"createdTime"`
+}
+
+func (InboundConnLog) TableName() string { return "inbound_conn_log" }
+
+// ConnlogNodeDropped is the panel-side cumulative count of
+// connection-log events an entry node's agent dropped before they
+// could be reported (design §4.2: buffer/spool overflow drops the
+// oldest and counts — losing data is acceptable, hiding the loss
+// is not). The agent attaches its not-yet-acknowledged drop count
+// to every batch; the panel books the delta under the reporting
+// node exactly when the batch is applied (replays and behind
+// batches never double-book). The inbound log modal's footer sums
+// this over the nodes that actually feed the inbound. Telemetry
+// bookkeeping: NOT part of backups (same ruling as inbound_conn_log).
+type ConnlogNodeDropped struct {
+	ID           int64 `gorm:"primaryKey;autoIncrement" json:"id"`
+	NodeID       int64 `gorm:"column:node_id;not null;uniqueIndex" json:"nodeId"`
+	DroppedTotal int64 `gorm:"column:dropped_total;not null;default:0" json:"droppedTotal"`
+	UpdatedTime  int64 `gorm:"column:updated_time;not null;default:0" json:"updatedTime"`
+}
+
+func (ConnlogNodeDropped) TableName() string { return "connlog_node_dropped" }
+
+// TrafficNodeDropped is the panel-side cumulative count of traffic
+// bytes an entry node's agent dead-lettered before they could be
+// reported (traffic audit A-中-1): when a spool batch fails to be
+// confirmed 8 times in a row (~130s) or ages past its 1h TTL, the
+// agent quarantines the batch to a local archive and counts its
+// bytes into DroppedBytes, which rides the next v2 envelope as
+// dropped_bytes. The agent attaches its not-yet-acknowledged drop
+// total to every batch; the panel books the delta under the reporting
+// node exactly when the batch is applied (replays and behind
+// batches never double-book) — same contract as
+// ConnlogNodeDropped. Telemetry bookkeeping: NOT part of backups
+// (same ruling as inbound_conn_log).
+type TrafficNodeDropped struct {
+	ID           int64 `gorm:"primaryKey;autoIncrement" json:"id"`
+	NodeID       int64 `gorm:"column:node_id;not null;uniqueIndex" json:"nodeId"`
+	DroppedTotal int64 `gorm:"column:dropped_total;not null;default:0" json:"droppedTotal"`
+	UpdatedTime  int64 `gorm:"column:updated_time;not null;default:0" json:"updatedTime"`
+}
+
+func (TrafficNodeDropped) TableName() string { return "traffic_node_dropped" }
+
+type TunnelMetric struct {
+	ID int64 `gorm:"primaryKey;autoIncrement" json:"id"`
+	// FIX132-C（A3-S2）：(tunnel_id, node_id, timestamp) 的唯一性由
+	// v6 去重迁移的 uidx_tunnel_metric_bucket 单独持有，模型层不再
+	// 声明唯一索引——AutoMigrate 在去重迁移之前运行，存量重复桶行
+	// 会让它建唯一索引时直接失败、升级启动被堵死；且同列双唯一
+	// 索引本就冗余。存量库已有的同名索引 AutoMigrate 不会删除，
+	// 无害保留。
+	TunnelID     int64   `gorm:"column:tunnel_id;not null" json:"tunnelId"`
+	NodeID       int64   `gorm:"column:node_id;not null" json:"nodeId"`
+	Timestamp    int64   `gorm:"not null;index:idx_tunnel_metric_time" json:"timestamp"`
+	BytesIn      int64   `gorm:"column:bytes_in" json:"bytesIn"`
+	BytesOut     int64   `gorm:"column:bytes_out" json:"bytesOut"`
+	Connections  int64   `gorm:"column:connections" json:"connections"`
+	Errors       int64   `gorm:"column:errors" json:"errors"`
+	AvgLatencyMs float64 `gorm:"column:avg_latency_ms" json:"avgLatencyMs"`
+}
+
+func (TunnelMetric) TableName() string { return "tunnel_metric" }
+
+type ServiceMonitor struct {
+	ID          int64  `gorm:"primaryKey;autoIncrement" json:"id"`
+	Name        string `gorm:"type:varchar(100);not null" json:"name"`
+	Type        string `gorm:"type:varchar(20);not null" json:"type"`
+	Target      string `gorm:"type:text;not null" json:"target"`
+	IntervalSec int    `gorm:"column:interval_sec;not null;default:60" json:"intervalSec"`
+	TimeoutSec  int    `gorm:"column:timeout_sec;not null;default:5" json:"timeoutSec"`
+	NodeID      int64  `gorm:"column:node_id;index" json:"nodeId"`
+	Enabled     int    `gorm:"not null;default:1" json:"enabled"`
+	CreatedTime int64  `gorm:"column:created_time;not null" json:"createdTime"`
+	UpdatedTime int64  `gorm:"column:updated_time;not null" json:"updatedTime"`
+}
+
+func (ServiceMonitor) TableName() string { return "service_monitor" }
+
+type ServiceMonitorResult struct {
+	ID        int64   `gorm:"primaryKey;autoIncrement" json:"id"`
+	MonitorID int64   `gorm:"column:monitor_id;not null;index:idx_monitor_result_monitor_time,priority:1" json:"monitorId"`
+	NodeID    int64   `gorm:"column:node_id;not null;index" json:"nodeId"`
+	Timestamp int64   `gorm:"not null;index:idx_monitor_result_monitor_time,priority:2" json:"timestamp"`
+	Success   int     `gorm:"not null" json:"success"`
+	LatencyMs float64 `gorm:"column:latency_ms" json:"latencyMs"`
+	// R2-C2-B01：agent 已删 statusCode 回包字段——读口恒缺失（恒 0）、
+	// 模型字段同步摘除；前端声明归路 6。存量列由 AutoMigrate 保留，
+	// 不再读写。
+	ErrorMessage string `gorm:"column:error_message;type:text" json:"errorMessage"`
+}
+
+func (ServiceMonitorResult) TableName() string { return "service_monitor_result" }
+
+// TunnelQuality stores periodic probe results for a tunnel.
+// Unlike the old upsert model, rows accumulate for history/charting.
+// Old rows are pruned periodically by the monitor_retention_days
+// config (default 7 days, range 1-400; see internal/monitoring/
+// retention.go and the prune in tunnel_quality_prober.go). There is
+// no 24h retention anywhere for this table (R2-E3-F04).
+type TunnelQuality struct {
+	ID                 int64   `gorm:"primaryKey;autoIncrement" json:"id"`
+	TunnelID           int64   `gorm:"column:tunnel_id;not null;index:idx_tunnel_quality_tunnel_time,priority:1" json:"tunnelId"`
+	EntryToExitLatency float64 `gorm:"column:entry_to_exit_latency" json:"entryToExitLatency"`
+	ExitToBingLatency  float64 `gorm:"column:exit_to_bing_latency" json:"exitToBingLatency"`
+	EntryToExitLoss    float64 `gorm:"column:entry_to_exit_loss" json:"entryToExitLoss"`
+	ExitToBingLoss     float64 `gorm:"column:exit_to_bing_loss" json:"exitToBingLoss"`
+	// EntryToExitPartial（R8-024）：入口→出口总值为部分和（仅实测
+	// 跳、至少一跳未测）时为 1，与快照 EntryToExitPartialUntested 同义。
+	EntryToExitPartial int    `gorm:"column:entry_to_exit_partial;not null;default:0" json:"entryToExitPartial"`
+	Success            int    `gorm:"not null;default:1" json:"success"`
+	ErrorMessage       string `gorm:"column:error_message;type:text" json:"errorMessage,omitempty"`
+	Timestamp          int64  `gorm:"not null;index:idx_tunnel_quality_tunnel_time,priority:2;index:idx_tunnel_quality_time" json:"timestamp"`
+	ChainDetails       string `gorm:"column:chain_details;type:text" json:"chainDetails,omitempty"`
+}
+
+func (TunnelQuality) TableName() string { return "tunnel_quality" }
+
+// NodeTunnelTLS records per-node tunnel-TLS distribution state
+// (R18-F1-01, D-3): which CA + node certificate the panel issued, and
+// whether the agent confirmed receipt. This is derived state, not
+// user data: dropping the table only loses the cached readiness flag
+// (nodes re-distribute on the next tunnel deploy). The table is
+// created by autoMigrateAll on both SQLite and PostgreSQL; rollback
+// is DROP TABLE IF EXISTS node_tunnel_tls.
+type NodeTunnelTLS struct {
+	NodeID     int64  `gorm:"primaryKey;column:node_id" json:"nodeId"`
+	CASha256   string `gorm:"column:ca_sha256;type:varchar(64);not null;default:''" json:"caSha256"`
+	CertSha256 string `gorm:"column:cert_sha256;type:varchar(64);not null;default:''" json:"certSha256"`
+	ServerName string `gorm:"column:server_name;type:varchar(128);not null;default:''" json:"serverName"`
+	Ready      int    `gorm:"column:ready;not null;default:0" json:"ready"`
+	IssuedAt   int64  `gorm:"column:issued_at;not null;default:0" json:"issuedAt"`
+	VerifiedAt int64  `gorm:"column:verified_at;not null;default:0" json:"verifiedAt"`
+}
+
+func (NodeTunnelTLS) TableName() string { return "node_tunnel_tls" }

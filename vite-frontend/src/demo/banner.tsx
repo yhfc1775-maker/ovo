@@ -1,0 +1,82 @@
+import { useState } from "react";
+import { ChevronDown, X } from "lucide-react";
+
+import { demoRole, switchDemoRole } from "@/demo";
+
+const DOCS = "https://yhfc1775-maker.github.io/ovo/guide/install";
+
+const BANNER_OPEN_KEY = "ovo-demo-banner-open";
+
+/** The demo's floating note: sample data, switch views, how to install. */
+export function DemoBanner() {
+  // F-W4-02：默认折叠为「演示站」小 pill——展开态 320×120 固定卡片
+  // 默认盖住右下内容（实测盖住订阅编辑保存钮），且源码与实测均无
+  // pointer-events: none（S3 的「点击可穿透」与源码/实测不符，见报告），
+  // 盖住即不可点。选择记 localStorage，跨导航/刷新跟随用户选择。
+  const [open, setOpen] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(BANNER_OPEN_KEY) === "true";
+    } catch {
+      return false;
+    }
+  });
+  const role = demoRole();
+
+  const setOpenPersisted = (next: boolean) => {
+    setOpen(next);
+    try {
+      localStorage.setItem(BANNER_OPEN_KEY, String(next));
+    } catch {
+      // 忽略写缓存失败：横幅状态不影响功能。
+    }
+  };
+
+  if (!open) {
+    return (
+      <button
+        className="fixed bottom-[84px] right-3 z-[60] rounded-full bg-primary px-3 py-1.5 text-xs font-semibold text-white shadow-lg lg:bottom-4"
+        type="button"
+        onClick={() => setOpenPersisted(true)}
+      >
+        演示站
+      </button>
+    );
+  }
+
+  return (
+    <div className="glass-surface fixed bottom-[84px] right-3 z-[60] w-[min(20rem,calc(100vw-24px))] rounded-2xl p-3 text-xs font-semibold shadow-xl lg:bottom-4">
+      <div className="mb-1 flex items-center justify-between">
+        <span className="font-semibold text-sm">OVO 在线演示</span>
+        <button
+          aria-label="收起"
+          className="rounded p-1 text-foreground hover:bg-white/40"
+          type="button"
+          onClick={() => setOpenPersisted(false)}
+        >
+          <X className="h-3.5 w-3.5" />
+        </button>
+      </div>
+      <p className="text-foreground">
+        数据都是示例，可以随便点；修改不会保存，刷新后还原。
+      </p>
+      <div className="mt-2 flex gap-2">
+        <button
+          className="flex flex-1 items-center justify-center gap-1 rounded-lg bg-tray px-2 py-1.5 hover:bg-white/40"
+          type="button"
+          onClick={() => switchDemoRole(role === "admin" ? "user" : "admin")}
+        >
+          <ChevronDown className="h-3 w-3" />
+          {role === "admin" ? "看普通用户视角" : "回到管理员视角"}
+        </button>
+        <a
+          className="flex flex-1 items-center justify-center rounded-lg bg-primary px-2 py-1.5 font-medium text-white"
+          href={DOCS}
+          rel="noreferrer"
+          target="_blank"
+        >
+          安装 OVO
+        </a>
+      </div>
+    </div>
+  );
+}

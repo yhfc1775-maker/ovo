@@ -1,0 +1,862 @@
+import type {
+  InboundApiItem,
+  InboundRelayApiItem,
+  InboundShareEntry,
+} from "@/api/types";
+
+import QRCode from "qrcode";
+import { useEffect, useRef, useState } from "react";
+import toast from "react-hot-toast";
+import { ChevronDown, Copy, QrCode, RefreshCw, Search } from "lucide-react";
+
+import { useTargetIdemKey } from "@/hooks/useIdemKey";
+import { copyWithToast } from "@/utils/clipboard";
+import { panelOrigin } from "@/utils/panel-origin";
+import { SubFrontPicker } from "@/pages/subscription/front-picker";
+import { Segmented } from "@/pages/subscription/controls";
+import {
+  GroupHeader,
+  groupItems,
+  groupKeyOf,
+  groupLabelOf,
+  groupRank,
+  inboundMatchesSearch,
+  inboundOriginOf,
+  inboundSubtitleOf,
+  type InboundOriginFilter,
+} from "@/pages/inbound/group";
+import { useSubscriptionFrontURLs } from "@/utils/subscription-front";
+import {
+  getInboundRelays,
+  getInboundShare,
+  getSubInfo,
+} from "@/api";
+import { Button } from "@/shadcn-bridge/heroui/button";
+import { Card, CardBody } from "@/shadcn-bridge/heroui/card";
+import { Chip } from "@/shadcn-bridge/heroui/chip";
+import { Input } from "@/shadcn-bridge/heroui/input";
+import {
+  Modal,
+  ModalBody,
+  ModalContent,
+  ModalFooter,
+  ModalHeader,
+} from "@/shadcn-bridge/heroui/modal";
+
+const modalBase =
+  "!w-[calc(100%-32px)] !mx-auto sm:!w-full rounded-2xl overflow-hidden";
+
+export async function copyText(text: string, label = "已复制") {
+  await copyWithToast(text, label);
+}
+
+// Re-exported for existing importers; the single definition lives in
+// @/utils/panel-origin so every link surface shares one origin rule.
+export { panelOrigin };
+
+export function QrImage({ text, size = 220 }: { text: string; size?: number }) {
+  const [src, setSrc] = useState("");
+  // 生成中与生成失败是两个状态：此前共用空 src，加载期就误报「内容过长」（D5-05）
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+
+    setSrc("");
+    setFailed(false);
+    QRCode.toDataURL(text, {
+      margin: 1,
+      width: size,
+      errorCorrectionLevel: "M",
+    })
+      .then((url) => alive && setSrc(url))
+      .catch(() => alive && setFailed(true));
+
+    return () => {
+      alive = false;
+    };
+  }, [text, size]);
+
+  if (!src) {
+    return (
+      <div
+        className="flex items-center justify-center text-xs font-semibold text-foreground glass-inset rounded-xl"
+        style={{ width: size, height: size }}
+      >
+        {failed ? "内容过长，无法生成二维码" : "二维码生成中..."}
+      </div>
+    );
+  }
+
+  return (
+    <img
+      alt="二维码"
+      className="rounded-xl bg-white p-2"
+      height={size}
+      src={src}
+      width={size}
+    />
+  );
+}
+
+/** 二维码按钮：点击弹出模态框显示订阅链接的二维码 */
+export function QrCodeButton({ url, label }: { url: string; label: string }) {
+  const [open, setOpen] = useState(false);
+  if (!url) return null;
+  return (
+    <>
+      <button
+        type="button"
+        title={`查看${label}二维码`}
+        onClick={() => setOpen(true)}
+        className="inline-flex items-center justify-center w-10 h-10 rounded hover:bg-white/40 text-foreground hover:text-primary-700 transition-colors"
+      >
+        <svg className="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 20 20">
+          <path
+            fillRule="evenodd"
+            d="M3 4a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1H4a1 1 0 01-1-1V4zm2 2v2h2V6H5zm6-2a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1V4zm2 2v2h2V6h-2zM3 12a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1H4a1 1 0 01-1-1v-4zm2 2v2h2v-2H5zm6-2a1 1 0 011-1h2a1 1 0 011 1v2a1 1 0 01-1 1h-2a1 1 0 01-1-1v-2zm2 0v2h.01v-2H13zm2 4a1 1 0 011-1h1a1 1 0 110 2h-1a1 1 0 01-1-1zm-2 1a1 1 0 011-1h1a1 1 0 110 2h-1a1 1 0 01-1-1zm-4 0a1 1 0 011-1h1a1 1 0 110 2H9a1 1 0 01-1-1z"
+            clipRule="evenodd"
+          />
+        </svg>
+      </button>
+      <Modal
+        backdrop="blur"
+        classNames={{ base: modalBase }}
+        isOpen={open}
+        placement="center"
+        size="sm"
+        onOpenChange={(o) => !o && setOpen(false)}
+      >
+        <ModalContent>
+          {() => (
+            <>
+              <ModalHeader>
+                <h3 className="text-base font-semibold">{label} - 扫码订阅</h3>
+              </ModalHeader>
+              <ModalBody className="flex flex-col items-center gap-3">
+                <QrImage text={url} size={240} />
+                <p className="text-xs font-semibold text-foreground break-all select-all text-center max-w-full">
+                  {url}
+                </p>
+              </ModalBody>
+              <ModalFooter>
+                <Button
+                  size="sm"
+                  color="primary"
+                  onPress={() => copyText(url, `${label}链接已复制`)}
+                >
+                  复制链接
+                </Button>
+              </ModalFooter>
+            </>
+          )}
+        </ModalContent>
+      </Modal>
+    </>
+  );
+}
+
+function ShareEntryCard({ entry }: { entry: InboundShareEntry }) {
+  const [showQr, setShowQr] = useState(false);
+  // Snell has no common link format; its Surge line is all there is.
+  const surgeOnly = !entry.uri;
+  const text = entry.uri || entry.surge;
+
+  return (
+    <div className="rounded-2xl border border-divider p-4 space-y-3">
+      <div className="min-w-0">
+        <div className="flex items-center gap-2 min-w-0">
+          <Chip
+            color={entry.kind === "relay" ? "secondary" : "primary"}
+            size="sm"
+            variant="flat"
+          >
+            {entry.kind === "relay" ? "中转" : "直连"}
+          </Chip>
+          <span className="font-medium truncate">{entry.name}</span>
+        </div>
+        <p className="text-xs font-semibold text-foreground font-mono mt-1 break-all">
+          {entry.host}:{entry.port}
+        </p>
+      </div>
+
+      <pre className="text-xs font-semibold font-mono whitespace-pre-wrap break-all rounded-xl bg-white/40 p-3 max-h-32 overflow-y-auto select-all">
+        {text}
+      </pre>
+
+      <div className="flex gap-2">
+        <Button
+          className="flex-1"
+          color="primary"
+          startContent={<Copy className="w-4 h-4" />}
+          onPress={() =>
+            copyText(text, surgeOnly ? "Surge 配置行已复制" : "链接已复制")
+          }
+        >
+          {surgeOnly ? "复制 Surge 配置" : "复制链接"}
+        </Button>
+        {!surgeOnly && (
+          <Button
+            isIconOnly
+            aria-label="二维码"
+            variant={showQr ? "solid" : "flat"}
+            onPress={() => setShowQr((v) => !v)}
+          >
+            <QrCode className="w-4 h-4" />
+          </Button>
+        )}
+      </div>
+
+      {surgeOnly && (
+        <p className="text-xs font-semibold text-foreground">
+          Snell 没有通用分享链接，粘贴到 Surge 配置的 [Proxy] 段，或使用 Surge
+          订阅。
+        </p>
+      )}
+      {showQr && (
+        <div className="flex justify-center">
+          <QrImage text={entry.uri} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function ShareModal({
+  item,
+  onClose,
+}: {
+  item: InboundApiItem | null;
+  onClose: () => void;
+}) {
+  const [entries, setEntries] = useState<InboundShareEntry[]>([]);
+  const [loading, setLoading] = useState(false);
+  // 拉取失败与「真的没有可分享地址」分开呈现：失败时不得断言归因文案（D5-06）
+  const [loadFailed, setLoadFailed] = useState(false);
+
+  useEffect(() => {
+    if (!item) return;
+    // 归属守卫：切换入站后旧请求迟到响应一律丢弃，防止 A 的链接串进 B 的弹窗
+    let alive = true;
+
+    setEntries([]);
+    setLoadFailed(false);
+    setLoading(true);
+    getInboundShare(item.id)
+      .then((res) => {
+        if (!alive) return;
+        if (res.code === 0) {
+          setEntries(res.data || []);
+        } else {
+          setLoadFailed(true);
+          toast.error(res.msg || "获取分享链接失败");
+        }
+      })
+      .finally(() => {
+        if (alive) setLoading(false);
+      });
+
+    return () => {
+      alive = false;
+    };
+  }, [item]);
+
+  return (
+    <Modal
+      backdrop="blur"
+      classNames={{ base: modalBase }}
+      isOpen={Boolean(item)}
+      placement="center"
+      scrollBehavior="inside"
+      size="lg"
+      onOpenChange={(open) => !open && onClose()}
+    >
+      <ModalContent>
+        {(close) => (
+          <>
+            <ModalHeader className="flex flex-col gap-1">
+              <h2 className="text-lg font-bold">分享 · {item?.name}</h2>
+              <p className="text-small text-foreground">
+                复制链接或扫码导入 v2rayN、Shadowrocket、NekoBox 等客户端；Surge
+                请使用订阅
+              </p>
+            </ModalHeader>
+            <ModalBody>
+              {loading && <p className="text-sm text-foreground">加载中...</p>}
+              {!loading && loadFailed && (
+                <p className="text-sm text-danger-700">
+                  获取分享链接失败，请关闭后重试。
+                </p>
+              )}
+              {!loading && !loadFailed && entries.length === 0 && (
+                <p className="text-sm text-foreground">
+                  没有可分享的地址：入站仅监听本机或设置了仅中转，但还没有对接中转。
+                </p>
+              )}
+              <div className="space-y-3">
+                {entries.map((e) => (
+                  <ShareEntryCard
+                    key={`${e.kind}-${e.host}-${e.port}`}
+                    entry={e}
+                  />
+                ))}
+              </div>
+            </ModalBody>
+            <ModalFooter>
+              <Button variant="light" onPress={close}>
+                关闭
+              </Button>
+            </ModalFooter>
+          </>
+        )}
+      </ModalContent>
+    </Modal>
+  );
+}
+
+const SUB_FORMATS: { key: string; label: string; hint: string }[] = [
+  { key: "", label: "自动识别", hint: "按客户端自动返回对应格式" },
+  {
+    key: "clash",
+    label: "Clash / Mihomo",
+    hint: "Clash Verge、Stash、FlClash",
+  },
+  { key: "singbox", label: "sing-box", hint: "SFA / SFI / SFM" },
+  { key: "base64", label: "通用", hint: "v2rayN、Shadowrocket、NekoBox" },
+  { key: "surge", label: "Surge", hint: "不含 VLESS / Reality" },
+];
+
+function InboundRelaySubList({
+  inbound,
+  path,
+  url,
+}: {
+  inbound: InboundApiItem;
+  path: string;
+  url: (format: string, inboundId?: number, relay?: string) => string;
+}) {
+  const [relays, setRelays] = useState<InboundRelayApiItem[]>([]);
+  const [loading, setLoading] = useState(false);
+  // 加载失败须与「没有中转」区分：失败整段消失会让用户误判为无中转（D5-06）
+  const [loadFailed, setLoadFailed] = useState(false);
+
+  useEffect(() => {
+    setLoading(true);
+    setLoadFailed(false);
+    getInboundRelays(inbound.id)
+      .then((res) => {
+        if (res.code === 0) {
+          setRelays((res.data || []).filter((r) => r.forwardExists));
+        } else {
+          setLoadFailed(true);
+        }
+      })
+      .catch(() => {
+        setLoadFailed(true);
+      })
+      .finally(() => setLoading(false));
+  }, [inbound.id]);
+
+  if (loading) {
+    return <p className="text-xs font-semibold text-foreground">加载中转列表...</p>;
+  }
+  if (loadFailed) {
+    return <p className="text-xs font-semibold text-danger-700">中转列表加载失败，请稍后重试</p>;
+  }
+  if (relays.length === 0) {
+    return null;
+  }
+
+  return (
+    <div className="pt-1 space-y-1.5">
+      <p className="text-xs font-semibold text-foreground">
+        按中转线路单独订阅（共 {relays.length} 条）
+      </p>
+      <div className="space-y-2">
+        {relays.map((r) => (
+          <div
+            key={r.id}
+            className="rounded-lg glass-inset px-2.5 py-2"
+          >
+            <div className="flex items-center justify-between mb-1.5">
+              <span className="text-xs font-semibold truncate">
+                🔀 {r.name || r.forwardName}
+                <span className="text-foreground ml-1">{r.remoteAddr}</span>
+              </span>
+              <button
+                className="text-xs font-semibold text-primary-700 flex items-center gap-1 shrink-0 disabled:opacity-50"
+                disabled={!path}
+                type="button"
+                onClick={() =>
+                  copyText(
+                    url("", inbound.id, String(r.id)),
+                    `${r.name || r.forwardName} 订阅已复制`,
+                  )
+                }
+              >
+                <Copy className="w-3 h-3" /> 复制通用
+              </button>
+            </div>
+            <div className="grid grid-cols-4 gap-1.5">
+              {SUB_FORMATS.filter((f) => f.key).map((f) => {
+                const fmtUrl = url(f.key, inbound.id, String(r.id));
+                return (
+                  <div key={f.key || "auto"} className="flex items-center gap-1">
+                    <button
+                      className="flex-1 text-xs font-semibold rounded border border-divider px-1.5 py-1 hover:bg-white/40 transition-colors disabled:opacity-50 text-center"
+                      disabled={!path}
+                      type="button"
+                      onClick={() =>
+                        copyText(
+                          fmtUrl,
+                          `${r.name || r.forwardName} ${f.label} 订阅已复制`,
+                        )
+                      }
+                    >
+                      {f.label}
+                    </button>
+                    <QrCodeButton
+                      url={fmtUrl}
+                      label={`${r.name || r.forwardName} ${f.label}`}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+export function SubscriptionCard({ inbounds = [] }: { inbounds?: InboundApiItem[] }) {
+  const [path, setPath] = useState("");
+  // 订阅前置地址（KU6）：选中的链接组装 base，"" = 面板域名；未配置
+  // 前置时选择器不渲染，url() 与此前逐字一致。
+  const fronts = useSubscriptionFrontURLs();
+  const [frontBase, setFrontBase] = useState("");
+  const [showQr, setShowQr] = useState(false);
+  const [resetOpen, setResetOpen] = useState(false);
+  const [resetting, setResetting] = useState(false);
+  const resetInFlightRef = useRef(false);
+  // C1-06：重置默认订阅（凭据轮换）的幂等键——load(true) 超时后
+  // 重试复用同键，后端回放首轮回执（含新 token）不二次轮换；
+  // 成功后清除，下一次重置是新意图、新键。目标恒为默认订阅，
+  // 以 0 为绑定键。
+  const {
+    keyFor: subResetKeyFor,
+    clearTargetIdemKey: clearSubResetKey,
+  } = useTargetIdemKey();
+  const [expandedInbound, setExpandedInbound] = useState<number | null>(null);
+  const [inboundSectionOpen, setInboundSectionOpen] = useState(true);
+  const [originFilter, setOriginFilter] =
+    useState<InboundOriginFilter>("all");
+  const [inboundSearch, setInboundSearch] = useState("");
+  const [groupOpenOverrides, setGroupOpenOverrides] = useState<
+    Record<string, boolean>
+  >({});
+
+  const load = (reset = false) =>
+    getSubInfo(reset, false, reset ? subResetKeyFor(0) : undefined).then((res) => {
+      if (res.code === 0) {
+        if (reset) clearSubResetKey();
+        // R4X-017（回执面 #26）：reset 成功但下发节点失败时后端回
+        // code=0 + 非标准 Msg，必须透出——与 subscription.tsx
+        // showResult 同型通道；标准 Msg 不弹，doReset 成功文案不变。
+        if (res.msg && res.msg !== "操作成功") toast(res.msg, { icon: "⚠️" });
+        setPath(res.data.path);
+
+        return true;
+      }
+      toast.error(res.msg || "获取订阅失败");
+
+      return false;
+    });
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  const url = (format: string, inboundId?: number, relay?: string) => {
+    if (!path) return "";
+    let u = `${frontBase || panelOrigin()}${path}`;
+    const params: string[] = [];
+    if (inboundId) params.push(`inbound=${inboundId}`);
+    if (relay) params.push(`relay=${relay}`);
+    if (format) params.push(`format=${format}`);
+    if (params.length) u += `?${params.join("&")}`;
+    return u;
+  };
+
+  const doReset = async () => {
+    // F-L6-01 自复扫补遗：重置是令牌轮换（非幂等），双发竞态下界面展示的
+    // 地址可能被后一道重置作废；此前只有 resetting 渲染状态，补 ref 复核。
+    if (resetInFlightRef.current) return;
+    resetInFlightRef.current = true;
+    setResetting(true);
+    try {
+      if (await load(true)) {
+        toast.success("订阅地址已重置，旧地址立即失效");
+        setResetOpen(false);
+      }
+    } finally {
+      resetInFlightRef.current = false;
+      setResetting(false);
+    }
+  };
+
+  const localInboundCount = inbounds.filter((i) => !i.external).length;
+  const importedInboundCount = inbounds.length - localInboundCount;
+  // IRL-5：总数里混着已停用入站时点名个数，与逐项「已停用」标记同口径。
+  const disabledInboundCount = inbounds.filter((i) => !i.enabled).length;
+  const filteredInbounds = inbounds.filter(
+    (inbound) =>
+      (originFilter === "all" || inboundOriginOf(inbound) === originFilter) &&
+      inboundMatchesSearch(inbound, inboundSearch),
+  );
+  const inboundGroups = groupItems(filteredInbounds, groupKeyOf, (_key, i) =>
+    groupLabelOf(i),
+  ).sort((a, b) => groupRank(a.key) - groupRank(b.key));
+  const showInboundGroups = inboundGroups.length > 1;
+  const groupIsOpen = (key: string) =>
+    groupOpenOverrides[key] ?? groupRank(key) === 0;
+  const toggleInboundGroup = (key: string) =>
+    setGroupOpenOverrides((prev) => ({
+      ...prev,
+      [key]: !groupIsOpen(key),
+    }));
+
+  const renderInbound = (inbound: InboundApiItem) => {
+    const expanded = expandedInbound === inbound.id;
+
+    return (
+      <div
+        key={inbound.id}
+        className="rounded-xl border border-divider px-3 py-2"
+      >
+        <button
+          className="w-full flex items-center justify-between gap-2 text-left"
+          type="button"
+          onClick={() => setExpandedInbound(expanded ? null : inbound.id)}
+        >
+          <div className="min-w-0">
+            <p className="flex items-center gap-2 text-sm font-medium">
+              <span className="truncate">{inbound.name}</span>
+              {inbound.external && (
+                <Chip
+                  className="shrink-0"
+                  color="warning"
+                  size="sm"
+                  title={
+                    inbound.sourceId
+                      ? `订阅源 ${inbound.sourceName || inbound.sourceId}`
+                      : "手动导入"
+                  }
+                  variant="flat"
+                >
+                  导入
+                </Chip>
+              )}
+              {/* IRL-5：已停用入站的单独链接拉回的是空节点集（后端
+                  拉取跳过停用行），必须当面标明，不能与可用入站同面
+                  陈列装作可复制即用。 */}
+              {!inbound.enabled && (
+                <Chip
+                  className="shrink-0"
+                  color="warning"
+                  size="sm"
+                  title="该入站已停用，单独订阅链接拉取为空，启用后恢复"
+                  variant="flat"
+                >
+                  已停用
+                </Chip>
+              )}
+            </p>
+            <p className="text-xs font-semibold text-foreground">
+              {inboundSubtitleOf(inbound)}
+            </p>
+          </div>
+          <div className="flex items-center gap-1 shrink-0">
+            <Button
+              size="sm"
+              variant="flat"
+              isDisabled={!path}
+              onPress={(e: any) => {
+                e.stopPropagation();
+                copyText(url("", inbound.id), `${inbound.name} 订阅已复制`);
+              }}
+            >
+              复制链接
+            </Button>
+            <span
+              className={`text-foreground transition-transform ${expanded ? "rotate-180" : ""}`}
+            >
+              ▾
+            </span>
+          </div>
+        </button>
+        {expanded && (
+          <div className="pt-2 space-y-2">
+            {!inbound.enabled && (
+              <p className="rounded-lg bg-warning-50 px-2 py-1.5 text-xs font-semibold text-warning-700">
+                该入站已停用：下面的单独订阅链接现在拉取到的是空节点集（其中转同理），在入站页启用后恢复。
+              </p>
+            )}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+              {SUB_FORMATS.filter((f) => f.key).map((f) => {
+                const fmtUrl = url(f.key, inbound.id);
+                return (
+                  <div
+                    key={f.key || "auto"}
+                    className="flex items-center gap-1"
+                  >
+                    <button
+                      className="flex-1 text-left rounded-lg border border-divider px-2 py-1.5 hover:bg-white/40 transition-colors disabled:opacity-50"
+                      disabled={!path}
+                      type="button"
+                      onClick={() =>
+                        copyText(
+                          fmtUrl,
+                          `${inbound.name} ${f.label} 订阅已复制`,
+                        )
+                      }
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-semibold">
+                          {f.label}
+                        </span>
+                        <Copy className="w-3 h-3 text-foreground" />
+                      </div>
+                    </button>
+                    <QrCodeButton
+                      url={fmtUrl}
+                      label={`${inbound.name} ${f.label}`}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+            <InboundRelaySubList inbound={inbound} path={path} url={url} />
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <Card className="shadow-sm">
+      <CardBody className="space-y-3">
+        <div className="flex items-center justify-between gap-2">
+          <div>
+            <h3 className="text-base font-semibold">订阅</h3>
+            <p className="text-xs font-semibold text-foreground">
+              包含全部已启用入站及其中转，客户端定期更新即可同步
+            </p>
+          </div>
+          <div className="flex gap-1">
+            <Button
+              isIconOnly
+              aria-label="订阅二维码"
+              size="sm"
+              variant="flat"
+              onPress={() => setShowQr((v) => !v)}
+            >
+              <QrCode className="w-4 h-4" />
+            </Button>
+            <Button
+              isIconOnly
+              aria-label="重置订阅地址"
+              size="sm"
+              variant="flat"
+              onPress={() => setResetOpen(true)}
+            >
+              <RefreshCw className="w-4 h-4" />
+            </Button>
+          </div>
+        </div>
+        {fronts.length > 0 && (
+          <SubFrontPicker
+            fronts={fronts}
+            value={frontBase}
+            onChange={setFrontBase}
+          />
+        )}
+        <div className="flex gap-2">
+          <Button
+            className="flex-1"
+            color="primary"
+            isDisabled={!path}
+            startContent={<Copy className="w-4 h-4" />}
+            variant="flat"
+            onPress={() => copyText(url(""), "订阅链接已复制")}
+          >
+            复制订阅链接（自动识别客户端）
+          </Button>
+        </div>
+        <p className="pt-1 text-xs font-semibold text-foreground">指定格式</p>
+        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-2">
+          {SUB_FORMATS.filter((f) => f.key).map((f) => {
+            const fmtUrl = url(f.key);
+            return (
+              <div key={f.key || "auto"} className="flex items-center gap-1">
+                <button
+                  className="flex-1 text-left rounded-xl border border-divider px-3 py-2 hover:bg-white/40 transition-colors disabled:opacity-50"
+                  disabled={!path}
+                  type="button"
+                  onClick={() => copyText(fmtUrl, `${f.label} 订阅已复制`)}
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm font-medium">{f.label}</span>
+                    <Copy className="w-3.5 h-3.5 text-foreground" />
+                  </div>
+                  <div className="text-xs font-semibold text-foreground">{f.hint}</div>
+                </button>
+                <QrCodeButton url={fmtUrl} label={`${f.label}订阅`} />
+              </div>
+            );
+          })}
+        </div>
+        {showQr && path && (
+          <div className="flex flex-col items-center gap-2 pt-1">
+            <QrImage text={url("")} />
+            <p className="text-xs font-semibold text-foreground font-mono break-all text-center">
+              {url("")}
+            </p>
+          </div>
+        )}
+
+        {inbounds.length > 0 && (
+          <div className="pt-2 space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <button
+                aria-expanded={inboundSectionOpen}
+                className="flex items-center gap-1 text-left"
+                type="button"
+                onClick={() => setInboundSectionOpen((open) => !open)}
+              >
+                <h4 className="text-sm font-semibold">
+                  按入站单独订阅（共 {inbounds.length}
+                  {disabledInboundCount > 0
+                    ? `，含 ${disabledInboundCount} 个已停用`
+                    : ""}
+                  ）
+                </h4>
+                <ChevronDown
+                  className={`h-4 w-4 shrink-0 text-foreground transition-transform ${inboundSectionOpen ? "" : "-rotate-90"}`}
+                />
+              </button>
+              <p className="text-xs font-semibold text-foreground">
+                每个入站独立链接，只包含该入站
+              </p>
+            </div>
+            {inboundSectionOpen && (
+              <>
+                {(localInboundCount > 0 && importedInboundCount > 0) ||
+                inbounds.length > 8 ? (
+                  <div className="flex flex-col gap-2 lg:flex-row lg:items-center">
+                    {localInboundCount > 0 && importedInboundCount > 0 && (
+                      <div className="lg:w-[22rem] lg:shrink-0">
+                        <Segmented<InboundOriginFilter>
+                          options={[
+                            ["all", `全部 ${inbounds.length}`],
+                            ["local", `本地创建 ${localInboundCount}`],
+                            ["imported", `导入 ${importedInboundCount}`],
+                          ]}
+                          value={originFilter}
+                          onChange={setOriginFilter}
+                        />
+                      </div>
+                    )}
+                    {inbounds.length > 8 && (
+                      <Input
+                        aria-label="搜索按入站单独订阅"
+                        className="lg:flex-1"
+                        placeholder="搜索名称、节点、协议、端口、备注或来源"
+                        size="sm"
+                        startContent={<Search className="h-4 w-4" />}
+                        value={inboundSearch}
+                        onChange={(e) => setInboundSearch(e.target.value)}
+                      />
+                    )}
+                  </div>
+                ) : null}
+                <div className="space-y-2">
+                  {filteredInbounds.length === 0 ? (
+                    <p className="rounded-xl glass-inset px-3 py-4 text-sm font-semibold text-foreground">
+                      没有匹配的入站
+                    </p>
+                  ) : showInboundGroups ? (
+                    inboundGroups.map((group) => {
+                      const open = groupIsOpen(group.key);
+                      const rank = groupRank(group.key);
+
+                      return (
+                        <div key={group.key} className="space-y-2">
+                          <GroupHeader
+                            collapsed={!open}
+                            count={group.items.length}
+                            extra={
+                              <Chip
+                                color={rank === 0 ? "default" : "warning"}
+                                size="sm"
+                                variant="flat"
+                              >
+                                {rank === 0
+                                  ? "本地创建"
+                                  : rank === 1
+                                    ? "手动导入"
+                                    : "订阅源导入"}
+                              </Chip>
+                            }
+                            title={group.title}
+                            unit="个入站"
+                            onToggle={() => toggleInboundGroup(group.key)}
+                          />
+                          {open && group.items.map(renderInbound)}
+                        </div>
+                      );
+                    })
+                  ) : (
+                    filteredInbounds.map(renderInbound)
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+        )}
+      </CardBody>
+
+      <Modal
+        backdrop="blur"
+        classNames={{ base: modalBase }}
+        isOpen={resetOpen}
+        placement="center"
+        onOpenChange={setResetOpen}
+      >
+        <ModalContent>
+          {(close) => (
+            <>
+              <ModalHeader>
+                <h2 className="text-lg font-bold">重置订阅地址</h2>
+              </ModalHeader>
+              <ModalBody>
+                <p className="text-sm text-foreground">
+                  旧的订阅地址会立即失效，所有客户端都需要重新导入新地址。
+                </p>
+              </ModalBody>
+              <ModalFooter>
+                <Button variant="light" onPress={close}>
+                  取消
+                </Button>
+                <Button color="warning" isLoading={resetting} onPress={doReset}>
+                  重置
+                </Button>
+              </ModalFooter>
+            </>
+          )}
+        </ModalContent>
+      </Modal>
+    </Card>
+  );
+}

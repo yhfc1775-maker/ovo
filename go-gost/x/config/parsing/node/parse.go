@@ -1,0 +1,312 @@
+package node
+
+import (
+	"fmt"
+	"io"
+	"net"
+	"regexp"
+	"strings"
+
+	"github.com/go-gost/core/chain"
+	"github.com/go-gost/core/connector"
+	"github.com/go-gost/core/dialer"
+	"github.com/go-gost/core/logger"
+	"github.com/go-gost/core/metadata"
+	xauth "github.com/go-gost/x/auth"
+	xbypass "github.com/go-gost/x/bypass"
+	xchain "github.com/go-gost/x/chain"
+	"github.com/go-gost/x/config"
+	"github.com/go-gost/x/config/parsing"
+	auth_parser "github.com/go-gost/x/config/parsing/auth"
+	bypass_parser "github.com/go-gost/x/config/parsing/bypass"
+	tls_util "github.com/go-gost/x/internal/util/tls"
+	mdx "github.com/go-gost/x/metadata"
+	mdutil "github.com/go-gost/x/metadata/util"
+	"github.com/go-gost/x/registry"
+	"github.com/go-gost/x/routing"
+)
+
+func ParseNode(hop string, cfg *config.NodeConfig, log logger.Logger) (*chain.Node, error) {
+	if cfg == nil {
+		return nil, nil
+	}
+
+	if cfg.Connector == nil {
+		cfg.Connector = &config.ConnectorConfig{
+			Type: "http",
+		}
+	}
+
+	if cfg.Dialer == nil {
+		cfg.Dialer = &config.DialerConfig{
+			Type: "tcp",
+		}
+	}
+
+	nodeLogger := log.WithFields(map[string]any{
+		"hop":       hop,
+		"kind":      "node",
+		"node":      cfg.Name,
+		"connector": cfg.Connector.Type,
+		"dialer":    cfg.Dialer.Type,
+	})
+
+	serverName, _, _ := net.SplitHostPort(cfg.Addr)
+
+	tlsCfg := cfg.Connector.TLS
+	if tlsCfg == nil {
+		tlsCfg = &config.TLSConfig{}
+	}
+	if tlsCfg.ServerName == "" {
+		tlsCfg.ServerName = serverName
+	}
+	tlsConfig, err := tls_util.LoadClientConfig(tlsCfg)
+	if err != nil {
+		nodeLogger.Error(err)
+		return nil, err
+	}
+
+	var nm metadata.Metadata
+	if cfg.Metadata != nil {
+		nm = mdx.NewMetadata(cfg.Metadata)
+	}
+
+	connectorLogger := nodeLogger.WithFields(map[string]any{
+		"kind": "connector",
+	})
+	var cr connector.Connector
+	var d dialer.Dialer
+	ownedByTransport := false
+	defer func() {
+		if !ownedByTransport {
+			if closer, ok := cr.(io.Closer); ok {
+				_ = closer.Close()
+			}
+			if closer, ok := d.(io.Closer); ok {
+				_ = closer.Close()
+			}
+		}
+	}()
+	if rf := registry.ConnectorRegistry().Get(cfg.Connector.Type); rf != nil {
+		cr = rf(
+			connector.AuthOption(auth_parser.Info(cfg.Connector.Auth)),
+			connector.TLSConfigOption(tlsConfig),
+			connector.LoggerOption(connectorLogger),
+		)
+	} else {
+		return nil, fmt.Errorf("unregistered connector: %s", cfg.Connector.Type)
+	}
+
+	if cfg.Connector.Metadata == nil {
+		cfg.Connector.Metadata = make(map[string]any)
+	}
+	if err := cr.Init(mdx.NewMetadata(cfg.Connector.Metadata)); err != nil {
+		connectorLogger.Error("init: ", err)
+		return nil, err
+	}
+
+	tlsCfg = cfg.Dialer.TLS
+	if tlsCfg == nil {
+		tlsCfg = &config.TLSConfig{}
+	}
+	if tlsCfg.ServerName == "" {
+		tlsCfg.ServerName = serverName
+	}
+	tlsConfig, err = tls_util.LoadClientConfig(tlsCfg)
+	if err != nil {
+		nodeLogger.Error(err)
+		return nil, err
+	}
+	// R18-F1-01 (D-3, transition hardening): a TLS-family chain dial
+	// hop rendered without secure verification silently accepts any
+	// peer certificate (LoadClientConfig sets InsecureSkipVerify when
+	// Secure is false). Never stay silent about it: warn at load time,
+	// naming the hop, until the panel issues tunnel certificates for
+	// this node (TunnelTLSIssue) and the render switches to verified
+	// TLS. Non-TLS dialers (tcp/kcp/udp/ws) are not TLS hops and do
+	// not warn; a verified dialer (secure=true) does not warn either.
+	if msg, ok := insecureTLSDialWarning(hop, cfg.Dialer.Type, tlsCfg); ok {
+		nodeLogger.Warn(msg)
+	}
+
+	var ppv int
+	if nm != nil {
+		ppv = mdutil.GetInt(nm, parsing.MDKeyProxyProtocol)
+	}
+
+	dialerLogger := nodeLogger.WithFields(map[string]any{
+		"kind": "dialer",
+	})
+
+	if rf := registry.DialerRegistry().Get(cfg.Dialer.Type); rf != nil {
+		d = rf(
+			dialer.AuthOption(auth_parser.Info(cfg.Dialer.Auth)),
+			dialer.TLSConfigOption(tlsConfig),
+			dialer.LoggerOption(dialerLogger),
+			dialer.ProxyProtocolOption(ppv),
+		)
+	} else {
+		return nil, fmt.Errorf("unregistered dialer: %s", cfg.Dialer.Type)
+	}
+
+	if cfg.Dialer.Metadata == nil {
+		cfg.Dialer.Metadata = make(map[string]any)
+	}
+	if err := d.Init(mdx.NewMetadata(cfg.Dialer.Metadata)); err != nil {
+		dialerLogger.Error("init: ", err)
+		return nil, err
+	}
+
+	var sockOpts *chain.SockOpts
+	if cfg.SockOpts != nil {
+		sockOpts = &chain.SockOpts{
+			Mark: cfg.SockOpts.Mark,
+		}
+	}
+
+	tr := xchain.NewTransport(d, cr,
+		chain.AddrTransportOption(cfg.Addr),
+		chain.InterfaceTransportOption(cfg.Interface),
+		chain.NetnsTransportOption(cfg.Netns),
+		chain.SockOptsTransportOption(sockOpts),
+	)
+
+	opts := []chain.NodeOption{
+		chain.TransportNodeOption(tr),
+		chain.BypassNodeOption(xbypass.BypassGroup(bypass_parser.List(cfg.Bypass, cfg.Bypasses...)...)),
+		chain.ResoloverNodeOption(registry.ResolverRegistry().Get(cfg.Resolver)),
+		chain.HostMapperNodeOption(registry.HostsRegistry().Get(cfg.Hosts)),
+		chain.MetadataNodeOption(nm),
+		chain.NetworkNodeOption(cfg.Network),
+	}
+
+	if filter := cfg.Filter; filter != nil {
+		// convert *.example.com to .example.com
+		// convert *example.com to example.com
+		host := filter.Host
+		if strings.HasPrefix(host, "*") {
+			host = host[1:]
+			if !strings.HasPrefix(host, ".") {
+				host = "." + host
+			}
+		}
+
+		settings := &chain.NodeFilterSettings{
+			Protocol: filter.Protocol,
+			Host:     host,
+			Path:     filter.Path,
+		}
+		opts = append(opts, chain.NodeFilterOption(settings))
+	}
+
+	if cfg.Matcher != nil {
+		priority := cfg.Matcher.Priority
+
+		if rule := strings.TrimSpace(cfg.Matcher.Rule); rule != "" {
+			matcher, err := routing.NewMatcher(rule)
+			if err != nil {
+				// Fail closed (D3-05): an invalid matcher rule must
+				// abort the node parse. Keeping the node without its
+				// matcher would silently widen it to serve every
+				// host/path in its hop.
+				return nil, fmt.Errorf("node %s: invalid matcher rule: %w", cfg.Name, err)
+			}
+			log.Debugf("new matcher for node %s with rule %s", cfg.Name, cfg.Matcher.Rule)
+			if priority == 0 {
+				priority = len(cfg.Matcher.Rule)
+			}
+			opts = append(opts, chain.MatcherNodeOption(matcher))
+		}
+
+		opts = append(opts, chain.PriorityNodeOption(priority))
+	}
+
+	if cfg.HTTP != nil {
+		settings := &chain.HTTPNodeSettings{
+			Host:           cfg.HTTP.Host,
+			RequestHeader:  cfg.HTTP.RequestHeader,
+			ResponseHeader: cfg.HTTP.ResponseHeader,
+		}
+		if settings.RequestHeader == nil {
+			settings.RequestHeader = cfg.HTTP.Header
+		}
+
+		if auth := cfg.HTTP.Auth; auth != nil && auth.Username != "" {
+			settings.Auther = xauth.NewAuthenticator(
+				xauth.AuthsOption(map[string]string{auth.Username: auth.Password}),
+				xauth.LoggerOption(log.WithFields(map[string]any{
+					"kind": "node",
+					"node": cfg.Name,
+					"addr": cfg.Addr,
+				})),
+			)
+		}
+
+		rewriteURL := cfg.HTTP.RewriteURL
+		if rewriteURL == nil {
+			rewriteURL = cfg.HTTP.Rewrite
+		}
+		for _, v := range rewriteURL {
+			if pattern, _ := regexp.Compile(v.Match); pattern != nil {
+				settings.RewriteURL = append(settings.RewriteURL, chain.HTTPURLRewriteSetting{
+					Pattern:     pattern,
+					Replacement: v.Replacement,
+				})
+			}
+		}
+		for _, v := range cfg.HTTP.RewriteBody {
+			if pattern, _ := regexp.Compile(v.Match); pattern != nil {
+				settings.RewriteResponseBody = append(settings.RewriteResponseBody, chain.HTTPBodyRewriteSettings{
+					Type:        v.Type,
+					Pattern:     pattern,
+					Replacement: []byte(v.Replacement),
+				})
+			}
+		}
+		opts = append(opts, chain.HTTPNodeOption(settings))
+	}
+
+	if cfg.TLS != nil {
+		tlsCfg := &chain.TLSNodeSettings{
+			ServerName: cfg.TLS.ServerName,
+			Secure:     cfg.TLS.Secure,
+		}
+		if o := cfg.TLS.Options; o != nil {
+			tlsCfg.Options.MinVersion = o.MinVersion
+			tlsCfg.Options.MaxVersion = o.MaxVersion
+			tlsCfg.Options.CipherSuites = o.CipherSuites
+			tlsCfg.Options.ALPN = o.ALPN
+		}
+		opts = append(opts, chain.TLSNodeOption(tlsCfg))
+	}
+	node := chain.NewNode(cfg.Name, cfg.Addr, opts...)
+	ownedByTransport = true
+	return node, nil
+}
+
+// isTLSFamilyDialerType reports whether a dialer type carries its traffic
+// over TLS (R18-F1-01): tls/mtls are raw TLS, wss/mwss are TLS-wrapped
+// WebSocket. All four share the node-parse dialer TLS face and therefore
+// the same unauthenticated-hop exposure when Secure is false.
+func isTLSFamilyDialerType(dialerType string) bool {
+	switch strings.ToLower(strings.TrimSpace(dialerType)) {
+	case "tls", "mtls", "wss", "mwss":
+		return true
+	default:
+		return false
+	}
+}
+
+// insecureTLSDialWarning returns the startup warning for a TLS-family
+// chain dial hop whose TLS config does not verify the peer certificate
+// (R18-F1-01 transition hardening). It returns ("", false) for non-TLS
+// dialers and for verified dialers (Secure=true). The message names the
+// hop and the dialer type so an operator can tell which chain leg is
+// unauthenticated; it points at the panel-issued tunnel certificates
+// that remove the warning.
+func insecureTLSDialWarning(hop, dialerType string, tlsCfg *config.TLSConfig) (string, bool) {
+	if tlsCfg == nil || tlsCfg.Secure || !isTLSFamilyDialerType(dialerType) {
+		return "", false
+	}
+	return fmt.Sprintf("R18-F1-01: TLS dial hop %q (dialer %q) does not verify the peer certificate (secure=false, no CA): the hop is encrypted but unauthenticated, a network-position attacker can impersonate the next hop; issue panel tunnel certificates for this node to verify it", hop, strings.ToLower(strings.TrimSpace(dialerType))), true
+}

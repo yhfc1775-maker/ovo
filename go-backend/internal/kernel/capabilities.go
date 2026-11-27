@@ -1,0 +1,520 @@
+// Package kernel turns panel-side inbound definitions into proxy-kernel
+// configuration (Xray, sing-box, ...). Everything here is pure so it can
+// be covered by golden tests; the HTTP layer only persists and dispatches.
+package kernel
+
+import (
+	"fmt"
+	"regexp"
+	"strings"
+)
+
+// SingboxForkRepo 是 sing-box 的 OVO fork 仓库：上游 SagerNet/sing-box
+// 的入站返回包队列只有 64，200 包零间隔突发会静默丢包；fork 把队列
+// 扩到 1024（1.14.4-flmx1）。面板侧全部 sing-box 默认面（下载 URL、
+// GitHub 锚定、版本列表）都以该常量为准，不再分叉写仓名；上游仓仅
+// 在 gh_mirror allowlist 里保留作回退，不作默认。
+const SingboxForkRepo = "iiiiiiiii7125-art/sing-box"
+
+// singboxForkSuffixPattern 是 fork 构建的版本后缀（1.14.4-flmx1）：
+// 与 handler 的 forkVersionSuffixPattern 同口径（白名单后缀），
+// 仅用于区分 fork 构建与上游构建，不参与版本高低比较。
+var singboxForkSuffixPattern = regexp.MustCompile(`^-flmx[0-9A-Za-z]*$`)
+
+// IsForkVersion reports whether a concrete sing-box version names a
+// FLMX fork build (发现 1)：fork 构建带 "-flmx*" 后缀
+// （1.14.4-flmx1）；裸底版（1.14.4）是回滚用的上游构建，不含入站
+// 返回包队列修复。latest/空串不是具体构建，返回 false。
+func IsForkVersion(version string) bool {
+	v := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(version), "v"))
+	if i := strings.IndexByte(v, '-'); i >= 0 {
+		return singboxForkSuffixPattern.MatchString(v[i:])
+	}
+	return false
+}
+
+// SingboxForkVersion 是当前唯一经核实的 fork 构建版本：fork 仓的
+// v1.14.4-flmx1 tag。latest 哨兵不得漂向它之外的 tag（见
+// kernelInstall 的 sing-box latest 拒绝与 apply 期的存量收敛钉死）。
+const SingboxForkVersion = "1.14.4-flmx1"
+
+const (
+	TypeXray    = "xray"
+	TypeSingbox = "singbox"
+	// TypeSingboxCompanion is the managed second sing-box instance
+	// that runs the metering companions (C-03). It is not an
+	// installable kernel: it lives outside the catalog (the install
+	// UI never offers it) and is resolved by Lookup's special case.
+	TypeSingboxCompanion = "singbox-companion"
+)
+
+const (
+	ProtocolVLESS       = "vless"
+	ProtocolVMess       = "vmess"
+	ProtocolTrojan      = "trojan"
+	ProtocolShadowsocks = "shadowsocks"
+	ProtocolHysteria2   = "hysteria2"
+	ProtocolTUIC        = "tuic"
+	ProtocolAnyTLS      = "anytls"
+	ProtocolSnell       = "snell"
+	ProtocolNaive       = "naive"
+)
+
+const (
+	TransportTCP   = "tcp"
+	TransportWS    = "ws"
+	TransportGRPC  = "grpc"
+	TransportXHTTP = "xhttp"
+	TransportQUIC  = "quic"
+)
+
+const (
+	SecurityNone      = "none"
+	SecurityTLS       = "tls"
+	SecurityReality   = "reality"
+	SecurityShadowTLS = "shadowtls"
+)
+
+// TransportCap lists which security layers a transport accepts for a protocol.
+type TransportCap struct {
+	Type       string   `json:"type"`
+	Securities []string `json:"securities"`
+}
+
+type ProtocolCap struct {
+	Protocol   string         `json:"protocol"`
+	Transports []TransportCap `json:"transports"`
+}
+
+// Download describes where an agent fetches the kernel binary. {VERSION} and
+// {ARCH} are substituted by the agent; ArchMap translates GOARCH to the
+// release asset naming of the kernel project.
+type Download struct {
+	URL string `json:"url"`
+	// R18-C2-02：LatestURL/ChecksumURL/LatestSum 是历史遗留字段，
+	// 不得使用——downloadSpec 的 default 分支已 fail-closed，任何
+	// 未配 Pinned 或 GitHubRepo 的 Download 均拒绝生成 spec，设置
+	// 这三个字段也不会再产生 checksumUrl 锚。字段本身保留（不删）
+	// 只是为了不改 Download 的序列化形态；GeoFile 的 ChecksumURL
+	//（split.go）是另一结构（GeoData 同源单锚残留，见 §八①），
+	// 不受本条影响。
+	LatestURL   string            `json:"latestUrl"`
+	ChecksumURL string            `json:"checksumUrl"`
+	LatestSum   string            `json:"latestChecksumUrl"`
+	Archive     string            `json:"archive"`
+	BinName     string            `json:"binName"`
+	ArchMap     map[string]string `json:"archMap"`
+	// Pinned SHA-256 per version and mapped arch, for projects that publish
+	// no checksum files. Only these versions install.
+	Pinned map[string]map[string]string `json:"-"`
+	// GitHub repo + asset template for digest lookup ("" when unused).
+	GitHubRepo  string `json:"-"`
+	GitHubAsset string `json:"-"`
+	// Mirrorable: this download may go through a GitHub mirror prefix
+	// (the agent's built-in candidate routes since 1.7.7; the panel's
+	// removed github_proxy_url setting no longer feeds this).
+	Mirrorable bool `json:"-"`
+}
+
+type Info struct {
+	Type        string        `json:"type"`
+	Name        string        `json:"name"`
+	Implemented bool          `json:"implemented"`
+	Protocols   []ProtocolCap `json:"protocols"`
+	// Versions, when set, is the closed list of installable versions (the
+	// first is the default); otherwise any version or "latest" is allowed.
+	Versions []string `json:"versions,omitempty"`
+	// DefaultVersion, when set, is the version the install form
+	// defaults to for an open-list kernel (F-LB-01): sing-box has no
+	// closed list, so the picker cannot take versions[0] — without
+	// this the form falls back to the literal "latest", which the
+	// install endpoint refuses for sing-box. The value is the
+	// verified fork build, never "latest"; kernels without a
+	// default keep the "latest" fallback.
+	DefaultVersion string `json:"defaultVersion,omitempty"`
+	// ReleaseRepo is the GitHub repository whose releases list the
+	// installable versions when Versions is empty.
+	ReleaseRepo string `json:"-"`
+	// CertModes lists the TLS certificate sources the kernel supports.
+	CertModes []string  `json:"certModes"`
+	Download  *Download `json:"-"`
+	// Relay kernels run forwards, not inbounds: the panel installs them
+	// itself and the UI keeps them out of the add-kernel list.
+	Relay bool `json:"relay,omitempty"`
+}
+
+// Xray gets the sing-box treatment (C2-02): the integrity anchor is the
+// GitHub release API's asset digest, not the .dgst checksum file served
+// from the same release as the binary. A co-located checksum file is a
+// single self-consistent anchor — one route serving a fake (binary,
+// .dgst) pair installs whenever the agent's cross-route corroboration
+// degrades to that route. The API digest is corroborated cross-route
+// by the agent and a release without a digest fails closed.
+var xrayDownload = &Download{
+	URL:         "https://github.com/XTLS/Xray-core/releases/download/v{VERSION}/Xray-linux-{ARCH}.zip",
+	Archive:     "zip",
+	BinName:     "xray",
+	ArchMap:     map[string]string{"amd64": "64", "arm64": "arm64-v8a", "386": "32", "arm": "arm32-v7a"},
+	GitHubRepo:  "XTLS/Xray-core",
+	GitHubAsset: "Xray-linux-{ARCH}.zip",
+	Mirrorable:  true,
+}
+
+// sing-box publishes no checksum files; the agent verifies against the
+// GitHub release asset digest. The default source is the OVO fork
+// (SingboxForkRepo), whose 1.14.4-flmx1 build carries the enlarged
+// inbound return-packet queue; upstream SagerNet/sing-box is retained
+// only in the gh_mirror allowlist as a fallback, never as the default.
+var singboxDownload = &Download{
+	URL:         "https://github.com/" + SingboxForkRepo + "/releases/download/v{VERSION}/sing-box-{VERSION}-linux-{ARCH}.tar.gz",
+	Archive:     "tar.gz",
+	BinName:     "sing-box",
+	ArchMap:     map[string]string{"amd64": "amd64", "arm64": "arm64", "arm": "armv7", "386": "386"},
+	GitHubRepo:  SingboxForkRepo,
+	GitHubAsset: "sing-box-{VERSION}-linux-{ARCH}.tar.gz",
+	Mirrorable:  true,
+}
+
+var catalog = []Info{
+	{
+		Type:        TypeXray,
+		Name:        "Xray",
+		Implemented: true,
+		ReleaseRepo: "XTLS/Xray-core",
+		CertModes:   []string{"self", "file"},
+		Download:    xrayDownload,
+		Protocols: []ProtocolCap{
+			{Protocol: ProtocolVLESS, Transports: []TransportCap{
+				{Type: TransportTCP, Securities: []string{SecurityReality, SecurityTLS, SecurityNone}},
+				{Type: TransportXHTTP, Securities: []string{SecurityReality, SecurityTLS, SecurityNone}},
+				{Type: TransportGRPC, Securities: []string{SecurityReality, SecurityTLS, SecurityNone}},
+				{Type: TransportWS, Securities: []string{SecurityTLS, SecurityNone}},
+			}},
+			{Protocol: ProtocolVMess, Transports: []TransportCap{
+				{Type: TransportTCP, Securities: []string{SecurityTLS, SecurityNone}},
+				{Type: TransportWS, Securities: []string{SecurityTLS, SecurityNone}},
+				{Type: TransportGRPC, Securities: []string{SecurityTLS, SecurityNone}},
+			}},
+			{Protocol: ProtocolTrojan, Transports: []TransportCap{
+				{Type: TransportTCP, Securities: []string{SecurityTLS, SecurityReality}},
+				{Type: TransportWS, Securities: []string{SecurityTLS}},
+				{Type: TransportGRPC, Securities: []string{SecurityTLS, SecurityReality}},
+			}},
+			{Protocol: ProtocolShadowsocks, Transports: []TransportCap{
+				{Type: TransportTCP, Securities: []string{SecurityNone}},
+			}},
+		},
+	},
+	{
+		Type:           TypeSingbox,
+		Name:           "sing-box",
+		Implemented:    true,
+		ReleaseRepo:    SingboxForkRepo,
+		DefaultVersion: SingboxForkVersion,
+		CertModes:      []string{"self", "file", "acme"},
+		Download:       singboxDownload,
+		Protocols: []ProtocolCap{
+			{Protocol: ProtocolHysteria2, Transports: []TransportCap{{Type: TransportQUIC, Securities: []string{SecurityTLS}}}},
+			{Protocol: ProtocolTUIC, Transports: []TransportCap{{Type: TransportQUIC, Securities: []string{SecurityTLS}}}},
+			{Protocol: ProtocolAnyTLS, Transports: []TransportCap{{Type: TransportTCP, Securities: []string{SecurityTLS}}}},
+			{Protocol: ProtocolNaive, Transports: []TransportCap{{Type: TransportTCP, Securities: []string{SecurityTLS}}}},
+			{Protocol: ProtocolVLESS, Transports: []TransportCap{
+				{Type: TransportTCP, Securities: []string{SecurityReality, SecurityTLS, SecurityNone}},
+				{Type: TransportWS, Securities: []string{SecurityTLS, SecurityNone}},
+				{Type: TransportGRPC, Securities: []string{SecurityTLS, SecurityNone, SecurityReality}},
+			}},
+			{Protocol: ProtocolVMess, Transports: []TransportCap{
+				{Type: TransportTCP, Securities: []string{SecurityTLS, SecurityNone}},
+				{Type: TransportWS, Securities: []string{SecurityTLS, SecurityNone}},
+				{Type: TransportGRPC, Securities: []string{SecurityTLS, SecurityNone}},
+			}},
+			{Protocol: ProtocolTrojan, Transports: []TransportCap{
+				{Type: TransportTCP, Securities: []string{SecurityTLS, SecurityReality}},
+				{Type: TransportWS, Securities: []string{SecurityTLS}},
+				{Type: TransportGRPC, Securities: []string{SecurityTLS, SecurityReality}},
+			}},
+			{Protocol: ProtocolShadowsocks, Transports: []TransportCap{
+				{Type: TransportTCP, Securities: []string{SecurityNone, SecurityShadowTLS}},
+			}},
+		},
+	},
+	{
+		Type:        TypeRealm,
+		Name:        "realm",
+		Implemented: true,
+		CertModes:   []string{},
+		Download:    realmDownload,
+		Versions:    []string{RealmVersion},
+		Protocols:   []ProtocolCap{},
+		Relay:       true,
+	},
+}
+
+// Catalog returns every known kernel; unimplemented ones are listed so the UI
+// can show them as upcoming.
+func Catalog() []Info {
+	out := make([]Info, len(catalog))
+	copy(out, catalog)
+	return out
+}
+
+// normalizeKernelType folds user-supplied kernel names onto the catalog
+// key space: lower-case, trim, and drop hyphens. The catalog display
+// name for sing-box is "sing-box" while its Type is "singbox", so the
+// alias is the name every operator naturally types (M-0001). Before
+// this, the alias failed three faces with three different wordings:
+// /kernel/versions said "未知内核", inbound creation said "请先在该
+// 节点安装内核" (misleading — the kernel was installed), and
+// Normalize said "暂不支持内核 sing-box".
+func normalizeKernelType(kernelType string) string {
+	return strings.ReplaceAll(strings.ToLower(strings.TrimSpace(kernelType)), "-", "")
+}
+
+// CanonicalKernelType returns the catalog Type for a kernel name, or
+// the normalized input when it names no known kernel, so DB lookups
+// keep today's not-found behaviour for genuinely unknown names.
+func CanonicalKernelType(kernelType string) string {
+	if info, ok := Lookup(kernelType); ok {
+		return info.Type
+	}
+	return normalizeKernelType(kernelType)
+}
+
+func Lookup(kernelType string) (Info, bool) {
+	kernelType = normalizeKernelType(kernelType)
+	for _, info := range catalog {
+		if info.Type == kernelType {
+			return info, true
+		}
+	}
+	// C-03: the metering companion is a managed second sing-box
+	// instance, not an installable kernel — it lives outside the
+	// catalog so the install UI never offers it, but Lookup must
+	// resolve it for payload building and version gates. Relay stays
+	// false: the companion renders a plain sing-box config, never a
+	// realm payload.
+	if kernelType == normalizeKernelType(TypeSingboxCompanion) {
+		if info, ok := Lookup(TypeSingbox); ok {
+			info.Type = TypeSingboxCompanion
+			info.Name = "sing-box (companion)"
+			return info, true
+		}
+	}
+	return Info{}, false
+}
+
+// EffectiveType folds the managed companion type onto its render family:
+// a companion instance renders exactly like sing-box. All render-side
+// type comparisons (settings conditions, version gates, outbound-IP
+// policy) must use this, never the raw companion type — those checks
+// compare against TypeSingbox/TypeXray and would misjudge the
+// companion string (notably NormalizeOutboundIPStrategy, which rejects
+// a non-auto strategy for any other type).
+func EffectiveType(kernelType string) string {
+	if normalizeKernelType(kernelType) == normalizeKernelType(TypeSingboxCompanion) {
+		return TypeSingbox
+	}
+	return kernelType
+}
+
+// ComboSupported 只读判断 (协议, 传输, 安全层) 是否在该内核的 catalog 内，
+// 供下发前复检使用：历史脏数据不得在渲染层被静默降级，必须整单拒绝并报错。
+// transport 为空按 Normalize 的缺省（有 tcp 用 tcp、否则该协议的首个
+// 传输，W3/P-001 两面同口径）。security 为空则不豁免、直接判不支持
+// （W3/P-002）：合法存量行的安全层恒由 Normalize 填充，空值只可能是
+// 毒行，而渲染面按字面消费空值（如 trojan 空安全层渲染为无 TLS、
+// 弱于界面所示），复检面若放行即等于背书该降级——拒绝由调用方点名
+// 整单报错。
+func ComboSupported(kernelType, protocol, transport, security string) bool {
+	info, ok := Lookup(kernelType)
+	if !ok {
+		return false
+	}
+	pc, ok := info.protocol(protocol)
+	if !ok {
+		return false
+	}
+	if transport == "" {
+		transport = TransportTCP
+		if _, ok := pc.transport(transport); !ok && len(pc.Transports) > 0 {
+			transport = pc.Transports[0].Type
+		}
+	}
+	tc, ok := pc.transport(transport)
+	if !ok {
+		return false
+	}
+	if security == "" {
+		return false
+	}
+	for _, s := range tc.Securities {
+		if s == security {
+			return true
+		}
+	}
+	return false
+}
+
+func (info Info) protocol(name string) (ProtocolCap, bool) {
+	for _, p := range info.Protocols {
+		if p.Protocol == name {
+			return p, true
+		}
+	}
+	return ProtocolCap{}, false
+}
+
+func (p ProtocolCap) transport(name string) (TransportCap, bool) {
+	for _, t := range p.Transports {
+		if t.Type == name {
+			return t, true
+		}
+	}
+	return TransportCap{}, false
+}
+
+func containsString(list []string, v string) bool {
+	for _, item := range list {
+		if item == v {
+			return true
+		}
+	}
+	return false
+}
+
+// kernelVersionPattern mirrors the agent's safeVersionPattern
+// (go-gost/x/kernel): a concrete version is a single URL path segment —
+// alphanumeric start, then alphanumerics, dots and dashes, at most 40
+// chars. validKernelVersion additionally rejects "..", which the bare
+// charset admits ("1..2") but a path segment must never contain.
+//
+// C2-01: this validation lives in the kernel package as the single
+// point. Before, ResolveVersion/downloadSpec substituted the version
+// into download URL templates unchecked, and the only guards were the
+// handler's normaliser and the agent's pattern — any future caller
+// bypassing the normaliser silently reopened template injection.
+//
+// 规范文法（R2-P2-11 收敛，本点为规范表述）:版本/tag 单段文法＝
+// ^[0-9A-Za-z][0-9A-Za-z.-]{0,39}$（首字符字母数字、总长 ≤40）且
+// 不含 ".."。其余实现点——agent safeVersionPattern（镜像本点）、
+// handler normalizeKernelVersion、validateUpgradeVersion、
+// redirectTagPattern、脚本 panel_validate_explicit_version 与
+// version_value_format_ok——一律按本规范对齐边缘;保留差异者必须
+// 在各自实现处点名并给出理由,新增版本文法实现点须先对照本规范。
+var kernelVersionPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9.-]{0,39}$`)
+
+func validKernelVersion(version string) bool {
+	return kernelVersionPattern.MatchString(version) && !strings.Contains(version, "..")
+}
+
+// ResolveVersion maps a requested version to the one that will be installed:
+// kernels with a closed version list use their default for "latest" and
+// reject anything else they cannot verify.
+func ResolveVersion(info Info, version string) (string, error) {
+	version = strings.TrimPrefix(strings.TrimSpace(version), "v")
+	if len(info.Versions) == 0 {
+		if version == "" {
+			return "latest", nil
+		}
+		if strings.EqualFold(version, "latest") {
+			return version, nil
+		}
+		if !validKernelVersion(version) {
+			return "", fmt.Errorf("版本号 %s 格式不正确", version)
+		}
+		return version, nil
+	}
+	if version == "" || strings.EqualFold(version, "latest") {
+		return info.Versions[0], nil
+	}
+	for _, v := range info.Versions {
+		if v == version {
+			return version, nil
+		}
+	}
+	return "", fmt.Errorf("%s 仅支持版本 %s", info.Name, strings.Join(info.Versions, " / "))
+}
+
+// ResolveDownload builds the agent download spec for an installable version.
+// proxy, when non-empty, prefixes GitHub URLs the same way agent upgrades are
+// mirrored.
+func ResolveDownload(info Info, version, proxy string) (map[string]interface{}, error) {
+	if info.Download == nil {
+		return nil, fmt.Errorf("%s 没有下载信息", info.Name)
+	}
+	version, err := ResolveVersion(info, version)
+	if err != nil {
+		return nil, err
+	}
+	return downloadSpec(info.Download, version, proxy)
+}
+
+func downloadSpec(d *Download, version, proxy string) (map[string]interface{}, error) {
+	// C2-01: downloadSpec is the funnel every spec build passes through
+	// (via ResolveDownload), so the version is validated here as
+	// well — a caller that skips ResolveVersion still cannot inject
+	// into the URL template.
+	if version != "" && !strings.EqualFold(version, "latest") && !validKernelVersion(version) {
+		return nil, fmt.Errorf("版本号 %s 格式不正确", version)
+	}
+	proxy = strings.TrimSuffix(strings.TrimSpace(proxy), "/")
+	if !d.Mirrorable {
+		proxy = ""
+	}
+	mirror := func(u string) string {
+		if proxy == "" || u == "" {
+			return u
+		}
+		return proxy + "/" + u
+	}
+	archMap := make(map[string]string, len(d.ArchMap))
+	for k, v := range d.ArchMap {
+		archMap[k] = v
+	}
+	spec := map[string]interface{}{
+		"archive": d.Archive,
+		"binName": d.BinName,
+		"archMap": archMap,
+	}
+	latest := version == "" || strings.EqualFold(version, "latest")
+
+	switch {
+	case d.Pinned != nil:
+		sums, ok := d.Pinned[version]
+		if !ok {
+			return nil, fmt.Errorf("版本 %s 没有内置校验值，无法安装", version)
+		}
+		pinned := make(map[string]string, len(sums))
+		for k, v := range sums {
+			pinned[k] = v
+		}
+		// Arches without a build of this version are left out, so the
+		// agent reports an unsupported arch instead of a missing checksum.
+		for goarch, arch := range archMap {
+			if _, ok := sums[arch]; !ok {
+				delete(archMap, goarch)
+			}
+		}
+		spec["url"] = mirror(strings.ReplaceAll(d.URL, "{VERSION}", version))
+		spec["sha256"] = pinned
+	case d.GitHubRepo != "":
+		gh := map[string]interface{}{"repo": d.GitHubRepo, "asset": d.GitHubAsset, "proxy": proxy}
+		if latest {
+			spec["url"] = d.URL // {VERSION} left for the agent to resolve
+		} else {
+			spec["url"] = mirror(strings.ReplaceAll(d.URL, "{VERSION}", version))
+			gh["tag"] = "v" + version
+		}
+		spec["github"] = gh
+	default:
+		// R18-C2-02：此前 default 分支按 URL+ChecksumURL 生成
+		// 单锚 checksumUrl spec——与本体同源的校验文件，一条线路
+		// 即可投放自洽的伪造（二进制、校验文件）对，退回旧审计
+		// C2-02 已修复的弱锚形态。该分支在现有 catalog 上是死代码
+		//（三个 Download 全部走 Pinned 或 GitHubRepo），但一旦被
+		// 未来新增的内核复用即悄悄退化，故 fail-closed：未配完整
+		// 性锚的 Download 一律拒绝生成 spec，不再发出 checksumUrl。
+		return nil, fmt.Errorf("内核下载未配置完整性锚（需 Pinned 或 GitHubRepo），拒绝生成 spec")
+	}
+	return spec, nil
+}

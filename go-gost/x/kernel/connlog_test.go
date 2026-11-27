@@ -1,0 +1,658 @@
+package kernel
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+// Sing-box fixture lines below are in the real LEVEL[uptime]
+// [connID elapsed] shape (LIVE-215 true-machine 1.14.4 lines pin
+// the grammar; see TestSingboxReal1144Lines). The pre-fix fixtures
+// carried the fabricated bare "LEVEL [id elapsed]" shape (no
+// [uptime] bracket, never emitted by any sing-box version — see
+// sbLineRe) and were migrated by inserting the [0000] uptime
+// bracket the real logger always emits; ids, elapsed values,
+// subsystems and messages are unchanged. The Xray lines are
+// untouched (out of scope for this fix).
+const (
+	sbOpenSlow   = "+0000 2026-11-09 21:25:34 INFO[0000] [431050131 0ms] inbound/socks[in-101]: inbound connection from 127.0.0.1:54754"
+	sbToSlow     = "+0000 2026-11-09 21:25:34 INFO[0000] [431050131 0ms] inbound/socks[in-101]: inbound connection to 127.0.0.1:18080"
+	sbDownFin    = "+0000 2026-11-09 21:25:36 DEBUG[0000] [431050131 2.60s] connection: connection download finished"
+	sbUpFin      = "+0000 2026-11-09 21:25:36 DEBUG[0000] [431050131 2.65s] connection: connection upload finished"
+	sbOpenAuth   = "+0000 2026-11-09 21:25:35 INFO[0000] [3060665359 0ms] inbound/socks[in-101]: inbound connection from 127.0.0.1:57134"
+	sbAuthFail   = "+0000 2026-11-09 21:25:35 ERROR[0000] [3060665359 0ms] inbound/socks[in-101]: process connection from 127.0.0.1:57134: socks5: authentication failed, username=u1, password=hunter2pw"
+	sbOpenRefuse = "+0000 2026-11-09 21:25:35 INFO[0000] [4140354012 0ms] inbound/socks[in-101]: inbound connection from 127.0.0.1:57144"
+	sbRefused    = "+0000 2026-11-09 21:25:35 ERROR[0000] [4140354012 3ms] connection: open connection to 127.0.0.1:19999 using outbound/direct[direct]: dial tcp 127.0.0.1:19999: connect: connection refused"
+	sbOpenSS     = "+0000 2026-11-09 21:25:35 INFO[0000] [2867101150 0ms] inbound/shadowsocks[in-102]: inbound connection from 127.0.0.1:39386"
+	sbSSFail     = "+0000 2026-11-09 21:25:35 ERROR[0000] [2867101150 0ms] inbound/shadowsocks[in-102]: process connection from 127.0.0.1:39386: shadowsocks: serve TCP from 127.0.0.1:39386: cipher: message authentication failed"
+	sbOpenPkt    = "+0000 2026-11-09 21:25:36 INFO[0000] [2803896598 0ms] inbound/socks[in-101]: inbound packet connection from 127.0.0.1:40000"
+	sbPktFin     = "+0000 2026-11-09 21:25:38 DEBUG[0000] [2803896598 2.60s] connection: packet download finished"
+
+	xrAccepted = "2026/11/09 21:39:56.020145 from tcp:127.0.0.1:55038 accepted tcp:127.0.0.1:18080 [in-201 >> direct]"
+	xrRejected = "2026/11/09 21:39:59.236063 from tcp:127.0.0.1:55040 rejected  proxy/socks: invalid username or password"
+	xrRejectV  = "2026/11/09 21:40:01.227131 from 127.0.0.1:45848 rejected  proxy/vless/encoding: invalid request user id: 00000000-0000-0000-0000-000000000000"
+)
+
+// xrUserLine builds an Xray access line for a connection from the
+// given peer on the given bracket (e.g. "in-348 -> ovo-u77"),
+// stamped at the current time. The kill map prunes entries older
+// than killPeerTTL, so a canned 2026-11-09 timestamp would be
+// dropped before it is read.
+func xrUserLine(peer, bracket string) string {
+	ts := time.Now().Format("2006/01/02 15:04:05.000000")
+	return ts + " from tcp:" + peer + " accepted tcp:127.0.0.1:18080 [" + bracket + "]"
+}
+
+func utcMs(sec int) int64 {
+	return time.Date(2026, 11, 9, 21, 25, sec, 0, time.UTC).UnixMilli()
+}
+
+func newTestCollector(kernelType string, ids ...int64) (*connLogCollector, *ConnLogBuffer) {
+	buf := NewConnLogBuffer()
+	c := newConnLogCollector(kernelType, buf)
+	c.setOptIns(connLogTags(ids))
+	return c, buf
+}
+
+// LIVE-215 true-machine captured lines (sing-box 1.14.4, grid 2A:
+// agent log ring on node 1, 2026-11-11). Verbatim, except the
+// finished line: the 2A evidence prints it as
+// "DEBUG[0025] [834714304 10.0s] connection upload/download finished"
+// (slash = either direction, subsystem prefix elided in the prose);
+// a literal slash line has no "tag: message" split and cannot occur
+// in sing-box output, so it is restored to the source-verified form
+// "connection: connection upload finished" (route/conn.go, per U4;
+// same form as sbUpFin). Level, uptime, id and elapsed are verbatim.
+const (
+	sbReal1144OpenSS  = "INFO[0015] [834714304 0ms] inbound/shadowsocks[in-69]: inbound connection from 127.0.0.1:30304"
+	sbReal1144Fin     = "DEBUG[0025] [834714304 10.0s] connection: connection upload finished"
+	sbReal1144OpenHy2 = "INFO[0026] [978362404 0ms] inbound/hysteria2[in-70]: inbound packet connection from 127.0.0.1:44244"
+)
+
+// TestSingboxReal1144Lines pins the parser to the sing-box 1.14.4
+// lines the LIVE-215 true machine actually emitted (grid 2A, red 2):
+// LEVEL[uptime] [connID elapsed], no wall-clock prefix. The old
+// grammar (LEVEL [connID elapsed], no [uptime] bracket) never
+// matched these lines, so the whole direct sing-box path was blind.
+func TestSingboxReal1144Lines(t *testing.T) {
+	c, buf := newTestCollector("singbox", 69, 70)
+	c.beginGeneration("singbox", time.UnixMilli(utcMs(30)))
+	now := time.UnixMilli(utcMs(40))
+	if !c.FeedAs("singbox", sbReal1144OpenSS, now) {
+		t.Fatal("real 1.14.4 SS open line not consumed")
+	}
+	if !c.FeedAs("singbox", sbReal1144Fin, now) {
+		t.Fatal("real 1.14.4 finished line not consumed")
+	}
+	if !c.FeedAs("singbox", sbReal1144OpenHy2, now) {
+		t.Fatal("real 1.14.4 Hy2 packet open line not consumed")
+	}
+	evs := buf.Drain(0)
+	if len(evs) != 3 {
+		t.Fatalf("events = %d, want 3 (SS open+close, Hy2 open): %+v", len(evs), evs)
+	}
+	open, cls, hy2 := evs[0], evs[1], evs[2]
+	if open.Type != ConnEventOpen || open.EntryID != "in-69" || open.ClientIP != "127.0.0.1" ||
+		open.ClientPort != 30304 || open.Network != "tcp" || open.SessionKind != ConnSessionKindTCP ||
+		open.StartMs != utcMs(40) {
+		t.Errorf("SS open event wrong: %+v", open)
+	}
+	if cls.Type != ConnEventClose || cls.ConnID != open.ConnID || cls.Status != ConnStatusClosed ||
+		cls.StartMs != utcMs(40) || cls.EndMs != utcMs(40)+10000 {
+		t.Errorf("SS close event wrong (kernel-reported 10.0s elapsed): %+v", cls)
+	}
+	if hy2.Type != ConnEventOpen || hy2.EntryID != "in-70" || hy2.ClientIP != "127.0.0.1" ||
+		hy2.ClientPort != 44244 || hy2.Network != "udp" || hy2.SessionKind != ConnSessionKindKernel {
+		t.Errorf("Hy2 packet open event wrong: %+v", hy2)
+	}
+}
+
+func TestParseSbElapsed(t *testing.T) {
+	cases := map[string]int64{
+		"0ms": 0, "3ms": 3, "999ms": 999,
+		"2.5s": 2050, "2.50s": 2500, "2.60s": 2600, "2.65s": 2650, "45s": 45000,
+		"1m30s": 90000, "2m5s": 125000,
+	}
+	for in, want := range cases {
+		got, ok := parseSbElapsed(in)
+		if !ok || got != want {
+			t.Errorf("parseSbElapsed(%q) = %d,%v; want %d,true", in, got, ok, want)
+		}
+	}
+	if _, ok := parseSbElapsed("soon"); ok {
+		t.Error("parseSbElapsed(soon) should fail")
+	}
+}
+
+func TestSingboxPairing(t *testing.T) {
+	c, buf := newTestCollector("singbox", 101)
+	c.beginGeneration("singbox", time.UnixMilli(utcMs(30)))
+	now := time.UnixMilli(utcMs(40))
+	if !c.FeedAs("singbox", sbOpenSlow, now) {
+		t.Fatal("open line not consumed")
+	}
+	if !c.FeedAs("singbox", sbToSlow, now) {
+		t.Fatal("to line not consumed")
+	}
+	if !c.FeedAs("singbox", sbDownFin, now) {
+		t.Fatal("download finished not consumed")
+	}
+	if !c.FeedAs("singbox", sbUpFin, now) {
+		t.Fatal("upload finished not consumed")
+	}
+	evs := buf.Drain(0)
+	if len(evs) != 2 {
+		t.Fatalf("events = %d, want 2 (open+close): %+v", len(evs), evs)
+	}
+	open, cls := evs[0], evs[1]
+	if open.Type != ConnEventOpen || open.EntryID != "in-101" || open.ClientIP != "127.0.0.1" ||
+		open.ClientPort != 54754 || open.Network != "tcp" || open.SessionKind != ConnSessionKindTCP ||
+		open.StartMs != utcMs(34) || open.EndMs != 0 || open.EntryKind != ConnEntryKindInbound {
+		t.Errorf("open event wrong: %+v", open)
+	}
+	if cls.Type != ConnEventClose || cls.ConnID != open.ConnID || cls.Status != ConnStatusClosed ||
+		cls.StartMs != utcMs(34) || cls.EndMs != utcMs(34)+2600 {
+		t.Errorf("close event wrong (duration must be the kernel-reported 2600ms): %+v", cls)
+	}
+}
+
+func TestSingboxErrorCloses(t *testing.T) {
+	now := time.UnixMilli(utcMs(40))
+
+	// Handshake failure under the inbound subsystem.
+	c, buf := newTestCollector("singbox", 101, 102)
+	c.beginGeneration("singbox", time.UnixMilli(utcMs(30)))
+	c.FeedAs("singbox", sbOpenAuth, now)
+	c.FeedAs("singbox", sbAuthFail, now)
+	evs := buf.Drain(0)
+	if len(evs) != 2 || evs[1].Type != ConnEventClose || evs[1].Status != ConnStatusClosed || evs[1].EndMs != evs[1].StartMs {
+		t.Fatalf("auth-fail pair wrong: %+v", evs)
+	}
+
+	// Dial failure under the connection subsystem.
+	c, buf = newTestCollector("singbox", 101)
+	c.beginGeneration("singbox", time.UnixMilli(utcMs(30)))
+	c.FeedAs("singbox", sbOpenRefuse, now)
+	c.FeedAs("singbox", sbRefused, now)
+	evs = buf.Drain(0)
+	if len(evs) != 2 || evs[1].Type != ConnEventClose || evs[1].EndMs != evs[1].StartMs+3 {
+		t.Fatalf("refused pair wrong: %+v", evs)
+	}
+
+	// A stand-alone process-connection failure (open line never
+	// seen) still materialises a close.
+	c, buf = newTestCollector("singbox", 102)
+	c.beginGeneration("singbox", time.UnixMilli(utcMs(30)))
+	c.FeedAs("singbox", sbSSFail, now)
+	evs = buf.Drain(0)
+	if len(evs) != 1 || evs[0].Type != ConnEventClose || evs[0].EntryID != "in-102" ||
+		evs[0].ClientIP != "127.0.0.1" || evs[0].ClientPort != 39386 || evs[0].Status != ConnStatusClosed {
+		t.Fatalf("stand-alone close wrong: %+v", evs)
+	}
+}
+
+// D-06：握手失败的独立终结行（open 行未见）不得硬编码
+// tcp/tcp_conn——QUIC 入站（tuic/hysteria2）流与包会话按
+// truth rule 是 kernel_session；包入站还是 udp。已跟踪连接经
+// pushClose 带正确 kind 的路径作回归对照。
+func TestSingboxTerminalKinds(t *testing.T) {
+	now := time.UnixMilli(utcMs(40))
+	c, buf := newTestCollector("singbox", 101, 103, 104)
+	c.beginGeneration("singbox", time.UnixMilli(utcMs(30)))
+	// Stand-alone handshake-failure terminals (open line never seen).
+	c.FeedAs("singbox", "+0000 2026-11-09 21:25:35 ERROR[0000] [777001 0ms] inbound/tuic[in-103]: process connection from 10.0.0.9:5000: tuic: handshake failed", now)
+	c.FeedAs("singbox", "+0000 2026-11-09 21:25:35 ERROR[0000] [777002 0ms] inbound/hysteria2[in-104]: process connection from 10.0.0.10:5001: hysteria2: handshake failed", now)
+	c.FeedAs("singbox", "+0000 2026-11-09 21:25:35 ERROR[0000] [777003 0ms] inbound/socks[in-101]: process packet connection from 127.0.0.1:40000: packet: invalid header", now)
+	evs := buf.Drain(0)
+	if len(evs) != 3 {
+		t.Fatalf("events = %d, want 3 stand-alone closes: %+v", len(evs), evs)
+	}
+	for _, ev := range evs {
+		if ev.Type != ConnEventClose || ev.Status != ConnStatusClosed {
+			t.Fatalf("stand-alone terminal must be a closed close: %+v", ev)
+		}
+	}
+	if evs[0].EntryID != "in-103" || evs[0].ClientIP != "10.0.0.9" || evs[0].ClientPort != 5000 ||
+		evs[0].Network != "tcp" || evs[0].SessionKind != ConnSessionKindKernel {
+		t.Errorf("tuic terminal must be a tcp kernel_session, never tcp_conn: %+v", evs[0])
+	}
+	if evs[1].EntryID != "in-104" || evs[1].ClientIP != "10.0.0.10" || evs[1].ClientPort != 5001 ||
+		evs[1].Network != "tcp" || evs[1].SessionKind != ConnSessionKindKernel {
+		t.Errorf("hysteria2 terminal must be a tcp kernel_session, never tcp_conn: %+v", evs[1])
+	}
+	if evs[2].EntryID != "in-101" || evs[2].ClientIP != "127.0.0.1" || evs[2].ClientPort != 40000 ||
+		evs[2].Network != "udp" || evs[2].SessionKind != ConnSessionKindKernel {
+		t.Errorf("packet terminal must be a udp kernel_session, never tcp_conn: %+v", evs[2])
+	}
+
+	// Tracked QUIC stream closed by its terminal line keeps kernel_session.
+	c2, buf2 := newTestCollector("singbox", 103)
+	c2.beginGeneration("singbox", time.UnixMilli(utcMs(30)))
+	c2.FeedAs("singbox", "+0000 2026-11-09 21:25:34 INFO[0000] [555 0ms] inbound/tuic[in-103]: inbound connection from 10.0.0.9:5000", now)
+	c2.FeedAs("singbox", "+0000 2026-11-09 21:25:35 ERROR[0000] [555 0ms] inbound/tuic[in-103]: process connection from 10.0.0.9:5000: tuic: handshake failed", now)
+	evs = buf2.Drain(0)
+	if len(evs) != 2 || evs[1].Type != ConnEventClose || evs[1].SessionKind != ConnSessionKindKernel {
+		t.Fatalf("tracked tuic terminal wrong: %+v", evs)
+	}
+}
+
+func TestSingboxGenerationIsolation(t *testing.T) {
+	c, buf := newTestCollector("singbox", 101)
+	now := time.UnixMilli(utcMs(40))
+	open111 := "+0000 2026-11-09 21:25:34 INFO[0000] [111 0ms] inbound/socks[in-101]: inbound connection from 127.0.0.1:50001"
+
+	// Generation 1: a connection left open at process exit is
+	// swept as interrupted with its last known timestamp.
+	c.beginGeneration("singbox", time.UnixMilli(1000))
+	c.FeedAs("singbox", open111, now)
+	c.endGeneration("singbox")
+	evs := buf.Drain(0)
+	if len(evs) != 2 || evs[1].Type != ConnEventClose || evs[1].Status != ConnStatusInterrupted ||
+		evs[1].EndMs != utcMs(34) {
+		t.Fatalf("generation sweep wrong: %+v", evs)
+	}
+	gen1ID := evs[0].ConnID
+
+	// Generation 2: the same raw id is a different connection.
+	c.beginGeneration("singbox", time.UnixMilli(2000))
+	c.FeedAs("singbox", open111, now)
+	c.FeedAs("singbox", "+0000 2026-11-09 21:25:36 DEBUG[0000] [111 1.20s] connection: connection download finished", now)
+	evs = buf.Drain(0)
+	if len(evs) != 2 || evs[0].ConnID == gen1ID || evs[1].Status != ConnStatusClosed || evs[1].EndMs != utcMs(34)+1200 {
+		t.Fatalf("generation 2 pairing wrong: %+v (gen1 id %s)", evs, gen1ID)
+	}
+
+	// Same-generation id reuse: the second open interrupts the
+	// first instead of corrupting it.
+	c2, buf2 := newTestCollector("singbox", 101)
+	c2.beginGeneration("singbox", time.UnixMilli(3000))
+	c2.FeedAs("singbox", "+0000 2026-11-09 21:25:34 INFO[0000] [222 0ms] inbound/socks[in-101]: inbound connection from 127.0.0.1:50002", now)
+	c2.FeedAs("singbox", "+0000 2026-11-09 21:25:35 INFO[0000] [222 0ms] inbound/socks[in-101]: inbound connection from 127.0.0.1:50003", now)
+	evs = buf2.Drain(0)
+	if len(evs) != 3 || evs[1].Type != ConnEventClose || evs[1].Status != ConnStatusInterrupted ||
+		evs[1].ClientPort != 50002 || evs[2].Type != ConnEventOpen || evs[2].ClientPort != 50003 {
+		t.Fatalf("id-reuse handling wrong: %+v", evs)
+	}
+}
+
+func TestSingboxPacketAndQuicKinds(t *testing.T) {
+	c, buf := newTestCollector("singbox", 101, 103)
+	c.beginGeneration("singbox", time.UnixMilli(utcMs(30)))
+	now := time.UnixMilli(utcMs(40))
+	c.FeedAs("singbox", sbOpenPkt, now)
+	c.FeedAs("singbox", sbPktFin, now)
+	c.FeedAs("singbox", "+0000 2026-11-09 21:25:36 INFO[0000] [555 0ms] inbound/tuic[in-103]: inbound connection from 10.0.0.9:5000", now)
+	evs := buf.Drain(0)
+	if len(evs) != 3 {
+		t.Fatalf("events = %d, want 3: %+v", len(evs), evs)
+	}
+	if evs[0].SessionKind != ConnSessionKindKernel || evs[0].Network != "udp" {
+		t.Errorf("packet open must be a udp kernel_session: %+v", evs[0])
+	}
+	if evs[1].Type != ConnEventClose || evs[1].EndMs != evs[1].StartMs+2600 {
+		t.Errorf("packet close wrong: %+v", evs[1])
+	}
+	if evs[2].SessionKind != ConnSessionKindKernel || evs[2].Network != "tcp" {
+		t.Errorf("tuic stream must be kernel_session (never tcp_conn): %+v", evs[2])
+	}
+}
+
+func TestSingboxOptInFiltering(t *testing.T) {
+	c, buf := newTestCollector("singbox", 101)
+	c.beginGeneration("singbox", time.UnixMilli(utcMs(30)))
+	now := time.UnixMilli(utcMs(40))
+	// Non-opted inbound: lines divert, no events.
+	if !c.FeedAs("singbox", sbOpenSS, now) {
+		t.Error("non-opted open line should still be diverted")
+	}
+	c.FeedAs("singbox", sbSSFail, now)
+	if n := buf.Len(); n != 0 {
+		t.Fatalf("non-opted inbound produced %d events", n)
+	}
+	// Not a per-connection line: not diverted.
+	if c.FeedAs("singbox", "+0000 2026-11-09 21:25:36 INFO inbound/socks: started", now) {
+		t.Error("bracket-less line must not be diverted")
+	}
+	// Collection switched off entirely: nothing is diverted.
+	c.setOptIns(nil)
+	if c.FeedAs("singbox", sbOpenSlow, now) {
+		t.Error("inactive collector must not divert")
+	}
+	// Switched back on without any process restart (the
+	// same-hash Apply case): parsing follows immediately.
+	c.setOptIns(connLogTags([]int64{101}))
+	if !c.FeedAs("singbox", sbOpenSlow, now) || buf.Len() != 1 {
+		t.Error("reactivated collector must parse again")
+	}
+}
+
+func TestSingboxLineShapes(t *testing.T) {
+	c, buf := newTestCollector("singbox", 101)
+	c.beginGeneration("singbox", time.UnixMilli(utcMs(30)))
+	// ANSI-wrapped variant (colorised rendering): the connection
+	// id and level arrive wrapped in escapes and must still parse.
+	wrapped := "+0000 2026-11-09 21:25:33 \x1b[36mINFO[0000]\x1b[0m [\x1b[38;5;38m4294444415\x1b[0m 0ms] inbound/socks[in-101]: inbound connection from 127.0.0.1:54750"
+	if !c.FeedAs("singbox", wrapped, time.UnixMilli(utcMs(40))) {
+		t.Fatal("ANSI-wrapped line not consumed")
+	}
+	// No timestamp prefix (log.timestamp=false): recvAt is the clock.
+	plain := "INFO[0000] [777 0ms] inbound/socks[in-101]: inbound connection from 127.0.0.1:40001"
+	recv := time.UnixMilli(123456789)
+	if !c.FeedAs("singbox", plain, recv) {
+		t.Fatal("timestamp-less line not consumed")
+	}
+	evs := buf.Drain(0)
+	if len(evs) != 2 || evs[0].ClientPort != 54750 || evs[1].StartMs != 123456789 {
+		t.Fatalf("line-shape events wrong: %+v", evs)
+	}
+}
+
+func TestXrayEventOnly(t *testing.T) {
+	c, buf := newTestCollector("xray", 201)
+	now := time.Now()
+	if !c.Feed(xrAccepted, now) {
+		t.Fatal("accepted line not consumed")
+	}
+	evs := buf.Drain(0)
+	if len(evs) != 1 {
+		t.Fatalf("events = %d, want 1: %+v", len(evs), evs)
+	}
+	ev := evs[0]
+	wantStart := time.Date(2026, 11, 9, 21, 39, 56, 20*1000*1000, time.Local).UnixMilli()
+	if ev.Type != ConnEventOpen || ev.SessionKind != ConnSessionKindEventOnly || ev.EndMs != 0 ||
+		ev.Status != "" || ev.EntryID != "in-201" || ev.ClientIP != "127.0.0.1" || ev.ClientPort != 55038 ||
+		ev.Network != "tcp" || ev.StartMs != wantStart || !strings.HasPrefix(ev.ConnID, "xr-") {
+		t.Errorf("event_only shape wrong: %+v (want start %d)", ev, wantStart)
+	}
+	// Deterministic id: replaying the same line replays to the
+	// same panel row.
+	c.Feed(xrAccepted, now)
+	evs = buf.Drain(0)
+	if len(evs) != 1 || evs[0].ConnID != ev.ConnID {
+		t.Fatalf("replay id not deterministic: %+v vs %s", evs, ev.ConnID)
+	}
+	// Rejected attempts: diverted, no events (both source shapes).
+	if !c.Feed(xrRejected, now) || !c.Feed(xrRejectV, now) {
+		t.Error("rejected lines should be diverted")
+	}
+	if n := buf.Len(); n != 0 {
+		t.Fatalf("rejected lines produced %d events", n)
+	}
+	// Non-access output is not diverted.
+	if c.Feed("2026/11/09 21:39:56.000000 [Info] infra/conf: converter: converting config", now) {
+		t.Error("non-access line must not be diverted")
+	}
+	// Non-opted tag: diverted, no event.
+	c2, buf2 := newTestCollector("xray", 999)
+	c2.Feed(xrAccepted, now)
+	if n := buf2.Len(); n != 0 {
+		t.Fatalf("non-opted xray tag produced %d events", n)
+	}
+}
+
+// LIVE-215 red 3 / D-01: Xray logs a proxied leg with `->`
+// ("[in-73 -> via-73-s1]") instead of `>>` ("[in-72 >> direct]").
+// The bracket and the S-leg source address below are verbatim
+// from the LIVE-215 grid-2A evidence (standalone reproduction of
+// the same binary); timestamp/target follow the xrAccepted shape.
+// Attribution is the LEFT (inbound) side in both shapes, exactly
+// as for `>>`: the event belongs to the entry inbound (in-73 for
+// the split leg). A `via-...` entry id could never be recorded —
+// the opt-in set only holds `in-<id>` tags (connLogTags) and the
+// panel's ResolveConnlogDisplayKeys only resolves an `in-` prefix
+// (via-... resolves to unassigned 0/0) — so taking the right side
+// would leave the S row missing, which is the defect itself.
+func TestXraySplitArrowRow(t *testing.T) {
+	const (
+		// S = in-73 (split source), T = in-72 (split target).
+		xrSplitLeg = "2026/11/10 22:17:08.000000 from tcp:16.146.199.68:26940 accepted tcp:16.146.199.68:26913 [in-73 -> via-73-s1]"
+		xrDirectS  = "2026/11/10 22:17:09.000000 from tcp:16.146.199.68:26941 accepted tcp:1.1.1.1:80 [in-73 >> direct]"
+		xrDirectT  = "2026/11/10 22:17:10.000000 from tcp:127.0.0.1:26942 accepted tcp:1.1.1.1:80 [in-72 >> direct]"
+	)
+	now := time.Now()
+
+	// Parser level: both arrow shapes attribute to the left
+	// (inbound) tag.
+	c, buf := newTestCollector("xray", 72, 73)
+	if !c.Feed(xrSplitLeg, now) {
+		t.Fatal("split `->` line not consumed")
+	}
+	if !c.Feed(xrDirectT, now) {
+		t.Fatal("direct `>>` line not consumed")
+	}
+	if !c.Feed(xrDirectS, now) {
+		t.Fatal("direct `>>` line (S) not consumed")
+	}
+	evs := buf.Drain(0)
+	if len(evs) != 3 {
+		t.Fatalf("events = %d, want 3: %+v", len(evs), evs)
+	}
+	if evs[0].EntryID != "in-73" || evs[0].ClientIP != "16.146.199.68" || evs[0].ClientPort != 26940 ||
+		evs[0].SessionKind != ConnSessionKindEventOnly || evs[0].Type != ConnEventOpen {
+		t.Errorf("split `->` leg must be an in-73 event_only open: %+v", evs[0])
+	}
+	if evs[1].EntryID != "in-72" {
+		t.Errorf("direct `>>` leg must keep EntryID in-72: %+v", evs[1])
+	}
+	if evs[2].EntryID != "in-73" {
+		t.Errorf("direct `>>` leg (S) must keep EntryID in-73: %+v", evs[2])
+	}
+
+	// D-01 panel-list level: after S was built, KernelApply
+	// carried connLogInbounds [68,73] — T (72) already excluded
+	// by the panel list. The S `->` leg must record; the T `>>`
+	// leg must divert with no event, by the list, not the parser.
+	c2, buf2 := newTestCollector("xray", 68, 73)
+	if !c2.Feed(xrSplitLeg, now) {
+		t.Fatal("split `->` line not consumed (panel-list collector)")
+	}
+	if evs := buf2.Drain(0); len(evs) != 1 || evs[0].EntryID != "in-73" {
+		t.Fatalf("panel-list collector: split leg events = %+v, want 1 in-73 event", evs)
+	}
+	if !c2.Feed(xrDirectT, now) {
+		t.Error("T `>>` line must still be diverted even when not opted in")
+	}
+	if n := buf2.Len(); n != 0 {
+		t.Fatalf("T leg produced %d events under the panel list [68,73]; exclusion must come from the list", n)
+	}
+}
+
+func TestConnLogBufferDropAccounting(t *testing.T) {
+	buf := NewConnLogBuffer()
+	for i := 0; i < ConnLogBufferCapacity+10; i++ {
+		buf.Push(ConnEvent{ConnID: string(rune('a' + i%26)), StartMs: int64(i)})
+	}
+	if buf.Len() != ConnLogBufferCapacity || buf.Dropped() != 10 {
+		t.Fatalf("len=%d dropped=%d, want %d/10", buf.Len(), buf.Dropped(), ConnLogBufferCapacity)
+	}
+	out := buf.Drain(1)
+	if len(out) != 1 || out[0].StartMs != 10 {
+		t.Fatalf("oldest surviving event should be #10, got %+v", out)
+	}
+}
+
+func TestXrayAccessPath(t *testing.T) {
+	files := []File{{Name: "config.json", Content: `{"log":{"access":"access.log","loglevel":"warning"}}`}}
+	if got := xrayAccessPath(files); got != "access.log" {
+		t.Errorf("access path = %q, want access.log", got)
+	}
+	if got := xrayAccessPath([]File{{Name: "config.json", Content: `{"log":{"loglevel":"warning"}}`}}); got != "" {
+		t.Errorf("missing access = %q, want empty", got)
+	}
+	if got := xrayAccessPath([]File{{Name: "config.json", Content: `{`}}); got != "" {
+		t.Errorf("broken json = %q, want empty", got)
+	}
+}
+
+func TestXrayAccessTailer(t *testing.T) {
+	dir := t.TempDir()
+	access := filepath.Join(dir, "access.log")
+	history := "2026/11/09 20:00:00.000001 from tcp:127.0.0.1:40000 accepted tcp:127.0.0.1:18080 [in-201 >> direct]\n"
+	if err := os.WriteFile(access, []byte(history), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, buf := newTestCollector("xray", 201)
+	c.ensureTailer(dir, []File{{Name: "config.json", Content: `{"log":{"access":"access.log"}}`}})
+	defer c.stopTailer()
+	// History from before the tailer attached is not replayed.
+	time.Sleep(400 * time.Millisecond)
+	if n := buf.Len(); n != 0 {
+		t.Fatalf("tailer replayed history: %d events", n)
+	}
+	f, err := os.OpenFile(access, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(xrAccepted + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if buf.Len() == 1 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	evs := buf.Drain(0)
+	if len(evs) != 1 || evs[0].SessionKind != ConnSessionKindEventOnly || evs[0].EntryID != "in-201" {
+		t.Fatalf("tailer events wrong: %+v", evs)
+	}
+	// stdout-rendered access: no tailer.
+	c.ensureTailer(dir, []File{{Name: "config.json", Content: `{"log":{"access":"/dev/stdout"}}`}})
+	c.mu.Lock()
+	tailed := c.tailer != nil
+	c.mu.Unlock()
+	if tailed {
+		t.Error("tailer must stop when access moves to stdout")
+	}
+}
+
+func TestApplyConnLogTagsValidation(t *testing.T) {
+	req := ApplyRequest{Type: "singbox", Version: "1.12.8", Download: &Download{BinName: "sing-box", Archive: "raw"}, ConnLogInbounds: []int64{0}}
+	if err := req.validate(); err == nil {
+		t.Error("connLogInbounds with id 0 must be rejected")
+	}
+	req.ConnLogInbounds = []int64{101}
+	if err := req.validate(); err != nil {
+		t.Errorf("valid connLogInbounds rejected: %v", err)
+	}
+}
+
+func TestConnlogEffectiveOptIns(t *testing.T) {
+	entries := []ConnlogEntry{{InboundID: 7, Tag: "in-7"}, {InboundID: 8, Tag: "in-8"}, {InboundID: 9, Tag: "in-9"}}
+	cases := []struct {
+		name  string
+		optIn []int64
+		want  []int64
+	}{
+		{"both lists agree", []int64{7, 9}, []int64{7, 9}},
+		{"opt-in without topology qualification is dropped", []int64{7, 42}, []int64{7}},
+		{"topology without opt-in collects nothing", nil, nil},
+		{"opt-in with empty topology collects nothing", []int64{7}, nil},
+	}
+	for _, tc := range cases {
+		req := ApplyRequest{ConnLogInbounds: tc.optIn}
+		if tc.name != "opt-in with empty topology collects nothing" {
+			req.ConnlogEntries = entries
+		}
+		got := connlogEffectiveOptIns(req)
+		if len(got) != len(tc.want) {
+			t.Fatalf("%s: connlogEffectiveOptIns = %v, want %v", tc.name, got, tc.want)
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Fatalf("%s: connlogEffectiveOptIns = %v, want %v", tc.name, got, tc.want)
+			}
+		}
+	}
+}
+
+// The inbound half of the over-quota kill (R5b 2026-11-23): an
+// Xray access line attributes a connection to its user through the
+// bracket's outbound tag (ovo-u<id>), and the `from` part is the
+// inbound socket's peer. The collector records that mapping for
+// every accepted line, even when connection-log collection is off
+// — enforcement must not depend on the logging toggle — and the
+// line is diverted from the troubleshooting ring either way. The
+// ConnEvent itself is still only emitted when the inbound is
+// opted in.
+func TestXrayInboundKillMap(t *testing.T) {
+	// Inactive collector (no opt-ins): the access line is still
+	// diverted and the kill map is still populated.
+	c := newConnLogCollector("xray", NewConnLogBuffer())
+	now := time.Now()
+	if !c.Feed(xrUserLine("127.0.0.1:55038", "in-348 -> ovo-u77"), now) {
+		t.Fatal("access line not diverted when collection is off")
+	}
+	if peers := c.inboundPeers(77); len(peers) != 1 || peers[0].addr != "127.0.0.1:55038" || peers[0].tag != "in-348" {
+		t.Fatalf("inboundPeers(77) = %v, want [{127.0.0.1:55038 in-348}]", peers)
+	}
+
+	// Idle-timeout outbound tag maps to the same user; a second
+	// peer from the same user accumulates.
+	if !c.Feed(xrUserLine("127.0.0.1:55041", "in-348 -> ovo-idle-348-u77"), now) {
+		t.Fatal("idle-tag access line not diverted")
+	}
+	if peers := c.inboundPeers(77); len(peers) != 2 || peers[0].addr != "127.0.0.1:55038" || peers[1].addr != "127.0.0.1:55041" {
+		t.Fatalf("inboundPeers(77) = %v, want [127.0.0.1:55038 127.0.0.1:55041]", peers)
+	}
+	if peers := c.inboundPeers(77); peers[0].tag != "in-348" || peers[1].tag != "in-348" {
+		t.Fatalf("inboundPeers(77) tags = %v, want both in-348", peers)
+	}
+
+	// A `direct` outbound (no user) and a rejected line add nothing.
+	if !c.Feed(xrUserLine("127.0.0.1:55042", "in-348 >> direct"), now) {
+		t.Fatal("direct access line not diverted")
+	}
+	if !c.Feed("2026/11/09 21:39:59.236063 from tcp:127.0.0.1:55043 rejected  proxy/socks: invalid username or password", now) {
+		t.Fatal("rejected line not diverted")
+	}
+	if peers := c.inboundPeers(77); len(peers) != 2 {
+		t.Fatalf("inboundPeers(77) = %v, want 2 peers (direct/rejected add nothing)", peers)
+	}
+	if peers := c.inboundPeers(999); len(peers) != 0 {
+		t.Fatalf("inboundPeers(999) = %v, want none", peers)
+	}
+
+	// L1-P3-03: the same client IP:port behind CGNAT on a
+	// different inbound (in-349) for another user is recorded
+	// separately, with its own tag — the kill must be able to
+	// tell the two sockets apart by (peer, inbound port).
+	if !c.Feed(xrUserLine("127.0.0.1:55038", "in-349 -> ovo-u78"), now) {
+		t.Fatal("CGNAT access line not diverted")
+	}
+	if peers := c.inboundPeers(78); len(peers) != 1 || peers[0].addr != "127.0.0.1:55038" || peers[0].tag != "in-349" {
+		t.Fatalf("inboundPeers(78) = %v, want [{127.0.0.1:55038 in-349}]", peers)
+	}
+	if peers := c.inboundPeers(77); len(peers) != 2 {
+		t.Fatalf("inboundPeers(77) after CGNAT line = %v, want still 2 peers", peers)
+	}
+
+	// A non-access line is not diverted and adds nothing.
+	if c.Feed("2026/11/09 21:39:56.000000 [Info] infra/conf: converter: converting config", now) {
+		t.Error("non-access line must not be diverted")
+	}
+
+	// dropInboundPeer forgets one peer; the other stays.
+	c.dropInboundPeer(77, "127.0.0.1:55038")
+	if peers := c.inboundPeers(77); len(peers) != 1 || peers[0].addr != "127.0.0.1:55041" {
+		t.Fatalf("after drop inboundPeers(77) = %v, want [127.0.0.1:55041]", peers)
+	}
+
+	// When active and opted in, the ConnEvent is still emitted
+	// (the FeedAs restructure must not break the event path).
+	c2, buf2 := newTestCollector("xray", 348)
+	if !c2.Feed(xrUserLine("127.0.0.1:55038", "in-348 -> ovo-u77"), now) {
+		t.Fatal("access line not diverted when active")
+	}
+	if evs := buf2.Drain(0); len(evs) != 1 || evs[0].EntryID != "in-348" || evs[0].ClientIP != "127.0.0.1" || evs[0].ClientPort != 55038 {
+		t.Fatalf("event = %+v, want one in-348 event for 127.0.0.1:55038", evs)
+	}
+	if peers := c2.inboundPeers(77); len(peers) != 1 || peers[0].addr != "127.0.0.1:55038" || peers[0].tag != "in-348" {
+		t.Fatalf("active collector inboundPeers(77) = %v, want [{127.0.0.1:55038 in-348}]", peers)
+	}
+}

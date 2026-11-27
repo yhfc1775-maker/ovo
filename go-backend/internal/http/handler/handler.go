@@ -1,0 +1,3441 @@
+package handler
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"math"
+	"net/http"
+	"net/url"
+	"reflect"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"go-backend/internal/auth"
+	"go-backend/internal/config"
+	"go-backend/internal/health"
+	"go-backend/internal/http/middleware"
+	"go-backend/internal/http/response"
+	"go-backend/internal/metrics"
+	"go-backend/internal/monitoring"
+	runtimenft "go-backend/internal/runtime/nftables"
+	"go-backend/internal/security"
+	"go-backend/internal/store/model"
+	"go-backend/internal/store/repo"
+	"go-backend/internal/ws"
+)
+
+type Handler struct {
+	repo      *repo.Repository
+	jwtSecret string
+	// SEC-01 BC-01 (b)：导入前自动备份快照的服务端留存目录
+	//（app.New 以 filepath.Dir(cfg.DBPath) 显式设置；未设置时回落
+	//到 repo.DBPath() 同级）。importAutoBackupMu 串行化快照的
+	//留存写与过期清理。
+	importAutoBackupDir string
+	importAutoBackupMu  sync.Mutex
+	// B14-001（用户 2026-10-30 裁决④）：备份导入进程内互斥。导入的
+	// 写入相位已与请求 ctx 解绑（见 backupImport），关页/断开不再是
+	// 取消手段，重复提交或双开页面并发导入会基于中间态叠写，故同一
+	// 时刻只允许一单备份导入（快照相位与写入相位全程持锁）。
+	backupImportMu sync.Mutex
+	// FIX-BASELINE（R2-E2-01）×R4X-009：备份导入尾钩子执行深度。
+	// 尾钩子内的内核 apply 属于导入这一次物化事件，其基线由导入
+	// reconcile 轮的尾随 poll 钉定（与轮内豁免同构）；若逐个
+	// settle 多发 KernelStatus，会被 R4X-009 的轮次口径计为额外
+	// reconcile 轮。深度 >0 时 applyKernelWithMode 抑制 settle。
+	importTailBatchDepth atomic.Int32
+	wsServer             *ws.Server
+	// R18-F1-01（D-3）：面板分发的隧道 TLS 证书。tunnelTLSCA 是
+	// 每安装唯一的 CA（惰性加载，见 tunnelTLSAuthority；绝不静默
+	// 重建）；tunnelTLSCommandSender 是节点命令发送缝（默认走
+	// sendNodeCommand，测试可注入假发送方）。
+	tunnelTLSMu            sync.Mutex
+	tunnelTLSCA            *config.TunnelTLSCA
+	tunnelTLSCommandSender func(nodeID int64, cmdType string, data interface{}, timeout time.Duration) (ws.CommandResult, error)
+	// R18-R3-F1-02：node_tunnel_tls 单行读的测试缝。置位时替代
+	// nodeTunnelTLSWasIssued 内的仓储读，测试用它模拟瞬时读错
+	// （批量就绪集读成功、单行读失败的交错）；生产恒为 nil，走
+	// 仓储读。
+	nodeTunnelTLSRowReader func(nodeID int64) (*model.NodeTunnelTLS, error)
+	metrics                *metrics.IngestionService
+	healthCheck            *health.Checker
+	// R5-B5 D14: 下沉到 manager 层的 per-node 串行化包装。
+	// 所有触碰节点 nft 状态的方法必须经此，不依赖调用方自觉。
+	nftablesManager *serializedNftManager
+
+	// R5-B5 D14: per-node single-flight 已下沉到 serializedNftManager，
+	// 此处不再保留 handler 层锁。
+	// R5-B3 D1-003/D9: 异步自动 reconcile（R2：采集循环只投递，不在事务内执行）。
+	nftAutoMu      sync.Mutex
+	nftAutoPending map[int64]bool
+	nftAutoQueue   chan int64
+	nftAutoFail    map[int64]*nftAutoFailState
+	// R5-B3 D1-003/D9(b): 最近一次 apply 失败的节点（节点恢复后触发 reconcile）。
+	nftApplyFailedMu sync.Mutex
+	nftApplyFailed   map[int64]bool
+
+	captchaMu     sync.Mutex
+	captchaTokens map[string]int64
+	// R10X-008（A-01）：captcha verify 端点独立 IP 限流桶（与登录
+	// 桶分开计量，形态对齐 loginRateLimiter：窗口计数 + 上限淘汰）。
+	captchaVerifyMu      sync.Mutex
+	captchaVerifyBuckets map[string]*loginAttemptBucket
+	// R8-060：/flow/* 节点 secret 鉴权失败限流（与 /system-info WS
+	// 面同口径，见 flow_auth_fail_limit.go）；惰性初始化。
+	flowAuthFailMu sync.Mutex
+	flowAuthFail   *flowAuthFailLimiter
+	passkeyMu      sync.Mutex
+	passkeyPending map[string]passkeyCeremony
+
+	// S3-2：展示分组名单（配置键 node_display_group_order）的读-改-写
+	// 串行化锁。建组/改名/删组与批量移入（其标签写面与改名级联须互
+	// 斥，否则级联扫过后并发移入旧名会留下在用残留）在 handler 内
+	// 全程持锁；通用配置写面（updateConfigs/updateSingleConfig）触
+	// 及同一键时在落库前同锁，避免并发下名单互相覆盖（lost-update）。
+	nodeGroupMu sync.Mutex
+
+	// R-078：nodeCreate（名称，serverIP）唯一性串行化。创建面此前
+	// 无同名同 IP 校验，两路并发创建均 code 0 落库两行、面板出现
+	// 不可区分的重名节点。单面板进程内以本锁串行化「查重＋落库」
+	// 临界区，命中即点名拒绝。未加 DB 唯一索引：存量库可能已有重
+	// 名行，AutoMigrate 建唯一索引会在升级时失败；进程内串行化覆
+	// 盖 nodeCreate 与 nodeUpdate 的快照读取、查重和主字段写入；
+	// nodeUpdate 主字段落库后即释放，不跨后续内核重推。
+	nodeCreateMu sync.Mutex
+
+	// B-NEW（入站行计数器 epoch/基线时序丢增量）：同一节点内核计数
+	// 摄入的 per-node 串行化锁。ingestKernelCountersMode 的 Phase A
+	//（入站/realm/用户三面纯记账）全程持锁，Phase B（syncSubscriptions
+	// 与执法尾，可触发 KernelApply→换代→settle 重定基线）无锁；另
+	// 外两路摄入（轮询 poll 与下发后 settle）同走 ingest，故同一
+	// 节点的两次摄入不可能在记账中途被对方触发的重建换代截断。
+	// 记账面只做 repo DB 写，不取 kernel/nft 锁；副作用面从不持本
+	// 锁，故无锁序环。
+	nodeIngestMu    sync.Mutex
+	nodeIngestLocks map[int64]*sync.Mutex
+
+	jobsLifecycleMu sync.Mutex // serialize complete startup and stop/join phases
+	jobsMu          sync.Mutex
+	jobsCtx         context.Context
+	jobsCancel      context.CancelFunc
+	jobsStarted     bool
+	jobsWG          sync.WaitGroup
+
+	// startedAt 是面板进程启动时刻（New 构造时记录），供 Telegram
+	// 机器人 /status 的运行时间复用。
+	startedAt time.Time
+
+	// R2-038：事件型状态对账清扫的小时级门（维护轮每分钟跑，
+	// 清扫低频即可，见 state_sweep.go）。
+	stateSweepMu   sync.Mutex
+	stateSweepLast time.Time
+
+	// FIX-D（D6-07）：通知派发有界队列 + worker 池状态（notify.go）。
+	notifyMu      sync.Mutex
+	notifyQueue   chan notifyJob
+	notifyCancel  context.CancelFunc
+	notifyRunning bool
+	notifyWG      sync.WaitGroup
+	// 通知配置读取缓存（短 TTL + 配置写路径显式失效），消除每条通知
+	// 一次 vite_config 全表扫描。
+	notifyCfgMu   sync.Mutex
+	notifyCfgVals map[string]string
+	notifyCfgAt   time.Time
+
+	// I-01：配额恢复通知待发标记的串行化锁（user_quota.go）。
+	quotaRecoveryMu sync.Mutex
+
+	// R3-MON-01：升级未落地告警待发台账的串行化锁
+	// （upgrade_verify.go，与配额台账同机制）。
+	upgradeAlertMu sync.Mutex
+
+	// R2X-018：日报待发原文缓存（notify_reports.go）。首次生成后
+	// 同日重试逐字复用，snapshot 与 daily_last 仅整条投递成功时推进。
+	dailyMu      sync.Mutex
+	dailyPending *dailyReportPending
+
+	upgradeMu       sync.Mutex
+	systemUpgradeMu sync.Mutex
+	// IL-NU-02：面板升级与节点升级的双向互斥门。upgradeGateMu
+	// 是短临界区锁——只覆盖“查面板升级态＋占节点操作”与“查
+	// 在途节点操作＋武装面板升级”这两对原子动作，绝不跨下发
+	// 或同步段持有。systemUpgradeArmed 是面板升级同步段开始
+	// 到落盘 inProgress 状态之间的内存标志：状态文件只在
+	// helper 启动前才落盘，标志补上这段窗口；落盘后 assess
+	// 口径接管，标志由 systemUpgrade 的 defer 清除。
+	upgradeGateMu          sync.Mutex
+	systemUpgradeArmed     bool
+	pendingUpgradeRedeploy map[int64]struct{}
+	// R5-FC（L2-10）：同节点升级类操作在途登记（nodeID → 操作展示名），
+	// 由 upgradeMu 保护；单节点升级 / 批量升级 / 节点回退三入口共用，
+	// 见 upgrade.go 的 tryAcquireNodeUpgradeOp。
+	nodeUpgradeOps map[int64]string
+	// F2-10：升级类操作在 ACK 后的执行期占用（nodeID → 操作名＋
+	// 到期时刻）：登记从「命令在途期」延展到核验终局（landed/
+	// failed）或有界 TTL，见 upgrade.go 的
+	// holdNodeUpgradeOpForVerification。
+	nodeUpgradeOpHolds map[int64]nodeUpgradeOpHold
+	// F2-02：启动复位前的在线节点快照（nodeID 集）：复位把本地
+	// 节点 status 1→0 后，「重启后仍离线」检查不能再以 DB
+	// status 为据，须以本快照＋实时会话判定。仅启动路径写一次。
+	startupOnlineSnapshot map[int64]struct{}
+	// FIX2-A（V2-04）：节点离线期间切走 realm 的待结算标记（按节点）。
+	// 离线切换时 settle 轮询够不到节点，重连后必须先结算 realm 计数
+	// 再允许重下发，否则增量随 agent 弃 realm 计数永久漏计。
+	pendingRealmSettle map[int64]struct{}
+	// FIX2-A（V2-01/V2-02）：配额执法 per-user 串行化锁。
+	quotaEnforceMu    sync.Mutex
+	quotaEnforceLocks map[int64]*sync.Mutex
+	// R18-F2-02 (M-3): 配额释放 backstop 的逐用户失败态，与 nft
+	// 自动对账守卫（nftables_reconcile_guard.go 的 nftAutoFail）
+	// 同模式：退避升级 + 连续失败达上限转需人工。零值可用（惰性初始化）。
+	quotaReleaseFailMu sync.Mutex
+	quotaReleaseFail   map[int64]*quotaReleaseFailState
+	// FIX2-A（V2-08）：转发计数入账 per-node 串行化锁（基线读→差分
+	// →落库整段），防 settle/周期/重连多路轮询以同一旧基线重复差分。
+	nodeAccountingMu            sync.Mutex
+	nodeAccountingLocks         map[int64]*sync.Mutex
+	nodeOnlineRedeployAt        map[int64]time.Time
+	nodeOnlineRedeployQueued    map[int64]struct{}
+	nodeOnlineRedeploying       map[int64]struct{}
+	nodeLocalRuntimeRetryQueued map[int64]struct{}
+	// R18-F3-02 (M-3): 节点本地运行时重试的逐节点失败态，与 nft
+	// 自动对账守卫（nftAutoFail）同模式：退避升级 + 连续失败达
+	// 上限转需人工（停止自动重排）。零值可用（惰性初始化）。
+	nodeLocalRuntimeRetryFail map[int64]*nodeLocalRuntimeRetryFailState
+
+	// R17-B：AddService 幂等守卫状态（add_service_guard.go）。
+	// 确认集只由 agent 成功响应建立、无 TTL；零值可用（惰性初始化）。
+	addSvcMu        sync.Mutex
+	addSvcInFlight  map[addServiceGuardKey]*addServiceGuardCall
+	addSvcConfirmed map[int64]map[string]struct{}
+	// addSvcSend 是 AddService 的发送缝（默认 nil → sendNodeCommand）；
+	// 仅测试注入假发送器，生产代码不得设置。
+	addSvcSend func(nodeID int64, services []map[string]interface{}) error
+
+	qualityProber  *tunnelQualityProber
+	externalProbes *externalProbeStore
+	// 节点延迟测试点测量结果缓存。
+	nodeLatency *nodeLatencyStore
+	// agent 上报的 connlog 打标数（connlog_mark.go）：每节点最
+	// 近一次 metric 心跳里 live 服务的打标转发数。内存态（同
+	// nodeLatency），离线即删、重启后一跳心跳即补。
+	connlogMarkMu     sync.Mutex
+	connlogMarkByNode map[int64]int64
+	// 节点回程路由追踪结果缓存。
+	nodeRoutes *nodeRouteStore
+	// 延迟连续劣化告警的连击计数（node_latency_history.go）。
+	latencyAlerts *latencyAlertTracker
+	// 宿主机累积面越阈告警状态（resource_alert.go，包 K）。
+	resourceAlerts *resourceAlertTracker
+	relayLatency   *relayLatencyStore
+	notifier       *notifier
+	bestExit       *bestExitManager
+
+	// DA-6/DB-5：每节点 TcpPing
+	// 并发槽位（队列与执行共用超时预算，见 node_ping_slots.go）。
+	pingSlots *nodePingSlots
+	// DB-3：节点重连后自动重测队列
+	// （见 node_reconnect_probe.go），由 StartBackgroundJobs 创建。
+	reconnectProbes *nodeReconnectProbeQueue
+	// R1-B-04：内核在节点保持在线时单独重启的检测基线（agent 状态
+	// 报告的 Restarts/StartedAt 上次值），见 noteKernelStart。
+	kernelStartsMu sync.Mutex
+	kernelStarts   map[kernelStartKey]kernelStartMark
+}
+
+const monitorTunnelQualityEnabledConfigKey = "monitor_tunnel_quality_enabled"
+const allowLocalRemoteAddrConfigKey = "allow_local_remote_addr"
+
+type loginRequest struct {
+	Username  string `json:"username"`
+	Password  string `json:"password"`
+	CaptchaID string `json:"captchaId"`
+}
+
+type captchaVerifyRequest struct {
+	ID   string `json:"id"`
+	Data string `json:"data"`
+}
+
+type nameRequest struct {
+	Name string `json:"name"`
+}
+
+type configSingleRequest struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+type changePasswordRequest struct {
+	NewUsername     string `json:"newUsername"`
+	CurrentPassword string `json:"currentPassword"`
+	NewPassword     string `json:"newPassword"`
+	ConfirmPassword string `json:"confirmPassword"`
+}
+
+type flowItem struct {
+	N string `json:"n"`
+	U int64  `json:"u"`
+	D int64  `json:"d"`
+}
+
+const (
+	pngDataURLPrefix          = "data:image/png;base64,"
+	maxBrandAssetDataURLBytes = 1024 * 1024
+)
+
+func New(repo *repo.Repository, jwtSecret string) *Handler {
+	h := &Handler{
+		repo:                     repo,
+		jwtSecret:                jwtSecret,
+		startedAt:                time.Now(),
+		wsServer:                 ws.NewServer(repo, jwtSecret),
+		metrics:                  metrics.NewIngestionService(repo),
+		healthCheck:              nil,
+		nftablesManager:          newSerializedNftManager(runtimenft.NewManagerWithInstall(nil, panelInstanceID(), panelInstallID())),
+		nftAutoPending:           make(map[int64]bool),
+		nftAutoQueue:             make(chan int64, 64),
+		nftAutoFail:              make(map[int64]*nftAutoFailState),
+		nftApplyFailed:           make(map[int64]bool),
+		captchaTokens:            make(map[string]int64),
+		captchaVerifyBuckets:     make(map[string]*loginAttemptBucket),
+		passkeyPending:           make(map[string]passkeyCeremony),
+		pendingUpgradeRedeploy:   make(map[int64]struct{}),
+		pendingRealmSettle:       make(map[int64]struct{}),
+		quotaEnforceLocks:        make(map[int64]*sync.Mutex),
+		nodeAccountingLocks:      make(map[int64]*sync.Mutex),
+		nodeOnlineRedeployAt:     make(map[int64]time.Time),
+		nodeOnlineRedeployQueued: make(map[int64]struct{}),
+		nodeOnlineRedeploying:    make(map[int64]struct{}),
+		bestExit:                 newBestExitManager(),
+		externalProbes:           newExternalProbeStore(),
+		nodeLatency:              newNodeLatencyStore(),
+		connlogMarkByNode:        make(map[int64]int64),
+		nodeRoutes:               newNodeRouteStore(),
+		latencyAlerts:            newLatencyAlertTracker(),
+		resourceAlerts:           newResourceAlertTracker(),
+		relayLatency:             newRelayLatencyStore(),
+		notifier:                 newNotifier(),
+		pingSlots:                newNodePingSlots(),
+	}
+	h.healthCheck = health.NewChecker(repo, h.wsServer)
+	h.qualityProber = newTunnelQualityProber(h)
+	h.wsServer.SetNodeOnlineHook(h.onNodeOnline)
+	h.wsServer.SetNodeLateCommandHook(h.onLateNodeLifecycleCommand)
+	// R17-B：节点离线即作废该节点的 AddService 确认集（agent 运行时态
+	// 不再可信），再走原有离线通知；下次同步经 UpdateService/AddService
+	// 成功重建确认。
+	h.wsServer.SetNodeOfflineHook(func(nodeID int64) {
+		h.invalidateAddServiceNode(nodeID)
+		// 离线即丢弃该节点的打标上报：断连 agent 的旧计数不是
+		// 其当前加载态的证据（connlog_mark.go）。
+		h.dropConnlogMark(nodeID)
+		h.notifyNodeOffline(nodeID)
+	})
+	h.wsServer.SetNodeMetricHook(func(nodeID int64, info ws.SystemInfo) {
+		metricInfo := metrics.SystemInfo{
+			Uptime:              info.Uptime,
+			BytesReceived:       info.BytesReceived,
+			BytesTransmitted:    info.BytesTransmitted,
+			BootID:              info.BootID,
+			CPUUsage:            info.CPUUsage,
+			MemoryUsage:         info.MemoryUsage,
+			DiskUsage:           info.DiskUsage,
+			Load1:               info.Load1,
+			Load5:               info.Load5,
+			Load15:              info.Load15,
+			TCPConns:            info.TCPConns,
+			UDPConns:            info.UDPConns,
+			NetInSpeed:          info.NetInSpeed,
+			NetOutSpeed:         info.NetOutSpeed,
+			ConntrackCount:      info.ConntrackCount,
+			ConntrackMax:        info.ConntrackMax,
+			AgentRSSBytes:       info.AgentRSSBytes,
+			MemTotalBytes:       info.MemTotalBytes,
+			ActiveSessions:      info.ActiveSessions,
+			BudgetRejectedTotal: info.BudgetRejectedTotal,
+			BudgetEvictedTotal:  info.BudgetEvictedTotal,
+		}
+		h.metrics.RecordNodeMetric(nodeID, metricInfo)
+		// agent 上报的 connlog 打标数（lane C）：新 agent 每跳
+		// 心跳都带 live 服务的打标转发数；旧 agent 不发该字段
+		// （nil），此前状态不动、未报过即未知，绝不把「没报」
+		// 读成 0。
+		if info.ConnlogMarkedForwards != nil {
+			h.setConnlogMark(nodeID, *info.ConnlogMarkedForwards)
+		}
+		// 包 K：累积面越阈判定与落库同源同点——每个指标样本都
+		// 过同一判定，不许有旁路样本绕过告警（与 kernel_error
+		// 单漏斗同口径，见 resource_alert.go）。
+		h.observeNodeResourceUsage(nodeID, metricInfo)
+	})
+	h.wsServer.SetUserAuthStateLookup(h.GetUserAuthState)
+	return h
+}
+
+func (h *Handler) WebSocketHandler() http.Handler {
+	return h.wsServer
+}
+
+// nodeIngestLock 返回同一节点内核计数摄入的 per-node 串行化锁
+// （B-NEW）。惰性初始化，与 nftAutoPending 同范式。
+func (h *Handler) nodeIngestLock(nodeID int64) *sync.Mutex {
+	h.nodeIngestMu.Lock()
+	defer h.nodeIngestMu.Unlock()
+	if h.nodeIngestLocks == nil {
+		h.nodeIngestLocks = make(map[int64]*sync.Mutex)
+	}
+	mu, ok := h.nodeIngestLocks[nodeID]
+	if !ok {
+		mu = &sync.Mutex{}
+		h.nodeIngestLocks[nodeID] = mu
+	}
+	return mu
+}
+
+func (h *Handler) GetUserAuthState(userID int64) (*auth.UserAuthState, error) {
+	return h.repo.GetUserAuthState(userID)
+}
+
+func (h *Handler) Register(mux *http.ServeMux) {
+	mux.HandleFunc("/api/v1/user/login", h.login)
+	mux.HandleFunc("/api/v1/user/passkey/status", h.passkeyStatus)
+	mux.HandleFunc("/api/v1/user/passkey/login/begin", h.passkeyLoginBegin)
+	mux.HandleFunc("/api/v1/user/passkey/login/finish", h.passkeyLoginFinish)
+	mux.HandleFunc("/api/v1/user/passkey/register/begin", h.passkeyRegisterBegin)
+	mux.HandleFunc("/api/v1/user/passkey/register/finish", h.passkeyRegisterFinish)
+	mux.HandleFunc("/api/v1/user/passkey/list", h.passkeyList)
+	mux.HandleFunc("/api/v1/user/passkey/delete", h.passkeyDelete)
+	mux.HandleFunc("/api/v1/user/list", h.userList)
+	mux.HandleFunc("/api/v1/user/create", h.userCreate)
+	mux.HandleFunc("/api/v1/user/update", h.userUpdate)
+	mux.HandleFunc("/api/v1/user/delete", h.userDelete)
+	mux.HandleFunc("/api/v1/user/reset", h.userResetFlow)
+	mux.HandleFunc("/api/v1/user/quota/reset", h.userQuotaReset)
+	mux.HandleFunc("/api/v1/user/quota/mine", h.userQuotaMine)
+	mux.HandleFunc("/api/v1/public/config/get", h.getPublicConfigByName)
+	mux.HandleFunc("/api/v1/config/get", h.getConfigByName)
+	mux.HandleFunc("/api/v1/config/list", h.getConfigs)
+	mux.HandleFunc("/api/v1/config/update", h.updateConfigs)
+	mux.HandleFunc("/api/v1/config/update-single", h.updateSingleConfig)
+	mux.HandleFunc("/api/v1/system/storage", h.storageSummary)
+	mux.HandleFunc("/api/v1/system/version", h.systemVersion)
+	mux.HandleFunc("/api/v1/system/check-updates", h.systemCheckUpdates)
+	mux.HandleFunc("/api/v1/system/upgrade", h.systemUpgrade)
+	mux.HandleFunc("/api/v1/system/upgrade/status", h.systemUpgradeStatus)
+	// R18-B8-01：镜像缓存按版本清除（仅管理员，见 requiresAdmin）。
+	mux.HandleFunc("/api/v1/system/gh-cache/purge", h.ghMirrorPurgeCache)
+	// 备份端点全集（B14-002）：正常前缀与历史双前缀别名
+	// （/api/v1/api/v1/backup/...，兼容曾把基址拼重一层的旧客户端/脚本）
+	// 由同一清单注册。新增备份端点只许往此清单加行，两个前缀自动齐全；
+	// 此前别名靠手工枚举，import-auto-backup 两端点（SEC-01 后加）漏注册，
+	// 双前缀访问拿到裸文本 404 而非 {code,msg} 信封。
+	for _, route := range []struct {
+		path string
+		fn   http.HandlerFunc
+	}{
+		{"/api/v1/backup/export", h.backupExport},
+		{"/api/v1/backup/import-auto-backup", h.backupImportAutoBackup},
+		{"/api/v1/backup/import-auto-backup/status", h.backupImportAutoBackupStatus},
+		{"/api/v1/backup/import", h.backupImport},
+		{"/api/v1/backup/restore", h.backupImport},
+	} {
+		mux.HandleFunc(route.path, route.fn)
+		mux.HandleFunc("/api/v1"+route.path, route.fn)
+	}
+	mux.HandleFunc("/api/v1/captcha/check", h.checkCaptcha)
+	mux.HandleFunc("/api/v1/captcha/verify", h.captchaVerify)
+	mux.HandleFunc("/api/v1/user/package", h.userPackage)
+	mux.HandleFunc("/api/v1/user/subscription/traffic", h.userSubscriptionTraffic)
+	mux.HandleFunc("/api/v1/user/updatePassword", h.updatePassword)
+	mux.HandleFunc("/api/v1/user/logout", h.userLogout)
+	mux.HandleFunc("/api/v1/system-info/ticket", h.issueWSTicket)
+	mux.HandleFunc("/api/v1/node/list", h.nodeList)
+	mux.HandleFunc("/api/v1/node/connlog", h.nodeConnlog)
+	mux.HandleFunc("/api/v1/node/connlog-readiness", h.nodeConnlogReadiness)
+	mux.HandleFunc("/api/v1/node/connlog-repush", h.nodeConnlogRepush)
+	mux.HandleFunc("/api/v1/node/create", h.nodeCreate)
+	mux.HandleFunc("/api/v1/node/update", h.nodeUpdate)
+	mux.HandleFunc("/api/v1/node/delete", h.nodeDelete)
+	mux.HandleFunc("/api/v1/node/install", h.nodeInstall)
+	// F03：节点 secret 独立轮换入口（泄露止血），与安装命令轮换同源。
+	mux.HandleFunc("/api/v1/node/rotate-secret", h.nodeRotateSecret)
+	mux.HandleFunc("/api/v1/node/update-order", h.nodeUpdateOrder)
+	mux.HandleFunc("/api/v1/node/dismiss-expiry-reminder", h.nodeDismissExpiryReminder)
+	mux.HandleFunc("/api/v1/node/batch-delete", h.nodeBatchDelete)
+	// 节点展示分组 v2（建组/改名/删组/批量移入，见 node_display_group.go）。
+	mux.HandleFunc("/api/v1/node/batch-set-group", h.nodeBatchSetGroup)
+	mux.HandleFunc("/api/v1/node/group/create", h.nodeGroupCreate)
+	mux.HandleFunc("/api/v1/node/group/rename", h.nodeGroupRename)
+	mux.HandleFunc("/api/v1/node/group/delete", h.nodeGroupDelete)
+	mux.HandleFunc("/api/v1/node/check-status", h.nodeCheckStatus)
+	mux.HandleFunc("/api/v1/node/upgrade", h.nodeUpgrade)
+	mux.HandleFunc("/api/v1/node/upgrade-verification/clear", h.clearNodeUpgradeVerification)
+	mux.HandleFunc("/api/v1/node/batch-upgrade", h.nodeBatchUpgrade)
+	mux.HandleFunc("/api/v1/node/rollback", h.nodeRollback)
+	// 节点延迟测试。
+	mux.HandleFunc("/api/v1/node/latency/probe", h.nodeLatencyProbe)
+	mux.HandleFunc("/api/v1/node/latency/targets", h.nodeLatencyTargetsSet)
+	mux.HandleFunc("/api/v1/node/latency/history", h.nodeLatencyHistory)
+	// 节点网络调优。
+	mux.HandleFunc("/api/v1/node/tune", h.nodeTune)
+	// 节点定时重启 agent 服务（开关＋时刻＋抖动，默认关）。
+	mux.HandleFunc("/api/v1/node/restart-schedule", h.nodeRestartScheduleSet)
+	mux.HandleFunc("/api/v1/node/restart", h.nodeRestart)
+	mux.HandleFunc("/api/v1/node/batch-restart", h.nodeBatchRestart)
+	// 节点一键设置 Swap（现状查询＋建/改 /swapfile 大小）。
+	mux.HandleFunc("/api/v1/node/swap-info", h.nodeSwapInfo)
+	mux.HandleFunc("/api/v1/node/swap-set", h.nodeSwapSet)
+	// 回程路由追踪。
+	mux.HandleFunc("/api/v1/node/route", h.nodeRouteGet)
+	mux.HandleFunc("/api/v1/node/route/probe", h.nodeRouteProbe)
+	// GitHub 镜像代理。
+	mux.HandleFunc(ghMirrorPath, h.githubMirror)
+	mux.HandleFunc("/api/v1/node/releases", h.listReleases)
+	mux.HandleFunc("/api/v1/node/nftables/test", h.nodeNftablesTest)
+	mux.HandleFunc("/api/v1/node/nftables/reconcile", h.nodeNftablesReconcile)
+	mux.HandleFunc("/api/v1/node/nftables/clear", h.nodeNftablesClear)
+	mux.HandleFunc("/api/v1/node/nftables/pending-deletes", h.nftPendingDeleteList)
+	mux.HandleFunc("/api/v1/kernel/capabilities", h.kernelCapabilities)
+	mux.HandleFunc("/api/v1/kernel/list", h.kernelList)
+	mux.HandleFunc("/api/v1/kernel/install", h.kernelInstall)
+	mux.HandleFunc("/api/v1/kernel/versions", h.kernelVersions)
+	mux.HandleFunc("/api/v1/kernel/control", h.kernelControl)
+	mux.HandleFunc("/api/v1/kernel/logs", h.kernelLogs)
+	mux.HandleFunc("/api/v1/inbound/list", h.inboundList)
+	mux.HandleFunc("/api/v1/inbound/create", h.inboundCreate)
+	mux.HandleFunc("/api/v1/inbound/update", h.inboundUpdate)
+	mux.HandleFunc("/api/v1/inbound/delete", h.inboundDelete)
+	mux.HandleFunc("/api/v1/inbound/batch-delete", h.inboundBatchDelete)
+	mux.HandleFunc("/api/v1/inbound/probe", h.inboundProbe)
+	mux.HandleFunc("/api/v1/inbound/batch-toggle", h.inboundBatchToggle)
+	mux.HandleFunc("/api/v1/notify/test", h.notifyTest)
+	mux.HandleFunc("/api/v1/notify/health", h.notifyHealth)
+	mux.HandleFunc("/api/v1/subscription/list", h.subscriptionList)
+	mux.HandleFunc("/api/v1/subscription/save", h.subscriptionSave)
+	mux.HandleFunc("/api/v1/subscription/delete", h.subscriptionDelete)
+	mux.HandleFunc("/api/v1/subscription/reset", h.subscriptionReset)
+	mux.HandleFunc("/api/v1/subscription/reset-traffic", h.subscriptionResetTraffic)
+	mux.HandleFunc("/api/v1/subscription/traffic", h.subscriptionTraffic)
+	mux.HandleFunc("/api/v1/subscription/source/list", h.remoteSourceList)
+	mux.HandleFunc("/api/v1/subscription/source/save", h.remoteSourceSave)
+	mux.HandleFunc("/api/v1/subscription/source/refresh", h.remoteSourceRefresh)
+	mux.HandleFunc("/api/v1/subscription/source/delete", h.remoteSourceDelete)
+	mux.HandleFunc("/api/v1/subscription/preview", h.subscriptionPreview)
+	mux.HandleFunc("/api/v1/subscription/template/catalog", h.subscriptionTemplateCatalog)
+	mux.HandleFunc("/api/v1/subscription/template/list", h.subscriptionTemplateList)
+	mux.HandleFunc("/api/v1/subscription/template/check", h.subscriptionTemplateCheck)
+	mux.HandleFunc("/api/v1/subscription/template/save", h.subscriptionTemplateSave)
+	mux.HandleFunc("/api/v1/subscription/template/refresh", h.subscriptionTemplateRefresh)
+	mux.HandleFunc("/api/v1/subscription/template/delete", h.subscriptionTemplateDelete)
+	mux.HandleFunc("/api/v1/inbound/toggle", h.inboundToggle)
+	mux.HandleFunc("/api/v1/inbound/split", h.inboundSplitSave)
+	mux.HandleFunc("/api/v1/inbound/reset-traffic", h.inboundResetTraffic)
+	mux.HandleFunc("/api/v1/inbound/regenerate", h.inboundRegenerate)
+	mux.HandleFunc("/api/v1/inbound/share", h.inboundShare)
+	mux.HandleFunc("/api/v1/inbound/import", h.inboundImport)
+	mux.HandleFunc("/api/v1/inbound/import/preview", h.inboundImportPreview)
+	mux.HandleFunc("/api/v1/inbound/external/update", h.inboundExternalUpdate)
+	mux.HandleFunc("/api/v1/inbound/sub/info", h.inboundSubInfo)
+	mux.HandleFunc("/api/v1/inbound/relay/list", h.inboundRelayList)
+	mux.HandleFunc("/api/v1/inbound/relay/create", h.inboundRelayCreate)
+	mux.HandleFunc("/api/v1/inbound/relay/delete", h.inboundRelayDelete)
+	mux.HandleFunc("/api/v1/inbound/relay/probe", h.inboundRelayProbe)
+	mux.HandleFunc("/api/v1/user-inbound/list", h.getUserInbounds)
+	mux.HandleFunc("/api/v1/user-inbound/set", h.setUserInbounds)
+	mux.HandleFunc("/api/v1/user-inbound/mine", h.getMyInbounds)
+	mux.HandleFunc("/api/v1/user-subscription/list", h.userSubscriptionList)
+	mux.HandleFunc("/api/v1/user-subscription/set", h.userSubscriptionSet)
+	mux.HandleFunc("/api/v1/user-subscription/mine", h.userSubscriptionMine)
+	mux.HandleFunc("/api/v1/open_api/sub/", h.openSubscription)
+	mux.HandleFunc("/api/v1/tunnel/list", h.tunnelList)
+	mux.HandleFunc("/api/v1/tunnel/create", h.tunnelCreate)
+	mux.HandleFunc("/api/v1/tunnel/get", h.tunnelGet)
+	mux.HandleFunc("/api/v1/tunnel/update", h.tunnelUpdate)
+	mux.HandleFunc("/api/v1/tunnel/delete", h.tunnelDelete)
+	mux.HandleFunc("/api/v1/tunnel/delete-preview", h.tunnelDeletePreview)
+	mux.HandleFunc("/api/v1/tunnel/delete-with-forwards", h.tunnelDeleteWithForwards)
+	mux.HandleFunc("/api/v1/tunnel/batch-delete-preview", h.tunnelBatchDeletePreview)
+	mux.HandleFunc("/api/v1/tunnel/batch-delete-with-forwards", h.tunnelBatchDeleteWithForwards)
+	mux.HandleFunc("/api/v1/tunnel/diagnose", h.tunnelDiagnose)
+	mux.HandleFunc("/api/v1/tunnel/diagnose/stream", h.tunnelDiagnoseStream)
+	mux.HandleFunc("/api/v1/tunnel/update-order", h.tunnelUpdateOrder)
+	mux.HandleFunc("/api/v1/tunnel/batch-delete", h.tunnelBatchDelete)
+	mux.HandleFunc("/api/v1/tunnel/batch-redeploy", h.tunnelBatchRedeploy)
+	mux.HandleFunc("/api/v1/tunnel/user/assign", h.userTunnelAssign)
+	mux.HandleFunc("/api/v1/tunnel/user/batch-assign", h.userTunnelBatchAssign)
+	mux.HandleFunc("/api/v1/tunnel/user/remove", h.userTunnelRemove)
+	mux.HandleFunc("/api/v1/tunnel/user/update", h.userTunnelUpdate)
+	mux.HandleFunc("/api/v1/forward/list", h.forwardList)
+	mux.HandleFunc("/api/v1/forward/create", h.forwardCreate)
+	mux.HandleFunc("/api/v1/forward/update", h.forwardUpdate)
+	mux.HandleFunc("/api/v1/forward/delete", h.forwardDelete)
+	mux.HandleFunc("/api/v1/forward/force-delete", h.forwardForceDelete)
+	mux.HandleFunc("/api/v1/forward/pause", h.forwardPause)
+	mux.HandleFunc("/api/v1/forward/resume", h.forwardResume)
+	mux.HandleFunc("/api/v1/forward/reset-flow", h.forwardResetFlow)
+	mux.HandleFunc("/api/v1/forward/diagnose", h.forwardDiagnose)
+	mux.HandleFunc("/api/v1/forward/diagnose/stream", h.forwardDiagnoseStream)
+	mux.HandleFunc("/api/v1/forward/update-order", h.forwardUpdateOrder)
+	mux.HandleFunc("/api/v1/forward/batch-delete", h.forwardBatchDelete)
+	mux.HandleFunc("/api/v1/forward/batch-pause", h.forwardBatchPause)
+	mux.HandleFunc("/api/v1/forward/batch-resume", h.forwardBatchResume)
+	mux.HandleFunc("/api/v1/forward/batch-redeploy", h.forwardBatchRedeploy)
+	mux.HandleFunc("/api/v1/forward/batch-change-tunnel", h.forwardBatchChangeTunnel)
+	mux.HandleFunc("/api/v1/speed-limit/list", h.speedLimitList)
+	mux.HandleFunc("/api/v1/speed-limit/create", h.speedLimitCreate)
+	mux.HandleFunc("/api/v1/speed-limit/update", h.speedLimitUpdate)
+	mux.HandleFunc("/api/v1/speed-limit/delete", h.speedLimitDelete)
+	mux.HandleFunc("/api/v1/tunnel/user/tunnel", h.userTunnelVisibleList)
+	mux.HandleFunc("/api/v1/tunnel/user/list", h.userTunnelList)
+	mux.HandleFunc("/api/v1/open_api/sub_store", h.openAPISubStore)
+
+	mux.HandleFunc("/api/v1/node/traffic/month", h.nodeTrafficMonth)
+	mux.HandleFunc("/api/v1/node/traffic/dropped", h.nodeTrafficDropped)
+	mux.HandleFunc("/api/v1/monitor/access", h.monitorAccessHandler)
+	mux.HandleFunc("/api/v1/monitor/nodes/", h.monitorNodeMetricsHandler)
+	mux.HandleFunc("/api/v1/monitor/nodes", h.monitorNodeListHandler)
+	mux.HandleFunc("/api/v1/monitor/tunnels", h.monitorTunnelListHandler)
+	mux.HandleFunc("/api/v1/monitor/tunnels/quality", h.monitorTunnelQualityHandler)
+	mux.HandleFunc("/api/v1/monitor/tunnels/", h.monitorTunnelMetrics)
+	mux.HandleFunc("/api/v1/monitor/services", h.monitorServiceListHandler)
+	mux.HandleFunc("/api/v1/monitor/services/create", h.monitorServiceCreate)
+	mux.HandleFunc("/api/v1/monitor/services/update", h.monitorServiceUpdate)
+	mux.HandleFunc("/api/v1/monitor/services/delete", h.monitorServiceDelete)
+	mux.HandleFunc("/api/v1/monitor/services/run", h.monitorServiceRun)
+	mux.HandleFunc("/api/v1/monitor/services/latest-results", h.monitorServiceLatestResultsHandler)
+	mux.HandleFunc("/api/v1/monitor/services/limits", h.monitorServiceLimitsHandler)
+	mux.HandleFunc("/api/v1/monitor/services/", h.monitorServiceResultsHandler)
+	mux.HandleFunc("/api/v1/monitor/permission/list", h.monitorPermissionList)
+	mux.HandleFunc("/api/v1/monitor/permission/assign", h.monitorPermissionAssign)
+	mux.HandleFunc("/api/v1/monitor/permission/remove", h.monitorPermissionRemove)
+
+	mux.HandleFunc("/flow/test", h.flowTest)
+	mux.HandleFunc("/flow/config", h.flowConfig)
+	mux.HandleFunc("/flow/upload", h.flowUpload)
+	mux.HandleFunc("/flow/upload/v2", h.flowUploadV2)
+	mux.HandleFunc("/flow/connlog/v2", h.flowConnlogV2)
+	mux.HandleFunc("/error", h.errorPage)
+}
+
+// dummyBcryptHash 是合法 bcrypt 格式（cost 10）的占位哈希：
+// 用户不存在的鉴权路径用它跑一次 VerifyPassword，使耗时与真实
+// 验证相近，消除用户名枚举时序差（K-001；login 与 sub_store 共用）。
+const dummyBcryptHash = "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"
+
+// isStoredDefaultPassword 判断存储的口令哈希是否为种子默认口令（M-05）。
+// 仅用于管理员账号；登录已做过一次 bcrypt，这里是通行密钥等无密码登录路径的补充检查。
+// R1-12-01：2.0.0 起新播种的初始口令是随机值（或 OVO_ADMIN_PASSWORD
+// 指定值），不再是公开字面量；repo 在播种/启动探针时登记的初始口令
+// 候选与字面量同口径参与裁决——初始口令未改前同样只发受限 token。
+// 字面量集保持不动：存量未认领部署的存储哈希仍是字面量，依赖它执法。
+func isStoredDefaultPassword(roleID int, pwdHash string) bool {
+	if roleID != 0 {
+		return false
+	}
+	for _, def := range []string{"admin@user", "admin_user"} {
+		if ok, _ := security.VerifyPassword(pwdHash, def); ok {
+			return true
+		}
+	}
+	if cand := repo.InitialAdminPasswordCandidate(); cand != "" {
+		if ok, _ := security.VerifyPassword(pwdHash, cand); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// tokenIssueTime 计算 token 签发时刻，保证 IatMs 严格大于吊销水位
+// （F-068；水位 = max(PasswordChangedAt, TokensRevokedBefore)，
+// E1-02 起含登出吊销）。中间件/WS 以 IatMs <= 水位判 token 失效
+// （M-05 有意口径，不得放宽）：改密/吊销与重新登录落在同一毫秒时，
+// 按 time.Now() 签发的新 token 会出生即失效。签发侧把时刻单调推到
+// 水位+1，与 legacy rehash 的既有做法一致。observedAt 必须取自
+// 读取认证快照前，不能在耗时验密后取当前时间跨过并发撤销水位。
+func tokenIssueTime(watermark int64, observedAt time.Time) time.Time {
+	now := observedAt
+	if watermark >= now.UnixMilli() {
+		return time.UnixMilli(watermark + 1)
+	}
+	return now
+}
+
+// respondInternalError 是未鉴权可达面的内部错误统一出口
+// （R2-021，与联邦面 O12-001 同口径）：原始错误只记服务端日志，
+// 调用方只见通用文案——仓储/DB 错误原文（SQLite 锁与表结构、
+// PG 的 SQL 片段）不得回给尚未通过任何鉴权的调用方。未鉴权面
+// 禁止 err.Error() 直出的回归门见 middleware 包
+// TestUnauthenticatedRawErrorGate。
+func respondInternalError(w http.ResponseWriter, op string, err error) {
+	log.Printf("%s: %v", op, err)
+	response.WriteJSON(w, response.Err(-2, "Internal error"))
+}
+
+// respondInternalErrorWithNote is respondInternalError with an additional
+// operator note appended to the generic message (T-001: a post-commit
+// side-effect failure the operator must see, e.g. a whitelist refresh
+// that failed while the primary operation already failed). When note is
+// empty it behaves exactly like respondInternalError.
+func respondInternalErrorWithNote(w http.ResponseWriter, op string, err error, note string) {
+	log.Printf("%s: %v", op, err)
+	if note == "" {
+		response.WriteJSON(w, response.Err(-2, "Internal error"))
+		return
+	}
+	response.WriteJSON(w, response.Err(-2, "Internal error；"+note))
+}
+
+// repoError 标记一个源自仓储层的原始错误（RR4-C1-01）。Error() 与
+// 原文逐字一致、Unwrap 保留链——既有展示点（管理员面、批量回执）
+// 行为不变；双受众面的混合助手（权限/配额/占用校验等：业务文案与
+// 仓储错误同出一口）靠它区分来源：业务文案原样回、仓储错误经
+// respondInternalIfRepoError 改走 respondInternalError。标记只加在
+// 助手的仓储直通点（h.repo.* 的 return err），助手自著的业务错误
+// 不经此标记。
+type repoError struct{ err error }
+
+func (e *repoError) Error() string { return e.err.Error() }
+func (e *repoError) Unwrap() error { return e.err }
+
+func markRepoError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var re *repoError
+	if errors.As(err, &re) {
+		return err
+	}
+	return &repoError{err: err}
+}
+
+// isRepoError 报告 err 是否携带仓储层标记——handler 侧 repoError
+// 或 repo 侧 StorageError（RAW291：validateIDsExistTx 在源头标
+// 记 gorm 直通错误，handler 调用点凭文案无法把它与固定缺失 ID
+// 文案区分）。Error() 文本在两种标记下均与原文一致。
+func isRepoError(err error) bool {
+	var re *repoError
+	var se *repo.StorageError
+	return errors.As(err, &re) || errors.As(err, &se)
+}
+
+// respondInternalIfRepoError 是混合错误出口的收口判：err 携带
+// repoError 标记（源自仓储层）时按 respondInternalError 回通用
+// 文案并返回 true；否则返回 false、由调用方按原有业务口径回执。
+func respondInternalIfRepoError(w http.ResponseWriter, op string, err error) bool {
+	if isRepoError(err) {
+		respondInternalError(w, op, err)
+		return true
+	}
+	return false
+}
+
+// batchFailureErr 是批量回执逐条失败原因的同口径净化（C1-01）：回执
+// 的 Reason 字段同样是回面通道，仓储错误（repoError / StorageError
+// 标记）替换为通用文案，业务/数据面原因逐字保留。直接的仓储调用点
+// 先以 markRepoError 标明来源再传入。
+func batchFailureErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if isRepoError(err) {
+		return errors.New("内部错误，请稍后重试")
+	}
+	return err
+}
+
+func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+
+	// M-04: 登录限流（每 IP 每分钟 10 次），防暴力破解
+	if !h.checkLoginRateLimit(w, r) {
+		return
+	}
+
+	var req loginRequest
+	if err := decodeJSON(r.Body, &req); err != nil {
+		response.WriteJSON(w, response.ErrDefault("请求参数错误"))
+		return
+	}
+
+	if strings.TrimSpace(req.Username) == "" {
+		response.WriteJSON(w, response.ErrDefault("用户名不能为空"))
+		return
+	}
+	// R5-B5 D11-D13: 用户名桶只作为"升级验证"信号，永不硬拒。
+	// 触发后：验证码启用则强制 captcha（下方已有）；未启用则收紧该 IP 阈值。
+	// 无论用户名是否存在都计数，避免用行为差异做用户名枚举。
+	captchaEnabledForSignal, _ := h.captchaEnabled()
+	// R6-L8-F-04：用户名信号 IP 与限流键同收口（rateLimitKeyForRequest），
+	// 不再以含端口的原始 RemoteAddr 记账（紧缩集合的键同理）。
+	clientIPStr := rateLimitKeyForRequest(r, "login username signal")
+	h.checkLoginUsernameRateLimit(req.Username, clientIPStr, captchaEnabledForSignal)
+	if strings.TrimSpace(req.Password) == "" {
+		response.WriteJSON(w, response.ErrDefault("密码不能为空"))
+		return
+	}
+
+	captchaEnabled, err := h.captchaEnabled()
+	if err != nil {
+		respondInternalError(w, "login: captchaEnabled failed", err)
+		return
+	}
+	// R5-B2 D2: 已删除 X-FLVX-API-Client 自声明头旁路；验证码开启时无例外。
+	if captchaEnabled {
+		captchaID := strings.TrimSpace(req.CaptchaID)
+		if captchaID == "" {
+			response.WriteJSON(w, response.ErrDefault("验证码校验失败"))
+			return
+		}
+
+		if !h.consumeCaptchaToken(captchaID) {
+			secretCfg, err := h.repo.GetConfigByName("cloudflare_secret_key")
+			if err != nil || secretCfg == nil || strings.TrimSpace(secretCfg.Value) == "" {
+				response.WriteJSON(w, response.ErrDefault("验证码校验失败"))
+				return
+			}
+
+			if !h.verifyCloudflareTurnstile(captchaID, strings.TrimSpace(secretCfg.Value)) {
+				response.WriteJSON(w, response.ErrDefault("验证码校验失败"))
+				return
+			}
+		}
+	}
+
+	// Anchor issuance before reading credentials: revocation during bcrypt
+	// must cover this attempt even if the response is signed much later.
+	observedAt := time.Now()
+	user, err := h.repo.GetUserByUsername(req.Username)
+	if err != nil {
+		respondInternalError(w, "login: GetUserByUsername failed", err)
+		return
+	}
+	if user == nil {
+		// K-001：用户不存在时也跑一次 dummy bcrypt，消除时序差，防止用户名枚举
+		// 旧逻辑：不存在用户立即返回（2-5ms），存在用户走 bcrypt（80-150ms），时序差可被利用
+		_, _ = security.VerifyPassword(dummyBcryptHash, req.Password)
+		response.WriteJSON(w, response.ErrDefault("账号或密码错误"))
+		return
+	}
+	passwordMatched, passwordWasLegacy := security.VerifyPassword(user.Pwd, req.Password)
+	if !passwordMatched && !passwordWasLegacy {
+		response.WriteJSON(w, response.ErrDefault("账号或密码错误"))
+		return
+	}
+	// R6X-014：停用判据与全族 fail-closed 口径对齐（Status != 1 即拒绝），
+	// 存量 status∉{0,1} 的僵尸行不得再取得 token。停用判定先于下方
+	// R-MD5 处置：已停用账户（含导入面收口的 legacy 账户）本次尝试
+	// 不触发任何存储变更，原哈希与 password_changed_at 保持不变。
+	if user.Status != 1 {
+		response.WriteJSON(w, response.ErrDefault("账号被停用"))
+		return
+	}
+	if passwordWasLegacy {
+		// R-MD5 sunset：legacy MD5 存储不再验密放行（VerifyPassword
+		// 对 legacy 恒不命中），透明 rehash 就此退役。把账户收口为
+		// 与导入面 normalizeImportedUserPassword 相同的终态——凭据
+		// 作废、停用、既有会话吊销，密码经既有管理员通道重置。对外
+		// 与错密同文案，不泄露「该账户仍持 legacy 哈希」；处置只
+		// 依赖存储形态、不依赖候选口令对错（错密尝试同触发：该凭据
+		// 在本版已不可用，终态与本人首登一致，登录限流另有节制）。
+		if applied, serr := h.repo.SunsetLegacyUserPassword(user.ID, user.Pwd, time.Now().UnixMilli()); serr != nil {
+			log.Printf("legacy password sunset failed user_id=%d path=login err=%v", user.ID, serr)
+		} else if applied {
+			log.Printf("legacy password sunset applied user_id=%d path=login: credential invalidated and account disabled pending admin password reset", user.ID)
+		}
+		response.WriteJSON(w, response.ErrDefault("账号或密码错误"))
+		return
+	}
+	issueAt := tokenIssueTime(max(user.PasswordChangedAt, user.TokensRevokedBefore), observedAt)
+
+	// M-05: 管理员用种子默认口令登录时签发受限 token（仅允许改密），
+	// 服务端强制改密。A1-D2：判定口径与 passkey 路径（R-002）统一为
+	// 「存储口令是否仍为种子默认口令」——登录已成功验证提交口令与存储
+	// 哈希一致，故该口径与「提交口令命中默认值」等价，且能覆盖口令被
+	// 其它路径重置为默认的情况。下方响应标志直接复用同一结果：
+	// JWT claim、响应标志、passkey 三方一致，不再按用户名现算
+	// （旧现算使已改密但保留 admin@user 用户名的管理员被永久误报）。
+	pwdChangeRequired := isStoredDefaultPassword(user.RoleID, user.Pwd)
+	var token string
+	if pwdChangeRequired {
+		token, err = auth.GenerateTokenAtWithPwdChangeRequired(user.ID, user.User, user.RoleID, h.jwtSecret, issueAt)
+	} else {
+		token, err = auth.GenerateTokenAt(user.ID, user.User, user.RoleID, h.jwtSecret, issueAt)
+	}
+	if err != nil {
+		respondInternalError(w, "login: GenerateToken failed", err)
+		return
+	}
+
+	// R5-B2 A-001: 登录成功，清除该用户名的限流状态（含退避计数）。
+	h.noteLoginUsernameSuccess(req.Username)
+	response.WriteJSON(w, response.OK(map[string]interface{}{
+		"token":                 token,
+		"name":                  user.User,
+		"role_id":               user.RoleID,
+		"requirePasswordChange": pwdChangeRequired,
+	}))
+}
+
+// thirdPartyCredentialConfigKeys 是 R7-L8-03 关闭读面的第三方凭
+// 据键全集：getConfigByName 对全角色 403、getConfigs 对全角色
+// delete，两面共用本清单防口径漂移（jwt/license 两组关闭集
+// 在彼时各自成对硬编码，本组起改单一清单）。键名口径与
+// repo/config_policy.go 的 sensitiveConfigKeys 同步。
+var thirdPartyCredentialConfigKeys = []string{
+	"cloudflare_secret_key",
+	notifyConfigTGToken,
+	notifyConfigTGAPIBase,
+	notifyConfigWebhookURL,
+}
+
+func isThirdPartyCredentialConfigKey(name string) bool {
+	for _, key := range thirdPartyCredentialConfigKeys {
+		if name == key {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) getConfigByName(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+
+	var req nameRequest
+	if err := decodeJSON(r.Body, &req); err != nil {
+		response.WriteJSON(w, response.ErrDefault("配置名称不能为空"))
+		return
+	}
+	if strings.TrimSpace(req.Name) == "" {
+		response.WriteJSON(w, response.ErrDefault("配置名称不能为空"))
+		return
+	}
+	configName := strings.ToLower(strings.TrimSpace(req.Name))
+	if configName == "license_key" || configName == "license_machine_id" || configName == "machine_fingerprint" {
+		response.WriteJSON(w, response.Err(403, "禁止访问系统授权凭据"))
+		return
+	}
+	// R10X-014（A-02）：读路径统一过 repo.PolicyForConfig 单一裁决
+	// 点。此前执行路径走名单制（仅 IsSensitiveConfigKey 列名键被
+	// 挡），未列名的新键任意已登录用户可读，与 PolicyForConfig
+	// 「未知键 → 敏感」的口径矛盾且该函数零生产调用。接线后：
+	// sensitive（含未分类）非管理员 403；public 匿名可读；
+	// authenticated 须已登录。现行在用键已逐键补分类（见
+	// config_policy.go authenticatedConfigKeys），读取行为不变。
+	if repo.PolicyForConfig(configName) == repo.ConfigAccessSensitive && !isAdminRequest(r) {
+		response.WriteJSON(w, response.Err(403, "禁止访问敏感配置"))
+		return
+	}
+
+	if _, ok := r.Context().Value(middleware.ClaimsContextKey).(auth.Claims); !ok && repo.PolicyForConfig(configName) != repo.ConfigAccessPublic {
+		response.WriteJSON(w, response.Err(401, "未登录或token已过期"))
+		return
+	}
+
+	// R6-L8-F-05：jwt_secret 与第三方凭据同口径——即使对管理员也不
+	// 经 config/get 回本体（getConfigs 侧同步 delete）。它是
+	// 跨用户凭据：经管理员会话泄露后可离线为任意用户
+	// 伪造令牌，且改密不影响该秘密（中间件只比对 iat 与
+	// PasswordChangedAt），须轮换签名密钥本身才止血，故读面与
+	// license 凭据一样彻底关闭；轮换走部署面（.env 的 JWT_SECRET
+	// 或数据库同级 jwt_secret 文件，见 internal/config），不经本
+	// 接口。其余 sensitive 键管理员可读仍是既有行为，不动。
+	if configName == "jwt_secret" {
+		response.WriteJSON(w, response.Err(403, "禁止访问 JWT 签名密钥"))
+		return
+	}
+
+	// R7-L8-03：第三方凭据同口径关闭读面——cloudflare_secret_key 与
+	// 通知三凭据（telegram bot token / webhook url / telegram
+	// api_base）都是可独立使用的第三方永久凭据，管理员会话被窃时
+	// 与 jwt_secret 同样可被兑换成面板外的长期访问，故即使对管理
+	// 员也不经 config/get 回本体（getConfigs 侧同步 delete，见
+	// thirdPartyCredentialConfigKeys）。写入路径不变；前端表单改
+	// hint/写-only 形态（不回填、留空保留、显式清除）。敏感度显著
+	// 更低的三键不在关闭范围：license_expiry（到期日）、
+	// notify_telegram_chat_id（标识符）、node_sub_token（legacy 键）。
+	if isThirdPartyCredentialConfigKey(configName) {
+		response.WriteJSON(w, response.Err(403, "禁止访问第三方凭据"))
+		return
+	}
+
+	cfg, err := h.repo.GetConfigByName(configName)
+	if err != nil {
+		respondInternalError(w, "getConfigByName: GetConfigByName failed", err)
+		return
+	}
+	if cfg == nil {
+		response.WriteJSON(w, response.ErrDefault("配置不存在"))
+		return
+	}
+
+	response.WriteJSON(w, response.OK(cfg))
+}
+
+func (h *Handler) getConfigs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+
+	cfgMap, err := h.repo.ListConfigs()
+	if err != nil {
+		// RR4-C1-01：/config/list 非管理员可达，仓储错误不得原文
+		// 直出（与 userPackage 的 R4-C1-I01 同口径，本轮按机制全集
+		// 补齐同族各面）。
+		respondInternalError(w, "getConfigs: ListConfigs failed", err)
+		return
+	}
+	ctxClaims := r.Context().Value(middleware.ClaimsContextKey)
+	// O11-P3-3：变量更名为 isAuthenticated（旧名 isAdmin 实为"断言成功"，
+	// 命名误导易被后人改错；逻辑不变，非 admin 仍走敏感配置过滤）。
+	// R10X-014（A-02）：FilterSensitiveConfigs 已统一过
+	// PolicyForConfig（仅 public/authenticated 下发），本处调用
+	// 形态不变，过滤口径随策略单点收口。
+	claims, isAuthenticated := ctxClaims.(auth.Claims)
+	if !isAuthenticated || claims.RoleID != 0 {
+		cfgMap = repo.FilterSensitiveConfigs(cfgMap)
+	}
+	delete(cfgMap, "license_key")
+	delete(cfgMap, "license_machine_id")
+	delete(cfgMap, "machine_fingerprint")
+	// R6-L8-F-05：jwt_secret 同口径——管理员经 config/list 亦不回
+	// 本体（与 getConfigByName 侧的 403 成对，理由见彼处注释）。
+	delete(cfgMap, "jwt_secret")
+	// R7-L8-03：第三方凭据同口径——管理员经 config/list 亦不回本
+	// 体（与 getConfigByName 侧的 403 成对，理由见彼处注释）。
+	for _, key := range thirdPartyCredentialConfigKeys {
+		delete(cfgMap, key)
+	}
+	response.WriteJSON(w, response.OK(cfgMap))
+}
+
+func (h *Handler) userList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+
+	var req struct {
+		Current int    `json:"current"`
+		Size    int    `json:"size"`
+		Keyword string `json:"keyword"`
+	}
+	if err := decodeJSON(r.Body, &req); err != nil && err != io.EOF {
+		response.WriteJSON(w, response.ErrDefault("请求参数错误"))
+		return
+	}
+
+	users, err := h.repo.ListUsers()
+	if err != nil {
+		// F4-01：仓储错误收口——真因进服务端日志、对外泛化，
+		// 与监控面 respondInternalError 纪律一致（原文直出会把
+		// SQL/驱动细节漏给前端）。
+		respondInternalError(w, "userList: ListUsers failed", err)
+		return
+	}
+
+	keyword := strings.ToLower(strings.TrimSpace(req.Keyword))
+	if keyword != "" {
+		filtered := make([]map[string]interface{}, 0, len(users))
+		for _, item := range users {
+			username := strings.ToLower(strings.TrimSpace(fmt.Sprint(item["user"])))
+			displayName := strings.ToLower(strings.TrimSpace(fmt.Sprint(item["name"])))
+			if strings.Contains(username, keyword) || strings.Contains(displayName, keyword) {
+				filtered = append(filtered, item)
+			}
+		}
+		users = filtered
+	}
+
+	// O5-003：正确使用 current/size 分页。旧逻辑解析了参数却完全忽略、全量返回。
+	// 未传分页参数（current/size 为 0）时保持旧全量行为兼容。
+	if req.Current > 0 && req.Size > 0 {
+		// R16-X-02：(Current-1)*Size 与 start+Size 均可回绕 int64（溢出形
+		// 见 audit-out-132/r16/R16-L3-sentinel-a2.md:196-198），回绕为负后
+		// users[start:end] panic；乘前判溢出、超界即空页，不改变正常分页语义。
+		start := len(users)
+		if req.Current-1 <= math.MaxInt64/req.Size {
+			start = (req.Current - 1) * req.Size
+			if start > len(users) {
+				start = len(users)
+			}
+		}
+		end := len(users)
+		if req.Size <= len(users)-start {
+			end = start + req.Size
+		}
+		users = users[start:end]
+	}
+
+	response.WriteJSON(w, response.OK(users))
+}
+
+func (h *Handler) nodeList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+
+	items, err := h.repo.ListNodes()
+	if err != nil {
+		respondInternalError(w, "nodeList", err)
+		return
+	}
+
+	h.attachNodeLatency(items)
+	h.attachNodeUninstallStates(items)
+	h.attachConnlogMarkStates(items)
+	h.attachNodeMetricStaleness(items)
+	h.attachNodeNicShared(items)
+	for _, item := range items {
+		verification, ok := item["upgradeVerification"].(map[string]interface{})
+		id, _ := item["id"].(int64)
+		if ok && verification["status"] == repo.NodeUpgradeVerifyFailed && verification["dispatchStatus"] != "failed" && !h.wsServer.NodeHasLifecycleGuard(id) {
+			verification["retryBlockedReason"] = legacyNodeOperationRetryMessage
+		}
+	}
+
+	response.WriteJSON(w, response.OK(items))
+}
+
+func (h *Handler) tunnelList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+
+	items, err := h.repo.ListTunnels()
+	if err != nil {
+		respondInternalError(w, "tunnelList", err)
+		return
+	}
+	h.attachBestExitStates(items)
+	h.attachOrphanTunnelFlags(items)
+	response.WriteJSON(w, response.OK(items))
+}
+
+// attachOrphanTunnelFlags marks list items whose tunnels lost nodes to
+// the v6 federation-removal migration (R18-B7-01). Two sources are
+// merged: the v6 orphan-todo key, and the list-time derivation
+// (R18-R3-B7-01, Repository.ListOrphanedType2TunnelIDs) for DBs that
+// already ran v6 before the key existed. The flag is advisory: a
+// read/parse/derivation failure logs and leaves the affected items
+// unflagged rather than failing the list call; listing never writes
+// the todo key.
+func (h *Handler) attachOrphanTunnelFlags(items []map[string]interface{}) {
+	orphaned := make(map[int64]bool)
+	cfg, err := h.repo.GetConfigByName(repo.RMShareOrphanTunnelsKey)
+	if err != nil {
+		log.Printf("tunnelList: orphan-tunnel flag read failed: %v", err)
+	} else if cfg != nil {
+		var ids []int64
+		if err := json.Unmarshal([]byte(cfg.Value), &ids); err != nil {
+			log.Printf("tunnelList: orphan-tunnel flag parse failed: %v", err)
+		} else {
+			for _, id := range ids {
+				orphaned[id] = true
+			}
+		}
+	}
+	if derived, err := h.repo.ListOrphanedType2TunnelIDs(); err != nil {
+		log.Printf("tunnelList: orphan-tunnel derivation failed: %v", err)
+	} else {
+		for _, id := range derived {
+			orphaned[id] = true
+		}
+	}
+	for _, item := range items {
+		if id, ok := item["id"].(int64); ok && orphaned[id] {
+			item["orphanedByFederationRemoval"] = true
+		}
+	}
+}
+
+// clearOrphanTunnelFlag removes one tunnel from the v6 orphan-todo key
+// after the admin handled it: a successful redeploy proves entry nodes
+// exist again (the entry gate now fail-closes), and a delete removes
+// the tunnel. The key itself is deleted once empty. Failures only
+// log: the flag is advisory and must never fail a redeploy or delete.
+func (h *Handler) clearOrphanTunnelFlag(tunnelID int64) {
+	cfg, err := h.repo.GetConfigByName(repo.RMShareOrphanTunnelsKey)
+	if err != nil || cfg == nil {
+		if err != nil {
+			log.Printf("orphan-tunnel flag clear failed for tunnel %d: read: %v", tunnelID, err)
+		}
+		return
+	}
+	var ids []int64
+	if err := json.Unmarshal([]byte(cfg.Value), &ids); err != nil {
+		log.Printf("orphan-tunnel flag clear failed for tunnel %d: parse: %v", tunnelID, err)
+		return
+	}
+	kept := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if id != tunnelID {
+			kept = append(kept, id)
+		}
+	}
+	if len(kept) == 0 {
+		if err := h.repo.DeleteConfig(repo.RMShareOrphanTunnelsKey); err != nil {
+			log.Printf("orphan-tunnel flag clear failed for tunnel %d: delete key: %v", tunnelID, err)
+		}
+		return
+	}
+	value, err := json.Marshal(kept)
+	if err != nil {
+		log.Printf("orphan-tunnel flag clear failed for tunnel %d: marshal: %v", tunnelID, err)
+		return
+	}
+	if err := h.repo.UpsertConfig(repo.RMShareOrphanTunnelsKey, string(value), time.Now().UnixMilli()); err != nil {
+		log.Printf("orphan-tunnel flag clear failed for tunnel %d: write: %v", tunnelID, err)
+	}
+}
+
+func (h *Handler) forwardList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+
+	userID, roleID, err := userRoleFromRequest(r)
+	if err != nil {
+		response.WriteJSON(w, response.Err(401, "无效的token或token已过期"))
+		return
+	}
+
+	items, err := h.repo.ListForwards()
+	if err != nil {
+		respondInternalError(w, "forwardList: ListForwards failed", err)
+		return
+	}
+	if roleID != 0 {
+		filtered := make([]map[string]interface{}, 0, len(items))
+		for _, item := range items {
+			if asInt64(item["userId"], 0) == userID {
+				filtered = append(filtered, item)
+			}
+		}
+		items = filtered
+	}
+	response.WriteJSON(w, response.OK(items))
+}
+
+func (h *Handler) speedLimitList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+
+	items, err := h.repo.ListSpeedLimits()
+	if err != nil {
+		respondInternalError(w, "speedLimitList", err)
+		return
+	}
+	response.WriteJSON(w, response.OK(items))
+}
+
+// R5-B2 D1: sub_store 保留 + 90 天弃用窗口（Sunset: 2027-01-17）。
+// POST JSON body 为正式用法；GET 保留但限流 + Deprecation/Sunset 头。
+// 凭据曾长期走 URL query（进 access_log/代理日志），限流器独立于 login，
+// 键 = 真实客户端 IP + 用户名，避免攻击者耗尽 login 桶锁死正常登录。
+var subStoreLimiter = &loginRateLimiter{buckets: make(map[string]*loginAttemptBucket)}
+
+// R7-L8-02：复合键（IP+用户名）按对计数，单 IP 轮换用户名跨账号
+// 喷洒在 IP 维度不聚合——在复合桶之外并行一条纯 IP 聚合桶（与
+// login 面「IP 桶＋用户名信号」双键并行同形态），只封顶单 IP 的
+// 喷洒总量。上限远宽于复合键的 10/min：正常同 NAT 多用户各自
+// 拉取远达不到，聚合桶耗尽也只拒 sub_store 本面——两个桶都独立
+// 于 login 桶，刷 sub_store 锁不死同 NAT 的正常登录（原复合键
+// 设计要保的隔离不变）。两桶均走 allowWithLimit：不查登录紧缩
+// 集（紧缩是 login 面的信号机制，复合键查它永不命中、纯 IP 键
+// 查它则会把登录信号外溢进本面，两头都错位）。
+var subStoreIPAggregateLimiter = &loginRateLimiter{buckets: make(map[string]*loginAttemptBucket)}
+
+// subStoreIPAggregateMaxAttempts 是纯 IP 聚合桶的每分钟上限
+// （窗口与 loginRateLimiter 共用 loginRateLimitWindow）。
+const subStoreIPAggregateMaxAttempts = 100
+
+const subStoreSunsetHTTPDate = "Sun, 17 Jan 2027 00:00:00 GMT"
+
+func (h *Handler) openAPISubStore(w http.ResponseWriter, r *http.Request) {
+	if h == nil || h.repo == nil {
+		response.WriteJSON(w, response.Err(-2, "database unavailable"))
+		return
+	}
+	// F-W3-01：本面全程禁存——成功体经下方 w.Write 直出（不走
+	// response 信封），错误体走信封（已自带 no-store）；入口统一
+	// 设头覆盖两路。本面是凭据鉴权后的订阅数据，且不在 CF 订阅
+	// 前置的绕缓存覆盖内（覆盖面只有 /api/v1/open_api/sub/*）。
+	w.Header().Set("Cache-Control", "no-store")
+
+	var username, password, tunnel string
+	switch r.Method {
+	case http.MethodPost:
+		// 正式用法：凭据走 POST body，不进 URL/query 日志
+		var req struct {
+			User     string `json:"user"`
+			Password string `json:"password"`
+			Tunnel   string `json:"tunnel"`
+		}
+		if err := decodeJSON(r.Body, &req); err != nil {
+			response.WriteJSON(w, response.ErrDefault("请求参数错误"))
+			return
+		}
+		username = strings.TrimSpace(req.User)
+		password = req.Password
+		tunnel = strings.TrimSpace(req.Tunnel)
+	case http.MethodGet:
+		// 弃用窗口：仍可用，但限流 + 标记弃用；窗口结束后删除
+		w.Header().Set("Deprecation", "true")
+		w.Header().Set("Sunset", subStoreSunsetHTTPDate)
+		q := r.URL.Query()
+		username = strings.TrimSpace(q.Get("user"))
+		password = q.Get("pwd")
+		tunnel = strings.TrimSpace(q.Get("tunnel"))
+	default:
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+	if tunnel == "" {
+		tunnel = "-1"
+	}
+
+	if username == "" {
+		response.WriteJSON(w, response.ErrDefault("用户不能为空"))
+		return
+	}
+	if password == "" {
+		response.WriteJSON(w, response.ErrDefault("密码不能为空"))
+		return
+	}
+
+	// 独立限流（不与 login 共用桶）：键 = 真实客户端 IP + 用户名。
+	// R6-L8-F-04：IP 段走 rateLimitKeyForRequest 收口（clientip 两级
+	// 解析 + UnresolvedKey 共享桶），不再以含端口的原始 RemoteAddr
+	// 为键；下方失败审计日志的 ip 亦同此口径。
+	ipStr := rateLimitKeyForRequest(r, "sub_store rate limit")
+	now := time.Now()
+	if !subStoreLimiter.allowWithLimit(ipStr+"\x00"+strings.ToLower(username), now, loginRateLimitMaxAttempts) {
+		w.Header().Set("Retry-After", "60")
+		response.WriteJSON(w, response.Err(429, "请求过于频繁，请稍后再试"))
+		return
+	}
+	// R7-L8-02：纯 IP 聚合桶封顶轮换用户名的跨账号喷洒总量；
+	// 与复合桶任一命中即拒，计数口径与复合桶一致（每次尝试都计）。
+	if !subStoreIPAggregateLimiter.allowWithLimit(ipStr, now, subStoreIPAggregateMaxAttempts) {
+		w.Header().Set("Retry-After", "60")
+		response.WriteJSON(w, response.Err(429, "请求过于频繁，请稍后再试"))
+		return
+	}
+	// C1-03（1.9.5 发版后审计）：用户名维度全局桶——与 login 共用
+	// globalLoginUsernameLimiter（同一批账号口令的尝试必须跨面
+	// 聚合：此前两桶键都含 IP，轮换源 IP 即可对单账号线性放大
+	// 猜测预算）。计数口径与 login 一致（每次尝试都计、无论用户
+	// 是否存在、成功后由 noteLoginUsernameSuccess 清桶）。login
+	// 面该桶只作信号（升级验证码强度），本面无验证码可升级，
+	// 故触发即硬拒 429：单账号全局预算封顶为既有口径的 30 次/
+	// 10 分钟——合法订阅客户端的拉取远低于此；代价是持续喷洒
+	// 期间该账号在本面（存量兼容面）被一并挡下至窗口滚动，
+	// login 面不受影响（其用户名桶仍只作信号、永不硬拒）。
+	if globalLoginUsernameLimiter.recordAttempt(username, now) {
+		w.Header().Set("Retry-After", "60")
+		response.WriteJSON(w, response.Err(429, "请求过于频繁，请稍后再试"))
+		return
+	}
+
+	authOK := false
+	defer func() {
+		if !authOK {
+			// 失败审计：只记用户名、解析后 IP、时间戳；
+			// 绝不记录密码、原始 query 或完整 URL。
+			log.Printf("sub_store auth failed user=%q ip=%s at=%d", username, ipStr, time.Now().UnixMilli())
+		}
+	}()
+
+	user, err := h.repo.GetUserByUsername(username)
+	if err != nil {
+		respondInternalError(w, "sub_store: GetUserByUsername failed", err)
+		return
+	}
+	if user == nil {
+		// A1 P3：与 login 的 K-001 同口径——用户不存在时也跑一次
+		// dummy bcrypt，消除用户名枚举时序侧信道（旧实现立即返回）。
+		_, _ = security.VerifyPassword(dummyBcryptHash, password)
+		response.WriteJSON(w, response.ErrDefault("鉴权失败"))
+		return
+	}
+	passwordMatched, passwordWasLegacy := security.VerifyPassword(user.Pwd, password)
+	if !passwordMatched && !passwordWasLegacy {
+		response.WriteJSON(w, response.ErrDefault("鉴权失败"))
+		return
+	}
+	// R6X-014：同 login——停用判据改 Status != 1 fail-closed，
+	// 存量 status∉{0,1} 的僵尸行不得再取得本人用量。停用判定
+	// 先于下方 R-MD5 处置（与 login 同序）：已停用账户本次尝试
+	// 不触发任何存储变更。
+	if user.Status != 1 {
+		response.WriteJSON(w, response.ErrDefault("账号被停用"))
+		return
+	}
+	if passwordWasLegacy {
+		// R-MD5 sunset：同 login——legacy MD5 存储不再验密放行，
+		// 账户经 SunsetLegacyUserPassword 收口为导入面终态（凭据
+		// 作废＋停用＋会话吊销，管理员通道重置）；对外与鉴权失败
+		// 同文案，处置细节只进服务端日志。
+		if applied, serr := h.repo.SunsetLegacyUserPassword(user.ID, user.Pwd, time.Now().UnixMilli()); serr != nil {
+			log.Printf("legacy password sunset failed user_id=%d path=sub_store err=%v", user.ID, serr)
+		} else if applied {
+			log.Printf("legacy password sunset applied user_id=%d path=sub_store: credential invalidated and account disabled pending admin password reset", user.ID)
+		}
+		response.WriteJSON(w, response.ErrDefault("鉴权失败"))
+		return
+	}
+	// L8-F-01（Round 5）：补种子默认口令门，与 login / passkey 登录
+	// 同口径。isStoredDefaultPassword 是「管理员仍用默认口令 ⇒ 不得
+	// 获得完整能力」的单一裁决点：login 命中只签发受限 token、
+	// passkey 登录同口径；本面是裸口令鉴权、不签发 token，无受限
+	// 形态可给，命中即拒——否则种子默认口令（源码公开、零猜测
+	// 成本）可直接兑换本接口的完整能力，绕过强制改密。本判定在
+	// 口令已验通过之后，非枚举面；拒绝经下方 authOK=false 的失败
+	// 审计通道留痕。
+	if isStoredDefaultPassword(user.RoleID, user.Pwd) {
+		log.Printf("sub_store rejected: stored default password still in use user=%q ip=%s", username, ipStr)
+		response.WriteJSON(w, response.ErrDefault("账号仍在使用默认密码，请先登录面板修改密码"))
+		return
+	}
+	authOK = true
+	// C1-03：与 login 同口径——鉴权成功清除该用户名的限流状态，
+	// 正常用户的历史失败计数不累积误伤后续拉取。
+	h.noteLoginUsernameSuccess(username)
+
+	// R10X-005（T1）：total 必须经 flowLimitBytes(Flow, FlowMiB) 按字节
+	// 精确下发，与执法面同值——旧读法 Flow×1GiB 忽略 FlowMiB，非整 GiB
+	// 限额被向上取整、(0,MiB>0) 备份可达对 total 误报 0。
+	// (Flow,FlowMiB)=(0,0) 时 total=0 保留：与分享订阅面 TrafficLimit
+	// 0=不限量同读法（kernel_relay.go 订阅头注记），执法面亦以 0=不限额
+	// 读之（R9X-001），三面一致。
+	headerValue := ""
+
+	if tunnel == "-1" {
+		headerValue = buildSubscriptionHeader(user.InFlow, user.OutFlow, flowLimitBytes(user.Flow, user.FlowMiB), user.ExpTime/1000)
+	} else {
+		tunnelID, parseErr := strconv.ParseInt(tunnel, 10, 64)
+		if parseErr != nil || tunnelID <= 0 {
+			response.WriteJSON(w, response.ErrDefault("隧道不存在"))
+			return
+		}
+
+		ut, err := h.repo.GetUserTunnelByID(tunnelID)
+		if err != nil {
+			respondInternalError(w, "sub_store: GetUserTunnelByID failed", err)
+			return
+		}
+		if ut == nil {
+			response.WriteJSON(w, response.ErrDefault("隧道不存在"))
+			return
+		}
+		if ut.UserID != user.ID {
+			response.WriteJSON(w, response.ErrDefault("隧道不存在"))
+			return
+		}
+
+		headerValue = buildSubscriptionHeader(ut.InFlow, ut.OutFlow, flowLimitBytes(ut.Flow, ut.FlowMiB), ut.ExpTime/1000)
+	}
+
+	w.Header().Set("subscription-userinfo", headerValue)
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write([]byte(headerValue))
+}
+
+func (h *Handler) errorPage(w http.ResponseWriter, _ *http.Request) {
+	// 后端直出的唯一 HTML 面：与前端入口文档统一 no-cache 口径，
+	// 别让浏览器启发式缓存把旧错误页留住（面板 UI 本身不经后端出站）。
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Content-Type", "text/html; charset=UTF-8")
+	w.WriteHeader(http.StatusNotFound)
+	_, _ = w.Write([]byte("<!DOCTYPE html><html lang='zh-CN'><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'><title>错误 404</title></head><body><div style='min-height:100vh;display:flex;align-items:center;justify-content:center;flex-direction:column;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;'><div style='font-size:6rem;color:#333;font-weight:300;'>404</div><div style='font-size:1.2rem;color:#666;'>你推开了后端的大门，却发现里面只有寂寞。</div></div></body></html>"))
+}
+
+// buildSubscriptionHeader 组 Subscription-Userinfo 头：形参序即计量
+// 方向——upload 取 InFlow（客户端→远端字节 = 用户上传）、download 取
+// OutFlow（远端→客户端字节 = 用户下载），与 flow_upload_batch.go 的
+// N-01 方向钉死同口径。旧形态靠「调用点反序 + Sprintf 反序」两层抵消
+// 才得到正确值，任一层单独被「顺手修正」即静默翻转真实值；现两层已
+// 归正，整头数值由 TestR6G6SubStoreHeaderDirectionPinned 逐字钉死，
+// 勿再反序。
+func buildSubscriptionHeader(upload, download, total, expire int64) string {
+	return fmt.Sprintf("upload=%d; download=%d; total=%d; expire=%d", upload, download, total, expire)
+}
+
+func (h *Handler) userTunnelVisibleList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+
+	userID, roleID, err := userRoleFromRequest(r)
+	if err != nil {
+		response.WriteJSON(w, response.Err(401, "无效的token或token已过期"))
+		return
+	}
+
+	items := make([]map[string]interface{}, 0)
+	if roleID == 0 {
+		items, err = h.repo.ListEnabledTunnelSummaries()
+	} else {
+		items, err = h.repo.ListUserAccessibleTunnels(userID)
+	}
+	if err != nil {
+		respondInternalError(w, "userTunnelVisibleList: list visible tunnels failed", err)
+		return
+	}
+	response.WriteJSON(w, response.OK(items))
+}
+
+func (h *Handler) userTunnelList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+
+	var req struct {
+		UserID int64 `json:"userId"`
+	}
+	if err := decodeJSON(r.Body, &req); err != nil {
+		response.WriteJSON(w, response.ErrDefault("请求参数错误"))
+		return
+	}
+	if req.UserID <= 0 {
+		response.WriteJSON(w, response.OK([]interface{}{}))
+		return
+	}
+
+	tunnels, err := h.repo.GetUserPackageTunnels(req.UserID)
+	if err != nil {
+		// R2-F4-01：仓储直通原文泛化回执、详情进日志。
+		respondInternalError(w, "userTunnelList", err)
+		return
+	}
+
+	out := make([]map[string]interface{}, 0, len(tunnels))
+	for _, t := range tunnels {
+		item := map[string]interface{}{
+			"id":             t.ID,
+			"userId":         t.UserID,
+			"tunnelId":       t.TunnelID,
+			"tunnelName":     t.TunnelName,
+			"status":         t.Status,
+			"flow":           t.Flow,
+			"flowMiB":        t.FlowMiB,
+			"num":            t.Num,
+			"expTime":        t.ExpTime,
+			"flowResetTime":  t.FlowResetTime,
+			"inFlow":         t.InFlow,
+			"outFlow":        t.OutFlow,
+			"tunnelFlow":     t.TunnelFlow,
+			"speedId":        nil,
+			"speedLimitName": nil,
+		}
+		if t.SpeedID.Valid {
+			item["speedId"] = t.SpeedID.Int64
+		}
+		if t.SpeedLimit.Valid {
+			item["speedLimitName"] = t.SpeedLimit.String
+		}
+		out = append(out, item)
+	}
+	response.WriteJSON(w, response.OK(out))
+}
+
+func (h *Handler) checkCaptcha(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+
+	enabled, err := h.captchaEnabled()
+	if err != nil {
+		respondInternalError(w, "checkCaptcha: captchaEnabled failed", err)
+		return
+	}
+	if enabled {
+		response.WriteJSON(w, response.OK(1))
+		return
+	}
+	response.WriteJSON(w, response.OK(0))
+}
+
+func (h *Handler) captchaVerify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+
+	// R10X-008（A-01）②：端点未认证可达，此前无任何限流——接入
+	// 独立 IP 限流桶，超限直接 429，不再进入校验与铸令牌路径。
+	if !h.checkCaptchaVerifyRateLimit(w, r) {
+		return
+	}
+
+	var req captchaVerifyRequest
+	if err := decodeJSON(r.Body, &req); err != nil {
+		h.writeCaptchaVerifyResult(w, false, "")
+		return
+	}
+	id := strings.TrimSpace(req.ID)
+	data := strings.TrimSpace(req.Data)
+	if id == "" || data == "" {
+		h.writeCaptchaVerifyResult(w, false, "")
+		return
+	}
+
+	secretCfg, err := h.repo.GetConfigByName("cloudflare_secret_key")
+	if err != nil {
+		respondInternalError(w, "captchaVerify: GetConfigByName failed", err)
+		return
+	}
+	if secretCfg == nil || strings.TrimSpace(secretCfg.Value) == "" {
+		// R10X-008（A-01）③ / BC-R10-07：secret 未配置时关闭本地
+		// data=="ok" 回退分支。此前默认部署形态下任意请求体
+		// data=="ok" 即判定通过并铸令牌入池，而 login 侧在该形态
+		// 下根本不消费验证码（captchaEnabled 要求 site+secret
+		// 双全），该端点的唯一实际效果是写入无界状态。现返回
+		// 未启用语义且不铸令牌；前端在该形态下本就无调用方
+		// （verifyCaptcha 无现行调用点，登录页只在 check 返回
+		// 启用后走 Turnstile 组件直连 login 消费路径）。
+		response.WriteJSON(w, response.Err(-1, "验证码未启用"))
+		return
+	}
+	if !h.verifyCloudflareTurnstile(data, strings.TrimSpace(secretCfg.Value)) {
+		h.writeCaptchaVerifyResult(w, false, "")
+		return
+	}
+
+	h.markCaptchaToken(id)
+	h.writeCaptchaVerifyResult(w, true, id)
+}
+
+// captcha verify 端点 IP 限流参数：独立小桶（不与登录桶共用，
+// 避免验证码流量挤占登录预算、或登录爆破连带锁死验证码）。
+const (
+	captchaVerifyRateLimitWindow      = time.Minute
+	captchaVerifyRateLimitMaxAttempts = 30
+	captchaVerifyRateLimitMaxBuckets  = 10000
+)
+
+// checkCaptchaVerifyRateLimit 形态对齐 checkLoginRateLimit：
+// 命中时直接写 429 并返回 false。桶表有界（上限 + 过期清理 +
+// LRU 淘汰最旧），与登录限流器同一淘汰口径（A-08）。
+func (h *Handler) checkCaptchaVerifyRateLimit(w http.ResponseWriter, r *http.Request) bool {
+	if h.allowCaptchaVerify(r) {
+		return true
+	}
+	w.Header().Set("Retry-After", "60")
+	response.WriteJSON(w, response.Err(429, "请求过于频繁，请稍后再试"))
+	return false
+}
+
+func (h *Handler) allowCaptchaVerify(r *http.Request) bool {
+	// R6-L8-F-04：与登录限流同收口（rateLimitKeyForRequest），
+	// 第三级回退不再用含端口的原始 RemoteAddr。
+	key := rateLimitKeyForRequest(r, "captcha verify rate limit")
+	now := time.Now()
+	h.captchaVerifyMu.Lock()
+	defer h.captchaVerifyMu.Unlock()
+	if h.captchaVerifyBuckets == nil {
+		h.captchaVerifyBuckets = make(map[string]*loginAttemptBucket)
+	}
+	b, ok := h.captchaVerifyBuckets[key]
+	if !ok {
+		h.evictCaptchaVerifyBucketsLocked(now)
+		h.captchaVerifyBuckets[key] = &loginAttemptBucket{count: 1, windowStart: now, lastSeen: now}
+		return true
+	}
+	b.lastSeen = now
+	if now.Sub(b.windowStart) >= captchaVerifyRateLimitWindow {
+		b.count = 1
+		b.windowStart = now
+		return true
+	}
+	b.count++
+	return b.count <= captchaVerifyRateLimitMaxAttempts
+}
+
+func (h *Handler) evictCaptchaVerifyBucketsLocked(now time.Time) {
+	if len(h.captchaVerifyBuckets) < captchaVerifyRateLimitMaxBuckets {
+		return
+	}
+	for k, v := range h.captchaVerifyBuckets {
+		if now.Sub(v.windowStart) >= captchaVerifyRateLimitWindow {
+			delete(h.captchaVerifyBuckets, k)
+		}
+	}
+	if len(h.captchaVerifyBuckets) < captchaVerifyRateLimitMaxBuckets {
+		return
+	}
+	var oldestKey string
+	var oldest time.Time
+	first := true
+	for k, v := range h.captchaVerifyBuckets {
+		if first || v.lastSeen.Before(oldest) {
+			oldestKey, oldest, first = k, v.lastSeen, false
+		}
+	}
+	if oldestKey != "" {
+		delete(h.captchaVerifyBuckets, oldestKey)
+	}
+}
+
+func (h *Handler) flowTest(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write([]byte("test"))
+}
+
+func (h *Handler) flowConfig(w http.ResponseWriter, r *http.Request) {
+	// C1-01：与 v2（flow_upload_v2.go）同口径补方法校验——v1 两面
+	// 此前不验方法，任意方法带 secret 均可达处理逻辑。
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	// R8-060：鉴权失败已达上限的来源不再查库，回包与未知 secret
+	// 同形（"ok"、不处理 body）。
+	failKey, throttled := h.flowAuthThrottleKey(r)
+	if throttled {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = w.Write([]byte("ok"))
+		return
+	}
+	// F08 第 ① 步：节点 secret 取自 X-OVO-Node-Secret 头（优先）
+	// 或 URL query（回退）；query 暂不下掉——agent 未发头，见
+	// doc/guide/install.md“反向代理”节。secret 绝不进日志。
+	secret := nodeSecretFromRequest(r)
+	node, err := h.repo.GetNodeBySecret(secret)
+	if err != nil || node == nil {
+		h.recordFlowAuthFailure(failKey)
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = w.Write([]byte("ok"))
+		return
+	}
+
+	rawData, err := readAndDecryptFlowBody(r.Body, secret)
+	if err == nil && strings.TrimSpace(rawData) != "" {
+		h.cleanNodeConfigs(node.ID, rawData)
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write([]byte("ok"))
+}
+
+// parseFlowSeqFromHeaders 解析上报 seq 头：新头 X-Ovo-Seq 优先、
+// 旧头 X-Flvx-Seq 次之。X-P3-19（L-06-1＝F-O01）：新头存在但解析
+// 失败时继续尝试旧头（与头注释口径对齐）——旧实现无条件 break，
+// 垃圾新头会把合法旧头 seq 一并丢弃、回落 legacy 失去重放防护。
+func parseFlowSeqFromHeaders(r *http.Request) *int64 {
+	if r == nil {
+		return nil
+	}
+	for _, hdr := range []string{"X-Ovo-Seq", "X-Flmx-Seq", "X-Flvx-Seq"} {
+		if hv := r.Header.Get(hdr); hv != "" {
+			if v, err := strconv.ParseInt(strings.TrimSpace(hv), 10, 64); err == nil {
+				return &v
+			}
+		}
+	}
+	return nil
+}
+
+// C1-01（1.9.5 发版后审计）：flow 加密信封 timestamp 新鲜度窗口。
+// agent 在每次发送时以 time.Now().Unix()（秒）现场封包（go-gost
+// encryptReportPayload，v1/v2/flowConfig 三面同路），重试亦重新
+// 封包，故正常上报恒新鲜，窗口只需覆盖节点与面板之间的时钟偏差。
+// 取值 15 分钟：宽于本仓既有的消息时效口径（passkey 仪式 2 分钟、
+// 幂等缓存 10 分钟），为无 NTP 同步的节点留偏差余量，正常旧 agent
+// 不受影响（钉格见 flow_v1_tighten_c101_test.go 的 ±10 分钟放行用例）。
+const flowEnvelopeMaxSkew = 15 * time.Minute
+
+// flowV1LegacySunset 是 v1 无 seq（legacy）上报的落日时刻，与
+// sub_store GET 的弃用窗口同型（R5-B2 D1：保留＋90 天窗口＋Sunset
+// 点名）：此前无 seq 批次照常入账、回执带 Deprecation/Sunset 头；
+// 此后整批拒收（非 ok，agent 保留批次待其升级）。带 seq 的 v1
+// 上报（X-Ovo-Seq 头或 {seq, items} 体）与 v2 均不受落日影响——
+// 落日只关停无重放防护的兼容形态。为包级 var 作测试注入缝
+// （与 turnstileSiteVerifyURL 同例）。
+var flowV1LegacySunset = time.Date(2027, time.February, 2, 0, 0, 0, 0, time.UTC)
+
+const flowV1LegacySunsetHTTPDate = "Tue, 02 Feb 2027 00:00:00 GMT"
+
+func (h *Handler) flowUpload(w http.ResponseWriter, r *http.Request) {
+	// C1-01：与 v2 同口径补方法校验（v2 在 flow_upload_v2.go 强制
+	// POST，v1 此前任意方法均可达）。
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	// R8-060：鉴权失败已达上限的来源不再查库，回包与未知 secret
+	// 同形（非 ok，agent 保留批次稍后重报）。不记 secret。
+	failKey, throttled := h.flowAuthThrottleKey(r)
+	if throttled {
+		log.Printf("flow upload auth throttled")
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = w.Write([]byte("error"))
+		return
+	}
+	// F08 第 ① 步：节点 secret 取自 X-OVO-Node-Secret 头（优先）
+	// 或 URL query（回退）；query 暂不下掉——agent 未发头，见
+	// doc/guide/install.md“反向代理”节。secret 绝不进日志。
+	secret := nodeSecretFromRequest(r)
+	node, _ := h.repo.GetNodeBySecret(secret)
+	if node == nil {
+		h.recordFlowAuthFailure(failKey)
+		// F-01：未知 secret 整批拒收返非 ok（原回 ok 使 agent 清零、
+		// 该批流量永久丢失且零日志）。secret 本身不记日志。
+		log.Printf("flow upload unknown secret")
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = w.Write([]byte("error"))
+		return
+	}
+
+	raw, err := readAndDecryptFlowBody(r.Body, secret)
+	if err != nil {
+		// F-01：解密失败整批拒收返非 ok，agent 不清零、可重报。
+		log.Printf("flow upload decrypt failed node_id=%d err=%v", node.ID, err)
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = w.Write([]byte("error"))
+		return
+	}
+	if strings.TrimSpace(raw) != "" {
+		// R5-B6 E-001: seq 优先从 HTTP 头 X-Ovo-Seq 读取（改名后新头），
+		// 回退旧头 X-Flvx-Seq，其次从 body 的 {seq, items} 对象读取，
+		// 最后兼容纯数组（legacy）。
+		seq := parseFlowSeqFromHeaders(r)
+		var items []flowItem
+		// 先尝试新格式：{seq, items}。
+		var batch struct {
+			Seq   *int64     `json:"seq"`
+			Items []flowItem `json:"items"`
+		}
+		if json.Unmarshal([]byte(raw), &batch) == nil && batch.Items != nil {
+			if seq == nil {
+				seq = batch.Seq
+			}
+			items = batch.Items
+		} else if json.Unmarshal([]byte(raw), &items) == nil {
+			// 旧格式：纯数组，seq 可能来自 header，否则为 nil（legacy）。
+		} else {
+			items = nil
+		}
+		if items == nil {
+			// F-01：非空 body 但两次解析均失败，整批无法解析、拒收
+			// 返非 ok（原静默落到末尾 ok 丢流量）。只记长度，不记内容。
+			log.Printf("flow upload unparsable body node_id=%d body_len=%d", node.ID, len(raw))
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			_, _ = w.Write([]byte("error"))
+			return
+		}
+		// F2-03：无 seq 批次的内容哈希（解密后明文的 SHA-256），
+		// 入账事务内落盘领取防逐字重放；带 seq 批次为空（seq 本身
+		// 即重放防护）。窗口与窗口外口径见 repo/flow_legacy_dedupe.go。
+		legacyBatchHash := ""
+		if seq == nil {
+			// C1-01：无 seq 的 legacy 形态没有任何重放防护，纳入
+			// 落日收紧（flowV1LegacySunset）：落日后整批拒收返非
+			// ok；落日前照常入账，但回执点名弃用（与 sub_store
+			// GET 同型），运维可从响应头/日志识别存量旧 agent。
+			if !time.Now().Before(flowV1LegacySunset) {
+				log.Printf("flow upload legacy (no seq) rejected after sunset node_id=%d", node.ID)
+				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+				_, _ = w.Write([]byte("error"))
+				return
+			}
+			w.Header().Set("Deprecation", "true")
+			w.Header().Set("Sunset", flowV1LegacySunsetHTTPDate)
+			sum := sha256.Sum256([]byte(raw))
+			legacyBatchHash = hex.EncodeToString(sum[:])
+		}
+		if items != nil {
+			// L3-01（SWEEP-CPU）：单批 Items 数上限（与 v2 /
+			// connlog 的 1000 对齐）。10MB 体上限 alone 可装约
+			// 25 万条，超限整批拒收返非 ok——不入账、seq 未推
+			// 进，agent 保留批次拆分重报（与 metas 失败同口径）。
+			if len(items) > flowUploadMaxItemsPerBatch {
+				log.Printf("flow upload items over limit node_id=%d items=%d limit=%d", node.ID, len(items), flowUploadMaxItemsPerBatch)
+				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+				_, _ = w.Write([]byte("error"))
+				return
+			}
+			now := time.Now()
+			// X-P3-31（V-08）：seq 改为「先只读校验、入账同 tx 推进」。
+			// 旧实现 CheckAndUpdateSeq 在入账前先行消费 seq：metas 失
+			// 败置空仍回 ok、入账两段分开写一段失败另一段继续——seq
+			// 已推进使同 seq 重报被判重放，分叉/漏计不可恢复。
+			isReplay, isLegacy, seqErr := h.repo.CheckSeq(node.ID, seq)
+			if seqErr != nil {
+				// 校验失败整批拒收（非 ok）：agent 不清零、可重报。
+				log.Printf("flow upload seq check failed node_id=%d err=%v", node.ID, seqErr)
+				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+				_, _ = w.Write([]byte("error"))
+				return
+			}
+			if isReplay {
+				// 已入账批次的重放：回 ok 终止 agent 重试，不重复入账。
+				log.Printf("flow upload replay rejected node_id=%d seq=%d", node.ID, *seq)
+			} else {
+				if isLegacy {
+					log.Printf("flow upload legacy (no seq) node_id=%d", node.ID)
+				}
+				forwardIDs := collectFlowUploadForwardIDs(items)
+				metas, metaErr := h.repo.GetFlowUploadForwardMetas(forwardIDs)
+				if metaErr != nil {
+					// V-08 ①：metas 失败整批拒收返非 ok——不入账、
+					// seq 未推进，同 seq 重报可入账。
+					log.Printf("flow upload metadata lookup failed node_id=%d err=%v", node.ID, metaErr)
+					w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+					_, _ = w.Write([]byte("error"))
+					return
+				}
+				batch, batchErr := h.buildNodeFlowUploadBatch(node.ID, items, metas)
+				if batchErr != nil {
+					// R2-019：归属查询失败与 metas 失败同口径整批
+					// 拒收返非 ok——不入账、seq 未推进，同 seq
+					// 重报可入账。
+					log.Printf("flow upload ownership lookup failed node_id=%d err=%v", node.ID, batchErr)
+					w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+					_, _ = w.Write([]byte("error"))
+					return
+				}
+				batch.seqAdvance = &repo.FlowSeqAdvance{NodeID: node.ID, Seq: seq, LegacyBatchHash: legacyBatchHash}
+				if applyErr := h.applyFlowUploadBatch(node.ID, batch, now); applyErr != nil {
+					if errors.Is(applyErr, repo.ErrLegacyBatchReplay) {
+						// F2-03：同节点同内容 legacy 批次已入账——
+						// 整 tx 回滚未重复入账，按重放分支回 ok
+						// 终止 agent 重试。
+						log.Printf("flow upload legacy batch replay rejected node_id=%d", node.ID)
+					} else if errors.Is(applyErr, repo.ErrSeqReplay) {
+						// R2X-011：并发同 seq 已由另一入账消费——
+						// 本批整 tx 回滚未入账，按既有重放分支回
+						// ok 终止 agent 重试，不重复入账。
+						log.Printf("flow upload replay (seq race) node_id=%d seq=%d", node.ID, *seq)
+					} else {
+						// 入账单事务失败：整批未入账、seq 未推进，返非 ok。
+						w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+						_, _ = w.Write([]byte("error"))
+						return
+					}
+				} else {
+					h.recordTunnelMetricsFromForwardBatch(node.ID, batch.forwardTraffic, metas, now.UnixMilli())
+				}
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write([]byte("ok"))
+}
+
+func (h *Handler) updateConfigs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+
+	var payload map[string]string
+	if err := decodeJSON(r.Body, &payload); err != nil {
+		response.WriteJSON(w, response.ErrDefault("配置数据不能为空"))
+		return
+	}
+	if len(payload) == 0 {
+		response.WriteJSON(w, response.ErrDefault("配置数据不能为空"))
+		return
+	}
+
+	now := time.Now().UnixMilli()
+
+	// O11-P3-2：先完成全部校验（敏感/系统管理/合法性），全部通过后再一次性
+	// 事务写入。旧逻辑逐个 UpsertConfig 且无事务：中途失败会留下部分写入。
+	// G3-131（A3 F-1）：空值不再整批拒绝。可清空键（凭据/URL/可选文本，
+	// 见 repo.IsClearableConfigKey）传空 = 删除该键、读取回落默认——
+	// Bot Token/Webhook 等凭据由此可以经 UI 撤下；必填键传空仍拒绝，
+	// 且错误信息带上键名以便定位。
+	validated := make(map[string]string, len(payload))
+	cleared := make([]string, 0, len(payload))
+	hooks := make([]string, 0, len(payload))
+	prevPools := make(map[string][]latencyTarget, len(payload))
+	// R3 B14-003：归一撞键定序——两个不同原始键归一到同一键时，此前
+	// 靠 map 迭代序决定 validated[key] 谁生效、同 payload 多次调用结果
+	// 不确定。现按归一键登记（原始键, 最终意图)：意图一致（同值写入、
+	// 或同为清空）按一处生效；不一致整批拒绝并点名归一键与两个原始键。
+	type configIntent struct {
+		rawKey  string
+		cleared bool
+		value   string
+	}
+	seenIntents := make(map[string]configIntent, len(payload))
+	for k, v := range payload {
+		// R2 B14-001：键名按 repo.NormalizeConfigKey 归一（小写+去空白）
+		// 后再校验落库，与读路径同口径——此前只 TrimSpace，大写变体写出
+		// 读不到的影子行、变体更新静默不生效。
+		key := repo.NormalizeConfigKey(k)
+		if key == "" {
+			continue
+		}
+		// R2 K1 枚举复扫（B03-001 同族）：键名按列宽 varchar(200) 校验，
+		// 超长键不再让 PG 吐原始落库错误。
+		if len([]rune(key)) > 200 {
+			response.WriteJSON(w, response.ErrDefault("配置名称长度不能超过200个字符"))
+			return
+		}
+		if repo.IsSensitiveConfigKey(key) && !isAdminRequest(r) {
+			response.WriteJSON(w, response.Err(403, "禁止访问敏感配置"))
+			return
+		}
+		if repo.IsSystemManagedConfigKey(key) {
+			response.WriteJSON(w, response.ErrDefault("该配置由系统管理"))
+			return
+		}
+
+		value, err := normalizeAndValidateConfigValue(key, v)
+		if err != nil {
+			response.WriteJSON(w, response.ErrDefault(err.Error()))
+			return
+		}
+
+		intent := configIntent{rawKey: k, cleared: value == "", value: value}
+		if value == "" && !repo.IsClearableConfigKey(key) {
+			response.WriteJSON(w, response.ErrDefault(fmt.Sprintf("配置值不能为空：%s", key)))
+			return
+		}
+		// R3 B14-003：撞键检出（同一原始键不可能重复出现于 map，
+		// 命中的必是不同原始键归一同键）。
+		if prev, seen := seenIntents[key]; seen {
+			if prev.cleared != intent.cleared || prev.value != intent.value {
+				response.WriteJSON(w, response.ErrDefault(fmt.Sprintf("配置键冲突：%q 与 %q 归一后同为 %q 且取值不一致，请只保留一个", prev.rawKey, k, key)))
+				return
+			}
+			// 意图一致：一处已登记，再写一遍结果相同，跳过重复登记。
+			continue
+		}
+		seenIntents[key] = intent
+
+		if value == "" {
+			cleared = append(cleared, key)
+			hooks = append(hooks, key)
+			prevPools[key] = h.latencyPoolBefore(key)
+			continue
+		}
+		validated[key] = value
+		hooks = append(hooks, key)
+		prevPools[key] = h.latencyPoolBefore(key)
+	}
+
+	// S3-2：载荷触及展示分组名单键时，与分组端点的名单读-改-写共用
+	// nodeGroupMu 落库，避免整值覆写与改名/删组交错互相覆盖。
+	if _, ok := validated[nodeGroupOrderConfigKey]; ok || slices.Contains(cleared, nodeGroupOrderConfigKey) {
+		h.nodeGroupMu.Lock()
+		defer h.nodeGroupMu.Unlock()
+	}
+
+	if err := h.repo.ApplyConfigBatch(validated, cleared, now); err != nil {
+		// F4-01：仓储错误收口（同 userList）。
+		respondInternalError(w, "updateConfigs: ApplyConfigBatch failed", err)
+		return
+	}
+	h.invalidateNotifyConfigCache()
+	var latencyDrops []latencyChoiceDrop
+	for _, key := range hooks {
+		h.notifyTunnelQualityConfigChanged(key)
+		latencyDrops = append(latencyDrops, h.onLatencyConfigChanged(key, prevPools[key])...)
+	}
+	if len(latencyDrops) > 0 {
+		// F2-17：有节点自选测试点因改名＋改址/删除失效回落全局默认，
+		// 保存回执点名披露，不再静默。
+		response.WriteJSON(w, response.OKWithWarning(nil, latencyChoiceDropWarning(latencyDrops)))
+		return
+	}
+
+	response.WriteJSON(w, response.OKEmpty())
+}
+
+func (h *Handler) updateSingleConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+
+	var req configSingleRequest
+	if err := decodeJSON(r.Body, &req); err != nil {
+		response.WriteJSON(w, response.ErrDefault("配置名称不能为空"))
+		return
+	}
+	// R2 B14-001：同 updateConfigs——键名归一后再校验落库。
+	name := repo.NormalizeConfigKey(req.Name)
+	if name == "" {
+		response.WriteJSON(w, response.ErrDefault("配置名称不能为空"))
+		return
+	}
+	// R2 K1 枚举复扫（B03-001 同族）：键名按列宽 varchar(200) 校验。
+	if len([]rune(name)) > 200 {
+		response.WriteJSON(w, response.ErrDefault("配置名称长度不能超过200个字符"))
+		return
+	}
+	if repo.IsSensitiveConfigKey(name) && !isAdminRequest(r) {
+		response.WriteJSON(w, response.Err(403, "禁止访问敏感配置"))
+		return
+	}
+	if repo.IsSystemManagedConfigKey(name) {
+		response.WriteJSON(w, response.ErrDefault("该配置由系统管理"))
+		return
+	}
+
+	value, err := normalizeAndValidateConfigValue(name, req.Value)
+	if err != nil {
+		response.WriteJSON(w, response.ErrDefault(err.Error()))
+		return
+	}
+
+	// S3-2：同 updateConfigs——触及展示分组名单键时与分组端点的名单
+	// 读-改-写同锁落库。
+	if name == nodeGroupOrderConfigKey {
+		h.nodeGroupMu.Lock()
+		defer h.nodeGroupMu.Unlock()
+	}
+
+	// G3-131（A3 F-1）：与 updateConfigs 同一清空语义——可清空键传空 =
+	// 删除该键回落默认；必填键传空拒绝并在错误中带上键名。
+	if value == "" {
+		if !repo.IsClearableConfigKey(name) {
+			response.WriteJSON(w, response.ErrDefault(fmt.Sprintf("配置值不能为空：%s", name)))
+			return
+		}
+		prevPool := h.latencyPoolBefore(name)
+		if err := h.repo.DeleteConfig(name); err != nil {
+			// F4-01：仓储错误收口（同 userList）。
+			respondInternalError(w, "updateSingleConfig: DeleteConfig failed", err)
+			return
+		}
+		h.invalidateNotifyConfigCache()
+		h.notifyTunnelQualityConfigChanged(name)
+		if drops := h.onLatencyConfigChanged(name, prevPool); len(drops) > 0 {
+			// F2-17：有节点自选测试点因改名＋改址/删除失效回落全局默认，
+			// 保存回执点名披露，不再静默。
+			response.WriteJSON(w, response.OKWithWarning(nil, latencyChoiceDropWarning(drops)))
+			return
+		}
+
+		response.WriteJSON(w, response.OKEmpty())
+		return
+	}
+
+	prevPool := h.latencyPoolBefore(name)
+	if err := h.repo.UpsertConfig(name, value, time.Now().UnixMilli()); err != nil {
+		// F4-01：仓储错误收口（同 userList）。
+		respondInternalError(w, "updateSingleConfig: UpsertConfig failed", err)
+		return
+	}
+	h.invalidateNotifyConfigCache()
+	h.notifyTunnelQualityConfigChanged(name)
+	if drops := h.onLatencyConfigChanged(name, prevPool); len(drops) > 0 {
+		// F2-17：同上，upsert 分支亦披露。
+		response.WriteJSON(w, response.OKWithWarning(nil, latencyChoiceDropWarning(drops)))
+		return
+	}
+
+	response.WriteJSON(w, response.OKEmpty())
+}
+
+func isAdminRequest(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	claims, ok := r.Context().Value(middleware.ClaimsContextKey).(auth.Claims)
+	return ok && claims.RoleID == 0
+}
+
+func normalizeAndValidateConfigValue(key, value string) (string, error) {
+	switch strings.TrimSpace(key) {
+	case "jwt_secret":
+		// R1-11-02：DB 配置行 jwt_secret 零消费——签名密钥真源只有
+		// 环境变量 JWT_SECRET 与 DB 同级 jwt_secret 文件（internal/
+		// config 的 EnsureJWTSecret，app 装配以 cfg.JWTSecret 注入）。
+		// 此前该键走 default 直通：管理员经 config/update 写任意非空
+		// 值返回成功、落库却永不生效，会误以为签名密钥已轮换。写面
+		// 点名拒绝并指引部署面轮换（空值另由 required 校验先行点名
+		// 拒绝，见 config_policy.requiredConfigKeys）。读面维持关闭
+		// （getConfigByName 403、config/list 删除，见 :804/:869 一带）。
+		return "", fmt.Errorf("jwt_secret 不能通过面板设置修改：签名密钥来源为环境变量 JWT_SECRET 或数据库同级 jwt_secret 文件，请在部署面轮换")
+	case "app_logo", "app_favicon":
+		normalized := strings.TrimSpace(value)
+		if normalized == "" {
+			return "", nil
+		}
+
+		if !strings.HasPrefix(normalized, pngDataURLPrefix) {
+			return "", fmt.Errorf("品牌图片必须通过上传生成 PNG 数据")
+		}
+
+		if len(normalized) > maxBrandAssetDataURLBytes {
+			return "", fmt.Errorf("品牌图片过大，请上传更小图片")
+		}
+
+		payload := strings.TrimSpace(strings.TrimPrefix(normalized, pngDataURLPrefix))
+		if payload == "" {
+			return "", fmt.Errorf("品牌图片数据不能为空")
+		}
+
+		if _, err := base64.StdEncoding.DecodeString(payload); err != nil {
+			return "", fmt.Errorf("品牌图片数据格式无效")
+		}
+
+		return pngDataURLPrefix + payload, nil
+	case latencyTargetsConfigKey:
+		// A2-01=A7-01：此键此前走 default 原样放行，非法值保存成功后
+		// latencyPool 解析失败恒空——全部延迟/回程测量静默停摆，且
+		// onLatencyConfigChanged 以空池同步会清掉每个节点的自选测试点。
+		// normalizeLatencyTargetsConfig 本为此写就，现正式接线（空串
+		// 返回 ""，与既有可清空语义兼容）。
+		return normalizeLatencyTargetsConfig(value)
+	case subscriptionFrontURLsConfigKey:
+		// 订阅前置地址（KU6）：JSON 数组、逐个 base 归一化校验
+		// （仅 scheme+host[:port]），非法整批拒绝；空串在
+		// normalizeSubscriptionFrontURLs 内返回 ""，走调用方的可
+		// 清空语义（本键非必填、非系统管理，天然可清空）。
+		return normalizeSubscriptionFrontURLs(value)
+	case kcpFecModeConfigKey:
+		// KCP FEC 档位（FIX-KCPMEM，P1-05）：仅 default/off 两
+		// 档，校验单点在 normalizeKCPFecMode；空串返回 "" 走
+		// 可清空语义（删键回未配置＝default）。
+		return normalizeKCPFecMode(value)
+	case repo.KCPNodeMemConfigKey:
+		// 节点内存声明（FIX-KCPMEM，P1-04）：校验/归一单点在
+		// repo.NormalizeKCPNodeMemMB（读面共用同口径），非法
+		// 整批拒绝；空串返回 "" 走可清空语义。
+		return repo.NormalizeKCPNodeMemMB(value)
+	case monitorTunnelQualityEnabledConfigKey:
+		normalized := strings.TrimSpace(strings.ToLower(value))
+		switch normalized {
+		case "true", "false":
+			return normalized, nil
+		default:
+			return "", fmt.Errorf("隧道质量检测开关配置值无效")
+		}
+	case repo.ConnLogEnabledConfigKey:
+		// 连接日志总开关（设计 §4.5）：值域/归一单点在
+		// repo.NormalizeConnLogEnabledValue（读面共用同口径）；空串
+		// 返回 "" 走可清空语义（本键非必填：清空回落默认开）。
+		return repo.NormalizeConnLogEnabledValue(value)
+	case notifyConfigDailyHour:
+		// R2-048：日报发送时刻此前走 default 直通落库，越界值靠读
+		// 面静默回落默认 9 点，与同族值域键（监控三键）「保存期拒
+		// 绝」口径不齐。校验单点在 repo.NormalizeNotifyDailyHour，
+		// 恢复面同源共用（B14-002 口径）。
+		return repo.NormalizeNotifyDailyHour(value)
+	case monitoring.ConfigMonitorRetentionDays:
+		return monitoring.NormalizeMonitoringRetentionDays(value)
+	case monitoring.ConfigConnlogRetentionDays:
+		return monitoring.NormalizeConnlogRetentionDays(value)
+	case monitoring.ConfigTunnelQualityProbeIntervalSec:
+		return monitoring.NormalizeTunnelQualityProbeIntervalSeconds(value)
+	case monitoring.ConfigServiceMonitorCheckerScanIntervalSec,
+		monitoring.ConfigServiceMonitorWorkerLimit,
+		monitoring.ConfigServiceMonitorMinIntervalSec,
+		monitoring.ConfigServiceMonitorDefaultIntervalSec,
+		monitoring.ConfigServiceMonitorMinTimeoutSec,
+		monitoring.ConfigServiceMonitorDefaultTimeoutSec,
+		monitoring.ConfigServiceMonitorMaxTimeoutSec:
+		// RR-F5-01：服务监控内部限值 7 键此前落 default 直通、无
+		// 保存期值域校验（max_timeout 写 >60 即推翻 monitoring.md
+		// 「超时最大 60 秒」），与同族监控键（保留天数/质量间隔
+		// 保存期拒绝）口径不齐。校验单点在
+		// monitoring.NormalizeServiceMonitorLimitValue，恢复面
+		// normalizeImportedMonitoringConfigValue 同源共用。
+		return monitoring.NormalizeServiceMonitorLimitValue(key, value)
+	case "panel_domain":
+		// 终审 L1-F-07：裸域名，语法层空标签判（只判语法、不做 DNS）；
+		// 空值走调用方的可清空语义，不在此拒。
+		if err := validateNoEmptyLabelHost(strings.TrimSpace(value)); err != nil {
+			return "", fmt.Errorf("面板域名格式无效：%w", err)
+		}
+		return value, nil
+	case "ip":
+		// 终审 L1-F-07：domain:port 形态，取 host 做空标签判；使用面
+		// validatePanelInstallAddr 由 Lane 2 修谓词本体覆盖。
+		if err := validateNoEmptyLabelAddr(strings.TrimSpace(value)); err != nil {
+			return "", fmt.Errorf("面板地址主机名格式无效：%w", err)
+		}
+		// R3 B04-001：写面先拒——面板地址是安装命令 -a 的无引号拼接
+		// 值，与生成面共用 validatePanelInstallAddr（内含 LDH 字符集
+		// 门），保存期即拦截 shell 元字符，不等生成安装命令时才发现。
+		if err := validatePanelInstallAddr(value); err != nil {
+			return "", fmt.Errorf("面板地址格式无效：%w", err)
+		}
+		return value, nil
+	// 1.7.7（KU5）：github_proxy_url 的专属写面校验已随「开启
+	// GitHub 加速」设置整体移除——该键不再有任何读写消费面，落
+	// default 直通；已存值不做破坏性迁移、仅不再读写。
+	case "notify_webhook_url":
+		// 复扫 R-03：与订阅源保存面同口径——
+		// 保存期补语法层空标签判；使用期 validateNotifyURL 的 DNS
+		// fail-closed 口径不变。
+		if err := validateNoEmptyLabelURLHost(value); err != nil {
+			return "", fmt.Errorf("通知地址主机名格式无效：%w", err)
+		}
+		return value, nil
+	case "notify_telegram_api_base":
+		// 再审计 X-04：与 notify_webhook_url（R-03）同型同口径——
+		// Telegram API 基址亦为 URL 型主机名字段，保存期补语法层
+		// 空标签判；使用期 sendTelegram → validateNotifyURL 的 DNS
+		// fail-closed 口径不变。空值走调用方的可清空语义（留空回落
+		// 默认 https://api.telegram.org），在此不拒。
+		if err := validateNoEmptyLabelURLHost(value); err != nil {
+			return "", fmt.Errorf("通知地址主机名格式无效：%w", err)
+		}
+		return value, nil
+	default:
+		return value, nil
+	}
+}
+
+func (h *Handler) notifyTunnelQualityConfigChanged(key string) {
+	if h == nil || h.qualityProber == nil {
+		return
+	}
+	switch strings.TrimSpace(key) {
+	// FIX2-B（V4-O1）：retention 键补入——probeConfig 三键合读，漏此
+	// 键时保留期新值只能等 5s TTL 兜底，与另两键的即时口径不一致。
+	case monitorTunnelQualityEnabledConfigKey, monitoring.ConfigTunnelQualityProbeIntervalSec, monitoring.ConfigMonitorRetentionDays:
+		h.qualityProber.NotifyConfigChanged()
+	}
+}
+
+func (h *Handler) isTunnelQualityMonitoringEnabled() bool {
+	if h == nil || h.repo == nil {
+		return true
+	}
+
+	cfg, err := h.repo.GetConfigByName(monitorTunnelQualityEnabledConfigKey)
+	if err != nil || cfg == nil {
+		return true
+	}
+
+	return strings.TrimSpace(strings.ToLower(cfg.Value)) != "false"
+}
+
+func (h *Handler) allowLocalRemoteAddr() bool {
+	if h == nil || h.repo == nil {
+		return false
+	}
+
+	cfg, err := h.repo.GetConfigByName(allowLocalRemoteAddrConfigKey)
+	if err != nil || cfg == nil {
+		return false
+	}
+
+	return strings.TrimSpace(strings.ToLower(cfg.Value)) == "true"
+}
+
+func (h *Handler) userPackage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+
+	claims, ok := r.Context().Value(middleware.ClaimsContextKey).(auth.Claims)
+	if !ok {
+		response.WriteJSON(w, response.Err(401, "无效的token或token已过期"))
+		return
+	}
+
+	userID, err := parseUserID(claims.Sub)
+	if err != nil {
+		response.WriteJSON(w, response.Err(401, "无效的token或token已过期"))
+		return
+	}
+
+	// R4-C1-I01：本面是普通用户可达面，仓储错误不得原文直出（与
+	// 未鉴权面 respondInternalError 同口径：原文只进服务端日志、
+	// 回通用文案），此前 4 处 err.Error() 直出会在 DB 故障时把
+	// SQLite/GORM 的表名与约束细节漏给任意已登录用户。
+	user, err := h.repo.GetUserByID(userID)
+	if err != nil {
+		respondInternalError(w, "userPackage: GetUserByID failed", err)
+		return
+	}
+	if user == nil {
+		response.WriteJSON(w, response.ErrDefault("用户不存在"))
+		return
+	}
+
+	tunnels, err := h.repo.GetUserPackageTunnels(userID)
+	if err != nil {
+		respondInternalError(w, "userPackage: GetUserPackageTunnels failed", err)
+		return
+	}
+
+	forwards, err := h.repo.GetUserPackageForwards(userID)
+	if err != nil {
+		respondInternalError(w, "userPackage: GetUserPackageForwards failed", err)
+		return
+	}
+
+	stats, err := h.repo.GetStatisticsFlows(userID, 24)
+	if err != nil {
+		respondInternalError(w, "userPackage: GetStatisticsFlows failed", err)
+		return
+	}
+
+	sort.Slice(stats, func(i, j int) bool { return stats[i].ID < stats[j].ID })
+
+	tunnelOut := make([]map[string]interface{}, 0, len(tunnels))
+	for _, t := range tunnels {
+		item := map[string]interface{}{
+			"id":             t.ID,
+			"userId":         t.UserID,
+			"tunnelId":       t.TunnelID,
+			"tunnelName":     t.TunnelName,
+			"tunnelFlow":     t.TunnelFlow,
+			"flow":           t.Flow,
+			"flowMiB":        t.FlowMiB,
+			"inFlow":         t.InFlow,
+			"outFlow":        t.OutFlow,
+			"num":            t.Num,
+			"flowResetTime":  t.FlowResetTime,
+			"expTime":        t.ExpTime,
+			"speedId":        nil,
+			"speedLimitName": nil,
+			"speed":          nil,
+		}
+		if t.SpeedID.Valid {
+			item["speedId"] = t.SpeedID.Int64
+		}
+		if t.SpeedLimit.Valid {
+			item["speedLimitName"] = t.SpeedLimit.String
+		}
+		if t.Speed.Valid {
+			item["speed"] = t.Speed.Int64
+		}
+		tunnelOut = append(tunnelOut, item)
+	}
+
+	forwardOut := make([]map[string]interface{}, 0, len(forwards))
+	for _, f := range forwards {
+		item := map[string]interface{}{
+			"id":          f.ID,
+			"name":        f.Name,
+			"tunnelId":    f.TunnelID,
+			"tunnelName":  f.TunnelName,
+			"inIp":        f.InIP,
+			"inPort":      nil,
+			"remoteAddr":  f.RemoteAddr,
+			"inFlow":      f.InFlow,
+			"outFlow":     f.OutFlow,
+			"status":      f.Status,
+			"createdTime": f.CreatedAt,
+		}
+		if f.InPort.Valid {
+			item["inPort"] = f.InPort.Int64
+		}
+		forwardOut = append(forwardOut, item)
+	}
+
+	payload := map[string]interface{}{
+		"userInfo": map[string]interface{}{
+			"id":            user.ID,
+			"name":          user.User,
+			"user":          user.User,
+			"status":        user.Status,
+			"flow":          user.Flow,
+			"flowMiB":       user.FlowMiB,
+			"inFlow":        user.InFlow,
+			"outFlow":       user.OutFlow,
+			"num":           user.Num,
+			"expTime":       user.ExpTime,
+			"flowResetTime": user.FlowResetTime,
+			"createdTime":   user.CreatedTime,
+			"updatedTime":   nullableNullInt64(user.UpdatedTime),
+		},
+		"tunnelPermissions": tunnelOut,
+		"forwards":          forwardOut,
+		"statisticsFlows":   stats,
+	}
+
+	response.WriteJSON(w, response.OK(payload))
+}
+
+// userLogout 服务端登出（E1-02）：推进当前用户的登出吊销水位
+// （tokens_revoked_before = now），此前签发的全部 JWT 随即失效——
+// 含本请求所用 token、被复制走的 token，以及已建立的浏览器 WS
+// 会话（keepalive 复检同一水位时被关闭）。只推进吊销水位，不改
+// 密码与 PasswordChangedAt；重新登录签发的新 token 不受影响。
+// 前端 safeLogout 在清本地态前 fire-and-forget 调用本端点。
+func (h *Handler) userLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.Err(405, "请求方法不允许"))
+		return
+	}
+	claims, ok := r.Context().Value(middleware.ClaimsContextKey).(auth.Claims)
+	if !ok {
+		response.WriteJSON(w, response.Err(401, "无效的token或token已过期"))
+		return
+	}
+	userID, err := parseUserID(claims.Sub)
+	if err != nil {
+		response.WriteJSON(w, response.Err(401, "无效的token或token已过期"))
+		return
+	}
+	if err := h.repo.RevokeUserTokens(userID, time.Now().UnixMilli()); err != nil {
+		response.WriteJSON(w, response.ErrDefault("退出登录时发生错误"))
+		return
+	}
+	response.WriteJSON(w, response.OKEmpty())
+}
+
+// issueWSTicket 为浏览器实时通道签发短期单次票据（R-WS-TICKET）：
+// 调用者以登录态 JWT 经 Authorization 头鉴权（本路由在 /api/v1/
+// 下，经 JWT 中间件全量复核；此处再以同一口径复核状态并读取吊销
+// 纪元）。票据绑定用户与当前吊销纪元、30 秒内单次有效；浏览器 WS
+// 握手只认票据，改密/登出后未消费票据随纪元推进作废。agent 节点
+// 通道走节点密钥，不经此端点。
+func (h *Handler) issueWSTicket(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.Err(405, "请求方法不允许"))
+		return
+	}
+	claims, ok := r.Context().Value(middleware.ClaimsContextKey).(auth.Claims)
+	if !ok {
+		response.WriteJSON(w, response.Err(401, "无效的token或token已过期"))
+		return
+	}
+	userID, err := parseUserID(claims.Sub)
+	if err != nil {
+		response.WriteJSON(w, response.Err(401, "无效的token或token已过期"))
+		return
+	}
+	state, err := h.GetUserAuthState(userID)
+	if err != nil || state == nil || state.Status != 1 || state.RoleID != claims.RoleID || state.TokenStale(claims.IatMs) {
+		response.WriteJSON(w, response.Err(401, "无效的token或token已过期"))
+		return
+	}
+	ticket, err := h.wsServer.IssueWSTicket(userID, claims.RoleID, claims.User, claims.IatMs, claims.Exp, state.RevocationWatermark())
+	if err != nil {
+		response.WriteJSON(w, response.ErrDefault("签发实时通道票据时发生错误"))
+		return
+	}
+	response.WriteJSON(w, response.OK(map[string]interface{}{
+		"ticket":    ticket,
+		"expiresIn": int(ws.WSTicketTTL / time.Second),
+	}))
+}
+
+func (h *Handler) updatePassword(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+
+	// R3 B01-001：改密是持 JWT 的在线密码校验面，此前无任何限流——
+	// token 泄露后可无限猜测当前密码（猜中即改密完成持久接管）。
+	// 与 login / passkeyRegisterBegin 同口径接入 IP 限流（10/min）。
+	// 密码校验面全集与守卫对应关系见 password_verify_census 回归。
+	if !h.checkLoginRateLimit(w, r) {
+		return
+	}
+
+	claims, ok := r.Context().Value(middleware.ClaimsContextKey).(auth.Claims)
+	if !ok {
+		response.WriteJSON(w, response.Err(401, "无效的token或token已过期"))
+		return
+	}
+
+	userID, err := parseUserID(claims.Sub)
+	if err != nil {
+		response.WriteJSON(w, response.Err(401, "无效的token或token已过期"))
+		return
+	}
+
+	var req changePasswordRequest
+	if err := decodeJSON(r.Body, &req); err != nil {
+		response.WriteJSON(w, response.ErrDefault("修改账号密码时发生错误"))
+		return
+	}
+
+	// R2 B02-001：改名面与 create/update 同口径归一+限长。create/update
+	// 经 asString 隐式 TrimSpace 且有 O5-002 的 1-100 rune 校验，本面
+	// 此前两者皆无——带尾空格名、101 rune 名可原样落库，导致同一逻辑名
+	// 的落库形态与可登录形态随写入面分裂（PG 还会吐原始落库错误）。
+	// 归一后的形态落库；存量已带尾空格的用户名在此后以 trim 形态登录。
+	newUsername := strings.TrimSpace(req.NewUsername)
+	if newUsername == "" {
+		response.WriteJSON(w, response.ErrDefault("新用户名不能为空"))
+		return
+	}
+	if n := len([]rune(newUsername)); n < 1 || n > 100 {
+		response.WriteJSON(w, response.ErrDefault("用户名长度必须为 1-100 个字符"))
+		return
+	}
+	if strings.TrimSpace(req.CurrentPassword) == "" {
+		response.WriteJSON(w, response.ErrDefault("当前密码不能为空"))
+		return
+	}
+	if strings.TrimSpace(req.NewPassword) == "" {
+		response.WriteJSON(w, response.ErrDefault("新密码不能为空"))
+		return
+	}
+	if strings.TrimSpace(req.ConfirmPassword) == "" {
+		response.WriteJSON(w, response.ErrDefault("确认密码不能为空"))
+		return
+	}
+	if req.NewPassword != req.ConfirmPassword {
+		response.WriteJSON(w, response.ErrDefault("新密码和确认密码不匹配"))
+		return
+	}
+	if len([]rune(req.NewPassword)) < 6 {
+		response.WriteJSON(w, response.ErrDefault("新密码至少6位"))
+		return
+	}
+	// B1-02：上限按字节计（bcrypt 72 字节截断面），与最小长度的
+	// rune 口径刻意不同——多字节字符正是会在字节面先触顶的形态。
+	if len(req.NewPassword) > security.MaxPasswordBytes {
+		response.WriteJSON(w, response.ErrDefault("新密码超过72字节上限（bcrypt限制），请使用更短的密码"))
+		return
+	}
+
+	user, err := h.repo.GetUserByID(userID)
+	if err != nil {
+		respondInternalError(w, "updatePassword: GetUserByID failed", err)
+		return
+	}
+	if user == nil {
+		response.WriteJSON(w, response.ErrDefault("用户不存在"))
+		return
+	}
+
+	passwordMatched, _ := security.VerifyPassword(user.Pwd, req.CurrentPassword)
+	if !passwordMatched {
+		response.WriteJSON(w, response.ErrDefault("当前密码错误"))
+		return
+	}
+
+	// B01-003：新密码与当前密码相同不算「修改」——直接拒绝，且不落库、
+	// 不推进 PasswordChangedAt。此前同值提交返回成功并推进
+	// PasswordChangedAt 把其它会话踢下线，强制改密（默认口令）可被同值
+	// 提交空转满足、普通用户则产生「已改密」假象。
+	if req.NewPassword == req.CurrentPassword {
+		response.WriteJSON(w, response.ErrDefault("新密码不能与当前密码相同"))
+		return
+	}
+
+	exists, err := h.repo.UsernameExistsExceptID(newUsername, userID)
+	if err != nil {
+		respondInternalError(w, "updatePassword: UsernameExistsExceptID failed", err)
+		return
+	}
+	if exists {
+		response.WriteJSON(w, response.ErrDefault("用户名已存在"))
+		return
+	}
+
+	hashedPassword, err := security.HashPassword(req.NewPassword)
+	if err != nil {
+		respondInternalError(w, "updatePassword: HashPassword failed", err)
+		return
+	}
+	if err := h.repo.UpdateUserNameAndPasswordIfCurrent(user, newUsername, hashedPassword, time.Now().UnixMilli()); err != nil {
+		if errors.Is(err, repo.ErrUserAuthChanged) {
+			response.WriteJSON(w, response.Err(401, "账号状态已变更，请重新登录"))
+			return
+		}
+		// 提交段复检命中同名（与锁外预检的竞态）仍回友好文案，
+		// 与 userCreate 的 R2X-049 口径一致；其余仓储错误收口。
+		if errors.Is(err, repo.ErrUsernameExists) {
+			response.WriteJSON(w, response.ErrDefault("用户名已存在"))
+			return
+		}
+		respondInternalError(w, "updatePassword: UpdateUserNameAndPassword failed", err)
+		return
+	}
+
+	response.WriteJSON(w, response.OKEmpty())
+}
+
+func (h *Handler) captchaEnabled() (bool, error) {
+	cfg, err := h.repo.GetConfigByName("captcha_enabled")
+	if err != nil {
+		return false, err
+	}
+	if cfg == nil || !strings.EqualFold(strings.TrimSpace(cfg.Value), "true") {
+		return false, nil
+	}
+
+	siteCfg, err := h.repo.GetConfigByName("cloudflare_site_key")
+	if err != nil {
+		return false, err
+	}
+	if siteCfg == nil || strings.TrimSpace(siteCfg.Value) == "" {
+		return false, nil
+	}
+
+	secretCfg, err := h.repo.GetConfigByName("cloudflare_secret_key")
+	if err != nil {
+		return false, err
+	}
+	if secretCfg == nil || strings.TrimSpace(secretCfg.Value) == "" {
+		return false, nil
+	}
+
+	return true, nil
+}
+
+// captchaTokenPoolMax 是 captcha 令牌池容量上限（R10X-008，
+// A-01）：与同仓未认证可写内存表的上限口径对齐——passkey pending
+// 池 1000（passkey.go putPasskeyCeremony）、登录双桶 10000、
+// gh 镜像 host 表 10000，三表均「上限 + 淘汰」；本池此前无上限，
+// 是全集枚举中唯一漏网（A 域口径）。令牌 TTL 统一 5 分钟、仅
+// 登录路径单次消费，1000 与 passkey 池同量级即足够，满时淘汰
+// 最旧（过期时刻最小者；TTL 统一故等价于最早铸造者）。
+const captchaTokenPoolMax = 1000
+
+func (h *Handler) markCaptchaToken(token string) {
+	if h == nil {
+		return
+	}
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return
+	}
+	now := time.Now().UnixMilli()
+	exp := now + int64(5*time.Minute/time.Millisecond)
+
+	h.captchaMu.Lock()
+	defer h.captchaMu.Unlock()
+	if h.captchaTokens == nil {
+		h.captchaTokens = make(map[string]int64)
+	}
+	for k, v := range h.captchaTokens {
+		if v <= now {
+			delete(h.captchaTokens, k)
+		}
+	}
+	if _, exists := h.captchaTokens[token]; !exists {
+		for len(h.captchaTokens) >= captchaTokenPoolMax {
+			var oldestKey string
+			var oldestExp int64
+			first := true
+			for k, v := range h.captchaTokens {
+				if first || v < oldestExp {
+					oldestKey, oldestExp, first = k, v, false
+				}
+			}
+			if oldestKey == "" {
+				break
+			}
+			delete(h.captchaTokens, oldestKey)
+		}
+	}
+	h.captchaTokens[token] = exp
+}
+
+func (h *Handler) consumeCaptchaToken(token string) bool {
+	if h == nil {
+		return false
+	}
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return false
+	}
+	now := time.Now().UnixMilli()
+
+	h.captchaMu.Lock()
+	defer h.captchaMu.Unlock()
+	if h.captchaTokens == nil {
+		return false
+	}
+	for k, v := range h.captchaTokens {
+		if v <= now {
+			delete(h.captchaTokens, k)
+		}
+	}
+	exp, ok := h.captchaTokens[token]
+	if !ok {
+		return false
+	}
+	delete(h.captchaTokens, token)
+	return exp > now
+}
+
+// R5-B2 D4/B-004: 统一信封 {code,msg,data,ts}，code 0 = 成功。
+// breaking change：旧裸形状 {success,data:{validToken}} 已移除，
+// 迁移时把对 success 字段的判断改为 code == 0。
+func (h *Handler) writeCaptchaVerifyResult(w http.ResponseWriter, success bool, token string) {
+	if success {
+		response.WriteJSON(w, response.OK(map[string]interface{}{"validToken": token}))
+		return
+	}
+	response.WriteJSON(w, response.Err(-1, "验证码校验失败"))
+}
+
+func decodeJSON(body io.ReadCloser, out interface{}) error {
+	return decodeJSONWithLimit(body, out, 10<<20)
+}
+
+// unknownJSONFieldName 从 DisallowUnknownFields 的解码错误中提取
+// 未知字段名（错误形态 `json: unknown field "xxx"`）；非该类错误
+// 返回 ""。
+func unknownJSONFieldName(err error) string {
+	if err == nil {
+		return ""
+	}
+	const marker = "unknown field "
+	msg := err.Error()
+	idx := strings.Index(msg, marker)
+	if idx < 0 {
+		return ""
+	}
+	rest := strings.TrimSpace(msg[idx+len(marker):])
+	if name, uerr := strconv.Unquote(rest); uerr == nil {
+		return name
+	}
+	return strings.Trim(rest, "\"")
+}
+
+// decodeJSONWithLimit 与 decodeJSON 相同，但允许调用方指定 body 上限。
+// 备份导入需要更大的上限（面板备份可达数十 MB），而普通 API 保持 10MB 防 DoS。
+func decodeJSONWithLimit(body io.ReadCloser, out interface{}, limit int64) error {
+	defer body.Close()
+	decoder := json.NewDecoder(http.MaxBytesReader(nil, body, limit))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(out); err != nil {
+		return err
+	}
+	// OPEN-11: a single Decode never looks past the first value,
+	// so a body like `{...} garbage` or `{...}{...}` decoded
+	// cleanly while the tail was silently dropped. A second
+	// Decode must hit EOF (trailing whitespace is fine); anything
+	// else means the body carries data this handler never sees.
+	var extra interface{}
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return errors.New("decodeJSON: trailing data after JSON value")
+		}
+		return err
+	}
+	return nil
+}
+
+// decodeBackupImportRequest 解码备份导入请求，对未知的顶层备份段容忍：
+// 旧版备份文件可能携带本版已不认识的段（随功能移除下线的段），这些键
+// 被丢弃并按名返回，由调用方在导入回执中披露；其余一律仍按
+// decodeJSONWithLimit 的严格口径拒绝（信封形态、嵌套未知字段）。
+// 返回的 dropped 按字典序排列；成功且无丢弃时返回 nil。
+func decodeBackupImportRequest(body io.ReadCloser, out *backupImportRequest, limit int64) ([]string, error) {
+	defer body.Close()
+	raw, err := io.ReadAll(http.MaxBytesReader(nil, body, limit))
+	if err != nil {
+		return nil, err
+	}
+	// 快径：严格解码，现行备份行为不变。
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(out); err == nil {
+		// R18-B9-05：快径此前只解第一个 JSON 值即返回，尾部垃圾
+		// （拼接/损坏备份）被静默丢弃；与慢径 Unmarshal 的严格口
+		// 径对齐：尾部除空白外不得再有内容。第二值是合法 JSON
+		// 时明文报错；其余尾部内容按解码错原样返回。
+		var extra json.RawMessage
+		if err := dec.Decode(&extra); err != io.EOF {
+			if err == nil {
+				return nil, errors.New("备份文件尾部存在多余数据")
+			}
+			return nil, err
+		}
+		return nil, nil
+	} else if unknownJSONFieldName(err) == "" {
+		return nil, err
+	}
+	// 慢径：存在未知字段。只有备份对象的未知顶层键才容忍（已移除
+	// 的段）；嵌套未知字段仍经下方严格重解码拒绝。
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &top); err != nil {
+		return nil, err
+	}
+	known := backupImportKnownTopKeys()
+	var dropped []string
+	for k := range top {
+		if !known[k] {
+			dropped = append(dropped, k)
+		}
+	}
+	if len(dropped) == 0 {
+		// 未知字段在嵌套层：复现严格解码的原错误。
+		dec2 := json.NewDecoder(bytes.NewReader(raw))
+		dec2.DisallowUnknownFields()
+		return nil, dec2.Decode(out)
+	}
+	sort.Strings(dropped)
+	filtered := make(map[string]json.RawMessage, len(top)-len(dropped))
+	for k, v := range top {
+		if known[k] {
+			filtered[k] = v
+		}
+	}
+	fraw, err := json.Marshal(filtered)
+	if err != nil {
+		return nil, err
+	}
+	dec3 := json.NewDecoder(bytes.NewReader(fraw))
+	dec3.DisallowUnknownFields()
+	if err := dec3.Decode(out); err != nil {
+		return nil, err
+	}
+	return dropped, nil
+}
+
+// backupImportKnownTopKeys 返回备份导入请求可携带的顶层 JSON 键集：
+// "types" 与 BackupData 全部字段 tag（反射推导，与备份覆盖率普查同源）。
+func backupImportKnownTopKeys() map[string]bool {
+	known := map[string]bool{"types": true}
+	rt := reflect.TypeOf(model.BackupData{})
+	for i := 0; i < rt.NumField(); i++ {
+		tag := rt.Field(i).Tag.Get("json")
+		if tag == "" || tag == "-" {
+			continue
+		}
+		known[strings.Split(tag, ",")[0]] = true
+	}
+	return known
+}
+
+func parseUserID(sub string) (int64, error) {
+	id, err := strconv.ParseInt(sub, 10, 64)
+	if err != nil || id <= 0 {
+		return 0, strconv.ErrSyntax
+	}
+	return id, nil
+}
+
+func userIDFromRequest(r *http.Request) (int64, error) {
+	claims, ok := r.Context().Value(middleware.ClaimsContextKey).(auth.Claims)
+	if !ok {
+		return 0, strconv.ErrSyntax
+	}
+	return parseUserID(claims.Sub)
+}
+
+func userRoleFromRequest(r *http.Request) (int64, int, error) {
+	claims, ok := r.Context().Value(middleware.ClaimsContextKey).(auth.Claims)
+	if !ok {
+		return 0, 0, strconv.ErrSyntax
+	}
+	userID, err := parseUserID(claims.Sub)
+	if err != nil {
+		return 0, 0, err
+	}
+	return userID, claims.RoleID, nil
+}
+
+func nullableNullInt64(v sql.NullInt64) interface{} {
+	if v.Valid {
+		return v.Int64
+	}
+	return nil
+}
+
+// flowCryptoCache caches AES crypto instances by secret to avoid per-request SHA256+GCM init.
+//
+// P1-07: the map previously only ever grew (one entry per distinct
+// secret ever seen, e.g. across node secret rotations). Legitimate
+// cardinality is the live node count (tens), so a generous hard cap
+// acts purely as a safety valve: past flowCryptoCacheMaxEntries the
+// table is swept wholesale — instances are cheap to recreate from the
+// secret and cache hits/misses are externally indistinguishable.
+var flowCryptoCache sync.Map
+var flowCryptoCacheSize atomic.Int64
+
+const flowCryptoCacheMaxEntries = 1024
+
+func getOrCreateFlowCrypto(secret string) *security.AESCrypto {
+	if v, ok := flowCryptoCache.Load(secret); ok {
+		return v.(*security.AESCrypto)
+	}
+	c, err := security.NewAESCrypto(secret)
+	if err != nil {
+		return nil
+	}
+	if _, loaded := flowCryptoCache.LoadOrStore(secret, c); loaded {
+		return flowCryptoCacheLoad(secret)
+	}
+	if flowCryptoCacheSize.Add(1) > flowCryptoCacheMaxEntries {
+		flowCryptoCache.Range(func(k, _ interface{}) bool {
+			flowCryptoCache.Delete(k)
+			return true
+		})
+		flowCryptoCacheSize.Store(0)
+		flowCryptoCache.Store(secret, c)
+		flowCryptoCacheSize.Store(1)
+	}
+	return c
+}
+
+func flowCryptoCacheLoad(secret string) *security.AESCrypto {
+	v, ok := flowCryptoCache.Load(secret)
+	if !ok {
+		return nil
+	}
+	return v.(*security.AESCrypto)
+}
+
+// checkFlowEnvelopeTimestamp 校验 flow 加密信封外层 timestamp 的
+// 新鲜度（C1-01）。timestamp 位于外层明文 JSON、可被改写，故本校验
+// 只约束「原样重放」：捕获的信封不改一字重发时，窗口外即被拒；
+// 真正的重放防护由 seq 游标（带 seq 的 v1 与 v2）承担，无 seq 的
+// legacy 形态则由 flowV1LegacySunset 落日关停。单位归一：现行
+// agent 写秒级（time.Now().Unix()），≥1e11 的值按毫秒级折算，
+// 避免跨代单位差把合法信封误判为未来时间。timestamp==0（无此
+// 字段的更古老构建）按 legacy 兼容放行。
+func checkFlowEnvelopeTimestamp(ts int64, now time.Time) error {
+	if ts == 0 {
+		return nil
+	}
+	sec := ts
+	if sec >= 100_000_000_000 {
+		sec /= 1000
+	}
+	delta := now.Unix() - sec
+	if delta < 0 {
+		delta = -delta
+	}
+	if maxSkewSec := int64(flowEnvelopeMaxSkew / time.Second); delta > maxSkewSec {
+		return fmt.Errorf("flow envelope timestamp outside freshness window: skew %ds exceeds %ds", delta, maxSkewSec)
+	}
+	return nil
+}
+
+func readAndDecryptFlowBody(body io.ReadCloser, secret string) (string, error) {
+	defer body.Close()
+	// R4B03-003：ReadAll 前以 MaxBytesReader 包裹与 decodeJSON/WS 同一
+	// 10MB 上限（旧实现无上限读入，持任一节点 secret 即可用超大请求
+	// 让面板内存随体大小线性膨胀）；超限返回 error，两调用方现有
+	// error 分支整批拒收（flowUpload 返非 ok、agent 可重报）。
+	raw, err := io.ReadAll(http.MaxBytesReader(nil, body, 10<<20))
+	if err != nil {
+		return "", err
+	}
+	text := strings.TrimSpace(string(raw))
+	if text == "" {
+		return "", nil
+	}
+
+	var wrap struct {
+		Encrypted bool   `json:"encrypted"`
+		Data      string `json:"data"`
+		Timestamp int64  `json:"timestamp"`
+	}
+	if err := json.Unmarshal(raw, &wrap); err != nil || !wrap.Encrypted || strings.TrimSpace(wrap.Data) == "" {
+		return text, nil
+	}
+
+	// C1-01：信封 timestamp 此前只解析从不校验——加密形态的重放
+	// 不受任何时间窗约束。在此收口校验（v1/v2/flowConfig 三个
+	// 调用面共用本函数，同批收紧）；超窗整批拒收，agent 保留
+	// 批次、以新封包重报即自愈。
+	if err := checkFlowEnvelopeTimestamp(wrap.Timestamp, time.Now()); err != nil {
+		return "", err
+	}
+
+	// F-01：解密失败必须返回 error，不得把密文原文当明文返回——
+	// 调用方无法区分“明文 body”与“解密失败的密文 body”，后者会
+	// 因两次解析失败被静默丢弃。密文不记日志。
+	crypto := getOrCreateFlowCrypto(secret)
+	if crypto == nil {
+		return "", errors.New("flow crypto unavailable")
+	}
+	plain, err := crypto.Decrypt(wrap.Data)
+	if err != nil {
+		return "", err
+	}
+	return string(plain), nil
+}
+
+// R6X-013（R6-C-02）：Turnstile 校验出站的专用 client 与端点。
+// 旧实现走 http.PostForm（DefaultClient：Timeout=0 永不超时、默认
+// 跟随 ≤10 跳重定向），且位于登录/验证码路径——上游挂死时调用
+// goroutine 无限期阻塞于 Decode、可累积。此处显式 10s 超时（与
+// 联邦面同量级）+ 不跟随重定向（校验端点无需重定向，3xx 响应体
+// 无 success 字段、按校验失败处理）。client 与 URL 均为包级 var
+// 作为注入缝，测试可替换为 httptest 端点/短超时 client；正常路径
+// 行为不变。
+var (
+	turnstileSiteVerifyURL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
+	turnstileClient        = &http.Client{
+		Timeout: 10 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+)
+
+func (h *Handler) verifyCloudflareTurnstile(token, secretKey string) bool {
+	if token == "" || secretKey == "" {
+		return false
+	}
+	resp, err := turnstileClient.PostForm(turnstileSiteVerifyURL, url.Values{
+		"secret":   {secretKey},
+		"response": {token},
+	})
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	var body struct {
+		Success bool `json:"success"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return false
+	}
+	return body.Success
+}
+
+type backupExportRequest struct {
+	Types []string `json:"types"`
+}
+
+func (h *Handler) backupExport(w http.ResponseWriter, r *http.Request) {
+	// R8-T-08: export generation scales with DB size and can pass
+	// the global 120s write cap.
+	extendWriteDeadline(w, backupWriteDeadline)
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+
+	var req backupExportRequest
+	if err := decodeJSON(r.Body, &req); err != nil {
+		response.WriteJSON(w, response.ErrDefault("请求参数错误"))
+		return
+	}
+
+	var backup interface{}
+	var err error
+
+	// X-P3-25（L-10-1）：导出绑定请求 ctx，断连即止。
+	if len(req.Types) == 0 {
+		backup, err = h.repo.ExportAllContext(r.Context())
+	} else {
+		backup, err = h.repo.ExportPartialContext(r.Context(), req.Types)
+	}
+
+	if err != nil {
+		respondInternalError(w, "backupExport", err)
+		return
+	}
+
+	w.Header().Set("Content-Disposition", "attachment; filename=backup.json")
+	w.Header().Set("Content-Type", "application/json")
+	// 备份含全量敏感配置：与通用信封同口径禁存（F-W3-02 同族补点）。
+	w.Header().Set("Cache-Control", "no-store")
+	// AUDIT-R22 (LAD22-001): 先 Encode 到 buffer，成功后再发 headers+body。
+	// 直接 Encode 到 w 时若中途失败（如客户端断开），HTTP 200 已发出，
+	// 错误信封会追加到截断的残缺流后，客户端收到既非合法备份也非合法信封的损坏响应。
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(backup); err != nil {
+		response.WriteJSON(w, response.Err(-2, err.Error()))
+		return
+	}
+	if _, err := w.Write(buf.Bytes()); err != nil {
+		// headers+body 已发出，此时只能记录日志，无法再返回错误信封。
+		log.Printf("backupExport: write response failed: %v", err)
+		return
+	}
+}
+
+type backupImportRequest struct {
+	Types []string `json:"types"`
+	repo.BackupData
+}
+
+// backupImportTimeout caps the detached write phase of backupImport
+// (B14-001, user ruling ④ on 2026-10-30). It shares the
+// backupWriteDeadline magnitude (30min) so the server-side work cap
+// and the write relief stay aligned: any import the server allows
+// to run to completion can still deliver its response.
+const backupImportTimeout = backupWriteDeadline
+
+func (h *Handler) backupImport(w http.ResponseWriter, r *http.Request) {
+	// R8-T-02 element (a): a non-trivial import runs far past the
+	// global 120s write cap, so arm the write relief first.
+	//
+	// R8-T-02 element (b) — resolved by user ruling ④ on 2026-10-30
+	// (B14-001): the two phases now differ deliberately. The
+	// pre-import snapshot phase below stays bound to r.Context(), so
+	// a client abort before any DB write cancels the whole import
+	// with no side effects. Once the snapshot is done, the import
+	// transaction runs on a detached context (WithoutCancel plus
+	// backupImportTimeout): a disconnect or page close can no longer
+	// roll back a legitimate import mid-write. This supersedes the
+	// handler-layer half of X-P3-21; the whole-import transaction
+	// itself is retained, and the repo-layer ImportContext contract
+	// (it honours whatever ctx it is given — TestR1B8_XP321) is
+	// unchanged.
+	extendWriteDeadline(w, backupWriteDeadline)
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+
+	var req backupImportRequest
+	// AUDIT-R22 (R5R22-001): 备份导入用 100MB 上限。面板备份（含数万用户/分配）
+	// 可达数十 MB，10MB 的通用上限会误拒合法备份。nginx 侧已放行 50m（SCR-002），
+	// 此处 100MB 与面板规模对齐；仍为有界值，防内存耗尽 DoS。
+	// 解码对未知顶层备份段容忍（旧版备份携带的已移除功能段被丢弃、
+	// 按名披露，不阻断导入）；嵌套未知字段仍严格拒绝。
+	droppedSegments, err := decodeBackupImportRequest(r.Body, &req, 100<<20)
+	if err != nil {
+		// J-008：导入面其余失败统一为 -2；唯请求体解码失败的文案
+		// 「请求参数错误」按全局同文案口径用 ErrDefault（-1），与
+		// decodeJSON 全部调用点同码（R9-14）。
+		// R1-07 F-4：未知字段拒绝时点名字段——此前解码器错误（含
+		// 字段名）被整体丢弃、只回固定文案，管理员无从定位是哪
+		// 一键触发整单拒绝。
+		if field := unknownJSONFieldName(err); field != "" {
+			response.WriteJSON(w, response.ErrDefault(fmt.Sprintf("请求参数错误：备份包含未知字段 %q", field)))
+			return
+		}
+		response.WriteJSON(w, response.ErrDefault("请求参数错误"))
+		return
+	}
+
+	if len(req.Types) == 0 {
+		// J-008：错误码统一为 -2
+		response.WriteJSON(w, response.Err(-2, "请选择要导入的数据类型"))
+		return
+	}
+
+	// SEC-01：导入前不再把全量自动备份导出塞进回执。旧逻辑把
+	// ExportAllContext 的整库快照（用户密码 hash、节点 secret、
+	// 配置 token）经 runBackupImportTailHooks 塞进回执 AutoBackup
+	// 字段，直接向 API 调用方泄露凭据；且 ImportContext 失败时直接
+	// 返回错误，从不用该快照回滚，该导出只为回执服务。
+	// SEC-01 BC-01 (b)：快照改为只留存服务端文件（最新一份、24h
+	// 过期，见 import_auto_backup.go），回执仍不得含 autoBackup。
+
+	// O7-009：版本兼容性检查（repo.Import 同样校验，此处提前给中文提示）。
+	if req.BackupData.Version != "1.0" {
+		// J-008：错误码统一为 -2
+		response.WriteJSON(w, response.Err(-2, "备份版本不支持（仅支持 1.0）"))
+		return
+	}
+
+	// R10-10（I-F2-03）：bcrypt 预算校验前置于单飞锁——构造备份的
+	// 非哈希口令行逐行 cost-10 哈希，此前无帽时一单即可在锁内把
+	// 30 分钟导入预算烧满。超限在此整单拒绝：不占锁、不进事务、
+	// 不烧哈希（repo.Import 进事务前同判收口，见 repo 层
+	// ValidateBackupImportUserHashBudget）。
+	if err := repo.ValidateBackupImportUserHashBudget(&req.BackupData, req.Types); err != nil {
+		// J-008：错误码统一为 -2
+		response.WriteJSON(w, response.Err(-2, err.Error()))
+		return
+	}
+
+	// SEC-01 BC-01 (b)：在 ImportContext 改写 DB 之前生成导入前快照
+	// 并落盘。生成失败时只记警告并继续导入（O7-010）：若当前库已损坏
+	// 致 ExportAll 失败，用户正是最需要从完好备份恢复的场景，失败即
+	// 中断会把恢复路堵死；警告进 result.ImportWarnings 向用户披露，
+	// 详情只记服务端日志。快照字节绝不进回执、日志与错误信息。
+	// B14-001（用户 2026-10-30 裁决④）：写入相位与请求 ctx 解绑后，
+	// 关页/断开不再能取消导入，重复提交或双开页面并发导入会基于
+	// 中间态叠写。进程内同一时刻只允许一单备份导入（快照+写入
+	// 全程持锁），第二单直接拒绝并说明原因，不排队。
+	if !h.backupImportMu.TryLock() {
+		// J-008：错误码统一为 -2
+		response.WriteJSON(w, response.Err(-2, "已有备份导入正在执行，请等待其完成后再试"))
+		return
+	}
+	defer h.backupImportMu.Unlock()
+
+	h.purgeExpiredImportAutoBackup()
+	snapshotErr := h.saveImportAutoBackup(r.Context())
+	if snapshotErr != nil {
+		log.Printf("backupImport: save pre-import auto-backup snapshot failed: %v", snapshotErr)
+	}
+
+	// B14-001（裁决④的可取消窗口边界）：快照相位结束、写入相位开始
+	// 之前，请求 ctx 已死（客户端在写入前中止/关页）则整单不启动、
+	// 无副作用。须与 O7-010 区分：快照因别的原因失败（如现有库损坏
+	// 致导出失败）只警告续行、不堵恢复路；唯有请求 ctx 取消构成
+	// 「写入前取消」。越过此边界后 ctx 解绑，断连不再影响导入。
+	if err := r.Context().Err(); err != nil {
+		// J-008：错误码统一为 -2
+		response.WriteJSON(w, response.Err(-2, fmt.Sprintf("导入已取消: %v", err)))
+		return
+	}
+
+	// B14-001（用户 2026-10-30 裁决④折中）：自此进入写入相位。快照
+	// 相位在上方仍绑请求 ctx——写入前中止则整单不启动、无副作用；
+	// 写入相位改用解绑 ctx 并叠加与写截止对齐的独立上限
+	// （backupImportTimeout）——断连/关页不再回滚整单，整单要么
+	// 跑完、要么被服务端上限终止。整单事务维持（X-P3-21 的事务性
+	// 部分保留，其 handler 层「断连可取消」语义经本次裁决废止）；
+	// 导入期间其余请求经 SQLite busy_timeout（DSN 5000ms）/ PG
+	// 语句超时走正常超时错误，并发导入由上方 backupImportMu 互斥。
+	// repo 层 ImportContext 尊重所传入 ctx 的契约（TestR1B8_XP321）
+	// 不触碰：此处只是改传解绑后的 ctx。
+	importCtx, cancelImport := context.WithTimeout(context.WithoutCancel(r.Context()), backupImportTimeout)
+	defer cancelImport()
+	result, err := h.repo.ImportContext(importCtx, &req.BackupData, req.Types)
+	if err != nil {
+		// R3-GEN-02①：恢复基线「导入失败: %v」——仅限 repo 定型的
+		// 备份校验错（ImportValidationError：版本/段类型/预算/端口
+		// 冲突/管理员不变式，均为用户可改正的自著文案），经
+		// errors.As 分流后以 -2 原文回；仓储/事务故障仍泛化。
+		// 呈现值取分流后的定型错本体，不直用 err 变量。
+		var importValidationErr *repo.ImportValidationError
+		if errors.As(err, &importValidationErr) {
+			response.WriteJSON(w, response.Err(-2, fmt.Sprintf("导入失败: %v", importValidationErr)))
+			return
+		}
+		respondInternalError(w, "backupImport", err)
+		return
+	}
+
+	h.runBackupImportTailHooks(result, &req.BackupData, req.Types)
+	// 已移除功能的旧备份段：解码时容忍丢弃的未知顶层段在此点名披露
+	// （与 repo 层 trio/peerShares/themes 的 ImportWarnings 同口径）。
+	for _, seg := range droppedSegments {
+		result.ImportWarnings = append(result.ImportWarnings, fmt.Sprintf("备份包含已移除功能的 %q 段，已忽略未恢复", seg))
+	}
+	// O7-010：快照生成失败只警告、不中断导入（见上）；警告随回执披露。
+	if snapshotErr != nil {
+		result.ImportWarnings = append(result.ImportWarnings, "导入前自动备份失败：未生成服务端快照，本次导入仍继续；如需回滚请使用此前的手动备份")
+	}
+	// SEC-01 BC-01 (b)：每次成功导入后顺带清理过期快照（本次刚写入
+	// 新鲜快照，正常情况下此处为 no-op；懒清理的第四个入口）。
+	h.purgeExpiredImportAutoBackup()
+	response.WriteJSON(w, response.OK(result))
+}
+
+// backupImport tail: metering reconciliation, configs cache
+// invalidation, kernel reconcile, revoked-authorization cleanup,
+// forward repush (backup_import_repush.go, FINAL-P2-1 seven-segment
+// predicate, untouched by this batch). SEC-01: no AutoBackup receipt —
+// the pre-import full-database snapshot used to be embedded in the
+// receipt and leaked live credentials, and ImportContext never used
+// it for rollback.
+// Import must never stop at the Import call itself, and must never
+// call only reconcileNodeKernels: every hook below runs.
+func (h *Handler) runBackupImportTailHooks(result *model.ImportResult, backup *model.BackupData, types []string) {
+	// FIX-BASELINE：整段尾钩子是一个导入批次——其内 apply 的基线
+	// 钉定由下方 reconcile 轮尾随 poll 承担，settle 全程抑制（见
+	// Handler.importTailBatchDepth）。同步段结束即退出批次；异步
+	// reconcile goroutine 的轮内 apply 本就不 settle。
+	h.importTailBatchDepth.Add(1)
+	defer h.importTailBatchDepth.Add(-1)
+
+	// R6X-010：恢复也是 origin 状态的写路径——导入成功后同步触发
+	// 一次残留伴生清理，使恢复出的 stale 伴生行立即清除，与入站
+	// 保存/删除路径同口径（恢复不再物化伴生；原地计量由开关直
+	// 接生效）。此前 backupImport 不在触发点全集内，伴生最早要等
+	// 订阅同步循环的节流顺带（≤~90s）才出现。清理幂等自愈，任何
+	// 成功导入都触发（部分导入同样可能改写 origin/订阅需求）。
+	h.cleanupStaleCompanions()
+
+	// FIX2-B（V4-N1）：configs 段写库后与 UI 两写入口同口径失效配置
+	// 缓存。此前导入绕过全部失效钩子：notify_enabled 与 prober 三键
+	// 只能等 5s TTL 兜底（notify_events 因派发时现读已对冲，不在此列）。
+	if slices.Contains(types, "configs") && len(backup.Configs) > 0 {
+		h.invalidateNotifyConfigCache()
+		for key := range backup.Configs {
+			h.notifyTunnelQualityConfigChanged(key)
+		}
+	}
+
+	// R4X-009（E4-02）：reconcile 触发条件由只认 inbounds 段放宽至
+	// 任一物化输入集段。nodes（节点地址）/ tunnels（Type 与入口·
+	// 出口集）/ forwards（隧道归属与存废，经 ForwardExists 决定
+	// relay 行是否计入 allow）同样改写白名单/RemoteAddr 输入集，
+	// 未选 inbounds 的部分导入旧口径不触发任何重推、物化与导入
+	// 后 DB 脱节驻留。其余段逐段核过均不改写输入集（授权/分配/
+	// 分组/权限段的撤销子面经下方 RevokedUserTunnels 漏斗自带
+	// 刷新、configs 段经上方缓存钩子），全集表见 R4-FIX-B5 §2。
+	// 计数以实际落库行计（被存在性校验跳过的行 DB 未变、不触发）；
+	// relays 子段旧条件在 relays-only 备份下同漏、本批一并补齐。
+	// 单个 if、单个 goroutine：全量导入多段同时命中也只触发一轮。
+	materializedImport := result.NodesImported > 0 || result.TunnelsImported > 0 ||
+		result.ForwardsImported > 0 || result.InboundsImported > 0 ||
+		backup.Inbounds != nil &&
+			(len(backup.Inbounds.Kernels) > 0 || len(backup.Inbounds.Relays) > 0)
+	if materializedImport {
+		// Restored kernels have no applied config yet: push them to the
+		// nodes that are online; the rest get it when they reconnect.
+		go func() {
+			nodeIDs, err := h.repo.ListKernelNodeIDs()
+			if err != nil {
+				// R18-B9-03：读节点列表失败不得静默丢弃整轮重推——
+				// goroutine 在回执发出后才跑，失败进不了回执，至少
+				// 须记日志，否则在线节点静默跑旧内核配置至重连，
+				// 与转发重推 R13X-001 的披露口径分裂。
+				log.Printf("backup restore: kernel repush skipped, list kernel nodes failed: %v (kernels keep pre-import config until nodes reconnect)", err)
+				return
+			}
+			for _, nodeID := range nodeIDs {
+				h.reconcileNodeKernels(nodeID)
+			}
+		}()
+	}
+
+	// R3X-005 facet (a)：导入在分组段成员替换 / 停用收敛中撤销的
+	// 组建授权经回执 revokedUserTunnels 回传，逐对清理其转发（与
+	// 运行时全部撤销路径的 cleanupForwardsForUserTunnel 同口径），
+	// 不留「授权已撤、转发仍跑」的静默残留。
+	for _, pair := range result.RevokedUserTunnels {
+		// T-001：备份恢复面无回执可点名，刷新失败只记日志（内核
+		// 仍按旧名单放行，下次面板清扫/节点重连时收敛）。
+		if failed, pending := h.cleanupForwardsForUserTunnel(pair.UserID, pair.TunnelID); len(failed) > 0 || len(pending) > 0 {
+			log.Printf("backup restore: revoked user-tunnel forward cleanup whitelist refresh failed user_id=%d tunnel_id=%d %s %s", pair.UserID, pair.TunnelID, whitelistRefreshFailureNote(failed), whitelistRefreshPendingNote(pending))
+		}
+	}
+
+	// F2-04：转发重推之前先做一轮配额重估。恢复出的计数已过负值
+	// 门，但仍可为合法的超限值（乃至 MaxInt64）：若不重估，
+	// repush 会把超限用户/订阅的 status=1 转发与凭据按
+	// 「可用」终态直接下发上线。此处与运行时入账后的执法面同
+	// 口径：用户日/月配额全量扫、订阅同步（超限摘凭据）、备份
+	// 内用户隧道对逐对跑流量策略。全部幂等，
+	// 未超限者无副作用。
+	h.reconcileUserQuotaEnforcement(time.Now())
+	h.syncSubscriptions(time.Now())
+	if backup != nil {
+		for _, ut := range backup.UserTunnels {
+			h.enforceFlowPolicies(ut.UserID, ut.ID)
+		}
+	}
+
+	// R13X-001（P2）：导入成功后对受影响节点集补一次转发重布（见
+	// backup_import_repush.go）。放在撤销清理之后，使重推下发的是
+	// 导入终态；离线节点不在此列（重连路径行为不变）。重推失败只
+	// 披露进回执，不改写导入成功结论。
+	if outcome := h.repushForwardRuntimeAfterImport(result, backup); len(outcome.attempted) > 0 || len(outcome.warnings) > 0 {
+		result.RepushNodeIDs = outcome.attempted
+		result.RepushFailedNodeIDs = outcome.failed
+		result.ImportWarnings = append(result.ImportWarnings, outcome.warnings...)
+	}
+}

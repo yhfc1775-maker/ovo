@@ -1,0 +1,579 @@
+package kernel
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"flag"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+var updateGolden = flag.Bool("update", false, "rewrite golden files")
+
+const (
+	testUUID       = "0b6e4c38-8f0e-4a3e-9d2d-7a1c2b3c4d5e"
+	testRealityKey = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA" // bytes 1..32, raw-url
+)
+
+func TestNormalizeFillsCredentials(t *testing.T) {
+	in := Inbound{ID: 1, Protocol: "VLESS", Port: 443, Settings: Settings{Flow: FlowVision}, Security: Security{Type: SecurityReality}}
+	if err := Normalize(TypeXray, &in); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if in.Protocol != ProtocolVLESS || in.Transport.Type != TransportTCP || in.Listen != "::" {
+		t.Fatalf("defaults not applied: %+v", in)
+	}
+	if !uuidPattern.MatchString(in.Settings.UUID) {
+		t.Fatalf("uuid not generated: %q", in.Settings.UUID)
+	}
+	if in.Settings.Flow != FlowVision {
+		t.Fatalf("vision flow dropped on tcp+reality")
+	}
+	sec := in.Security
+	if sec.SNI != DefaultRealitySNI || sec.RealityDest != DefaultRealitySNI+":443" {
+		t.Fatalf("reality defaults: %+v", sec)
+	}
+	pub, err := RealityPublicKey(sec.RealityPrivateKey)
+	if err != nil || pub != sec.RealityPublicKey {
+		t.Fatalf("public key mismatch: %v", err)
+	}
+	if len(sec.RealityShortIDs) != 1 || len(sec.RealityShortIDs[0]) != 16 {
+		t.Fatalf("short id: %v", sec.RealityShortIDs)
+	}
+}
+
+func TestNormalizeRejectsUnsupportedCombos(t *testing.T) {
+	cases := []struct {
+		name string
+		in   Inbound
+	}{
+		{"unknown protocol", Inbound{Protocol: "snell", Port: 1}},
+		{"ws reality", Inbound{Protocol: ProtocolVLESS, Port: 1, Transport: Transport{Type: TransportWS}, Security: Security{Type: SecurityReality}}},
+		{"trojan without tls", Inbound{Protocol: ProtocolTrojan, Port: 1, Security: Security{Type: SecurityNone}}},
+		{"bad port", Inbound{Protocol: ProtocolVMess, Port: 70000}},
+		{"tls without sni", Inbound{Protocol: ProtocolVMess, Port: 1, Security: Security{Type: SecurityTLS}}},
+		{"bad ss2022 key", Inbound{Protocol: ProtocolShadowsocks, Port: 1, Settings: Settings{Method: DefaultSSMethod, Password: "short"}}},
+		{"bad uuid", Inbound{Protocol: ProtocolVMess, Port: 1, Settings: Settings{UUID: "nope"}}},
+		{"extra not object", Inbound{Protocol: ProtocolVMess, Port: 1, Extra: json.RawMessage(`[1]`)}},
+		{"bad short id", Inbound{Protocol: ProtocolVLESS, Port: 1, Security: Security{Type: SecurityReality, RealityShortIDs: []string{"xyz"}}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := tc.in
+			if err := Normalize(TypeXray, &in); err == nil {
+				t.Fatalf("expected error for %+v", tc.in)
+			}
+		})
+	}
+	in := Inbound{Protocol: ProtocolVLESS, Port: 1}
+	if err := Normalize("nosuchkernel", &in); err == nil {
+		t.Fatal("unimplemented kernel must be rejected")
+	}
+}
+
+// F-L3-01: flow 在组合不成立时必须显式拒绝并点名，不再静默清零。
+func TestNormalizeRejectsVisionWhereUnsupported(t *testing.T) {
+	in := Inbound{Protocol: ProtocolVLESS, Port: 1, Transport: Transport{Type: TransportWS}, Security: Security{Type: SecurityNone}, Settings: Settings{Flow: FlowVision}}
+	err := Normalize(TypeXray, &in)
+	if err == nil {
+		t.Fatal("vision on ws must be rejected, not silently cleared")
+	}
+	if !strings.Contains(err.Error(), "Vision") {
+		t.Fatalf("error must name the rejected feature: %v", err)
+	}
+	// WS 无 flow 时归一化照常（路径默认值填充不受影响）。
+	in.Settings.Flow = ""
+	if err := Normalize(TypeXray, &in); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(in.Transport.Path, "/") {
+		t.Fatalf("ws path default: %q", in.Transport.Path)
+	}
+}
+
+// F-L3-01: 两条触达路径——① API 直调携带不成立的 flow 组合；
+// ② 编辑既有 Vision 入站改传输/安全层后重新保存。全部必须拒绝。
+func TestNormalizeFlowValidation(t *testing.T) {
+	reject := []struct {
+		name string
+		in   Inbound
+	}{
+		{"api vless ws tls vision", Inbound{Protocol: ProtocolVLESS, Port: 1, Transport: Transport{Type: TransportWS}, Security: Security{Type: SecurityTLS, SNI: "cdn.example.com"}, Settings: Settings{Flow: FlowVision}}},
+		{"api vless ws none vision", Inbound{Protocol: ProtocolVLESS, Port: 1, Transport: Transport{Type: TransportWS}, Security: Security{Type: SecurityNone}, Settings: Settings{Flow: FlowVision}}},
+		{"api vless xhttp tls vision", Inbound{Protocol: ProtocolVLESS, Port: 1, Transport: Transport{Type: TransportXHTTP}, Security: Security{Type: SecurityTLS, SNI: "cdn.example.com"}, Settings: Settings{Flow: FlowVision}}},
+		{"api vless grpc reality vision", Inbound{Protocol: ProtocolVLESS, Port: 1, Transport: Transport{Type: TransportGRPC}, Security: Security{Type: SecurityReality}, Settings: Settings{Flow: FlowVision}}},
+		{"api vless tcp none no-enc vision", Inbound{Protocol: ProtocolVLESS, Port: 1, Transport: Transport{Type: TransportTCP}, Security: Security{Type: SecurityNone}, Settings: Settings{Flow: FlowVision}}},
+		{"api vless unknown flow value", Inbound{Protocol: ProtocolVLESS, Port: 1, Transport: Transport{Type: TransportTCP}, Security: Security{Type: SecurityReality}, Settings: Settings{Flow: "xtls-rprx-vision-udp443"}}},
+		{"api vmess with flow", Inbound{Protocol: ProtocolVMess, Port: 1, Transport: Transport{Type: TransportTCP}, Security: Security{Type: SecurityTLS, SNI: "cdn.example.com"}, Settings: Settings{Flow: FlowVision}}},
+	}
+	for _, tc := range reject {
+		t.Run(tc.name, func(t *testing.T) {
+			in := tc.in
+			if err := Normalize(TypeXray, &in); err == nil {
+				t.Fatalf("expected rejection for %+v", tc.in)
+			}
+		})
+	}
+
+	accept := []struct {
+		name string
+		in   Inbound
+	}{
+		{"vless tcp reality vision", Inbound{Protocol: ProtocolVLESS, Port: 1, Transport: Transport{Type: TransportTCP}, Security: Security{Type: SecurityReality}, Settings: Settings{Flow: FlowVision}}},
+		{"vless tcp tls vision", Inbound{Protocol: ProtocolVLESS, Port: 1, Transport: Transport{Type: TransportTCP}, Security: Security{Type: SecurityTLS, SNI: "cdn.example.com"}, Settings: Settings{Flow: FlowVision}}},
+		{"vless tcp none enc vision", Inbound{Protocol: ProtocolVLESS, Port: 1, Transport: Transport{Type: TransportTCP}, Security: Security{Type: SecurityNone}, Settings: Settings{Flow: FlowVision, EncryptionAuth: EncryptionAuthMLKEM}}},
+	}
+	for _, tc := range accept {
+		t.Run(tc.name, func(t *testing.T) {
+			in := tc.in
+			if err := Normalize(TypeXray, &in); err != nil {
+				t.Fatalf("valid vision combo rejected: %v", err)
+			}
+			if in.Settings.Flow != FlowVision {
+				t.Fatalf("vision flow must survive: %q", in.Settings.Flow)
+			}
+		})
+	}
+
+	// 路径②：既有 VLESS+TCP+Reality+Vision 入站先合法落形，编辑时
+	// 改传输为 WS（+TLS）再保存——必须拒绝，而不是静默丢 Vision。
+	stored := Inbound{Protocol: ProtocolVLESS, Port: 443, Transport: Transport{Type: TransportTCP}, Security: Security{Type: SecurityReality}, Settings: Settings{Flow: FlowVision}}
+	if err := Normalize(TypeXray, &stored); err != nil {
+		t.Fatalf("stored vision inbound must normalize: %v", err)
+	}
+	edited := stored
+	edited.Transport = Transport{Type: TransportWS, Path: "/ws"}
+	edited.Security = Security{Type: SecurityTLS, SNI: "cdn.example.com"}
+	if err := Normalize(TypeXray, &edited); err == nil {
+		t.Fatal("editing a vision inbound onto ws must be rejected, not silently downgraded")
+	}
+}
+
+func TestNormalizeSS2022Key(t *testing.T) {
+	in := Inbound{Protocol: ProtocolShadowsocks, Port: 8388}
+	if err := Normalize(TypeXray, &in); err != nil {
+		t.Fatal(err)
+	}
+	key, err := base64.StdEncoding.DecodeString(in.Settings.Password)
+	if err != nil || len(key) != 16 {
+		t.Fatalf("ss2022 key: %q", in.Settings.Password)
+	}
+	if in.Network() != "tcp,udp" {
+		t.Fatalf("ss network: %s", in.Network())
+	}
+}
+
+func TestNormalizeSelfSignedCertKeptWhenSNIUnchanged(t *testing.T) {
+	in := Inbound{Protocol: ProtocolTrojan, Port: 443, Security: Security{Type: SecurityTLS, SNI: "a.example.com"}}
+	if err := Normalize(TypeXray, &in); err != nil {
+		t.Fatal(err)
+	}
+	cert := in.Security.CertPEM
+	if !certMatchesName(cert, "a.example.com") {
+		t.Fatal("cert does not match sni")
+	}
+	if err := Normalize(TypeXray, &in); err != nil {
+		t.Fatal(err)
+	}
+	if in.Security.CertPEM != cert {
+		t.Fatal("cert regenerated although sni unchanged")
+	}
+	in.Security.SNI = "b.example.com"
+	if err := Normalize(TypeXray, &in); err != nil {
+		t.Fatal(err)
+	}
+	if in.Security.CertPEM == cert || !certMatchesName(in.Security.CertPEM, "b.example.com") {
+		t.Fatal("cert must follow sni change")
+	}
+}
+
+func TestRegenerateRotatesSecrets(t *testing.T) {
+	in := Inbound{Protocol: ProtocolVLESS, Port: 1, Security: Security{Type: SecurityReality}}
+	if err := Normalize(TypeXray, &in); err != nil {
+		t.Fatal(err)
+	}
+	before := in
+	if err := Regenerate(TypeXray, &in); err != nil {
+		t.Fatal(err)
+	}
+	if in.Settings.UUID == before.Settings.UUID || in.Security.RealityPrivateKey == before.Security.RealityPrivateKey {
+		t.Fatal("secrets not rotated")
+	}
+	if in.Security.SNI != before.Security.SNI {
+		t.Fatal("shape must be kept")
+	}
+}
+
+func goldenInbounds(t *testing.T) []Inbound {
+	t.Helper()
+	certPEM := "-----BEGIN CERTIFICATE-----\nMIIB\nAAAA\n-----END CERTIFICATE-----\n"
+	keyPEM := "-----BEGIN EC PRIVATE KEY-----\nMHcC\n-----END EC PRIVATE KEY-----\n"
+	list := []Inbound{
+		{ID: 3, Protocol: ProtocolVMess, Port: 8443,
+			Settings:  Settings{UUID: testUUID},
+			Transport: Transport{Type: TransportWS, Path: "/ws", Host: "cdn.example.com"},
+			Security:  Security{Type: SecurityTLS, SNI: "cdn.example.com", CertMode: "file", CertFile: "/etc/ssl/a.crt", KeyFile: "/etc/ssl/a.key"}},
+		{ID: 1, Protocol: ProtocolVLESS, Port: 443,
+			Settings: Settings{UUID: testUUID, Flow: FlowVision},
+			Security: Security{Type: SecurityReality, SNI: "www.example.com", RealityPrivateKey: testRealityKey, RealityShortIDs: []string{"0123456789abcdef"}}},
+		{ID: 2, Protocol: ProtocolShadowsocks, Port: 8388,
+			Settings: Settings{Method: DefaultSSMethod, Password: "AAAAAAAAAAAAAAAAAAAAAA=="}},
+		{ID: 4, Protocol: ProtocolTrojan, Port: 2053,
+			Settings:  Settings{Password: "trojan-secret"},
+			Transport: Transport{Type: TransportGRPC, ServiceName: "tun"},
+			Security:  Security{Type: SecurityTLS, SNI: "t.example.com", ALPN: []string{"h2"}, CertPEM: certPEM, KeyPEM: keyPEM}},
+		{ID: 5, Protocol: ProtocolVLESS, Port: 9443, Listen: "127.0.0.1",
+			Settings:  Settings{UUID: testUUID},
+			Transport: Transport{Type: TransportXHTTP, Path: "/x"},
+			Security:  Security{Type: SecurityNone},
+			Extra:     json.RawMessage(`{"sniffing":{"enabled":false},"streamSettings":{"sockopt":{"tcpFastOpen":true}}}`)},
+	}
+	for i := range list {
+		if list[i].Security.Type == SecurityTLS && list[i].Security.CertPEM != "" {
+			// Keep the fixed fake PEM: Normalize would replace a cert that
+			// does not parse, so only validate the non-TLS parts here.
+			saved := list[i].Security
+			if err := Normalize(TypeXray, &list[i]); err != nil {
+				t.Fatalf("normalize %d: %v", list[i].ID, err)
+			}
+			list[i].Security.CertPEM, list[i].Security.KeyPEM = saved.CertPEM, saved.KeyPEM
+			continue
+		}
+		if err := Normalize(TypeXray, &list[i]); err != nil {
+			t.Fatalf("normalize %d: %v", list[i].ID, err)
+		}
+	}
+	return list
+}
+
+func TestRenderXrayGolden(t *testing.T) {
+	out, err := Render(TypeXray, goldenInbounds(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Files) != 1 || out.Files[0].Name != "config.json" {
+		t.Fatalf("files: %+v", out.Files)
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal([]byte(out.Files[0].Content), &parsed); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	assertGolden(t, "xray.golden.json", out.Files[0].Content)
+
+	again, _ := Render(TypeXray, goldenInbounds(t))
+	if again.Hash != out.Hash {
+		t.Fatal("render must be deterministic")
+	}
+}
+
+func TestRenderEmptyXray(t *testing.T) {
+	out, err := Render(TypeXray, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.Files[0].Content, `"inbounds": []`) {
+		t.Fatalf("empty inbounds must render as []: %s", out.Files[0].Content)
+	}
+}
+
+func TestResolveDownload(t *testing.T) {
+	xray, _ := Lookup(TypeXray)
+	d, err := ResolveDownload(xray, "v25.1.1", "https://mirror.example/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d["url"] != "https://mirror.example/https://github.com/XTLS/Xray-core/releases/download/v25.1.1/Xray-linux-{ARCH}.zip" {
+		t.Fatalf("url: %v", d["url"])
+	}
+	// C2-02: the anchor is the GitHub API asset digest (tag pinned),
+	// never the co-located .dgst checksum file.
+	if d["github"].(map[string]interface{})["repo"] != "XTLS/Xray-core" || d["github"].(map[string]interface{})["tag"] != "v25.1.1" {
+		t.Fatalf("xray github anchor: %v", d["github"])
+	}
+	if _, weak := d["checksumUrl"]; weak {
+		t.Fatalf("xray must not carry a checksumUrl anchor: %v", d)
+	}
+	latest, _ := ResolveDownload(xray, "latest", "")
+	if !strings.Contains(latest["url"].(string), "{VERSION}") || latest["github"].(map[string]interface{})["repo"] != "XTLS/Xray-core" {
+		t.Fatalf("xray latest must defer to the agent like sing-box: %v", latest)
+	}
+
+	sb, _ := Lookup(TypeSingbox)
+	sl, err := ResolveDownload(sb, "latest", "")
+	if err != nil || !strings.Contains(sl["url"].(string), "{VERSION}") || sl["github"].(map[string]interface{})["repo"] != SingboxForkRepo {
+		t.Fatalf("sing-box latest must defer to the agent: %v %v", sl, err)
+	}
+	sv, _ := ResolveDownload(sb, "1.12.8", "")
+	if sv["url"] != "https://github.com/"+SingboxForkRepo+"/releases/download/v1.12.8/sing-box-1.12.8-linux-{ARCH}.tar.gz" || sv["github"].(map[string]interface{})["tag"] != "v1.12.8" {
+		t.Fatalf("sing-box pinned version: %v", sv)
+	}
+	// Fork 构建：默认源是 fork 仓，tag 与资产名带 -flmx1 后缀。
+	sf, err := ResolveDownload(sb, SingboxForkVersion, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sf["url"] != "https://github.com/"+SingboxForkRepo+"/releases/download/v1.14.4-flmx1/sing-box-1.14.4-flmx1-linux-{ARCH}.tar.gz" || sf["github"].(map[string]interface{})["tag"] != "v1.14.4-flmx1" {
+		t.Fatalf("sing-box fork version: %v", sf)
+	}
+
+}
+
+func assertGolden(t *testing.T, name, got string) {
+	t.Helper()
+	path := filepath.Join("testdata", name)
+	if *updateGolden {
+		if err := os.MkdirAll("testdata", 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(got), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read golden (run with -update): %v", err)
+	}
+	if string(want) != got {
+		t.Fatalf("%s mismatch:\n--- got ---\n%s", name, got)
+	}
+}
+
+func TestRenderAcceptProxyProtocol(t *testing.T) {
+	ins := []Inbound{
+		{ID: 1, Protocol: ProtocolVLESS, Port: 443, Security: Security{Type: SecurityReality}, AcceptProxyProtocol: true},
+		{ID: 2, Protocol: ProtocolShadowsocks, Port: 8388, AcceptProxyProtocol: true},
+		{ID: 3, Protocol: ProtocolShadowsocks, Port: 8389},
+	}
+	for i := range ins {
+		if err := Normalize(TypeXray, &ins[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out, err := Render(TypeXray, ins)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg struct {
+		Inbounds []struct {
+			Tag            string                 `json:"tag"`
+			StreamSettings map[string]interface{} `json:"streamSettings"`
+		} `json:"inbounds"`
+	}
+	if err := json.Unmarshal([]byte(out.Files[0].Content), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	for _, in := range cfg.Inbounds[:2] {
+		sockopt, _ := in.StreamSettings["sockopt"].(map[string]interface{})
+		if sockopt["acceptProxyProtocol"] != true {
+			t.Fatalf("%s: acceptProxyProtocol missing: %v", in.Tag, in.StreamSettings)
+		}
+	}
+	if cfg.Inbounds[2].StreamSettings != nil {
+		t.Fatalf("plain ss must not get streamSettings: %v", cfg.Inbounds[2].StreamSettings)
+	}
+}
+
+func TestParseAllowList(t *testing.T) {
+	got, err := ParseAllowList("1.2.3.4, 10.0.0.0/8\n2001:db8::1，1.2.3.4 10.1.2.3/8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"1.2.3.4/32", "10.0.0.0/8", "2001:db8::1/128"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("got %v want %v", got, want)
+	}
+	for _, bad := range []string{"example.com", "1.2.3.4/33", "1.2.3.4; drop"} {
+		if _, err := ParseAllowList(bad); err == nil {
+			t.Fatalf("%q must be rejected", bad)
+		}
+	}
+	if got, _ := ParseAllowList("  "); len(got) != 0 {
+		t.Fatal("empty list")
+	}
+}
+
+func phase3Inbounds(t *testing.T) []Inbound {
+	t.Helper()
+	certPEM := "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
+	keyPEM := "-----BEGIN EC PRIVATE KEY-----\nMHcC\n-----END EC PRIVATE KEY-----\n"
+	tls := Security{Type: SecurityTLS, SNI: "www.bing.com", CertMode: "self", CertPEM: certPEM, KeyPEM: keyPEM, Fingerprint: DefaultFingerprint}
+	list := []Inbound{
+		{ID: 1, Protocol: ProtocolHysteria2, Listen: "::", Port: 443, Transport: Transport{Type: TransportQUIC}, Security: tls,
+			Settings: Settings{Password: "hy2-secret", Masquerade: "https://www.bing.com"}},
+		{ID: 2, Protocol: ProtocolTUIC, Listen: "::", Port: 8443, Transport: Transport{Type: TransportQUIC}, Security: tls,
+			Settings: Settings{UUID: testUUID, Password: "tuic-secret"}},
+		{ID: 3, Protocol: ProtocolAnyTLS, Listen: "::", Port: 9443, Security: tls, Settings: Settings{Password: "anytls-secret"}},
+		{ID: 4, Protocol: ProtocolShadowsocks, Listen: "::", Port: 10443,
+			Settings: Settings{Method: DefaultSSMethod, Password: "AAAAAAAAAAAAAAAAAAAAAA=="},
+			Security: Security{Type: SecurityShadowTLS, SNI: "www.microsoft.com", ShadowTLSPassword: "stls-secret-123"}},
+		{ID: 5, Protocol: ProtocolVLESS, Listen: "::", Port: 11443, Settings: Settings{UUID: testUUID, Flow: FlowVision},
+			Security: Security{Type: SecurityReality, SNI: "www.example.com", RealityPrivateKey: testRealityKey, RealityShortIDs: []string{"0123456789abcdef"}}},
+	}
+	for i := range list {
+		saved := list[i].Security
+		if err := Normalize(TypeSingbox, &list[i]); err != nil {
+			t.Fatalf("normalize %d: %v", list[i].ID, err)
+		}
+		if saved.CertPEM != "" {
+			list[i].Security.CertPEM, list[i].Security.KeyPEM = saved.CertPEM, saved.KeyPEM
+		}
+	}
+	return list
+}
+
+func TestRenderSingboxGolden(t *testing.T) {
+	out, err := Render(TypeSingbox, phase3Inbounds(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal([]byte(out.Files[0].Content), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	assertGolden(t, "singbox-server.golden.json", out.Files[0].Content)
+	if len(parsed["inbounds"].([]interface{})) != 6 {
+		t.Fatal("shadowtls must add a loopback shadowsocks backend")
+	}
+}
+
+func TestNormalizePhase3Rules(t *testing.T) {
+	hy := Inbound{Protocol: ProtocolHysteria2, Port: 443, Transport: Transport{Type: TransportQUIC}, Security: Security{Type: SecurityTLS}}
+	if err := Normalize(TypeSingbox, &hy); err != nil {
+		t.Fatal(err)
+	}
+	if hy.Security.SNI != DefaultQUICSNI || strings.Join(hy.Security.ALPN, ",") != "h3" || hy.Settings.Password == "" || hy.Network() != "udp" {
+		t.Fatalf("hy2 defaults: %+v", hy)
+	}
+	bad := []struct {
+		kernel string
+		in     Inbound
+	}{
+		{TypeSingbox, Inbound{Protocol: ProtocolHysteria2, Port: 1, Transport: Transport{Type: TransportQUIC}, Settings: Settings{Masquerade: "ftp://x"}}},
+		{TypeSingbox, Inbound{Protocol: ProtocolVLESS, Port: 1, AcceptProxyProtocol: true}},
+		{TypeXray, Inbound{Protocol: ProtocolHysteria2, Port: 1}},
+		{TypeSingbox, Inbound{Protocol: ProtocolTrojan, Port: 1, Security: Security{Type: SecurityShadowTLS}}},
+	}
+	for i, tc := range bad {
+		in := tc.in
+		if err := Normalize(tc.kernel, &in); err == nil {
+			t.Fatalf("case %d must fail: %+v", i, tc.in)
+		}
+	}
+}
+
+func TestSingboxACMEAndNaive(t *testing.T) {
+	acme := Security{Type: SecurityTLS, CertMode: CertModeACME, SNI: "hk.example.com", ACMEEmail: "me@example.com"}
+	list := []Inbound{
+		{ID: 1, Protocol: ProtocolNaive, Port: 443, Settings: Settings{Username: "flvx", Password: "naive-secret"}, Security: acme},
+		{ID: 2, Protocol: ProtocolHysteria2, Port: 443, Transport: Transport{Type: TransportQUIC}, Settings: Settings{Password: "hy2-secret"}, Security: acme},
+		{ID: 3, Protocol: ProtocolTrojan, Port: 8443, Settings: Settings{Password: "trojan-secret"},
+			Security: Security{Type: SecurityTLS, CertMode: CertModeACME, SNI: "cf.example.com", ACMEDNS: ACMEDNSCloudflare, ACMEDNSKey: "cf-token"}},
+	}
+	for i := range list {
+		if err := Normalize(TypeSingbox, &list[i]); err != nil {
+			t.Fatalf("inbound %d: %v", list[i].ID, err)
+		}
+	}
+	out, err := Render(TypeSingbox, list)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := out.Files[0].Content
+	assertGolden(t, "singbox-acme.golden.json", cfg)
+	var parsed struct {
+		Providers []map[string]interface{} `json:"certificate_providers"`
+		Inbounds  []map[string]interface{} `json:"inbounds"`
+	}
+	if err := json.Unmarshal([]byte(cfg), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Providers) != 2 {
+		t.Fatalf("one provider per domain, got %d", len(parsed.Providers))
+	}
+	for i, want := range []string{"acme-1", "acme-1", "acme-2"} {
+		if got := parsed.Inbounds[i]["tls"].(map[string]interface{})["certificate_provider"]; got != want {
+			t.Fatalf("inbound %d provider %v, want %s", i, got, want)
+		}
+	}
+
+	for name, c := range map[string]struct {
+		kernel string
+		in     Inbound
+		want   string
+	}{
+		"acme on xray":       {TypeXray, Inbound{Protocol: ProtocolTrojan, Port: 1443, Security: acme}, "sing-box"},
+		"self-signed naive":  {TypeSingbox, Inbound{Protocol: ProtocolNaive, Port: 1443, Security: Security{Type: SecurityTLS, SNI: "a.example.com"}}, "真实证书"},
+		"acme without host":  {TypeSingbox, Inbound{Protocol: ProtocolHysteria2, Port: 1443, Transport: Transport{Type: TransportQUIC}, Security: Security{Type: SecurityTLS, CertMode: CertModeACME}}, "域名"},
+		"alidns w/o secret":  {TypeSingbox, Inbound{Protocol: ProtocolAnyTLS, Port: 1443, Security: Security{Type: SecurityTLS, CertMode: CertModeACME, SNI: "a.example.com", ACMEDNS: ACMEDNSAliDNS, ACMEDNSKey: "id"}}, "AccessKey"},
+		"naive bad username": {TypeSingbox, Inbound{Protocol: ProtocolNaive, Port: 1443, Settings: Settings{Username: "a b"}, Security: acme}, "用户名"},
+	} {
+		in := c.in
+		if err := Normalize(c.kernel, &in); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Fatalf("%s: got %v, want error containing %q", name, err, c.want)
+		}
+	}
+
+	naive := list[0]
+	direct := Endpoint{Name: "naive", Host: "hk.example.com", Port: 443, Inbound: naive, Direct: true}
+	relay := Endpoint{Name: "relay", Host: "198.51.100.7", Port: 31000, Inbound: naive}
+	if uri, _ := ShareURI(direct); uri != "naive+https://flvx:naive-secret@hk.example.com:443#naive" {
+		t.Fatalf("naive uri: %s", uri)
+	}
+	if uri, _ := ShareURI(relay); !strings.Contains(uri, "@198.51.100.7:31000?sni=hk.example.com#") {
+		t.Fatalf("relay naive uri needs sni: %s", uri)
+	}
+	if _, ok := ClashProxy(direct); ok {
+		t.Fatal("Mihomo has no naive client")
+	}
+	if _, ok := SurgeLine(direct); ok {
+		t.Fatal("Surge has no naive client")
+	}
+	o, _ := singboxOutbound(direct)
+	tls := o["tls"].(map[string]interface{})
+	if o["type"] != "naive" || tls["utls"] != nil || tls["insecure"] != nil {
+		t.Fatalf("sing-box naive outbound: %v", o)
+	}
+	if uri, _ := ShareURI(Endpoint{Name: "hy2", Host: "hk.example.com", Port: 443, Inbound: list[1], Direct: true}); strings.Contains(uri, "insecure") {
+		t.Fatalf("ACME certificates are trusted: %s", uri)
+	}
+}
+
+// TestACMEEmailEmptyLabel：sweep §3——ACME 邮箱域名含空标签（`x@a..b.com`）
+// 须拒。acmeEmailPattern 的域名段 `[A-Za-z0-9.-]+` 放行连续点号，域名
+// 按 `.` 分段判空标签，与主机名同口径；文案复用既有邮箱校验。
+func TestACMEEmailEmptyLabel(t *testing.T) {
+	bad := []string{"x@a..b.com", "x@a...b.com"}
+	for _, email := range bad {
+		in := Inbound{ID: 1, Protocol: ProtocolNaive, Port: 443,
+			Settings: Settings{Username: "flvx", Password: "naive-secret"},
+			Security: Security{Type: SecurityTLS, CertMode: CertModeACME, SNI: "hk.example.com", ACMEEmail: email}}
+		if err := Normalize(TypeSingbox, &in); err == nil || err.Error() != "ACME 邮箱格式错误" {
+			t.Errorf("ACMEEmail %q: Normalize = %v, want %q", email, err, "ACME 邮箱格式错误")
+		}
+	}
+	good := Inbound{ID: 2, Protocol: ProtocolNaive, Port: 443,
+		Settings: Settings{Username: "flvx", Password: "naive-secret"},
+		Security: Security{Type: SecurityTLS, CertMode: CertModeACME, SNI: "hk.example.com", ACMEEmail: "me@example.com"}}
+	if err := Normalize(TypeSingbox, &good); err != nil {
+		t.Errorf("ACMEEmail me@example.com: Normalize = %v, want nil", err)
+	}
+}
+
+func TestRealityMinClientVer(t *testing.T) {
+	in := Inbound{ID: 1, Protocol: ProtocolVLESS, Port: 443, Security: Security{Type: SecurityReality}}
+	if err := Normalize(TypeXray, &in); err != nil || in.Security.RealityMinClientVer != "1.0.0" {
+		t.Fatalf("default: %v %q", err, in.Security.RealityMinClientVer)
+	}
+	// Stored before the field existed: still rendered with the default.
+	in.Security.RealityMinClientVer = ""
+	out, err := Render(TypeXray, []Inbound{in})
+	if err != nil || !strings.Contains(out.Files[0].Content, `"minClientVer": "1.0.0"`) {
+		t.Fatalf("legacy inbound must get minClientVer: %v", err)
+	}
+	bad := Inbound{ID: 2, Protocol: ProtocolVLESS, Port: 443, Security: Security{Type: SecurityReality, RealityMinClientVer: "v26"}}
+	if err := Normalize(TypeXray, &bad); err == nil {
+		t.Fatal("malformed version must be rejected")
+	}
+}

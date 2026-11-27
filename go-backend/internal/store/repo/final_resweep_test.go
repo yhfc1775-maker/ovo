@@ -1,0 +1,416 @@
+package repo
+
+import (
+	"database/sql"
+	"encoding/json"
+	"strings"
+	"testing"
+	"time"
+
+	"go-backend/internal/kernel"
+	"go-backend/internal/store/model"
+)
+
+// 复扫（fix/final-resweep）：从头机械重推发现的新增同族残留（恢复面）。
+// 先红后绿：每项修复前应失败，修复后须通过；含合法对照（防过修）。
+
+// R-04（恢复面）：节点 SSH 配置 Host `a..b` 随备份逐字恢复。
+func TestResweepImportNodeSSHConfigClearsEmptyLabelHost(t *testing.T) {
+	now := time.Now().UnixMilli()
+	source := openBackupRepo(t, "ssh-restore-src.db")
+	createRow(t, source, &model.Node{ID: 3, Name: "nft-node", Secret: "s", ServerIP: "10.0.0.3", Port: "10000-10100",
+		CreatedTime: now, UpdatedTime: sql.NullInt64{Int64: now, Valid: true}, ForwardMode: "nftables"})
+	createRow(t, source, &model.NodeSSHConfig{NodeID: 3, Host: "a..b", Port: 2222, Username: "root",
+		AuthType: "password", Password: sql.NullString{String: "ssh-pw", Valid: true}, SudoMode: "sudo",
+		CreatedTime: now, UpdatedTime: now})
+
+	dest := openBackupRepo(t, "ssh-restore-dst.db")
+	result := roundTripBackup(t, source, dest)
+
+	var cfg model.NodeSSHConfig
+	if err := dest.DB().Where("node_id = ?", 3).First(&cfg).Error; err != nil {
+		t.Fatalf("R-04: ssh config row must be restored: %v", err)
+	}
+	if cfg.Host != "" {
+		t.Fatalf("R-04: restored ssh host = %q, want empty (cleared) for a..b", cfg.Host)
+	}
+	found := false
+	for _, w := range result.ImportWarnings {
+		if strings.Contains(w, "SSH") && strings.Contains(w, "a..b") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("R-04: import warnings must disclose cleared ssh host, got %v", result.ImportWarnings)
+	}
+}
+
+// R-05：转发 RemoteAddr `a..b:80` 随备份逐字恢复（创建面已 gate，恢复面漂移）。
+// 直接 Import 模式（参照 TestFix132ImportForwardsSkipsDangling）：引用行
+// 预置在目标库，避免整单往返的 ID 重映射干扰。
+func TestResweepImportForwardsSkipsEmptyLabelRemoteAddr(t *testing.T) {
+	now := time.Now().UnixMilli()
+	dest := openBackupRepo(t, "fwd-restore-dst.db")
+	createRow(t, dest, &model.User{ID: 7, User: "fwd-user", Pwd: "x", RoleID: 1, Status: 1, CreatedTime: now})
+	createRow(t, dest, &model.Tunnel{ID: 5, Name: "tun", Type: 1, Protocol: "tls", Status: 1, CreatedTime: now, UpdatedTime: now})
+	// 转发恢复需用户隧道授权（R4X-006 尾部收口），否则整行以
+	// forwardsUnauthorized 跳过——与本项无关，须预置。
+	createRow(t, dest, &model.UserTunnel{UserID: 7, TunnelID: 5, Num: 99999, Flow: 99999, Status: 1, ExpTime: now + 86400000})
+	backup := &model.BackupData{
+		Version: "1.0",
+		Forwards: []model.ForwardBackup{
+			{ID: 11, UserID: 7, UserName: "fwd-user", Name: "bad-target",
+				TunnelID: 5, RemoteAddr: "a..b:80", Strategy: "fifo", Status: 1, CreatedTime: now, UpdatedTime: now},
+			{ID: 12, UserID: 7, UserName: "fwd-user", Name: "good-target",
+				TunnelID: 5, RemoteAddr: "203.0.113.5:443", Strategy: "fifo", Status: 1, CreatedTime: now, UpdatedTime: now},
+		},
+	}
+	result, err := dest.Import(backup, []string{"forwards"})
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+
+	var count int64
+	if err := dest.DB().Model(&model.Forward{}).Where("id = ?", 11).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatal("R-05: forward with RemoteAddr=a..b:80 must be skipped on restore, got restored")
+	}
+	if err := dest.DB().Model(&model.Forward{}).Where("id = ?", 12).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatal("R-05: forward with RemoteAddr=203.0.113.5:443 must be restored (control)")
+	}
+	found := false
+	for _, w := range result.ImportWarnings {
+		if strings.Contains(w, "a..b") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("R-05: import warnings must disclose skipped forward, got %v", result.ImportWarnings)
+	}
+}
+
+// R-06：订阅源 URL `https://a..b/x` 随备份逐字恢复（保存面已 gate，恢复面漂移）。
+func TestResweepImportRemoteSourceSkipsEmptyLabelURL(t *testing.T) {
+	now := time.Now().UnixMilli()
+	source := openBackupRepo(t, "src-restore-src.db")
+	createRow(t, source, &model.RemoteSource{ID: 4, Name: "bad-src", URL: "https://a..b/x",
+		Kind: "url", Enabled: 1, CreatedTime: now, UpdatedTime: now})
+	createRow(t, source, &model.RemoteSource{ID: 5, Name: "good-src", URL: "https://example.com/sub",
+		Kind: "url", Enabled: 1, CreatedTime: now, UpdatedTime: now})
+
+	dest := openBackupRepo(t, "src-restore-dst.db")
+	result := roundTripBackup(t, source, dest)
+
+	var count int64
+	if err := dest.DB().Model(&model.RemoteSource{}).Where("id = ?", 4).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatal("R-06: remote source with URL=https://a..b/x must be skipped on restore, got restored")
+	}
+	if err := dest.DB().Model(&model.RemoteSource{}).Where("id = ?", 5).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatal("R-06: remote source with URL=https://example.com/sub must be restored (control)")
+	}
+	found := false
+	for _, w := range result.ImportWarnings {
+		if strings.Contains(w, "a..b") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("R-06: import warnings must disclose skipped source, got %v", result.ImportWarnings)
+	}
+}
+
+// R-09：配置恢复面主机名键（panel_domain / ip / github_proxy_url /
+// notify_webhook_url）原值恢复，绕过全部保存门。
+func TestResweepImportConfigsSkipsEmptyLabelHostKeys(t *testing.T) {
+	now := time.Now().UnixMilli()
+	source := openBackupRepo(t, "cfg-restore-src.db")
+	createRow(t, source, &model.ViteConfig{Name: "panel_domain", Value: "a..b", Time: now})
+	createRow(t, source, &model.ViteConfig{Name: "github_proxy_url", Value: "https://a..b/x", Time: now})
+	// 控制键：非主机名键、且非 Open() 预置键（app_name / hide_footer_brand）。
+	createRow(t, source, &model.ViteConfig{Name: "monitor_retention_days", Value: "30", Time: now})
+
+	dest := openBackupRepo(t, "cfg-restore-dst.db")
+	result := roundTripBackup(t, source, dest)
+
+	var count int64
+	if err := dest.DB().Model(&model.ViteConfig{}).Where("name = ?", "panel_domain").Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatal("R-09: panel_domain=a..b must be skipped on restore, got restored")
+	}
+	if err := dest.DB().Model(&model.ViteConfig{}).Where("name = ?", "github_proxy_url").Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatal("R-09: github_proxy_url=https://a..b/x must be skipped on restore, got restored")
+	}
+	var cfg model.ViteConfig
+	if err := dest.DB().Where("name = ?", "monitor_retention_days").First(&cfg).Error; err != nil {
+		t.Fatalf("R-09: monitor_retention_days must be restored (control): %v", err)
+	}
+	if cfg.Value != "30" {
+		t.Fatalf("R-09: monitor_retention_days = %q, want %q", cfg.Value, "30")
+	}
+	found := false
+	for _, w := range result.ImportWarnings {
+		if strings.Contains(w, "a..b") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("R-09: import warnings must disclose skipped config keys, got %v", result.ImportWarnings)
+	}
+}
+
+// D-01（发版后审计）：备份恢复面 importTunnels 逐字恢复链路 ConnectIP
+// `a..b`（写面 C-16 明明拒收）。链路行跳过 + warning，与 R-05 同口径。
+func TestResweepImportTunnelsSkipsEmptyLabelChainConnectIP(t *testing.T) {
+	now := time.Now().UnixMilli()
+	dest := openBackupRepo(t, "tun-chain-restore-dst.db")
+	createRow(t, dest, &model.Node{ID: 3, Name: "n3", Secret: "s", ServerIP: "10.0.0.3", Port: "10000-10100",
+		CreatedTime: now, UpdatedTime: sql.NullInt64{Int64: now, Valid: true}})
+	badConnectIP := "a..b"
+	goodConnectIP := "203.0.113.9"
+	backup := &model.BackupData{
+		Version: "1.0",
+		Tunnels: []model.TunnelBackup{
+			{ID: 21, Name: "tun-bad-chain", TrafficRatio: 1, Flow: 1, Status: 1, CreatedTime: now,
+				ChainTunnels: []model.ChainTunnelBackup{
+					{ID: 31, TunnelID: 21, NodeID: 3, ConnectIP: &badConnectIP},
+					{ID: 32, TunnelID: 21, NodeID: 3, ConnectIP: &goodConnectIP},
+				}},
+		},
+	}
+	result, err := dest.Import(backup, []string{"tunnels"})
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+
+	var count int64
+	if err := dest.DB().Model(&model.ChainTunnel{}).Where("id = ?", 31).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatal("D-01: chain with ConnectIP=a..b must be skipped on restore, got restored")
+	}
+	if err := dest.DB().Model(&model.ChainTunnel{}).Where("id = ?", 32).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatal("D-01: chain with ConnectIP=203.0.113.9 must be restored (control)")
+	}
+	// 隧道行本身照常恢复（只跳坏链路行）。
+	if err := dest.DB().Model(&model.Tunnel{}).Where("id = ?", 21).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatal("D-01: tunnel row itself must be restored (only the bad chain row is skipped)")
+	}
+	found := false
+	for _, w := range result.ImportWarnings {
+		if strings.Contains(w, "a..b") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("D-01: import warnings must disclose skipped chain, got %v", result.ImportWarnings)
+	}
+}
+
+// D-02（发版后审计）：备份恢复面 importTunnels 逐字恢复隧道
+// ProbeTargetHost `a..b`（写面 C-26 明明拒收）。整行跳过 + warning。
+func TestResweepImportTunnelsSkipsEmptyLabelProbeTargetHost(t *testing.T) {
+	now := time.Now().UnixMilli()
+	dest := openBackupRepo(t, "tun-probe-restore-dst.db")
+	backup := &model.BackupData{
+		Version: "1.0",
+		Tunnels: []model.TunnelBackup{
+			{ID: 6, Name: "bad-probe", TrafficRatio: 1, Flow: 1, Status: 1, CreatedTime: now,
+				ProbeTargetHost: "a..b", ProbeTargetPort: 443},
+			{ID: 7, Name: "good-probe", TrafficRatio: 1, Flow: 1, Status: 1, CreatedTime: now,
+				ProbeTargetHost: "www.bing.com", ProbeTargetPort: 443},
+		},
+	}
+	result, err := dest.Import(backup, []string{"tunnels"})
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+
+	var count int64
+	if err := dest.DB().Model(&model.Tunnel{}).Where("id = ?", 6).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatal("D-02: tunnel with ProbeTargetHost=a..b must be skipped on restore, got restored")
+	}
+	var tun model.Tunnel
+	if err := dest.DB().Where("id = ?", 7).First(&tun).Error; err != nil {
+		t.Fatalf("D-02: tunnel with ProbeTargetHost=www.bing.com must be restored (control): %v", err)
+	}
+	if tun.ProbeTargetHost != "www.bing.com" {
+		t.Fatalf("D-02: restored probe target host = %q, want %q", tun.ProbeTargetHost, "www.bing.com")
+	}
+	found := false
+	for _, w := range result.ImportWarnings {
+		if strings.Contains(w, "a..b") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("D-02: import warnings must disclose skipped tunnel, got %v", result.ImportWarnings)
+	}
+}
+
+// F-PORT-01（任务 3）：节点端口段无上限——`1-99999` 会产出 >65535 的候选端口。
+func TestResweepPortRangeSpecClampsTo65535(t *testing.T) {
+	for _, p := range parsePortRangeSpec("1-99999") {
+		if p > 65535 {
+			t.Fatalf("parsePortRangeSpec(1-99999) yielded port %d > 65535", p)
+		}
+	}
+	if got := parsePortRangeSpec("70000-80000"); len(got) != 0 {
+		t.Fatalf("parsePortRangeSpec(70000-80000) = %v, want empty", got)
+	}
+	if got := parsePortRangeSpec("1000-65535"); len(got) == 0 || got[len(got)-1] != 65535 {
+		t.Fatalf("parsePortRangeSpec(1000-65535) must keep 65535, got %v", got)
+	}
+	minP, maxP := parsePortRangeMinMax("1-99999")
+	if maxP != 65535 {
+		t.Fatalf("parsePortRangeMinMax(1-99999) = (%d, %d), want max 65535", minP, maxP)
+	}
+	minP, maxP = parsePortRangeMinMax("70000-80000")
+	if minP != 0 || maxP != 0 {
+		t.Fatalf("parsePortRangeMinMax(70000-80000) = (%d, %d), want (0, 0)", minP, maxP)
+	}
+}
+
+// X-05（第二轮再审计）：备份恢复面分流规则域名 `a..b` 逐字恢复（写面
+// NormalizeSplitRules 明明拒收）。恢复面按 R-08 同口径：坏 domains 逐项
+// 剔除 + warning；剔除后无任何匹配项的规则整条丢弃（写面亦拒收空选择
+// 子规则）；合法条目逐字保留。先红后绿。
+
+// x05SplitInboundSource 在源库建一个带分流规则的入站（四整对象全空，
+// 绕过 validateImportedInboundObjects 的 Normalize 门，只测 SplitRules 面）。
+func x05SplitInboundSource(t *testing.T, splitRules string) *Repository {
+	t.Helper()
+	now := time.Now().UnixMilli()
+	source := openBackupRepo(t, "x05-split-src.db")
+	createRow(t, source, &model.Node{ID: 3, Name: "n3", Secret: "s", ServerIP: "10.0.0.3", Port: "10000-10100",
+		CreatedTime: now, UpdatedTime: sql.NullInt64{Int64: now, Valid: true}})
+	createRow(t, source, &model.NodeKernel{ID: 5, NodeID: 3, KernelType: "xray", Version: "latest",
+		Enabled: 1, CreatedTime: now, UpdatedTime: now})
+	createRow(t, source, &model.NodeInbound{ID: 7, KernelID: 5, NodeID: 3, Name: "split-in",
+		Protocol: "vless", Listen: "::", Port: 12345, Enabled: 1,
+		SplitRules: splitRules, CreatedTime: now, UpdatedTime: now})
+	return source
+}
+
+func x05RestoredSplitRules(t *testing.T, dest *Repository) []kernel.SplitRule {
+	t.Helper()
+	var row model.NodeInbound
+	if err := dest.DB().Where("id = ?", 7).First(&row).Error; err != nil {
+		t.Fatalf("X-05: inbound must be restored: %v", err)
+	}
+	if strings.TrimSpace(row.SplitRules) == "" {
+		return nil
+	}
+	var rules []kernel.SplitRule
+	if err := json.Unmarshal([]byte(row.SplitRules), &rules); err != nil {
+		t.Fatalf("X-05: restored split_rules %q must parse: %v", row.SplitRules, err)
+	}
+	return rules
+}
+
+func x05WarningsMention(t *testing.T, result *model.ImportResult, want string) {
+	t.Helper()
+	for _, w := range result.ImportWarnings {
+		if strings.Contains(w, want) {
+			return
+		}
+	}
+	t.Fatalf("X-05: import warnings must mention %q, got %v", want, result.ImportWarnings)
+}
+
+// 坏 domains 单条：整条规则失效，应整条丢弃 + warning，SplitRules 清空。
+func TestResweepImportSplitRulesDropsEmptyLabelOnlyRule(t *testing.T) {
+	source := x05SplitInboundSource(t, `[{"domains":["a..b"],"action":"direct"}]`)
+	dest := openBackupRepo(t, "x05-split-dst.db")
+	result := roundTripBackup(t, source, dest)
+
+	if rules := x05RestoredSplitRules(t, dest); len(rules) != 0 {
+		t.Fatalf("X-05: restored split rules = %v, want empty (bad-only rule dropped)", rules)
+	}
+	x05WarningsMention(t, result, "a..b")
+}
+
+// 坏 domains 与合法 domains 同条：只剔除坏条目，合法条目与规则照常恢复。
+func TestResweepImportSplitRulesDropsEmptyLabelDomainMixed(t *testing.T) {
+	source := x05SplitInboundSource(t, `[{"domains":["a..b","example.com"],"action":"direct"}]`)
+	dest := openBackupRepo(t, "x05-split-dst.db")
+	result := roundTripBackup(t, source, dest)
+
+	rules := x05RestoredSplitRules(t, dest)
+	if len(rules) != 1 || len(rules[0].Domains) != 1 || rules[0].Domains[0] != "example.com" {
+		t.Fatalf("X-05: restored split rules = %v, want [{domains:[example.com] action:direct}]", rules)
+	}
+	x05WarningsMention(t, result, "a..b")
+}
+
+// 多条规则混坏与合法：坏-only 规则丢弃、全坏 domains 规则丢弃、
+// 分类兜底的规则保留（domains 清空）、合法规则逐字恢复；原本就无
+// 选择子的规则保持原样（R2X-015 既有口径，本轮不重判其去留）。
+func TestResweepImportSplitRulesMixedRules(t *testing.T) {
+	source := x05SplitInboundSource(t, `[{"domains":["a..b"],"action":"direct"},`+
+		`{"domains":["example.com"],"action":"direct"},`+
+		`{"domains":["a..b","b..c"],"action":"block"},`+
+		`{"categories":["cn"],"domains":["a..b"],"action":"direct"},`+
+		`{"action":"direct"}]`)
+	dest := openBackupRepo(t, "x05-split-dst.db")
+	result := roundTripBackup(t, source, dest)
+
+	rules := x05RestoredSplitRules(t, dest)
+	if len(rules) != 3 {
+		t.Fatalf("X-05: restored split rules = %v, want 3 rules (legal + category fallback + bare direct)", rules)
+	}
+	if len(rules[0].Domains) != 1 || rules[0].Domains[0] != "example.com" || rules[0].Action != "direct" {
+		t.Fatalf("X-05: rules[0] = %+v, want {domains:[example.com] action:direct}", rules[0])
+	}
+	if len(rules[1].Categories) != 1 || rules[1].Categories[0] != "cn" || len(rules[1].Domains) != 0 {
+		t.Fatalf("X-05: rules[1] = %+v, want {categories:[cn] domains:[] action:direct}", rules[1])
+	}
+	if rules[2].Action != "direct" || len(rules[2].Domains) != 0 || len(rules[2].Categories) != 0 {
+		t.Fatalf("X-05: rules[2] = %+v, want bare {action:direct} kept verbatim (R2X-015)", rules[2])
+	}
+	x05WarningsMention(t, result, "a..b")
+	x05WarningsMention(t, result, "b..c")
+}
+
+// OBS-L1-1 顺带探针（不立案）：恢复面 X-04 镜像谓词
+// configValueHasEmptyLabelHost 须直接覆盖——既有 R-09 探针只覆盖
+// panel_domain/github_proxy_url，且走 Export 往返测不到该镜像本体
+// （Export 已滤除 sensitive 键）。
+func TestResweepX04RestoreMirrorProbe(t *testing.T) {
+	if !configValueHasEmptyLabelHost("notify_telegram_api_base", "https://a..b/") {
+		t.Fatalf("OBS-L1-1: configValueHasEmptyLabelHost(notify_telegram_api_base, https://a..b/) = false, want true")
+	}
+	if !configValueHasEmptyLabelHost("notify_telegram_api_base", "https://a...b/") {
+		t.Fatalf("OBS-L1-1: configValueHasEmptyLabelHost(notify_telegram_api_base, https://a...b/) = false, want true")
+	}
+	for _, good := range []string{"", "https://example.com/", "https://api.telegram.org", "https://203.0.113.9/"} {
+		if configValueHasEmptyLabelHost("notify_telegram_api_base", good) {
+			t.Fatalf("OBS-L1-1: configValueHasEmptyLabelHost(notify_telegram_api_base, %q) = true, want false", good)
+		}
+	}
+}

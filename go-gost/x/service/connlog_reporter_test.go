@@ -1,0 +1,806 @@
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/go-gost/x/internal/util/crypto"
+)
+
+// ---- 测试脚手架 ----
+
+// fakeConnlogSender 可编程的假面板：记录每次收到的批次，按脚本
+// 返回确认/失败/拒绝。
+type fakeConnlogSender struct {
+	calls   []connlogEnvelope
+	handler func(call int, b connlogEnvelope) (int64, error)
+}
+
+func (f *fakeConnlogSender) send(_ context.Context, b connlogEnvelope) (int64, error) {
+	f.calls = append(f.calls, b)
+	if f.handler != nil {
+		return f.handler(len(f.calls), b)
+	}
+	return b.Sequence, nil // 默认：确认，cursor=所发序号
+}
+
+// delivered 汇总所有「被确认」批次的事件（handler 返回 nil 的次）。
+// 本脚手架按调用序号在各测试内自行断言，delivered 只做收集辅助。
+func (f *fakeConnlogSender) allEvents() []ConnEvent {
+	var out []ConnEvent
+	for _, c := range f.calls {
+		out = append(out, c.Events...)
+	}
+	return out
+}
+
+func newTestConnlogReporter(t *testing.T, dir string, sender *fakeConnlogSender, boot *string, tweak func(*connlogConfig)) *connlogReporter {
+	t.Helper()
+	sp, err := openConnlogSpool(filepath.Join(dir, connlogSpoolFileName("connlog-test-identity")))
+	if err != nil {
+		t.Fatalf("open spool: %v", err)
+	}
+	cfg := connlogConfig{
+		spool:    sp,
+		sendFn:   sender.send,
+		bootIDFn: func() string { return *boot },
+	}
+	if tweak != nil {
+		tweak(&cfg)
+	}
+	r := newConnlogReporter(cfg)
+	if err := r.prepare(); err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	return r
+}
+
+func reopenTestConnlogReporter(t *testing.T, dir string, sender *fakeConnlogSender, boot *string, tweak func(*connlogConfig)) *connlogReporter {
+	// 与 newTest 相同（openConnlogSpool 本就从盘载入）——单列一
+	// 个名字让「进程重启」语义在测试里可读。
+	return newTestConnlogReporter(t, dir, sender, boot, tweak)
+}
+
+func testOpenEvent(connID string, startMs int64) ConnEvent {
+	return ConnEvent{
+		Type: ConnEventOpen, ConnID: connID, EntryKind: ConnEntryForward,
+		EntryID: "svc_tcp", ClientIP: "203.0.113.7", ClientPort: 51000,
+		Network: "tcp", SessionKind: "tcp_conn", StartMs: startMs,
+	}
+}
+
+func testCloseEvent(connID string, startMs, endMs int64) ConnEvent {
+	ev := testOpenEvent(connID, startMs)
+	ev.Type = ConnEventClose
+	ev.EndMs = endMs
+	ev.Status = ConnStatusClosed
+	return ev
+}
+
+func readSpoolStateFromDisk(t *testing.T, dir string) connlogSpoolState {
+	t.Helper()
+	// CPU-S2：盘上有效状态 = 快照＋journal 重放（热路径只追加
+	// journal，快照文件本身不含最新周期）。直接读快照会漏掉
+	// journal 里的增量，故经 openConnlogSpool 重放后取状态。
+	sp, err := openConnlogSpool(filepath.Join(dir, connlogSpoolFileName("connlog-test-identity")))
+	if err != nil {
+		t.Fatalf("reopen spool: %v", err)
+	}
+	return sp.state
+}
+
+// ---- 1. 断连续报：面板不可达期间事件落盘，进程重启后全量续报 ----
+
+func TestConnlogResumeAfterDisconnectAndRestart(t *testing.T) {
+	dir := t.TempDir()
+	boot := "boot-A"
+	down := &fakeConnlogSender{handler: func(int, connlogEnvelope) (int64, error) {
+		return 0, fmt.Errorf("connection refused")
+	}}
+	r1 := newTestConnlogReporter(t, dir, down, &boot, nil)
+	r1.Enqueue(testOpenEvent("c1", 1000))
+	r1.Enqueue(testCloseEvent("c1", 1000, 1600))
+	r1.Enqueue(testOpenEvent("c2", 2000))
+	r1.Enqueue(testCloseEvent("c2", 2000, 2900))
+	r1.cycle(context.Background())
+
+	if len(down.calls) == 0 {
+		t.Fatal("面板不可达时应至少尝试发送一次")
+	}
+	// 事件必须已落盘：盘上状态里 Pending 含整批 4 条、顺序不变。
+	st := readSpoolStateFromDisk(t, dir)
+	if st.Pending == nil || len(st.Pending.Events) != 4 {
+		t.Fatalf("断连后盘上 Pending 应含 4 条事件, got %+v", st.Pending)
+	}
+	for i, want := range []string{"c1", "c1", "c2", "c2"} {
+		if st.Pending.Events[i].ConnID != want {
+			t.Fatalf("盘上事件顺序错位: idx %d = %s, want %s", i, st.Pending.Events[i].ConnID, want)
+		}
+	}
+
+	// 进程重启：新 reporter 从同一 spool 续报，全量送达不多不少。
+	up := &fakeConnlogSender{}
+	r2 := reopenTestConnlogReporter(t, dir, up, &boot, nil)
+	r2.cycle(context.Background())
+	if len(up.calls) != 1 {
+		t.Fatalf("续报应只发一批, got %d 批", len(up.calls))
+	}
+	got := up.calls[0].Events
+	if len(got) != 4 {
+		t.Fatalf("续报事件数 = %d, want 4", len(got))
+	}
+	st = readSpoolStateFromDisk(t, dir)
+	if st.Pending != nil || len(st.Buffered) != 0 {
+		t.Fatalf("确认后续报状态应清空, pending=%v buffered=%d", st.Pending, len(st.Buffered))
+	}
+	if st.Next != 2 {
+		t.Fatalf("确认后 Next 应为 2, got %d", st.Next)
+	}
+}
+
+// ---- 2. 重复投递幂等：回执丢失后整批原样重报（同 stream/seq/digest） ----
+
+func TestConnlogReplayIsByteIdentical(t *testing.T) {
+	dir := t.TempDir()
+	boot := "boot-A"
+	attempts := 0
+	sender := &fakeConnlogSender{handler: func(_ int, b connlogEnvelope) (int64, error) {
+		attempts++
+		if attempts <= 2 {
+			return 0, fmt.Errorf("ack lost in transit") // 面板已入账、回执丢失
+		}
+		return b.Sequence, nil
+	}}
+	r := newTestConnlogReporter(t, dir, sender, &boot, nil)
+	r.Enqueue(testOpenEvent("c1", 1000))
+	r.Enqueue(testCloseEvent("c1", 1000, 1500))
+
+	for i := 0; i < 3; i++ {
+		r.retryAt = time.Time{} // 测试手动越过退避
+		r.cycle(context.Background())
+	}
+	if len(sender.calls) != 3 {
+		t.Fatalf("应发送 3 次（2 失败 1 成功）, got %d", len(sender.calls))
+	}
+	first := sender.calls[0]
+	for i, c := range sender.calls[1:] {
+		if c.Stream != first.Stream || c.Sequence != first.Sequence || c.Digest != first.Digest {
+			t.Fatalf("重报 %d 与首发不一致: stream/seq/digest 必须全同 (first %s/%d/%s, got %s/%d/%s)",
+				i+2, first.Stream, first.Sequence, first.Digest, c.Stream, c.Sequence, c.Digest)
+		}
+		if len(c.Events) != len(first.Events) || c.Events[0].ConnID != first.Events[0].ConnID {
+			t.Fatalf("重报 %d 事件集与首发不一致", i+2)
+		}
+	}
+	// 成功后不得再发：面板靠 (stream,seq,digest)+conn_id 双重幂等，
+	// agent 侧靠确认后清 Pending。
+	r.retryAt = time.Time{}
+	r.cycle(context.Background())
+	if len(sender.calls) != 3 {
+		t.Fatalf("确认后不应再发送, got %d 次", len(sender.calls))
+	}
+}
+
+// ---- 3. spool 上限：溢出丢最旧并计数，计数随批上行、确认后清零 ----
+
+func TestConnlogSpoolCapDropsOldestAndReportsCount(t *testing.T) {
+	dir := t.TempDir()
+	boot := "boot-A"
+	fail := true
+	sender := &fakeConnlogSender{handler: func(_ int, b connlogEnvelope) (int64, error) {
+		if fail {
+			return 0, fmt.Errorf("panel down")
+		}
+		return b.Sequence, nil
+	}}
+	r := newTestConnlogReporter(t, dir, sender, &boot, func(c *connlogConfig) {
+		c.spoolMax = 400 // 约容 2 条事件
+		c.openThrottle = time.Nanosecond
+	})
+	for i := 0; i < 10; i++ {
+		// L1-01：fixture 用真实时间戳——远古 StartMs 会被 Open
+		// TTL 清道夫同周期结清，不再是「未闭合 open」。
+		r.Enqueue(testOpenEvent(fmt.Sprintf("c%02d", i), time.Now().UnixMilli()+int64(i)))
+	}
+	r.cycle(context.Background())
+
+	st := readSpoolStateFromDisk(t, dir)
+	if st.Dropped <= 0 {
+		t.Fatalf("超上限后 Dropped 应 > 0, got %d", st.Dropped)
+	}
+	if qb := st.queuedBytes(); qb > 400 {
+		t.Fatalf("spool 占用 %d 字节超过上限 400", qb)
+	}
+	droppedTotal := st.Dropped
+	// 丢的是最旧：留下的应是序号最大的那批 conn。
+	for _, ev := range st.Pending.Events {
+		if ev.ConnID < "c05" {
+			t.Fatalf("留下的事件应为最新, 却见 %s（丢最旧口径被破坏）", ev.ConnID)
+		}
+	}
+
+	fail = false
+	r.retryAt = time.Time{}
+	r.cycle(context.Background())
+	// 承载丢弃计数的那一批必须已确认且计数与落盘一致。
+	found := false
+	for _, c := range sender.calls {
+		if c.Dropped == droppedTotal {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("没有任何已发批次携带 Dropped=%d（各批: %+v）", droppedTotal, sender.calls)
+	}
+	if got := r.DroppedPending(); got != 0 {
+		t.Fatalf("确认后未报丢弃计数应清零, got %d", got)
+	}
+}
+
+// ---- 4. boot 切换结清：上代遗留 open 批量 interrupted，end=最后已知时刻 ----
+
+func TestConnlogBootChangeSettlesOpenAsInterrupted(t *testing.T) {
+	dir := t.TempDir()
+	boot := "boot-A"
+	sender1 := &fakeConnlogSender{handler: func(int, connlogEnvelope) (int64, error) {
+		return 0, fmt.Errorf("panel down")
+	}}
+	r1 := newTestConnlogReporter(t, dir, sender1, &boot, nil)
+	// L1-01：fixture 用真实时间戳——远古 StartMs 会被 Open TTL
+	// 清道夫在 r1 周期内结清，r2 的换代结清将无条目可结。
+	start1 := time.Now().UnixMilli() - 2000
+	start2 := time.Now().UnixMilli() - 1000
+	r1.Enqueue(testOpenEvent("x1", start1))
+	r1.Enqueue(testOpenEvent("x2", start2))
+	r1.cycle(context.Background()) // 落盘进台账（纯 open 节流未组批也无妨）
+	if st := readSpoolStateFromDisk(t, dir); len(st.Open) != 2 {
+		t.Fatalf("台账应有 2 条未闭合, got %d", len(st.Open))
+	}
+	// r1 进程死亡（不发 close、不 Stop）。
+
+	boot = "boot-B"
+	sender2 := &fakeConnlogSender{}
+	r2 := reopenTestConnlogReporter(t, dir, sender2, &boot, nil)
+	r2.cycle(context.Background())
+	if len(sender2.calls) == 0 {
+		t.Fatal("结清事件应随首批上报")
+	}
+	events := sender2.calls[0].Events
+	// 结清事件在最前（起始最早），按 start 排序：x1(1000) 先于 x2(2000)。
+	var settles []ConnEvent
+	for _, ev := range events {
+		if ev.Type == ConnEventClose && ev.Status == ConnStatusInterrupted {
+			settles = append(settles, ev)
+		}
+	}
+	if len(settles) != 2 {
+		t.Fatalf("应结清 2 条 interrupted, got %d（批次: %+v）", len(settles), events)
+	}
+	if settles[0].ConnID != "x1" || settles[1].ConnID != "x2" {
+		t.Fatalf("结清顺序应按起始时刻: got %s, %s", settles[0].ConnID, settles[1].ConnID)
+	}
+	if settles[0].EndMs != start1 || settles[1].EndMs != start2 {
+		t.Fatalf("interrupted 的 end 必须是最后已知时刻（=各自 start）, got %d / %d",
+			settles[0].EndMs, settles[1].EndMs)
+	}
+	if st := readSpoolStateFromDisk(t, dir); len(st.Open) != 0 {
+		t.Fatalf("结清后台账应为空, got %d", len(st.Open))
+	}
+}
+
+// ---- 5. 三路拒绝自愈：invalid_batch 二分、identity_conflict 隔离留证 ----
+
+func TestConnlogRecoverRejectedBisectAndQuarantine(t *testing.T) {
+	dir := t.TempDir()
+	boot := "boot-A"
+	call := 0
+	sender := &fakeConnlogSender{handler: func(_ int, b connlogEnvelope) (int64, error) {
+		call++
+		if call == 1 {
+			return 0, connlogRejectionInvalidBatch
+		}
+		return b.Sequence, nil
+	}}
+	r := newTestConnlogReporter(t, dir, sender, &boot, nil)
+	r.Enqueue(testOpenEvent("c1", 1000))
+	r.Enqueue(testCloseEvent("c1", 1000, 1100))
+	r.Enqueue(testOpenEvent("c2", 2000))
+	r.Enqueue(testCloseEvent("c2", 2000, 2100))
+
+	r.cycle(context.Background()) // 组批 4 条 → 被判 invalid_batch → 二分
+	st := r.spool.state
+	if st.Pending == nil || len(st.Pending.Events) != 2 {
+		t.Fatalf("二分后 Pending 应含前半 2 条, got %+v", st.Pending)
+	}
+	if len(st.Retry) != 1 || len(st.Retry[0]) != 2 {
+		t.Fatalf("二分后 Retry 应含后半 2 条, got %+v", st.Retry)
+	}
+	firstStream := sender.calls[0].Stream
+	if st.Stream == firstStream {
+		t.Fatal("二分自愈应轮换 stream")
+	}
+
+	r.cycle(context.Background()) // 发前半 → 确认
+	r.cycle(context.Background()) // Retry 组批 → 发后半 → 确认
+	delivered := map[string]int{}
+	for i, c := range sender.calls {
+		if i == 0 {
+			continue // 被拒的那批不算送达
+		}
+		for _, ev := range c.Events {
+			delivered[ev.ConnID+"/"+ev.Type]++
+		}
+	}
+	for _, key := range []string{"c1/open", "c1/close", "c2/open", "c2/close"} {
+		if delivered[key] != 1 {
+			t.Fatalf("事件 %s 应恰送达 1 次, got %d", key, delivered[key])
+		}
+	}
+
+	// identity_conflict：单条批次隔离留证、绝不重放、计入丢弃。
+	dir2 := t.TempDir()
+	sender2 := &fakeConnlogSender{handler: func(int, connlogEnvelope) (int64, error) {
+		return 0, connlogRejectionIdentityConflict
+	}}
+	r2 := newTestConnlogReporter(t, dir2, sender2, &boot, nil)
+	r2.Enqueue(testCloseEvent("q1", 1000, 1100))
+	r2.cycle(context.Background())
+	st2 := r2.spool.state
+	if st2.Pending != nil {
+		t.Fatal("隔离后 Pending 应清空")
+	}
+	if st2.Dropped != 1 {
+		t.Fatalf("隔离事件应计入 Dropped=1, got %d", st2.Dropped)
+	}
+	archives, _ := filepath.Glob(filepath.Join(dir2, "*.rejected-*.json"))
+	spoolName := connlogSpoolFileName("connlog-test-identity")
+	archives, _ = filepath.Glob(filepath.Join(dir2, spoolName+".rejected-*.json"))
+	if len(archives) != 1 {
+		t.Fatalf("应有 1 份隔离留证, got %v", archives)
+	}
+	callsBefore := len(sender2.calls)
+	r2.cycle(context.Background())
+	if len(sender2.calls) != callsBefore {
+		t.Fatal("隔离批次绝不重放")
+	}
+}
+
+// ---- 6. open 节流：纯 open 批次等满 5s 级窗口才发，含 close 即时发 ----
+
+func TestConnlogOpenThrottleAndClosePromptness(t *testing.T) {
+	dir := t.TempDir()
+	boot := "boot-A"
+	sender := &fakeConnlogSender{}
+	r := newTestConnlogReporter(t, dir, sender, &boot, func(c *connlogConfig) {
+		c.openThrottle = time.Hour
+	})
+	// L1-01：fixture 用真实时间戳——远古 StartMs 会被 Open TTL
+	// 清道夫同周期结清，纯 open 节流分支将走不到。
+	start := time.Now().UnixMilli()
+	r.Enqueue(testOpenEvent("c1", start))
+	r.cycle(context.Background())
+	if len(sender.calls) != 0 {
+		t.Fatal("纯 open 未满节流窗口不应发送")
+	}
+	r.bufferedSince = time.Now().Add(-2 * time.Hour) // 模拟窗口已满
+	r.cycle(context.Background())
+	if len(sender.calls) != 1 {
+		t.Fatal("节流窗口满后纯 open 批次应发送")
+	}
+
+	r.Enqueue(testCloseEvent("c1", start, start+500))
+	r.cycle(context.Background())
+	if len(sender.calls) != 2 {
+		t.Fatal("含 close 的批次应即时发送（不等节流窗口）")
+	}
+}
+
+// ---- 7. 线上契约：AES 信封、路径改写、回执 stream+sequence 对齐、三路拒绝 ----
+
+func TestConnlogWireContract(t *testing.T) {
+	secret := "connlog-test-secret"
+	oldURL, oldCrypto, oldDo := httpReportURL, httpAESCrypto, reportDo
+	defer func() { httpReportURL, httpAESCrypto, reportDo = oldURL, oldCrypto, oldDo }()
+	SetHTTPReportURL("panel.example.com:8443", secret)
+
+	batch := connlogEnvelope{
+		Stream: "0123456789abcdef0123456789abcdef", Sequence: 7,
+		BootID: "boot-A", Dropped: 3,
+		Events: []ConnEvent{testOpenEvent("c1", 1000)},
+	}
+	batch.Digest = connlogBatchDigest(batch.Events)
+
+	var gotPath string
+	var gotBatch connlogEnvelope
+	reportDo = func(_ context.Context, req *http.Request, _ time.Duration) (*http.Response, error) {
+		gotPath = req.URL.Path
+		body, _ := io.ReadAll(req.Body)
+		var envelope struct {
+			Encrypted bool   `json:"encrypted"`
+			Data      string `json:"data"`
+		}
+		if err := json.Unmarshal(body, &envelope); err != nil || !envelope.Encrypted {
+			t.Errorf("上报体应为 AES 信封: %v", err)
+		}
+		aes, _ := crypto.NewAESCrypto(secret)
+		plain, err := aes.Decrypt(envelope.Data)
+		if err != nil {
+			t.Errorf("上报体解密失败: %v", err)
+		}
+		if err := json.Unmarshal(plain, &gotBatch); err != nil {
+			t.Errorf("批次 JSON 解析失败: %v", err)
+		}
+		ack, _ := json.Marshal(map[string]any{"stream": batch.Stream, "sequence": batch.Sequence, "cursor": batch.Sequence})
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(string(ack)))}, nil
+	}
+	cursor, err := sendConnlogBatch(context.Background(), batch)
+	if err != nil {
+		t.Fatalf("sendConnlogBatch: %v", err)
+	}
+	if cursor != batch.Sequence {
+		t.Fatalf("cursor = %d, want %d", cursor, batch.Sequence)
+	}
+	if gotPath != "/flow/connlog/v2" {
+		t.Fatalf("上报路径 = %s, want /flow/connlog/v2", gotPath)
+	}
+	if gotBatch.Digest != batch.Digest || gotBatch.BootID != "boot-A" || gotBatch.Dropped != 3 || len(gotBatch.Events) != 1 {
+		t.Fatalf("线上批次字段不符: %+v", gotBatch)
+	}
+
+	// 回执与批次不对齐 → 普通失败（保留重报），不是拒绝。
+	reportDo = func(_ context.Context, req *http.Request, _ time.Duration) (*http.Response, error) {
+		ack, _ := json.Marshal(map[string]any{"stream": batch.Stream, "sequence": batch.Sequence + 1, "cursor": 0})
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(string(ack)))}, nil
+	}
+	if _, err := sendConnlogBatch(context.Background(), batch); err == nil {
+		t.Fatal("回执 sequence 不对齐应报错")
+	} else {
+		var rej connlogReportRejection
+		if errors.As(err, &rej) {
+			t.Fatalf("回执不对齐不应判为拒绝, got %v", rej)
+		}
+	}
+
+	// 三路拒绝：409 reset_stream。
+	reportDo = func(_ context.Context, req *http.Request, _ time.Duration) (*http.Response, error) {
+		ack, _ := json.Marshal(map[string]any{"stream": batch.Stream, "sequence": batch.Sequence, "error": "reset_stream"})
+		return &http.Response{StatusCode: http.StatusConflict, Body: io.NopCloser(strings.NewReader(string(ack)))}, nil
+	}
+	_, err = sendConnlogBatch(context.Background(), batch)
+	var rej connlogReportRejection
+	if !errors.As(err, &rej) || rej != connlogRejectionResetStream {
+		t.Fatalf("409 reset_stream 应判为拒绝, got %v", err)
+	}
+}
+
+// ---- L1-01: Open 台账 TTL 清道夫（Xray event_only 会话永无
+// close 事件，Open 条目须有界增长） ----
+
+func TestConnlogOpenTTLExpiresStaleEntries(t *testing.T) {
+	dir := t.TempDir()
+	boot := "boot-A"
+	sender := &fakeConnlogSender{}
+	now := time.Now().UnixMilli()
+	r := newTestConnlogReporter(t, dir, sender, &boot, func(c *connlogConfig) {
+		c.openTTL = 50 * time.Millisecond
+	})
+	// 1 小时前的 open：相对 50ms TTL 已过期，须在本周期结清。
+	staleStart := now - 3600*1000
+	r.Enqueue(testOpenEvent("old1", staleStart))
+	r.cycle(context.Background())
+	if st := readSpoolStateFromDisk(t, dir); len(st.Open) != 0 {
+		t.Fatalf("过期 open 应已结清出台账, 台账仍有 %d 条", len(st.Open))
+	}
+	// 结清事件随批上报：interrupted，end=最后已知时刻（=open 的 start）。
+	found := false
+	for _, c := range sender.calls {
+		for _, ev := range c.Events {
+			if ev.Type == ConnEventClose && ev.ConnID == "old1" {
+				found = true
+				if ev.Status != ConnStatusInterrupted {
+					t.Fatalf("结清状态 = %q, want interrupted", ev.Status)
+				}
+				if ev.EndMs != staleStart {
+					t.Fatalf("结清 end = %d, want 最后已知时刻 %d", ev.EndMs, staleStart)
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("过期 open 的 interrupted close 未上报（各批: %+v）", sender.calls)
+	}
+}
+
+func TestConnlogOpenTTLKeepsFreshEntries(t *testing.T) {
+	dir := t.TempDir()
+	boot := "boot-A"
+	sender := &fakeConnlogSender{}
+	r := newTestConnlogReporter(t, dir, sender, &boot, func(c *connlogConfig) {
+		c.openTTL = time.Hour
+	})
+	r.Enqueue(testOpenEvent("fresh1", time.Now().UnixMilli()))
+	r.cycle(context.Background())
+	if st := readSpoolStateFromDisk(t, dir); len(st.Open) != 1 {
+		t.Fatalf("新鲜 open 应留在台账, got %d 条", len(st.Open))
+	}
+	if len(sender.calls) != 0 {
+		t.Fatalf("新鲜 open 不应产生结清上报, got %d 批", len(sender.calls))
+	}
+}
+
+func TestConnlogOpenTTLEnvOverride(t *testing.T) {
+	t.Setenv("OVO_CONNLOG_OPEN_TTL", "90s")
+	r := newConnlogReporter(connlogConfig{})
+	if r.cfg.openTTL != 90*time.Second {
+		t.Fatalf("env TTL = %v, want 90s", r.cfg.openTTL)
+	}
+	t.Setenv("OVO_CONNLOG_OPEN_TTL", "bogus")
+	r2 := newConnlogReporter(connlogConfig{})
+	if r2.cfg.openTTL != defaultConnlogOpenTTL {
+		t.Fatalf("无效 env TTL 应回退默认 24h, got %v", r2.cfg.openTTL)
+	}
+}
+
+// ---- CPU-S2: 热路径增量 journal（旧版每 1s tick 全量 marshal＋
+// fsync 整个 spool，16MB 顶满时单次约 357ms、占单核 36%） ----
+
+func readSnapshotFileRaw(t *testing.T, dir string) connlogSpoolState {
+	t.Helper()
+	// 只读快照文件本身，不重放 journal：用于证明热路径没有全量重写。
+	data, err := os.ReadFile(filepath.Join(dir, connlogSpoolFileName("connlog-test-identity")))
+	if err != nil {
+		t.Fatalf("read snapshot file: %v", err)
+	}
+	var st connlogSpoolState
+	if err := json.Unmarshal(data, &st); err != nil {
+		t.Fatalf("unmarshal snapshot file: %v", err)
+	}
+	return st
+}
+
+func journalPathForTest(t *testing.T, dir string) string {
+	t.Helper()
+	return filepath.Join(dir, connlogSpoolFileName("connlog-test-identity")+".journal")
+}
+
+// 断连＋churn 下多周期只写 journal：进程死亡后重开须一字不差续报。
+func TestConnlogJournalCrashNoLoss(t *testing.T) {
+	dir := t.TempDir()
+	boot := "boot-A"
+	down := &fakeConnlogSender{handler: func(int, connlogEnvelope) (int64, error) {
+		return 0, fmt.Errorf("connection refused")
+	}}
+	r1 := newTestConnlogReporter(t, dir, down, &boot, nil)
+	now := time.Now().UnixMilli()
+	for i := 0; i < 20; i++ {
+		r1.Enqueue(testOpenEvent(fmt.Sprintf("j%02d", i), now+int64(i)))
+		r1.Enqueue(testCloseEvent(fmt.Sprintf("j%02d", i), now+int64(i), now+int64(i)+50))
+	}
+	for i := 0; i < 3; i++ {
+		r1.retryAt = time.Time{}
+		r1.cycle(context.Background())
+	}
+	// 热路径只追加 journal：快照文件里不得出现最新批次。
+	if raw := readSnapshotFileRaw(t, dir); raw.Pending != nil {
+		t.Fatalf("热路径应只写 journal，快照里不应出现 Pending（%d 条）", len(raw.Pending.Events))
+	}
+	jinfo, err := os.Stat(journalPathForTest(t, dir))
+	if err != nil || jinfo.Size() == 0 {
+		t.Fatalf("journal 文件应非空，stat=%v size=%v", jinfo, err)
+	}
+	// 进程死亡（不 Stop、不 checkpoint）后重开，全量续报、恰一次。
+	up := &fakeConnlogSender{}
+	r2 := reopenTestConnlogReporter(t, dir, up, &boot, nil)
+	r2.retryAt = time.Time{}
+	r2.cycle(context.Background())
+	if len(up.calls) != 1 {
+		t.Fatalf("续报应只发一批, got %d 批", len(up.calls))
+	}
+	got := up.calls[0].Events
+	if len(got) != 40 {
+		t.Fatalf("续报事件数 = %d, want 40", len(got))
+	}
+	for i := 0; i < 20; i++ {
+		if got[2*i].ConnID != fmt.Sprintf("j%02d", i) || got[2*i].Type != ConnEventOpen {
+			t.Fatalf("续报顺序错位: idx %d = %s/%s", 2*i, got[2*i].ConnID, got[2*i].Type)
+		}
+		if got[2*i+1].ConnID != fmt.Sprintf("j%02d", i) || got[2*i+1].Type != ConnEventClose {
+			t.Fatalf("续报顺序错位: idx %d = %s/%s", 2*i+1, got[2*i+1].ConnID, got[2*i+1].Type)
+		}
+	}
+	if st := readSpoolStateFromDisk(t, dir); st.Pending != nil || len(st.Buffered) != 0 {
+		t.Fatalf("确认后续报状态应清空, pending=%v buffered=%d", st.Pending, len(st.Buffered))
+	}
+}
+
+// journal 尾部撕裂行（写一半即崩溃）须丢弃，不丢已落盘数据、不拒载。
+func TestConnlogJournalTornTailIgnored(t *testing.T) {
+	dir := t.TempDir()
+	boot := "boot-A"
+	down := &fakeConnlogSender{handler: func(int, connlogEnvelope) (int64, error) {
+		return 0, fmt.Errorf("connection refused")
+	}}
+	r1 := newTestConnlogReporter(t, dir, down, &boot, nil)
+	now := time.Now().UnixMilli()
+	r1.Enqueue(testOpenEvent("c1", now))
+	r1.Enqueue(testCloseEvent("c1", now, now+100))
+	r1.Enqueue(testOpenEvent("c2", now+1))
+	r1.Enqueue(testCloseEvent("c2", now+1, now+101))
+	r1.cycle(context.Background())
+
+	jpath := journalPathForTest(t, dir)
+	f, err := os.OpenFile(jpath, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatalf("open journal: %v", err)
+	}
+	// 无换行残行：seq 99 的伪造记录写一半即断电。
+	if _, err := f.WriteString(`{"seq":99,"appended":[{"type":"open","conn_id":"torn"`); err != nil {
+		t.Fatalf("append torn tail: %v", err)
+	}
+	f.Close()
+
+	r2 := reopenTestConnlogReporter(t, dir, &fakeConnlogSender{}, &boot, nil)
+	st := r2.spool.state
+	if st.Pending == nil || len(st.Pending.Events) != 4 {
+		t.Fatalf("撕裂行丢弃后 Pending 应仍含 4 条, got %+v", st.Pending)
+	}
+	for _, ev := range st.Pending.Events {
+		if ev.ConnID == "torn" {
+			t.Fatal("撕裂行里的伪造事件绝不能进入状态")
+		}
+	}
+}
+
+// journal 攒满即 checkpoint：快照含全部状态，journal 截空，重开仍全量。
+func TestConnlogJournalCheckpointCompacts(t *testing.T) {
+	dir := t.TempDir()
+	boot := "boot-A"
+	down := &fakeConnlogSender{handler: func(int, connlogEnvelope) (int64, error) {
+		return 0, fmt.Errorf("connection refused")
+	}}
+	r := newTestConnlogReporter(t, dir, down, &boot, nil)
+	r.spool.journalMaxBytes = 256 // 强制本周期走 checkpoint 而非追加
+	now := time.Now().UnixMilli()
+	r.Enqueue(testOpenEvent("c1", now))
+	r.Enqueue(testCloseEvent("c1", now, now+100))
+	r.Enqueue(testOpenEvent("c2", now+1))
+	r.Enqueue(testCloseEvent("c2", now+1, now+101))
+	r.cycle(context.Background())
+
+	if jinfo, err := os.Stat(journalPathForTest(t, dir)); err != nil || jinfo.Size() != 0 {
+		t.Fatalf("checkpoint 后 journal 应截空，stat=%v size=%v", jinfo, err)
+	}
+	if raw := readSnapshotFileRaw(t, dir); raw.Pending == nil || len(raw.Pending.Events) != 4 {
+		t.Fatalf("checkpoint 后快照应含 4 条 Pending, got %+v", raw.Pending)
+	}
+	up := &fakeConnlogSender{}
+	r2 := reopenTestConnlogReporter(t, dir, up, &boot, nil)
+	r2.retryAt = time.Time{}
+	r2.cycle(context.Background())
+	if len(up.calls) != 1 || len(up.calls[0].Events) != 4 {
+		t.Fatalf("checkpoint 后重开应续报 4 条, got %+v", up.calls)
+	}
+}
+
+// 队头丢弃（enforceCap）走 journal 后，重启仍须记得丢了谁、丢了多少。
+func TestConnlogJournalCapDropSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	boot := "boot-A"
+	fail := true
+	sender := &fakeConnlogSender{handler: func(_ int, b connlogEnvelope) (int64, error) {
+		if fail {
+			return 0, fmt.Errorf("panel down")
+		}
+		return b.Sequence, nil
+	}}
+	r := newTestConnlogReporter(t, dir, sender, &boot, func(c *connlogConfig) {
+		c.spoolMax = 400 // 约容 2 条事件
+		c.openThrottle = time.Nanosecond
+	})
+	now := time.Now().UnixMilli()
+	for i := 0; i < 10; i++ {
+		r.Enqueue(testOpenEvent(fmt.Sprintf("c%02d", i), now+int64(i)))
+	}
+	r.cycle(context.Background())
+	st1 := readSpoolStateFromDisk(t, dir)
+	if st1.Dropped <= 0 {
+		t.Fatalf("超上限后 Dropped 应 > 0, got %d", st1.Dropped)
+	}
+	// 进程死亡后重开：丢弃计数与最新事件都须在，旧事件不得复活。
+	fail = false
+	r2 := reopenTestConnlogReporter(t, dir, sender, &boot, func(c *connlogConfig) {
+		c.spoolMax = 400
+		c.openThrottle = time.Nanosecond
+	})
+	r2.retryAt = time.Time{}
+	r2.cycle(context.Background())
+	if len(sender.calls) == 0 {
+		t.Fatal("重开后应续报")
+	}
+	last := sender.calls[len(sender.calls)-1]
+	if last.Dropped != st1.Dropped {
+		t.Fatalf("续报批次 Dropped = %d, want %d", last.Dropped, st1.Dropped)
+	}
+	for _, ev := range last.Events {
+		if ev.ConnID < "c05" {
+			t.Fatalf("重启后旧事件 %s 复活（journal 丢弃记录丢失）", ev.ConnID)
+		}
+	}
+}
+
+// 顶满 spool 下单 tick 落盘代价有界：只写增量、快照文件不得被重写，
+// 且须显著快于同状态全量 save。
+func TestConnlogJournalTickCostBounded(t *testing.T) {
+	dir := t.TempDir()
+	boot := "boot-A"
+	down := &fakeConnlogSender{handler: func(int, connlogEnvelope) (int64, error) {
+		return 0, fmt.Errorf("connection refused")
+	}}
+	r := newTestConnlogReporter(t, dir, down, &boot, nil)
+	const n = 20000
+	now := time.Now().UnixMilli()
+	for i := 0; i < n; i++ {
+		r.spool.state.Buffered = append(r.spool.state.Buffered,
+			testCloseEvent(fmt.Sprintf("b%05d", i), now, now+10))
+	}
+	if err := r.spool.save(r.spool.state); err != nil {
+		t.Fatalf("checkpoint big spool: %v", err)
+	}
+	snapPath := filepath.Join(dir, connlogSpoolFileName("connlog-test-identity"))
+	// 预热事件尺寸缓存（稳态 tick 的尺寸是整数累加，2.1.12 已修），
+	// 再量全量 save 基线。
+	_ = r.spool.state.queuedBytes()
+	start := time.Now()
+	if err := r.spool.save(r.spool.state); err != nil {
+		t.Fatalf("baseline full save: %v", err)
+	}
+	fullSave := time.Since(start)
+	snapBefore, err := os.Stat(snapPath)
+	if err != nil {
+		t.Fatalf("stat snapshot: %v", err)
+	}
+
+	r.Enqueue(testCloseEvent("new1", now, now+5))
+	r.Enqueue(testCloseEvent("new2", now, now+6))
+	start = time.Now()
+	r.retryAt = time.Time{}
+	r.cycle(context.Background())
+	tick := time.Since(start)
+	t.Logf("tick=%v fullSave=%v snapshot=%d bytes journalMax=%d", tick, fullSave, snapBefore.Size(), r.spool.journalMaxBytes)
+
+	snapAfter, err := os.Stat(snapPath)
+	if err != nil {
+		t.Fatalf("stat snapshot after tick: %v", err)
+	}
+	if !snapAfter.ModTime().Equal(snapBefore.ModTime()) || snapAfter.Size() != snapBefore.Size() {
+		t.Fatalf("热路径不得重写快照（mtime %v→%v, size %d→%d）",
+			snapBefore.ModTime(), snapAfter.ModTime(), snapBefore.Size(), snapAfter.Size())
+	}
+	if tick > 100*time.Millisecond {
+		t.Fatalf("顶满 spool 下单 tick 落盘 %v, want < 100ms", tick)
+	}
+	if tick >= fullSave {
+		t.Fatalf("journal 追加 %v 应快于同状态全量 save %v", tick, fullSave)
+	}
+	// 新事件确实落盘：重开后总数 20002 条，new1/new2 在 Buffered 尾部。
+	st := readSpoolStateFromDisk(t, dir)
+	total := len(st.Buffered)
+	if st.Pending != nil {
+		total += len(st.Pending.Events)
+	}
+	if total != n+2 {
+		t.Fatalf("重开后事件总数 = %d, want %d", total, n+2)
+	}
+	if len(st.Buffered) < 2 || st.Buffered[len(st.Buffered)-2].ConnID != "new1" || st.Buffered[len(st.Buffered)-1].ConnID != "new2" {
+		t.Fatalf("新事件应在 Buffered 尾部, got tail %+v", st.Buffered[len(st.Buffered)-2:])
+	}
+}

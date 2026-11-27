@@ -1,0 +1,200 @@
+name: Deploy Docs
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'doc/**'
+      - 'vite-frontend/**'
+      - '.github/workflows/deploy-docs.yml'
+  # R3-C4-01: re-run after every successful release build so the demo
+  # version (read from releases/latest at build time, see Build demo)
+  # aligns with the release that just landed instead of lagging one
+  # version until someone dispatches this workflow by hand. This must
+  # NOT be a `release: published` trigger: docker-build creates the
+  # Release with GITHUB_TOKEN, and events fired by GITHUB_TOKEN never
+  # start new workflow runs, so such a trigger would silently never
+  # fire. workflow_run is the supported chain: it fires when the whole
+  # "Build and Push Images" run completes, and create-release (its
+  # final job) has by then already published the Release, so
+  # releases/latest already names the new version when the demo is
+  # rebuilt. The job below gates on conclusion == 'success', so a
+  # release blocked by verify never triggers a redeploy either.
+  workflow_run:
+    workflows:
+      - Build and Push Images
+    types:
+      - completed
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: deploy-docs
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    # R3-C4-01: workflow_run fires for failed and cancelled release
+    # builds too; only a successful one means a Release landed and the
+    # demo version needs realigning.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    # Pinned (not ubuntu-latest), same reason as ci-build's frontend
+    # job: the demo check below installs the Chromium pinned by
+    # playwright-core 1.55.0, whose newest supported Ubuntu is 24.04;
+    # a floating latest runner breaks the install (and with it this
+    # gate) for environment reasons.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0 # lastUpdated reads git history
+          # R3-C4-01: pin the tree explicitly. On workflow_run the
+          # default checkout would be the default branch's current
+          # HEAD, which may have advanced past the release; build the
+          # docs/demo from the exact commit the release build released
+          # (the tag commit). Other events fall back to their own sha
+          # (main tip for push/dispatch — the pre-existing behavior).
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: doc/package-lock.json
+
+      - name: Build
+        working-directory: doc
+        run: |
+          npm ci
+          npm run build
+
+      # The online demo: the panel with recorded sample data and no backend
+      # (vite-frontend/src/demo), served at /ovo/demo/. It must be
+      # rebuilt into the same dist tree on every run: the deploy below is
+      # force_orphan, so a skipped demo build would delete the demo.
+      - name: Build demo
+        working-directory: vite-frontend
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          npm install -g pnpm@10.28.1
+          pnpm install --frozen-lockfile
+          # F-L6-02: the demo footer must name the latest published release.
+          # git describe only finds the nearest tag reachable from HEAD, so
+          # it lags whenever the newest release tag is not an ancestor of
+          # the checked-out commit; ask the Releases API instead and fall
+          # back to git describe only if the API is unreachable.
+          APP_VERSION="$(gh api "repos/${{ github.repository }}/releases/latest" --jq .tag_name 2>/dev/null || true)"
+          if [ -z "$APP_VERSION" ] || [ "$APP_VERSION" = "null" ]; then
+            APP_VERSION="$(git describe --tags --abbrev=0 2>/dev/null || echo dev)"
+          fi
+          VITE_DEMO=true VITE_BASE=/ovo/demo/ \
+          VITE_APP_VERSION="$APP_VERSION" \
+          VITE_GITHUB_REPO="https://github.com/${{ github.repository }}" \
+            pnpm exec vite build --outDir ../doc/.vitepress/dist/demo --emptyOutDir
+
+      # R2-C4-03: gate the publish on the same demo check ci-build
+      # runs. Previously the check existed only in ci-build, which
+      # runs parallel to this workflow with no dependency — a broken
+      # demo (page errors, unrecorded API calls) could reach the
+      # public site on a direct push to main while ci-build was red.
+      # Same pinned browser and same check entry as ci-build's
+      # frontend job; a failure here skips the Deploy step.
+      - name: Install pinned Chromium for demo check
+        working-directory: vite-frontend
+        run: pnpm exec playwright-core install --with-deps chromium
+
+      - name: Check online demo before deploy
+        working-directory: vite-frontend
+        run: |
+          CHROME="$(node -e "const { chromium } = require('playwright-core'); process.stdout.write(chromium.executablePath())")" node scripts/demo/check.mjs ../doc/.vitepress/dist/demo
+
+      # R3-C4-02: the push gets up to three attempts. A single
+      # transient network failure (HTTP 408 during send-pack in the
+      # 1.9.6 first run) previously voided an otherwise fully green
+      # deploy until a human re-ran the workflow. Retrying re-runs the
+      # same action from scratch — it stages the publish in a fresh
+      # temp clone every time, so each attempt re-syncs with the
+      # remote instead of resuming a half-pushed state — with a pause
+      # between attempts. Same action, same publish_dir and
+      # force_orphan semantics on every attempt; the last attempt has
+      # no continue-on-error, so a persistent failure still turns the
+      # run red.
+      - name: Deploy to gh-pages
+        id: deploy_attempt_1
+        continue-on-error: true
+        uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: doc/.vitepress/dist
+          force_orphan: true
+
+      - name: Wait before deploy retry
+        if: steps.deploy_attempt_1.outcome == 'failure'
+        run: sleep 30
+
+      - name: Deploy to gh-pages (retry 1)
+        id: deploy_attempt_2
+        if: steps.deploy_attempt_1.outcome == 'failure'
+        continue-on-error: true
+        uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: doc/.vitepress/dist
+          force_orphan: true
+
+      - name: Wait before final deploy retry
+        if: steps.deploy_attempt_2.outcome == 'failure'
+        run: sleep 60
+
+      - name: Deploy to gh-pages (retry 2)
+        if: steps.deploy_attempt_2.outcome == 'failure'
+        uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: doc/.vitepress/dist
+          force_orphan: true
+
+      # R2-C5-02: assert the live demo actually serves the release
+      # version. Pushing to gh-pages is not the same as serving:
+      # Pages propagation lags, and a human fetch racing the deploy
+      # misread 2.1.2 as still live after the 2.1.3 deploy (the
+      # deploy chain itself was green). Poll the live demo bundle
+      # until it contains the release tag, or fail the run after
+      # ~15 minutes, so a stale or half-propagated demo can never
+      # pass silently. Runs after every successful deploy (push,
+      # workflow_run chain, or manual dispatch — the demo version is
+      # always baked from releases/latest at build time, so the
+      # expectation holds for all triggers).
+      - name: Assert live demo version matches release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -u
+          EXPECTED="$(gh api "repos/${{ github.repository }}/releases/latest" --jq .tag_name 2>/dev/null || true)"
+          if [ -z "$EXPECTED" ] || [ "$EXPECTED" = "null" ]; then
+            echo "::error::could not read releases/latest tag"
+            exit 1
+          fi
+          SITE="https://${{ github.repository_owner }}.github.io/ovo/demo/"
+          echo "expecting live demo to serve version: $EXPECTED"
+          for attempt in $(seq 1 15); do
+            ASSETS="$(curl -fsSL --max-time 30 "$SITE" 2>/dev/null | grep -o '/ovo/demo/assets/[^"]*\.js' | sort -u || true)"
+            if [ -n "$ASSETS" ]; then
+              BUNDLES="$(mktemp)"
+              while IFS= read -r ASSET; do
+                curl -fsSL --max-time 60 "https://${{ github.repository_owner }}.github.io$ASSET" >> "$BUNDLES" || exit 1
+              done <<< "$ASSETS"
+              HITS="$(grep -o -F "$EXPECTED" "$BUNDLES" | wc -l || true)"
+              if [ "${HITS:-0}" -gt 0 ]; then
+                echo "live demo serves $EXPECTED (bundle hits: $HITS)"
+                exit 0
+              fi
+            fi
+            echo "attempt $attempt/15: live demo does not serve $EXPECTED yet; retrying in 60s"
+            sleep 60
+          done
+          echo "::error::live demo did not serve version $EXPECTED within 15 minutes of deploy"
+          exit 1

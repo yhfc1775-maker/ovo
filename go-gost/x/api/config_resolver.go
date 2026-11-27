@@ -1,0 +1,198 @@
+package api
+
+import (
+	"fmt"
+	"net/http"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+	"github.com/go-gost/core/logger"
+	"github.com/go-gost/x/config"
+	parser "github.com/go-gost/x/config/parsing/resolver"
+	"github.com/go-gost/x/registry"
+)
+
+// swagger:parameters createResolverRequest
+type createResolverRequest struct {
+	// in: body
+	Data config.ResolverConfig `json:"data"`
+}
+
+// successful operation.
+// swagger:response createResolverResponse
+type createResolverResponse struct {
+	Data Response
+}
+
+func createResolver(ctx *gin.Context) {
+	// swagger:route POST /config/resolvers Resolver createResolverRequest
+	//
+	// Create a new resolver, the name of the resolver must be unique in resolver list.
+	//
+	//     Security:
+	//       basicAuth: []
+	//
+	//     Responses:
+	//       200: createResolverResponse
+
+	var req createResolverRequest
+	ctx.ShouldBindJSON(&req.Data)
+
+	name := strings.TrimSpace(req.Data.Name)
+	if name == "" {
+		writeError(ctx, NewError(http.StatusBadRequest, ErrCodeInvalid, "resolver name is required"))
+		return
+	}
+	req.Data.Name = name
+
+	if registry.ResolverRegistry().IsRegistered(name) {
+		writeError(ctx, NewError(http.StatusBadRequest, ErrCodeDup, fmt.Sprintf("resolver %s already exists", name)))
+		return
+	}
+
+	v, err := parser.ParseResolver(&req.Data)
+	if err != nil {
+		writeError(ctx, NewError(http.StatusInternalServerError, ErrCodeFailed, fmt.Sprintf("create resolver %s failed: %s", name, err.Error())))
+		return
+	}
+
+	if !commitNamedConfig(ctx, registry.ResolverRegistry(), name, v, false, func(c *config.Config) error {
+		// R18-F02/F-04: 按名 upsert（R17-A 同款）。成员已在配置中、但不在注册表里时
+		// （例如暂停后 loader 跳过注册），无去重 append 会把第二份同名项写进配置并落盘。
+		c.Resolvers = upsertNamed(c.Resolvers, &req.Data, func(v *config.ResolverConfig) string { return v.Name })
+		return nil
+	}) {
+		return
+	}
+
+	ctx.JSON(http.StatusOK, Response{
+		Msg: "OK",
+	})
+}
+
+// swagger:parameters updateResolverRequest
+type updateResolverRequest struct {
+	// in: path
+	// required: true
+	Resolver string `uri:"resolver" json:"resolver"`
+	// in: body
+	Data config.ResolverConfig `json:"data"`
+}
+
+// successful operation.
+// swagger:response updateResolverResponse
+type updateResolverResponse struct {
+	Data Response
+}
+
+func updateResolver(ctx *gin.Context) {
+	// swagger:route PUT /config/resolvers/{resolver} Resolver updateResolverRequest
+	//
+	// Update resolver by name, the resolver must already exist.
+	//
+	//     Security:
+	//       basicAuth: []
+	//
+	//     Responses:
+	//       200: updateResolverResponse
+
+	var req updateResolverRequest
+	ctx.ShouldBindUri(&req)
+	ctx.ShouldBindJSON(&req.Data)
+
+	name := strings.TrimSpace(req.Resolver)
+
+	if !registry.ResolverRegistry().IsRegistered(name) {
+		writeError(ctx, NewError(http.StatusBadRequest, ErrCodeNotFound, fmt.Sprintf("resolver %s not found", name)))
+		return
+	}
+
+	req.Data.Name = name
+
+	v, err := parser.ParseResolver(&req.Data)
+	if err != nil {
+		writeError(ctx, NewError(http.StatusInternalServerError, ErrCodeFailed, fmt.Sprintf("create resolver %s failed: %s", name, err.Error())))
+		return
+	}
+
+	if !commitNamedConfig(ctx, registry.ResolverRegistry(), name, v, false, func(c *config.Config) error {
+		for i := range c.Resolvers {
+			// R19-F02: nil 项跳过并记日志（原样保留，清理只走启动自愈），不得 panic。
+			if c.Resolvers[i] == nil {
+				logger.Default().Warnf("update resolver: skipped nil resolver entry at index %d", i)
+				continue
+			}
+			if c.Resolvers[i].Name == name {
+				c.Resolvers[i] = &req.Data
+				break
+			}
+		}
+		return nil
+	}) {
+		return
+	}
+
+	ctx.JSON(http.StatusOK, Response{
+		Msg: "OK",
+	})
+}
+
+// swagger:parameters deleteResolverRequest
+type deleteResolverRequest struct {
+	// in: path
+	// required: true
+	Resolver string `uri:"resolver" json:"resolver"`
+}
+
+// successful operation.
+// swagger:response deleteResolverResponse
+type deleteResolverResponse struct {
+	Data Response
+}
+
+func deleteResolver(ctx *gin.Context) {
+	// swagger:route DELETE /config/resolvers/{resolver} Resolver deleteResolverRequest
+	//
+	// Delete resolver by name.
+	//
+	//     Security:
+	//       basicAuth: []
+	//
+	//     Responses:
+	//       200: deleteResolverResponse
+
+	var req deleteResolverRequest
+	ctx.ShouldBindUri(&req)
+
+	name := strings.TrimSpace(req.Resolver)
+
+	if !registry.ResolverRegistry().IsRegistered(name) {
+		writeError(ctx, NewError(http.StatusBadRequest, ErrCodeNotFound, fmt.Sprintf("resolver %s not found", name)))
+		return
+	}
+
+	var zero = registry.ResolverRegistry().Get(name)
+	if !commitNamedConfig(ctx, registry.ResolverRegistry(), name, zero, true, func(c *config.Config) error {
+		resolvers := c.Resolvers
+		c.Resolvers = nil
+		for _, s := range resolvers {
+			// R19-F02: nil 项原样保留并记日志，不得 panic（清理只走启动自愈）。
+			if s == nil {
+				logger.Default().Warnf("delete resolver: kept nil resolver entry as-is")
+				c.Resolvers = append(c.Resolvers, s)
+				continue
+			}
+			if s.Name == name {
+				continue
+			}
+			c.Resolvers = append(c.Resolvers, s)
+		}
+		return nil
+	}) {
+		return
+	}
+
+	ctx.JSON(http.StatusOK, Response{
+		Msg: "OK",
+	})
+}

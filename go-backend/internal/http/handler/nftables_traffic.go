@@ -1,0 +1,881 @@
+package handler
+
+import (
+	"context"
+	"errors"
+	"log"
+	"math"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	runtimenft "go-backend/internal/runtime/nftables"
+	"go-backend/internal/store/model"
+	"go-backend/internal/store/repo"
+)
+
+// errDiscardedDueToApplying: 采集轮因处于 apply 窗口或 generation 变化而丢弃。
+// 调用方不得写 nft_counter_state、不推进基线。
+var errDiscardedDueToApplying = errors.New("discarded: applying window or generation changed")
+
+type nftTrafficDelta struct {
+	ForwardID int64
+	BytesIn   int64
+	BytesOut  int64
+}
+
+type nftCounterStateKey struct {
+	forwardID int64
+	protocol  string
+	direction string
+}
+
+func (h *Handler) runNftablesTrafficCollectJob(now time.Time) {
+	if h == nil || h.repo == nil {
+		return
+	}
+	nodes, err := h.repo.ListNftablesNodesForCollection()
+	if err != nil {
+		log.Printf("nftables traffic collection failed op=list_nodes err=%v", err)
+		return
+	}
+	// L3-04：旧实现串行逐节点，每节点 SSH 最坏 15s，轮次时长 O(N)；
+	// N=16 最坏 240s＞30s tick，采集频率退化。节点间采集互不依赖
+	// （采集不取写锁、入账按节点串行，见 D18 与 lockNodeForwardAccounting），
+	// 改为有界并发，与内核状态轮询 kernelStatusParallel=8 同口径。
+	// 最坏轮次 ceil(N/8)×15s；单节点 SSH 挂死只拖住自己一个槽位，
+	// 不拖死整轮。ticker 丢 tick、不重叠的现状不变（jobs.go 的
+	// runNftablesTrafficCollectLoop 仍同步跑完本轮才等下一 tick）。
+	byID := make(map[int64]*model.NodeSSHConfig, len(nodes))
+	ids := make([]int64, 0, len(nodes))
+	for i := range nodes {
+		node := &nodes[i]
+		byID[node.NodeID] = &node.Config
+		ids = append(ids, node.NodeID)
+	}
+	runParallelNodeTasks(ids, nftablesTrafficCollectParallel, func(nodeID int64) {
+		h.collectNftablesNodeTraffic(nodeID, byID[nodeID], now)
+	})
+}
+
+// nftablesTrafficCollectParallel 是 nft 采集轮的单轮并发上限
+// （L3-04）：与内核状态轮询 kernelStatusParallel=8 同口径。
+const nftablesTrafficCollectParallel = 8
+
+// nftCollectFailAlertThreshold 是 nft 采集失败的告警阈值（A-中-2）：
+// 采集每 30 秒一轮，连续失败 3 轮（90 秒）即在节点行记 failing
+// 并发一次告警；单轮抖动（一次 SSH  hiccup）不惊动管理员。
+const nftCollectFailAlertThreshold = 3
+
+// nftCollectLastErrorMaxLen 是节点行最近一次采集失败原因的截断长
+// 度（A-中-2）：SSH 失败原文可能很长，行内只留首段可读部分。
+const nftCollectLastErrorMaxLen = 500
+
+// nftWsReadErrorPrefix marks a failure recorded by the WS
+// kernel-table path (R3A-NEW-1): the SSH forward-table path and the
+// WS kernel-table path read DIFFERENT tables (ovo vs ovo_kernel_*),
+// so their failures are independent signals sharing one health row.
+// The prefix on the error text is only the provenance of that one
+// failure round — the streak's composition is stored durably in
+// NftCollectSshFailCount / NftCollectWsFailCount (R4C-01): a success
+// on one path clears only that path's contribution, and the streak
+// clears fully only when both contributions reach zero. Judging the
+// whole streak by the latest error's prefix (the pre-R4C-01 code)
+// lost mixed streaks: a WS success cleared SSH failures and sent a
+// false "采集恢复".
+const nftWsReadErrorPrefix = "agent nft 计数读取失败："
+
+// recordNftCollectFailure records one failed periodic nft collection
+// round for nodeID (A-中-2): consecutive failure count +1, state flips
+// to "failing" at the threshold, last error kept verbatim (truncated).
+// The alert fires exactly on the threshold crossing; later rounds of
+// the same streak stay silent (the node row already says failing).
+// The failure also increments the contributing path's own streak
+// count (R4C-01): the WS path's errors carry nftWsReadErrorPrefix,
+// anything else counts as the SSH path. Rounds discarded because a
+// newer apply is in flight (errDiscardedDueToApplying) are NOT
+// failures and must never call this — their samples are re-collected
+// by the next round.
+func (h *Handler) recordNftCollectFailure(nodeID int64, err error) {
+	if h == nil || h.repo == nil || nodeID <= 0 {
+		return
+	}
+	node, rerr := h.repo.GetNodeByID(nodeID)
+	if rerr != nil || node == nil {
+		log.Printf("nft collect health record failed node_id=%d err=%v", nodeID, rerr)
+		return
+	}
+	failCount := node.NftCollectFailCount + 1
+	sshCount, wsCount := node.NftCollectSshFailCount, node.NftCollectWsFailCount
+	if err != nil && strings.HasPrefix(err.Error(), nftWsReadErrorPrefix) {
+		wsCount++
+	} else {
+		sshCount++
+	}
+	state := node.NftCollectState
+	if failCount >= nftCollectFailAlertThreshold {
+		state = "failing"
+	}
+	errText := ""
+	if err != nil {
+		errText = err.Error()
+	}
+	if len(errText) > nftCollectLastErrorMaxLen {
+		errText = errText[:nftCollectLastErrorMaxLen]
+	}
+	if uerr := h.repo.UpdateNftCollectHealthPaths(nodeID, state, failCount, errText, node.NftCollectLastOKAt, sshCount, wsCount); uerr != nil {
+		log.Printf("nft collect health record failed node_id=%d err=%v", nodeID, uerr)
+		return
+	}
+	if failCount == nftCollectFailAlertThreshold {
+		h.dispatchNftCollectFailedAlert(nodeID)
+	}
+}
+
+// recordNftCollectSuccess records one successful periodic nft
+// collection round for nodeID (A-中-2, R4C-01): it clears only the
+// SSH contribution of the current streak. The row clears fully (state
+// ok, count 0, LastError empty, LastOKAt stamped, recovery
+// notification if it was failing) only when no WS contribution
+// remains; otherwise the row is left otherwise untouched — the WS
+// table is still missing and the streak is still failing. The SSH
+// contribution is zeroed even in that case, so a later WS success
+// can finish the clear instead of deadlocking against a streak the
+// WS prefix used to guard. Steady-state successes write nothing, so
+// LastOKAt reads as "healthy since <time>".
+func (h *Handler) recordNftCollectSuccess(nodeID int64, nowMs int64) {
+	if h == nil || h.repo == nil || nodeID <= 0 {
+		return
+	}
+	node, err := h.repo.GetNodeByID(nodeID)
+	if err != nil || node == nil {
+		// R2A-4：查库失败静默返回会使采集成功路径的静默丢失无法
+		// 定位（健康态写不进、也不留日志）；只记 node_id＋err，
+		// 不记节点配置原文。
+		log.Printf("nft collect success lookup failed node_id=%d err=%v", nodeID, err)
+		return
+	}
+	if node.NftCollectState == "ok" && node.NftCollectFailCount == 0 && node.NftCollectLastError == "" {
+		return
+	}
+	if node.NftCollectWsFailCount > 0 {
+		// R4C-01：streak 里还有 WS 路的失败未恢复——SSH 成功只
+		// 解决自己这路，不清行、不发恢复通知；SSH 计数归零后
+		// 待 WS 路自己恢复时再整条清除。
+		if node.NftCollectSshFailCount > 0 {
+			if uerr := h.repo.UpdateNftCollectHealthPaths(nodeID, node.NftCollectState, node.NftCollectFailCount, node.NftCollectLastError, node.NftCollectLastOKAt, 0, node.NftCollectWsFailCount); uerr != nil {
+				log.Printf("nft collect health record failed node_id=%d err=%v", nodeID, uerr)
+			}
+		}
+		return
+	}
+	wasFailing := node.NftCollectState == "failing"
+	if uerr := h.repo.UpdateNftCollectHealthPaths(nodeID, "ok", 0, "", nowMs, 0, 0); uerr != nil {
+		log.Printf("nft collect health record failed node_id=%d err=%v", nodeID, uerr)
+		return
+	}
+	if wasFailing {
+		h.dispatchNftCollectRecoveredAlert(nodeID)
+	}
+}
+
+// recordNftWsCollectSuccess clears the WS contribution of a WS-path
+// nft failure streak (R3A-NEW-1, R4C-01): it zeroes only the WS
+// count. The row clears fully (mirroring recordNftCollectSuccess
+// including the recovery notification) only when no SSH contribution
+// remains; a mixed streak stays failing with its count and alert
+// mark untouched until the SSH path itself recovers. Steady-state
+// successes write nothing.
+func (h *Handler) recordNftWsCollectSuccess(nodeID int64, nowMs int64) {
+	if h == nil || h.repo == nil || nodeID <= 0 {
+		return
+	}
+	node, err := h.repo.GetNodeByID(nodeID)
+	if err != nil || node == nil {
+		log.Printf("nft collect success lookup failed node_id=%d err=%v", nodeID, err)
+		return
+	}
+	if node.NftCollectState == "ok" && node.NftCollectFailCount == 0 && node.NftCollectLastError == "" {
+		return
+	}
+	if node.NftCollectSshFailCount > 0 {
+		// R4C-01：streak 里还有 SSH 路的失败未恢复——WS 成功只
+		// 解决自己这路，不清行、不发恢复通知；WS 计数归零后
+		// 待 SSH 路自己恢复时再整条清除。
+		if node.NftCollectWsFailCount > 0 {
+			if uerr := h.repo.UpdateNftCollectHealthPaths(nodeID, node.NftCollectState, node.NftCollectFailCount, node.NftCollectLastError, node.NftCollectLastOKAt, node.NftCollectSshFailCount, 0); uerr != nil {
+				log.Printf("nft collect health record failed node_id=%d err=%v", nodeID, uerr)
+			}
+		}
+		return
+	}
+	wasFailing := node.NftCollectState == "failing"
+	if uerr := h.repo.UpdateNftCollectHealthPaths(nodeID, "ok", 0, "", nowMs, 0, 0); uerr != nil {
+		log.Printf("nft collect health record failed node_id=%d err=%v", nodeID, uerr)
+		return
+	}
+	if wasFailing {
+		h.dispatchNftCollectRecoveredAlert(nodeID)
+	}
+}
+
+func (h *Handler) collectNftablesNodeTraffic(nodeID int64, cfgModel *model.NodeSSHConfig, now time.Time) {
+	batch, metas, nowMs, quotaViews, err := h.accountNftablesNodeTraffic(nodeID, cfgModel, now)
+	if err != nil {
+		// A-中-2：采集失败必须在节点侧可见（节点行健康态＋越阈
+		// 值告警），不止后端日志一行。
+		h.recordNftCollectFailure(nodeID, err)
+		return
+	}
+	if batch == nil {
+		// 无增量本轮：nowMs>0 是采集成功的空轮（基线已推进）；
+		// nowMs==0 是丢弃轮（accountNftablesNodeTrafficCtx 在
+		// applying 丢弃时回 0）——丢弃既非成功也非失败，其样本
+		// 由下轮补回，健康态不动。
+		if nowMs > 0 {
+			h.recordNftCollectSuccess(nodeID, nowMs)
+		}
+		return
+	}
+	h.recordNftCollectSuccess(nodeID, nowMs)
+	h.recordTunnelMetricsFromForwardBatch(nodeID, batch.forwardTraffic, metas, nowMs)
+	for userID, quota := range quotaViews {
+		h.enforceUserQuotaIfNeeded(userID, quota)
+	}
+	for _, target := range batch.policyTargets {
+		if target.UserID <= 0 || target.UserTunnelID <= 0 {
+			continue
+		}
+		h.enforceFlowPolicies(target.UserID, target.UserTunnelID)
+	}
+}
+
+// accountNftablesNodeTraffic 执行采集→增量→落库（不含执法），供采集循环与
+// reconcile 前 drain（R5-B3 D1-004/D8）复用。返回 batch+metas+nowMs+quotaViews 供调用方
+// 执法；无增量时返回 nil batch（基线已推进）。
+func (h *Handler) accountNftablesNodeTraffic(nodeID int64, cfgModel *model.NodeSSHConfig, now time.Time) (*flowUploadBatch, map[int64]repo.FlowUploadForwardMeta, int64, map[int64]*model.UserQuotaView, error) {
+	return h.accountNftablesNodeTrafficCtx(context.Background(), nodeID, cfgModel, now)
+}
+
+// accountNftablesNodeTrafficCtx 与 accountNftablesNodeTraffic 相同，
+// 但采集的 CollectCounters 使用调用方 ctx（F-135：超时取消可达
+// 底层 SSH 读）。
+func (h *Handler) accountNftablesNodeTrafficCtx(ctx context.Context, nodeID int64, cfgModel *model.NodeSSHConfig, now time.Time) (*flowUploadBatch, map[int64]repo.FlowUploadForwardMeta, int64, map[int64]*model.UserQuotaView, error) {
+	if h == nil || h.repo == nil {
+		return nil, nil, 0, nil, errors.New("handler not initialized")
+	}
+	if h.nftablesManager == nil {
+		return nil, nil, 0, nil, errors.New("nftables manager not initialized")
+	}
+	sshCfg, err := sshConfigFromModel(cfgModel)
+	if err != nil {
+		log.Printf("nftables traffic collection failed op=ssh_config node_id=%d err=%v", nodeID, err)
+		return nil, nil, 0, nil, err
+	}
+	samples, err := func() ([]runtimenft.CounterSample, error) {
+		// R5-B5B D18: 采集前记录 generation（节点级单调计数器，独立于 applying）。
+		gen0 := h.nftablesManager.GetGeneration(nodeID)
+		samples, err := h.nftablesManager.CollectCounters(ctx, nodeID, sshCfg)
+		if err != nil {
+			return nil, err
+		}
+		// D18: 若处于 apply 窗口（未超时）→ 丢弃本轮，不阻塞。
+		if h.nftablesManager.IsApplying(nodeID) {
+			log.Printf("nftables traffic discarded op=applying_window node_id=%d", nodeID)
+			return nil, errDiscardedDueToApplying
+		}
+		// D18: 若 generation 变化（期间发生过完整 apply）→ 脏读，丢弃。
+		if h.nftablesManager.GetGeneration(nodeID) != gen0 {
+			log.Printf("nftables traffic discarded op=generation_changed node_id=%d", nodeID)
+			return nil, errDiscardedDueToApplying
+		}
+		return samples, nil
+	}()
+	if err != nil {
+		if err == errDiscardedDueToApplying {
+			// 丢弃轮：不写 nft_counter_state，不推进基线，下轮补回。
+			// （nft 计数器是累计值，跳过区间在下轮 delta 中补回；
+			// 若期间 apply 重建表，负 delta 走既有 reset 逻辑。）
+			return nil, nil, 0, nil, nil
+		}
+		// R5-B3 D1-003/D9(a): 表缺失（节点重启）→ 仅投递异步任务，由独立
+		// worker 执行；采集循环立即返回（R2：不在事务内做 SSH+DB）。
+		if isNftTableMissingError(err) {
+			h.enqueueNftAutoReconcile(nodeID, "table_missing")
+		}
+		log.Printf("nftables traffic collection failed op=collect node_id=%d err=%v", nodeID, err)
+		return nil, nil, 0, nil, err
+	}
+	// R5-B3 D1-003/D9(b): 采集成功而最近一次 apply 失败过 → 节点已恢复可达，
+	// 触发自动 reconcile（投递后由 worker 异步执行）。
+	h.checkNftNodeRecovered(nodeID)
+	bindings, err := h.repo.ListNftRuleBindingsByNode(nodeID)
+	if err != nil {
+		log.Printf("nftables traffic collection failed op=list_bindings node_id=%d err=%v", nodeID, err)
+		return nil, nil, 0, nil, err
+	}
+	hashes := make(map[int64]string, len(bindings))
+	for _, binding := range bindings {
+		if strings.ToLower(strings.TrimSpace(binding.Status)) != runtimenft.StatusApplied {
+			continue
+		}
+		ruleHash := strings.TrimSpace(binding.RuleHash)
+		if ruleHash == "" {
+			continue
+		}
+		hashes[binding.ForwardID] = ruleHash
+	}
+
+	boundSamples := filterNftCounterSamplesWithBinding(nodeID, samples, hashes)
+	return h.accountForwardCounterSamples(nodeID, boundSamples, hashes, now)
+}
+
+// accountForwardCounterSamples 是 nftables 转发与 realm 转发共用的入账段：
+// 把按 forward 归属的累计计数样本转成流量增量并单事务落库（基线推进 +
+// forward 流量 + 用户配额）。hashes 给出每个 forward 的计数代际标识，
+// 代际变化即基线重置（nftables 是规则 hash，realm 是 "realm:"+agent
+// epoch，样本不经 filterNftCounterSamplesWithBinding）。本方法只做入账；
+// 执法尾（隧道指标、配额强制、流量策略）由调用方按返回的 batch 执行，
+// 与采集路径既有分工一致。我方审计加固全部保留在此段内：pending-delete
+// delta 过滤、缺 meta 按 forward 跳过（D10 poison-scope）、有 delta 未被
+// batch 覆盖时不推进基线。
+// lockNodeForwardAccounting 取某节点的转发计数入账串行锁
+// （FIX2-A V2-08）。锁表懒初始化，Handler 未经 New 构造时亦可用。
+func (h *Handler) lockNodeForwardAccounting(nodeID int64) func() {
+	h.nodeAccountingMu.Lock()
+	if h.nodeAccountingLocks == nil {
+		h.nodeAccountingLocks = make(map[int64]*sync.Mutex)
+	}
+	mu, ok := h.nodeAccountingLocks[nodeID]
+	if !ok {
+		mu = &sync.Mutex{}
+		h.nodeAccountingLocks[nodeID] = mu
+	}
+	h.nodeAccountingMu.Unlock()
+	mu.Lock()
+	return mu.Unlock
+}
+
+func (h *Handler) accountForwardCounterSamples(nodeID int64, samples []runtimenft.CounterSample, hashes map[int64]string, now time.Time) (*flowUploadBatch, map[int64]repo.FlowUploadForwardMeta, int64, map[int64]*model.UserQuotaView, error) {
+	if h == nil || h.repo == nil {
+		return nil, nil, 0, nil, errors.New("handler not initialized")
+	}
+	// FIX2-A（V2-08）：per-node 串行化「读基线→差分→落库」整段。
+	// 切换 settle 轮询、60s 周期轮询、重连对账轮询三路都经本段入
+	// 账，旧实现无串行化且基线在事务外读（ApplyNftTrafficAccounting
+	// 事务内不复检基线）：两轮并发拿到同一旧基线会各差分一次，同
+	// 一样本被重复入账（探针：8 并发同一样本入账 8 次 4800/4800，
+	// 期望 600/600）。锁内读到的恒为最新已提交基线，即入账路径的
+	// 基线复检。执法在调用方拿到 batch 后执行（不在锁内），不会
+	// 与 reconcile→drain 路径构环。
+	unlock := h.lockNodeForwardAccounting(nodeID)
+	defer unlock()
+	nowMs := now.UnixMilli()
+	oldStates, err := h.repo.GetNftCounterStatesByNode(nodeID)
+	if err != nil {
+		log.Printf("forward counter accounting failed op=list_states node_id=%d err=%v", nodeID, err)
+		return nil, nil, nowMs, nil, err
+	}
+	deltas, newStates := buildNftCounterDeltas(nodeID, samples, oldStates, hashes, nowMs)
+	if len(newStates) == 0 {
+		if len(deltas) != 0 {
+			log.Printf("forward counter accounting skipped suspicious deltas without states node_id=%d deltas=%d", nodeID, len(deltas))
+		}
+		return nil, nil, nowMs, nil, nil
+	}
+
+	// R5-B3 D1-001 矩阵 #9 / 补充 A: pending-delete 行的 delta 丢弃（不产生
+	// 任何计费增量），但 newStates 照常落库使基线推进，避免攒出巨大 delta。
+	// 注意：newStates 不在此处过滤，下游的 Upsert/Accounting 会推进其基线。
+	deltas = h.filterOutPendingDeleteDeltas(nodeID, deltas)
+
+	var metas map[int64]repo.FlowUploadForwardMeta
+	forwardIDs := make([]int64, 0, len(deltas))
+	for _, delta := range deltas {
+		if delta.ForwardID > 0 {
+			forwardIDs = append(forwardIDs, delta.ForwardID)
+		}
+	}
+	if len(deltas) != 0 {
+		metas, err = h.repo.GetFlowUploadForwardMetas(forwardIDs)
+		if err != nil {
+			log.Printf("forward counter accounting failed op=load_flow_metas node_id=%d err=%v", nodeID, err)
+			return nil, nil, nowMs, nil, err
+		}
+		// R5-B3 D1-001(poison-scope)/D10: 缺 meta 的 forward 仅跳过其 delta
+		// （不计费），保留其旧基线（newStates 中剔除，下周期重试），warn 日志
+		// 带 forward_id；其他 forward 正常累积。不再整节点 return。
+		deltas, newStates = filterOutNftDeltasMissingMeta(deltas, newStates, metas, nodeID)
+	}
+	if len(deltas) == 0 {
+		if err := h.repo.UpsertNftCounterStates(newStates, nowMs); err != nil {
+			log.Printf("forward counter accounting failed op=upsert_states node_id=%d err=%v", nodeID, err)
+			return nil, nil, nowMs, nil, err
+		}
+		return nil, nil, nowMs, nil, nil
+	}
+
+	batch := buildNftFlowUploadBatch(deltas, metas)
+	if missingForwardID, ok := firstNftBatchMissingDelta(deltas, batch); ok {
+		log.Printf("forward counter accounting skipped state advance op=unaccounted_delta node_id=%d forward_id=%d", nodeID, missingForwardID)
+		return nil, nil, nowMs, nil, nil
+	}
+	quotaViews, err := h.repo.ApplyNftTrafficAccounting(batch.flowDeltas, batch.quotaUsage, newStates, now)
+	if err != nil {
+		log.Printf("forward counter accounting failed op=accounting node_id=%d err=%v", nodeID, err)
+		return nil, nil, nowMs, nil, err
+	}
+	return &batch, metas, nowMs, quotaViews, nil
+}
+
+// drainNftCountersBeforeReconcile 是 D8：reconcile 删表重建前 best-effort
+// drain 计数器。成功返回 true；失败返回 false（调用方记 gap，
+// 不得阻塞 apply）。
+// F-134（X1-205）注释订正：旧注释称「drain 与重建必须在同一
+// single-flight 内」与实现不符——drain 实际在 handler 层、
+// Reconcile/Clear 取 per-node 锁之前执行，采集本身按 D18 不取锁。
+// 并发安全靠两点兜底：写路径（Reconcile/Clear）置 applying+gen++
+// 使在途普通采集丢弃脏读；drain 落库走计数器基线事务，增量只结算
+// 一次（重建后样本小于基线时走 reset 分支只推进基线）。
+func (h *Handler) drainNftCountersBeforeReconcile(nodeID int64, cfgModel *model.NodeSSHConfig, now time.Time) bool {
+	return h.drainNftCountersBeforeReconcileCtx(context.Background(), nodeID, cfgModel, now)
+}
+
+func (h *Handler) drainNftCountersBeforeReconcileCtx(ctx context.Context, nodeID int64, cfgModel *model.NodeSSHConfig, now time.Time) bool {
+	_, _, _, _, err := h.accountNftablesNodeTrafficCtx(ctx, nodeID, cfgModel, now)
+	if err != nil {
+		// M-005：告警级 gap：删表重建前 drain 失败，本轮到重建之间的流量将漏计（计数器已知局限）
+		log.Printf("nftables reconcile drain gap node_id=%d err=%v action=apply_continues_baseline_reset ALERT=traffic_may_be_lost", nodeID, err)
+		return false
+	}
+	return true
+}
+
+// settleNftCountersAfterSync 是 R2-E2-02（FIX-BASELINE）：sync 的
+// Reconcile 重建表、binding 已按新 hash 落库后，立即走既有采集漏
+// 斗（accountNftablesNodeTrafficCtx，与周期采集/drain 同一入口、
+// 同一 per-node 入账串行锁）做一次结算，把新绑定与哈希变化绑定
+// 的计数基线钉在落成时刻。此前基线只能由首个 30s 周期样本建
+// 立，buildNftCounterDeltas 对「无旧状态/哈希变化」只落基线零增
+// 量——绑定落成至首采集之间的流量被基线整段吞掉、永不入账（首
+// 次创建无 drain 兜底，全同形于 realm 修复前的窗口）。
+// 代际语义内的安全性：本调用在 manager.Reconcile 返回后执行，
+// serializedNftManager 此时已清 applying、generation 已递增并稳
+// 定，采集不会被 D18 丢弃；若期间另有 apply 并发，D18 整轮丢弃
+// 本次结算（不写基线），退化为周期采集补建，与旧行为一致。
+// 可结算部分（同 hash 绑定的真实增量等）经同一入账段正常入账，
+// 执法尾（配额强制/隧道指标/流量策略）与 drain 同口径留待周期
+// 采集执行。失败不阻塞 sync（可用性优先，与 drain 同口径）：
+// 记日志，基线退化为首个周期样本建立。
+func (h *Handler) settleNftCountersAfterSync(ctx context.Context, nodeID int64, cfgModel *model.NodeSSHConfig) {
+	if h == nil || h.repo == nil || cfgModel == nil {
+		return
+	}
+	if _, _, _, _, err := h.accountNftablesNodeTrafficCtx(ctx, nodeID, cfgModel, time.Now()); err != nil {
+		log.Printf("nftables post-sync settle failed op=settle node_id=%d err=%v action=baseline_deferred_to_periodic_collect", nodeID, err)
+	}
+}
+
+func firstNftBatchMissingDelta(deltas []nftTrafficDelta, batch flowUploadBatch) (int64, bool) {
+	flowSeen := make(map[int64]struct{}, len(batch.flowDeltas))
+	for _, delta := range batch.flowDeltas {
+		flowSeen[delta.ForwardID] = struct{}{}
+	}
+
+	expectedRaw := make(map[int64]tunnelTrafficDelta, len(batch.forwardTraffic))
+	for _, delta := range deltas {
+		if delta.ForwardID <= 0 || (delta.BytesIn == 0 && delta.BytesOut == 0) {
+			continue
+		}
+		if delta.BytesIn < 0 || delta.BytesOut < 0 {
+			return delta.ForwardID, true
+		}
+		raw := expectedRaw[delta.ForwardID]
+		if raw.bytesIn > math.MaxInt64-delta.BytesIn || raw.bytesOut > math.MaxInt64-delta.BytesOut {
+			return delta.ForwardID, true
+		}
+		raw.bytesIn += delta.BytesIn
+		raw.bytesOut += delta.BytesOut
+		expectedRaw[delta.ForwardID] = raw
+	}
+
+	for forwardID, expected := range expectedRaw {
+		actual, ok := batch.forwardTraffic[forwardID]
+		if !ok || actual.bytesIn != expected.bytesIn || actual.bytesOut != expected.bytesOut {
+			return forwardID, true
+		}
+		if expected.bytesIn != 0 || expected.bytesOut != 0 {
+			if _, ok := flowSeen[forwardID]; !ok {
+				return forwardID, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// filterOutPendingDeleteDeltas 丢弃 pending-delete 行的 delta（R5-B3 D1-001
+// 矩阵 #9 / 补充 A）。被丢弃的 delta 不产生计费增量；其 newStates 由调用方
+// 照常落库，基线继续推进。
+func (h *Handler) filterOutPendingDeleteDeltas(nodeID int64, deltas []nftTrafficDelta) []nftTrafficDelta {
+	if len(deltas) == 0 || h == nil || h.repo == nil {
+		return deltas
+	}
+	ids := make([]int64, 0, len(deltas))
+	for _, d := range deltas {
+		if d.ForwardID > 0 {
+			ids = append(ids, d.ForwardID)
+		}
+	}
+	statusMap, err := h.repo.GetForwardStatusMap(ids)
+	if err != nil {
+		log.Printf("nftables traffic collection failed op=pending_status node_id=%d err=%v", nodeID, err)
+		return deltas
+	}
+	kept := deltas[:0]
+	for _, d := range deltas {
+		if d.ForwardID > 0 && statusMap[d.ForwardID] == model.ForwardStatusPendingDelete {
+			continue
+		}
+		kept = append(kept, d)
+	}
+	if len(kept) != len(deltas) {
+		log.Printf("nftables traffic collection dropped pending-delete deltas node_id=%d dropped=%d", nodeID, len(deltas)-len(kept))
+	}
+	return kept
+}
+
+// filterOutNftDeltasMissingMeta 是 D10：缺 meta 的 forward 仅跳过其 delta
+// （不产生计费），并从 newStates 剔除其基线更新（保留旧基线，下周期重试），
+// warn 日志带 forward_id；其他 forward 正常累积。
+// 注意：旧的整节点 return 逻辑（firstNftDeltaMissingMeta）已删除。
+func filterOutNftDeltasMissingMeta(deltas []nftTrafficDelta, newStates []repo.NftCounterStateInput, metas map[int64]repo.FlowUploadForwardMeta, nodeID int64) ([]nftTrafficDelta, []repo.NftCounterStateInput) {
+	if len(deltas) == 0 {
+		return deltas, newStates
+	}
+	skip := make(map[int64]bool)
+	for _, delta := range deltas {
+		if delta.ForwardID <= 0 {
+			continue
+		}
+		if _, ok := metas[delta.ForwardID]; !ok {
+			if !skip[delta.ForwardID] {
+				skip[delta.ForwardID] = true
+				log.Printf("nftables traffic skipped op=missing_flow_meta node_id=%d forward_id=%d action=delta_dropped_baseline_kept", nodeID, delta.ForwardID)
+			}
+		}
+	}
+	if len(skip) == 0 {
+		return deltas, newStates
+	}
+	keptDeltas := deltas[:0]
+	for _, delta := range deltas {
+		if !skip[delta.ForwardID] {
+			keptDeltas = append(keptDeltas, delta)
+		}
+	}
+	keptStates := newStates[:0]
+	for _, st := range newStates {
+		if !skip[st.ForwardID] {
+			keptStates = append(keptStates, st)
+		}
+	}
+	return keptDeltas, keptStates
+}
+
+// filterNftCounterSamplesWithBinding drops counter samples whose
+// forward has no applied binding (A-中-3): without an applied binding
+// the sample cannot be attributed to a live rule, so it is skipped.
+// The skip is logged once per call when >0 — an unbound sample usually
+// means a rule was removed while its counters were still reporting,
+// which the admin should be able to see instead of silently losing.
+func filterNftCounterSamplesWithBinding(nodeID int64, samples []runtimenft.CounterSample, hashes map[int64]string) []runtimenft.CounterSample {
+	if len(samples) == 0 || len(hashes) == 0 {
+		if len(samples) > 0 {
+			log.Printf("nft counter samples dropped node_id=%d samples=%d reason=no_applied_binding", nodeID, len(samples))
+		}
+		return nil
+	}
+	filtered := make([]runtimenft.CounterSample, 0, len(samples))
+	dropped := 0
+	for _, sample := range samples {
+		if _, ok := hashes[sample.ForwardID]; !ok {
+			dropped++
+			continue
+		}
+		filtered = append(filtered, sample)
+	}
+	if dropped > 0 {
+		log.Printf("nft counter samples dropped node_id=%d samples=%d reason=no_applied_binding", nodeID, dropped)
+	}
+	return filtered
+}
+
+func nftCounterKey(forwardID int64, protocol, direction string) nftCounterStateKey {
+	return nftCounterStateKey{
+		forwardID: forwardID,
+		protocol:  strings.ToLower(strings.TrimSpace(protocol)),
+		direction: strings.ToLower(strings.TrimSpace(direction)),
+	}
+}
+
+func buildNftCounterDeltas(nodeID int64, samples []runtimenft.CounterSample, oldStates []model.NftCounterState, hashes map[int64]string, nowMs int64) ([]nftTrafficDelta, []repo.NftCounterStateInput) {
+	oldByKey := make(map[nftCounterStateKey]model.NftCounterState, len(oldStates))
+	for _, old := range oldStates {
+		if old.NodeID != nodeID {
+			continue
+		}
+		oldByKey[nftCounterKey(old.ForwardID, old.Protocol, old.Direction)] = old
+	}
+
+	stateInputs := make([]repo.NftCounterStateInput, 0, len(samples))
+	deltaByForward := make(map[int64]nftTrafficDelta)
+	// A-中-3：畸形样本丢弃计数——方向/协议不在枚举内、字节数溢出
+	// int64 的样本无法入账；每轮一行摘要日志（无丢弃不打）。计数
+	// 器重置（sample.Bytes < oldBytes）不在此列：那是已登记的
+	// M-004 已知局限（基线推进、不计费），不是畸形丢弃。
+	droppedBadDirection, droppedBadProtocol, droppedOversize := 0, 0, 0
+	for _, sample := range samples {
+		direction := strings.ToLower(strings.TrimSpace(sample.Direction))
+		if direction != runtimenft.CounterDirectionToTarget && direction != runtimenft.CounterDirectionFromTarget {
+			droppedBadDirection++
+			continue
+		}
+
+		protocol := strings.ToLower(strings.TrimSpace(sample.Protocol))
+		if protocol != "tcp" && protocol != "udp" {
+			droppedBadProtocol++
+			continue
+		}
+		if sample.Bytes > uint64(math.MaxInt64) || sample.Packets > uint64(math.MaxInt64) {
+			droppedOversize++
+			continue
+		}
+		ruleHash := strings.TrimSpace(hashes[sample.ForwardID])
+		stateInput := repo.NftCounterStateInput{
+			NodeID:        nodeID,
+			ForwardID:     sample.ForwardID,
+			Protocol:      protocol,
+			Direction:     direction,
+			RuleHash:      ruleHash,
+			Bytes:         sample.Bytes,
+			Packets:       sample.Packets,
+			CollectedTime: nowMs,
+		}
+
+		old, exists := oldByKey[nftCounterKey(sample.ForwardID, protocol, direction)]
+		if !exists || old.RuleHash != ruleHash {
+			stateInputs = append(stateInputs, stateInput)
+			continue
+		}
+		if old.Bytes < 0 {
+			stateInputs = append(stateInputs, stateInput)
+			continue
+		}
+		oldBytes := uint64(old.Bytes)
+		if sample.Bytes < oldBytes {
+			// M-004/O6-003：已知局限——计数器重置（节点重启/规则重建）时，
+			// 上次采样到重置之间的流量无法回收，直接以新值更新基线、不计费（漏计）。
+			// 计数器方案天然无法感知重置前未采集的增量，无法完美解决，此处只更新基线。
+			stateInputs = append(stateInputs, stateInput)
+			continue
+		}
+		rawDelta := sample.Bytes - oldBytes
+		if rawDelta == 0 {
+			stateInputs = append(stateInputs, stateInput)
+			continue
+		}
+
+		delta := deltaByForward[sample.ForwardID]
+		delta.ForwardID = sample.ForwardID
+		rawDeltaInt := int64(rawDelta)
+		if direction == runtimenft.CounterDirectionToTarget {
+			if delta.BytesIn > math.MaxInt64-rawDeltaInt {
+				// M-006：溢出保护触发，丢弃本次增量（极低频），记录以便排查
+				log.Printf("nftables overflow discard forward_id=%d direction=in dropped_bytes=%d", sample.ForwardID, rawDeltaInt)
+				continue
+			}
+			delta.BytesIn += rawDeltaInt
+		} else {
+			if delta.BytesOut > math.MaxInt64-rawDeltaInt {
+				// M-006：溢出保护触发，丢弃本次增量（极低频），记录以便排查
+				log.Printf("nftables overflow discard forward_id=%d direction=out dropped_bytes=%d", sample.ForwardID, rawDeltaInt)
+				continue
+			}
+			delta.BytesOut += rawDeltaInt
+		}
+		stateInputs = append(stateInputs, stateInput)
+		deltaByForward[sample.ForwardID] = delta
+	}
+
+	forwardIDs := make([]int64, 0, len(deltaByForward))
+	for forwardID := range deltaByForward {
+		forwardIDs = append(forwardIDs, forwardID)
+	}
+	sort.Slice(forwardIDs, func(i, j int) bool { return forwardIDs[i] < forwardIDs[j] })
+
+	deltas := make([]nftTrafficDelta, 0, len(forwardIDs))
+	for _, forwardID := range forwardIDs {
+		delta := deltaByForward[forwardID]
+		if delta.BytesIn == 0 && delta.BytesOut == 0 {
+			continue
+		}
+		deltas = append(deltas, delta)
+	}
+	if droppedBadDirection+droppedBadProtocol+droppedOversize > 0 {
+		log.Printf("nft counter samples dropped node_id=%d samples=%d bad_direction=%d bad_protocol=%d oversize=%d",
+			nodeID, droppedBadDirection+droppedBadProtocol+droppedOversize,
+			droppedBadDirection, droppedBadProtocol, droppedOversize)
+	}
+	return deltas, stateInputs
+}
+
+func buildNftFlowUploadBatch(deltas []nftTrafficDelta, metas map[int64]repo.FlowUploadForwardMeta) flowUploadBatch {
+	batch := flowUploadBatch{
+		quotaUsage:     make(map[int64]int64),
+		forwardTraffic: make(map[int64]tunnelTrafficDelta),
+		orphanServices: make(map[string]struct{}),
+	}
+	policySeen := map[flowPolicyTarget]struct{}{}
+	flowSeen := map[int64]int{}
+
+	for _, delta := range deltas {
+		meta, exists := metas[delta.ForwardID]
+		if !exists {
+			continue
+		}
+
+		// O6-005：TrafficRatio=0 会产生零计费（不拒绝，可能为有意免费配置），记录警告以便管理员发现误配置
+		if meta.TrafficRatio == 0 && (delta.BytesIn > 0 || delta.BytesOut > 0) {
+			log.Printf("nftables zero billing forward_id=%d traffic_bytes=%d zero_ratio_config_confirm_intended", delta.ForwardID, delta.BytesIn+delta.BytesOut)
+		}
+
+		raw := batch.forwardTraffic[delta.ForwardID]
+		if delta.BytesIn < 0 || delta.BytesOut < 0 || raw.bytesIn > math.MaxInt64-delta.BytesIn || raw.bytesOut > math.MaxInt64-delta.BytesOut {
+			// M-006：负值/溢出保护触发，丢弃本条增量（极低频），记录以便排查
+			log.Printf("nftables invalid delta discard forward_id=%d bytes_in=%d bytes_out=%d", delta.ForwardID, delta.BytesIn, delta.BytesOut)
+			continue
+		}
+
+		scaledIn, ok := scaleNftTrafficBytes(delta.BytesIn, meta.TrafficRatio)
+		if !ok {
+			// M-006：倍率缩放溢出（极低频），丢弃本条增量并记录
+			log.Printf("nftables scale overflow discard forward_id=%d bytes=%d ratio=%v", delta.ForwardID, delta.BytesIn, meta.TrafficRatio)
+			continue
+		}
+		// Flow=1 单向：只计上传（BytesIn）；Flow=2 双向：计上传+下载
+		// 历史 bug：曾把 Flow 当乘数用，导致 Flow=2 双倍扣费
+		var quotaDelta int64
+		var scaledOut int64
+		if meta.TunnelFlow == 1 {
+			quotaDelta = scaledIn
+			// scaledOut 保持 0
+		} else {
+			var ok bool
+			scaledOut, ok = scaleNftTrafficBytes(delta.BytesOut, meta.TrafficRatio)
+			if !ok {
+				// M-006：倍率缩放溢出（极低频），丢弃本条增量并记录
+				log.Printf("nftables scale overflow discard forward_id=%d bytes=%d ratio=%v", delta.ForwardID, delta.BytesOut, meta.TrafficRatio)
+				continue
+			}
+			if scaledIn > math.MaxInt64-scaledOut {
+				// R2A-3：与本函数其余溢出 continue 同口径（M-006），
+				// 丢弃须留行，否则双向合计溢出的整条丢弃无迹可查。
+				log.Printf("nftables quota overflow discard forward_id=%d scaled_in=%d scaled_out=%d", delta.ForwardID, scaledIn, scaledOut)
+				continue
+			}
+			quotaDelta = scaledIn + scaledOut
+		}
+		if batch.quotaUsage[meta.UserID] > math.MaxInt64-quotaDelta {
+			// R2A-3：用户 quota 合计溢出丢弃须留行（M-006 同口径）。
+			log.Printf("nftables quota overflow discard forward_id=%d user_id=%d quota_delta=%d", delta.ForwardID, meta.UserID, quotaDelta)
+			continue
+		}
+
+		flowIdx, flowExists := flowSeen[delta.ForwardID]
+		if flowExists && (batch.flowDeltas[flowIdx].InFlow > math.MaxInt64-scaledIn || batch.flowDeltas[flowIdx].OutFlow > math.MaxInt64-scaledOut ||
+			batch.flowDeltas[flowIdx].RawInFlow > math.MaxInt64-delta.BytesIn || batch.flowDeltas[flowIdx].RawOutFlow > math.MaxInt64-delta.BytesOut) {
+			// R2A-3：同转发多 delta 合并溢出丢弃须留行（M-006 同口径）。
+			log.Printf("nftables flow delta overflow discard forward_id=%d scaled_in=%d scaled_out=%d bytes_in=%d bytes_out=%d", delta.ForwardID, scaledIn, scaledOut, delta.BytesIn, delta.BytesOut)
+			continue
+		}
+
+		raw.bytesIn += delta.BytesIn
+		raw.bytesOut += delta.BytesOut
+		batch.forwardTraffic[delta.ForwardID] = raw
+
+		// R5X-013：delta 拆 raw/scaled 两组——forward 行落 raw
+		// （delta.BytesIn/BytesOut 全量原始字节，不受单向计费门控，
+		// 与 forwardTraffic 指标桶同源），user/user_tunnel 行与
+		// quota 落 scaled（scaledOut 在 TunnelFlow=1 时为 0）。
+		if flowExists {
+			batch.flowDeltas[flowIdx].InFlow += scaledIn
+			batch.flowDeltas[flowIdx].OutFlow += scaledOut
+			batch.flowDeltas[flowIdx].RawInFlow += delta.BytesIn
+			batch.flowDeltas[flowIdx].RawOutFlow += delta.BytesOut
+		} else {
+			flowSeen[delta.ForwardID] = len(batch.flowDeltas)
+			batch.flowDeltas = append(batch.flowDeltas, repo.FlowUploadCounterDelta{
+				ForwardID:    delta.ForwardID,
+				UserID:       meta.UserID,
+				UserTunnelID: meta.UserTunnelID,
+				InFlow:       scaledIn,
+				OutFlow:      scaledOut,
+				RawInFlow:    delta.BytesIn,
+				RawOutFlow:   delta.BytesOut,
+				HasRaw:       true,
+			})
+		}
+		batch.quotaUsage[meta.UserID] += quotaDelta
+
+		target := flowPolicyTarget{UserID: meta.UserID, UserTunnelID: meta.UserTunnelID}
+		if _, seen := policySeen[target]; !seen {
+			policySeen[target] = struct{}{}
+			batch.policyTargets = append(batch.policyTargets, target)
+		}
+	}
+
+	sort.Slice(batch.policyTargets, func(i, j int) bool {
+		if batch.policyTargets[i].UserID == batch.policyTargets[j].UserID {
+			return batch.policyTargets[i].UserTunnelID < batch.policyTargets[j].UserTunnelID
+		}
+		return batch.policyTargets[i].UserID < batch.policyTargets[j].UserID
+	})
+
+	return batch
+}
+
+// scaleTrafficBytes is the ONE shared traffic-scaling guard for every
+// accounting engine (gost flow upload and nftables/realm). R7-F-01: the
+// two engines must never carry separate criteria again — the gost path
+// previously judged overflow by `scaledF > float64(MaxInt64)`, but
+// float64(MaxInt64) IS 2^63, so a product of exactly 2^63 passed the
+// check and int64(2^63) wrapped to MinInt64 and persisted into the
+// user/user_tunnel totals. Semantics (identical on both engines):
+// ratio == 1 passes the byte count through untouched (no float64
+// round-trip, so values above 2^53 keep their low bits); a product
+// >= 2^63, NaN, Inf, or any negative operand/result is rejected and
+// the caller discards the whole item and logs it.
+func scaleTrafficBytes(bytes int64, ratio float64) (int64, bool) {
+	if bytes < 0 || ratio < 0 {
+		return 0, false
+	}
+	var scaled int64
+	if ratio == 1 {
+		scaled = bytes
+	} else {
+		scaledFloat := float64(bytes) * ratio
+		if math.IsNaN(scaledFloat) || math.IsInf(scaledFloat, 0) || scaledFloat < 0 || scaledFloat >= math.Pow(2, 63) {
+			return 0, false
+		}
+		scaled = int64(scaledFloat)
+	}
+	return scaled, true
+}
+
+// scaleNftTrafficBytes is the nft path's name for the shared scaling
+// guard. It must never grow its own criteria: all scaling semantics
+// live in scaleTrafficBytes so the gost and nft engines cannot drift.
+func scaleNftTrafficBytes(bytes int64, ratio float64) (int64, bool) {
+	return scaleTrafficBytes(bytes, ratio)
+}

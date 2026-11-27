@@ -1,0 +1,887 @@
+import type { Dispatch, SetStateAction } from "react";
+
+import { useEffect, useState } from "react";
+import toast from "react-hot-toast";
+
+import { Button } from "@/shadcn-bridge/heroui/button";
+import { Checkbox } from "@/shadcn-bridge/heroui/checkbox";
+import { Input } from "@/shadcn-bridge/heroui/input";
+import { Textarea } from "@/shadcn-bridge/heroui/input";
+import {
+  Modal,
+  ModalContent,
+  ModalHeader,
+  ModalBody,
+  ModalFooter,
+} from "@/shadcn-bridge/heroui/modal";
+import { Switch } from "@/shadcn-bridge/heroui/switch";
+import { Alert } from "@/shadcn-bridge/heroui/alert";
+import { Accordion, AccordionItem } from "@/shadcn-bridge/heroui/accordion";
+import { Select, SelectItem } from "@/shadcn-bridge/heroui/select";
+import { type NodeRenewalCycle } from "@/pages/node/renewal";
+import { NodeForm } from "@/pages/node/types";
+import { testNodeNftables } from "@/api";
+
+export interface NodeFormModalProps {
+  dialogTitle: string;
+  dialogVisible: boolean;
+  errors: Record<string, string>;
+  form: NodeForm;
+  handleSubmit: () => Promise<void>;
+  protocolControlsDisabled: boolean;
+  protocolControlsReason: string;
+  /** C3-02：该节点已钉入的 SSH 主机密钥指纹（""＝未钉入/新节点）。 */
+  sshHostKeyFingerprint?: string;
+  /**
+   * 展示分组的可选项（v2：分组登记册∪在用标签）：分组字段是下拉，
+   * 只能从已有组里选或未分组——建组统一走节点页「新建分组」。
+   */
+  groupOptions?: string[];
+  setDialogVisible: Dispatch<SetStateAction<boolean>>;
+  setForm: Dispatch<SetStateAction<NodeForm>>;
+  submitLoading: boolean;
+}
+
+/** Create or edit a node. */
+export function NodeFormModal({
+  dialogTitle,
+  dialogVisible,
+  errors,
+  form,
+  handleSubmit,
+  protocolControlsDisabled,
+  protocolControlsReason,
+  sshHostKeyFingerprint,
+  groupOptions,
+  setDialogVisible,
+  setForm,
+  submitLoading,
+}: NodeFormModalProps) {
+  // C3-02 主机密钥指纹区本地状态：展示值以打开弹窗时的已钉入指纹为
+  // 初值，本次测连通钉入/重钉后按回执即时更新；重置勾选只作用于
+  // 下一次测连通请求（resetHostKey），不随节点表单提交。
+  const [pinnedFingerprint, setPinnedFingerprint] = useState("");
+  const [resetHostKey, setResetHostKey] = useState(false);
+  const [sshTesting, setSshTesting] = useState(false);
+
+  useEffect(() => {
+    if (dialogVisible) {
+      setPinnedFingerprint(sshHostKeyFingerprint || "");
+      setResetHostKey(false);
+    }
+  }, [dialogVisible, form.id, sshHostKeyFingerprint]);
+
+  const handleTestSsh = async () => {
+    if (!form.id) return;
+    setSshTesting(true);
+    try {
+      const res = await testNodeNftables(form.id, resetHostKey);
+
+      if (res.code !== 0) {
+        toast.error(res.msg || "测试连接失败");
+
+        return;
+      }
+      const data = res.data;
+
+      if (data?.hostKeyFingerprint) {
+        setPinnedFingerprint(data.hostKeyFingerprint);
+        setResetHostKey(false);
+        toast.success(
+          data.hostKeyRepinned
+            ? "测试连接成功，SSH 主机密钥指纹已重新钉入"
+            : "测试连接成功，SSH 主机密钥指纹已钉入",
+        );
+        // 后端钉入回执带核对 warning（须与节点本机 ssh-keygen 输出
+        // 人工核对），原样长时间呈现，不许吞掉。
+        if (data.warning) {
+          toast(data.warning, { duration: 12000, icon: "⚠️" });
+        }
+      } else {
+        toast.success("测试连接成功（SSH 主机密钥指纹校验通过）");
+      }
+    } catch {
+      toast.error("网络错误，请重试");
+    } finally {
+      setSshTesting(false);
+    }
+  };
+
+  return (
+    <Modal
+      backdrop="blur"
+      classNames={{
+        base: "!w-[calc(100%-32px)] !mx-auto sm:!w-full rounded-2xl overflow-hidden",
+      }}
+      isOpen={dialogVisible}
+      placement="center"
+      scrollBehavior="inside"
+      size="2xl"
+      onClose={() => setDialogVisible(false)}
+    >
+      <ModalContent>
+        <ModalHeader>{dialogTitle}</ModalHeader>
+        <ModalBody>
+          <div className="space-y-4">
+            <Input
+              errorMessage={errors.name}
+              isInvalid={!!errors.name}
+              label="节点名称"
+              placeholder="请输入节点名称"
+              value={form.name}
+              variant="bordered"
+              onChange={(e) =>
+                setForm((prev) => ({ ...prev, name: e.target.value }))
+              }
+            />
+
+            <Textarea
+              description="可记录供应商、用途、续费说明等补充信息"
+              label="备注"
+              maxRows={4}
+              minRows={3}
+              placeholder="例如: 搬瓦工年付，2026-12 续费，日本中转"
+              value={form.remark}
+              variant="bordered"
+              onChange={(e) =>
+                setForm((prev) => ({ ...prev, remark: e.target.value }))
+              }
+            />
+
+            <Select
+              description="纯展示：节点页按分组分段排列，一个节点至多一个分组；新建分组请用节点页工具栏的「新建分组」"
+              label="分组"
+              placeholder="未分组"
+              selectedKeys={form.displayGroup ? [form.displayGroup] : []}
+              variant="bordered"
+              onSelectionChange={(keys) => {
+                const selected = Array.from(keys)[0] as string | undefined;
+
+                setForm((prev) => ({
+                  ...prev,
+                  displayGroup: selected || "",
+                }));
+              }}
+            >
+              {(groupOptions ?? []).map((label) => (
+                <SelectItem key={label} textValue={label}>
+                  {label}
+                </SelectItem>
+              ))}
+            </Select>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <Select
+                label="续费周期"
+                placeholder="选择续费周期"
+                selectedKeys={form.renewalCycle ? [form.renewalCycle] : []}
+                variant="bordered"
+                onSelectionChange={(keys) => {
+                  const selected = Array.from(keys)[0] as
+                    | NodeRenewalCycle
+                    | undefined;
+
+                  setForm((prev) => ({
+                    ...prev,
+                    renewalCycle: selected || "",
+                  }));
+                }}
+              >
+                <SelectItem key="month" textValue="month">
+                  月付
+                </SelectItem>
+                <SelectItem key="quarter" textValue="quarter">
+                  季付
+                </SelectItem>
+                <SelectItem key="year" textValue="year">
+                  年付
+                </SelectItem>
+              </Select>
+            </div>
+
+            <Input
+              description="填写最近一次续费时间或周期起始时间，系统会按月/季/年自动推算下次续费"
+              errorMessage={errors.expiryTime}
+              isInvalid={!!errors.expiryTime}
+              label="续费基准时间"
+              max="9999-12-31"
+              type="date"
+              value={
+                form.expiryTime > 0
+                  ? new Date(form.expiryTime).toISOString().slice(0, 10)
+                  : ""
+              }
+              variant="bordered"
+              onChange={(e) =>
+                setForm((prev) => ({
+                  ...prev,
+                  expiryTime: e.target.value
+                    ? new Date(e.target.value).getTime()
+                    : 0,
+                }))
+              }
+            />
+
+            <Alert
+              color="primary"
+              description="例如选择月付并填写 2026-03-01，系统会自动按每月同日推算下次续费时间。"
+              variant="flat"
+            />
+
+            <Input
+              description="可选：不带协议、不带端口。建议在 IPv4 和 IPv6 都未填写时使用。至少填写一个 IPv4/IPv6 域名"
+              errorMessage={errors.serverHost}
+              isInvalid={!!errors.serverHost}
+              label="域名/主机名"
+              placeholder="例如: test.example.com"
+              value={form.serverHost}
+              variant="bordered"
+              onChange={(e) =>
+                setForm((prev) => ({ ...prev, serverHost: e.target.value }))
+              }
+            />
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <Input
+                description="填写一个 IPv4 地址"
+                errorMessage={errors.serverIpV4}
+                isInvalid={!!errors.serverIpV4}
+                label="IPv4 地址"
+                placeholder="例如: 192.168.1.100"
+                value={form.serverIpV4}
+                variant="bordered"
+                onChange={(e) =>
+                  setForm((prev) => ({ ...prev, serverIpV4: e.target.value }))
+                }
+              />
+
+              <Input
+                description="填写一个 IPv6 地址"
+                errorMessage={errors.serverIpV6}
+                isInvalid={!!errors.serverIpV6}
+                label="IPv6 地址"
+                placeholder="例如: 2001:db8::10"
+                value={form.serverIpV6}
+                variant="bordered"
+                onChange={(e) =>
+                  setForm((prev) => ({ ...prev, serverIpV6: e.target.value }))
+                }
+              />
+            </div>
+
+            <Input
+              classNames={{
+                input: "font-mono",
+              }}
+              description="支持单个端口(80)、多个端口(80,443)或端口范围(10000-65535)，多个可用逗号分隔；转发/中转/隧道入口端口从此范围分配与校验，内核入站的监听端口不在此限"
+              errorMessage={errors.port}
+              isInvalid={!!errors.port}
+              label="可用端口"
+              placeholder="例如: 80,443,10000-65535"
+              value={form.port}
+              variant="bordered"
+              onChange={(e) =>
+                setForm((prev) => ({ ...prev, port: e.target.value }))
+              }
+            />
+
+            <Select
+              label="转发模式"
+              selectedKeys={[form.forwardMode]}
+              variant="bordered"
+              onSelectionChange={(keys) => {
+                const selected = Array.from(keys)[0] as
+                  | NodeForm["forwardMode"]
+                  | undefined;
+
+                setForm((prev) => ({
+                  ...prev,
+                  forwardMode: selected || "agent",
+                }));
+              }}
+            >
+              <SelectItem key="agent" textValue="agent">
+                agent 模式
+              </SelectItem>
+              <SelectItem key="nftables" textValue="nftables">
+                nftables 模式
+              </SelectItem>
+            </Select>
+
+            {form.forwardMode === "nftables" ? (
+              <Alert
+                color="warning"
+                description="nftables 模式仅支持纯转发，不支持隧道、流量控制和 agent 安装，规则将由面板通过 SSH 下发。"
+                variant="flat"
+              />
+            ) : (
+              <Alert
+                color="primary"
+                description="agent 模式会继续使用节点 agent 执行转发与管理操作。"
+                variant="flat"
+              />
+            )}
+
+            {/* 高级配置 */}
+            <Accordion className="px-0" variant="light">
+              <AccordionItem
+                key="advanced"
+                aria-label="高级配置"
+                className="border-b-0 [&_[data-slot=accordion-trigger]]:no-underline [&_[data-slot=accordion-trigger]]:hover:no-underline"
+                title={
+                  <span className="text-small text-foreground font-medium">
+                    高级配置
+                  </span>
+                }
+              >
+                <div className="space-y-4 pb-2">
+                  {form.forwardMode === "nftables" ? (
+                    <div className="space-y-4 rounded-xl border border-warning-500/25 bg-warning-500/10 p-4">
+                      <div>
+                        <div className="text-sm font-medium text-warning-700">
+                          SSH 配置
+                        </div>
+                        <div className="text-xs font-semibold text-foreground">
+                          面板会通过 SSH 下发 nftables 规则，不会安装 agent。
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <Input
+                          errorMessage={errors.sshHost}
+                          isInvalid={!!errors.sshHost}
+                          label="SSH 主机"
+                          placeholder="例如: 192.0.2.10"
+                          value={form.sshHost}
+                          variant="bordered"
+                          onChange={(e) =>
+                            setForm((prev) => ({
+                              ...prev,
+                              sshHost: e.target.value,
+                            }))
+                          }
+                        />
+
+                        <Input
+                          errorMessage={errors.sshPort}
+                          isInvalid={!!errors.sshPort}
+                          label="SSH 端口"
+                          placeholder="22"
+                          value={form.sshPort}
+                          variant="bordered"
+                          onChange={(e) =>
+                            setForm((prev) => ({
+                              ...prev,
+                              sshPort: e.target.value,
+                            }))
+                          }
+                        />
+                      </div>
+
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <Input
+                          errorMessage={errors.sshUsername}
+                          isInvalid={!!errors.sshUsername}
+                          label="SSH 用户名"
+                          placeholder="例如: root"
+                          value={form.sshUsername}
+                          variant="bordered"
+                          onChange={(e) =>
+                            setForm((prev) => ({
+                              ...prev,
+                              sshUsername: e.target.value,
+                            }))
+                          }
+                        />
+
+                        <Select
+                          label="SSH 认证方式"
+                          selectedKeys={[form.sshAuthType]}
+                          variant="bordered"
+                          onSelectionChange={(keys) => {
+                            const selected = Array.from(keys)[0] as
+                              | "password"
+                              | "private_key"
+                              | undefined;
+
+                            setForm((prev) => ({
+                              ...prev,
+                              sshAuthType: selected || "private_key",
+                            }));
+                          }}
+                        >
+                          <SelectItem key="private_key" textValue="private_key">
+                            私钥
+                          </SelectItem>
+                          <SelectItem key="password" textValue="password">
+                            密码
+                          </SelectItem>
+                        </Select>
+                      </div>
+
+                      {form.sshAuthType === "password" ? (
+                        <Input
+                          errorMessage={errors.sshPassword}
+                          isInvalid={!!errors.sshPassword}
+                          label="SSH 密码"
+                          placeholder="请输入 SSH 密码"
+                          type="password"
+                          value={form.sshPassword}
+                          variant="bordered"
+                          onChange={(e) =>
+                            setForm((prev) => ({
+                              ...prev,
+                              sshPassword: e.target.value,
+                            }))
+                          }
+                        />
+                      ) : (
+                        <Textarea
+                          errorMessage={errors.sshPrivateKey}
+                          isInvalid={!!errors.sshPrivateKey}
+                          label="SSH 私钥"
+                          minRows={6}
+                          placeholder="粘贴 PEM 格式私钥内容"
+                          value={form.sshPrivateKey}
+                          variant="bordered"
+                          onChange={(e) =>
+                            setForm((prev) => ({
+                              ...prev,
+                              sshPrivateKey: e.target.value,
+                            }))
+                          }
+                        />
+                      )}
+
+                      <Input
+                        label="SSH 私钥密码短语"
+                        placeholder="可选"
+                        type="password"
+                        value={form.sshPassphrase}
+                        variant="bordered"
+                        onChange={(e) =>
+                          setForm((prev) => ({
+                            ...prev,
+                            sshPassphrase: e.target.value,
+                          }))
+                        }
+                      />
+
+                      <Select
+                        label="sudo 提权方式"
+                        selectedKeys={[form.sshSudoMode]}
+                        variant="bordered"
+                        onSelectionChange={(keys) => {
+                          const selected = Array.from(keys)[0] as
+                            | "none"
+                            | "sudo"
+                            | "sudo_su"
+                            | undefined;
+
+                          setForm((prev) => ({
+                            ...prev,
+                            sshSudoMode: selected || "none",
+                          }));
+                        }}
+                      >
+                        <SelectItem key="none" textValue="none">
+                          无需提权
+                        </SelectItem>
+                        <SelectItem key="sudo" textValue="sudo">
+                          sudo
+                        </SelectItem>
+                        <SelectItem key="sudo_su" textValue="sudo_su">
+                          sudo su
+                        </SelectItem>
+                      </Select>
+
+                      <div className="space-y-3 rounded-xl border border-default-200 p-3">
+                        <div className="text-sm font-medium text-foreground">
+                          SSH 主机密钥指纹
+                        </div>
+                        {pinnedFingerprint ? (
+                          <div className="space-y-1">
+                            <div className="text-xs font-semibold text-foreground">
+                              已钉入指纹（连接时按此校验，不符将被拒绝）
+                            </div>
+                            <code className="block break-all rounded-lg glass-inset px-2 py-1.5 font-mono text-xs font-semibold text-foreground">
+                              {pinnedFingerprint}
+                            </code>
+                            <p className="text-xs font-semibold text-foreground">
+                              请与在节点本机执行 ssh-keygen -lf
+                              /etc/ssh/ssh_host_ed25519_key.pub
+                              的输出核对一致；节点重装或更换主机密钥后，勾选下方「重置主机密钥」再测试连接重新钉入。
+                            </p>
+                          </div>
+                        ) : (
+                          <p className="text-xs font-semibold text-foreground">
+                            尚未钉入指纹：首次测试连接成功后，面板会把节点当前呈现的
+                            SSH
+                            主机密钥指纹钉入（首次信任），此后指纹不符的连接将被拒绝。
+                          </p>
+                        )}
+                        {form.id ? (
+                          <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+                            <Button
+                              isLoading={sshTesting}
+                              size="sm"
+                              variant="bordered"
+                              onPress={handleTestSsh}
+                            >
+                              测试连接
+                            </Button>
+                            <Checkbox
+                              isSelected={resetHostKey}
+                              size="sm"
+                              onValueChange={setResetHostKey}
+                            >
+                              重置主机密钥
+                            </Checkbox>
+                          </div>
+                        ) : (
+                          <p className="text-xs font-semibold text-foreground">
+                            保存节点后，可在此测试连接并钉入指纹。
+                          </p>
+                        )}
+                        <p className="text-xs font-semibold text-foreground">
+                          测试连接使用已保存的 SSH
+                          配置执行；修改上方主机/端口/凭据后请先保存节点，再回来测试。
+                        </p>
+                      </div>
+                    </div>
+                  ) : (
+                    <Alert
+                      color="primary"
+                      description="agent 模式下无需填写 SSH 配置；节点安装 agent 后会自行接管转发。"
+                      variant="flat"
+                    />
+                  )}
+
+                  <Input
+                    description="用于多IP服务器指定使用那个IP请求远程地址，不懂的默认为空就行"
+                    errorMessage={errors.interfaceName}
+                    isInvalid={!!errors.interfaceName}
+                    label="出口网卡名或IP"
+                    placeholder="请输入出口网卡名或IP"
+                    value={form.interfaceName}
+                    variant="bordered"
+                    onChange={(e) =>
+                      setForm((prev) => ({
+                        ...prev,
+                        interfaceName: e.target.value,
+                      }))
+                    }
+                  />
+
+                  <Input
+                    description="多IP服务器可填写额外IP地址，逗号分隔"
+                    label="额外IP地址"
+                    placeholder="例如: 192.168.1.100, 10.0.0.5"
+                    value={form.extraIPs}
+                    variant="bordered"
+                    onChange={(e) =>
+                      setForm((prev) => ({
+                        ...prev,
+                        extraIPs: e.target.value,
+                      }))
+                    }
+                  />
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <Input
+                      errorMessage={errors.tcpListenAddr}
+                      isInvalid={!!errors.tcpListenAddr}
+                      label="TCP监听地址"
+                      placeholder="请输入TCP监听地址"
+                      startContent={
+                        <div className="pointer-events-none flex items-center">
+                          <span className="text-foreground text-small">
+                            TCP
+                          </span>
+                        </div>
+                      }
+                      value={form.tcpListenAddr}
+                      variant="bordered"
+                      onChange={(e) =>
+                        setForm((prev) => ({
+                          ...prev,
+                          tcpListenAddr: e.target.value,
+                        }))
+                      }
+                    />
+
+                    <Input
+                      errorMessage={errors.udpListenAddr}
+                      isInvalid={!!errors.udpListenAddr}
+                      label="UDP监听地址"
+                      placeholder="请输入UDP监听地址"
+                      startContent={
+                        <div className="pointer-events-none flex items-center">
+                          <span className="text-foreground text-small">
+                            UDP
+                          </span>
+                        </div>
+                      }
+                      value={form.udpListenAddr}
+                      variant="bordered"
+                      onChange={(e) =>
+                        setForm((prev) => ({
+                          ...prev,
+                          udpListenAddr: e.target.value,
+                        }))
+                      }
+                    />
+                  </div>
+
+                  <Input
+                    description="保险丝，默认关闭：填 0 表示永不因空闲拆除会话；填正整数（1–86400）表示一条会话在两个方向都完全没有流量满该秒数时才被 agent 拆除——任一方向有流量都不会拆。修改后在该节点的服务配置重新下发时生效"
+                    label="会话无进展拆除（秒）"
+                    max={86400}
+                    min={0}
+                    placeholder="0（关闭）"
+                    type="number"
+                    value={String(form.idleTimeoutSeconds)}
+                    variant="bordered"
+                    onChange={(e) =>
+                      setForm((prev) => ({
+                        ...prev,
+                        idleTimeoutSeconds: Math.max(
+                          0,
+                          Math.floor(Number(e.target.value) || 0),
+                        ),
+                      }))
+                    }
+                  />
+
+                  <Input
+                    description="僵尸会话根治（入口判死），默认关闭：填 0 表示不判死；填正整数（≥60，推荐 ≥900）表示仅当本节点的入口会话在客户端方向零字节满该秒数、且客户端腿数据无人签收（内核证明无读者）时才拆除。单纯静默不会被拆；在中途节点上填了不生效（判死只发生在客户端直连的入口面）"
+                    label="入口判死窗口（秒）"
+                    min={0}
+                    placeholder="0（关闭）"
+                    type="number"
+                    value={String(form.edgeIdleTimeoutSeconds)}
+                    variant="bordered"
+                    onChange={(e) =>
+                      setForm((prev) => ({
+                        ...prev,
+                        edgeIdleTimeoutSeconds: Math.max(
+                          0,
+                          Math.floor(Number(e.target.value) || 0),
+                        ),
+                      }))
+                    }
+                  />
+
+                  <Input
+                    description="僵尸会话根治（中途兜底），默认关闭：填 0 表示不兜底；填正整数（≥60，推荐 ≥3600）表示中途节点上的隧道段会话在源头方向沉默满该秒数、且服务器方向仅以低于下方滴流上限的速率滴流时才拆除。下载/流媒体等持续流量速率远高于滴流，不受影响"
+                    label="中途兜底窗口（秒）"
+                    min={0}
+                    placeholder="0（关闭）"
+                    type="number"
+                    value={String(form.backstopIdleTimeoutSeconds)}
+                    variant="bordered"
+                    onChange={(e) =>
+                      setForm((prev) => ({
+                        ...prev,
+                        backstopIdleTimeoutSeconds: Math.max(
+                          0,
+                          Math.floor(Number(e.target.value) || 0),
+                        ),
+                      }))
+                    }
+                  />
+
+                  <Input
+                    description="配合中途兜底窗口：服务器方向速率低于此值才算「滴流」。填 0 表示用 agent 内置默认 256 字节/秒；可填 1–1000000。调大更激进（可能误伤低速真实流），调小更保守"
+                    label="兜底滴流上限（字节/秒）"
+                    max={1000000}
+                    min={0}
+                    placeholder="0（默认 256）"
+                    type="number"
+                    value={String(form.backstopTrickleBps)}
+                    variant="bordered"
+                    onChange={(e) =>
+                      setForm((prev) => ({
+                        ...prev,
+                        backstopTrickleBps: Math.max(
+                          0,
+                          Math.floor(Number(e.target.value) || 0),
+                        ),
+                      }))
+                    }
+                  />
+                  {/* 屏蔽协议 */}
+                  <div>
+                    <div className="text-sm font-medium text-default-800 mb-2">
+                      屏蔽协议
+                    </div>
+                    <div className="text-xs font-semibold text-foreground mb-2">
+                      开启开关以屏蔽对应协议
+                    </div>
+                    {protocolControlsDisabled && (
+                      <Alert
+                        className="mb-2"
+                        color="warning"
+                        description={protocolControlsReason}
+                        variant="flat"
+                      />
+                    )}
+                    <div
+                      className={`grid grid-cols-1 sm:grid-cols-3 gap-3 p-3 rounded-md border border-divider ${protocolControlsDisabled ? "opacity-70" : ""}`}
+                    >
+                      {/* HTTP tile */}
+                      <div className="px-3 py-3 rounded-lg glass-inset border border-divider hover:border-primary-200 transition-colors">
+                        <div className="flex items-center gap-2 mb-2">
+                          <svg
+                            aria-hidden="true"
+                            className="w-4 h-4 text-foreground"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            strokeWidth="2"
+                            viewBox="0 0 24 24"
+                          >
+                            <rect height="16" rx="2" width="20" x="2" y="4" />
+                            <path d="M2 10h20" />
+                          </svg>
+                          <div className="text-sm font-medium text-default-800">
+                            HTTP
+                          </div>
+                        </div>
+                        <div className="flex items-center justify-between">
+                          <div className="text-xs font-semibold text-foreground">
+                            禁用/启用
+                          </div>
+                          <Switch
+                            isDisabled={protocolControlsDisabled}
+                            isSelected={form.http === 1}
+                            size="sm"
+                            onValueChange={(v) =>
+                              setForm((prev) => ({
+                                ...prev,
+                                http: v ? 1 : 0,
+                              }))
+                            }
+                          />
+                        </div>
+                        <div className="mt-1 text-xs font-semibold text-foreground">
+                          {form.http === 1 ? "已开启" : "已关闭"}
+                        </div>
+                      </div>
+
+                      {/* TLS tile */}
+                      <div className="px-3 py-3 rounded-lg glass-inset border border-divider hover:border-primary-200 transition-colors">
+                        <div className="flex items-center gap-2 mb-2">
+                          <svg
+                            aria-hidden="true"
+                            className="w-4 h-4 text-foreground"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            strokeWidth="2"
+                            viewBox="0 0 24 24"
+                          >
+                            <path d="M6 10V7a6 6 0 1 1 12 0v3" />
+                            <rect height="10" rx="2" width="16" x="4" y="10" />
+                          </svg>
+                          <div className="text-sm font-medium text-default-800">
+                            TLS
+                          </div>
+                        </div>
+                        <div className="flex items-center justify-between">
+                          <div className="text-xs font-semibold text-foreground">
+                            禁用/启用
+                          </div>
+                          <Switch
+                            isDisabled={protocolControlsDisabled}
+                            isSelected={form.tls === 1}
+                            size="sm"
+                            onValueChange={(v) =>
+                              setForm((prev) => ({ ...prev, tls: v ? 1 : 0 }))
+                            }
+                          />
+                        </div>
+                        <div className="mt-1 text-xs font-semibold text-foreground">
+                          {form.tls === 1 ? "已开启" : "已关闭"}
+                        </div>
+                      </div>
+
+                      {/* SOCKS tile */}
+                      <div className="px-3 py-3 rounded-lg glass-inset border border-divider hover:border-primary-200 transition-colors">
+                        <div className="flex items-center gap-2 mb-2">
+                          <svg
+                            aria-hidden="true"
+                            className="w-4 h-4 text-foreground"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            strokeWidth="2"
+                            viewBox="0 0 24 24"
+                          >
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                            <polyline points="7 10 12 15 17 10" />
+                            <line x1="12" x2="12" y1="15" y2="3" />
+                          </svg>
+                          <div className="text-sm font-medium text-default-800">
+                            SOCKS
+                          </div>
+                        </div>
+                        <div className="flex items-center justify-between">
+                          <div className="text-xs font-semibold text-foreground">
+                            禁用/启用
+                          </div>
+                          <Switch
+                            isDisabled={protocolControlsDisabled}
+                            isSelected={form.socks === 1}
+                            size="sm"
+                            onValueChange={(v) =>
+                              setForm((prev) => ({
+                                ...prev,
+                                socks: v ? 1 : 0,
+                              }))
+                            }
+                          />
+                        </div>
+                        <div className="mt-1 text-xs font-semibold text-foreground">
+                          {form.socks === 1 ? "已开启" : "已关闭"}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <Alert
+                    color="danger"
+                    description="请不要在出口节点执行屏蔽协议，否则可能影响转发；屏蔽协议仅需在入口节点执行。"
+                    variant="flat"
+                  />
+                </div>
+              </AccordionItem>
+            </Accordion>
+
+            <Alert
+              className="mt-4"
+              color="primary"
+              description="节点ip地址是你要添加的入口/出口的ip地址，不是面板的ip地址。"
+              variant="flat"
+            />
+          </div>
+        </ModalBody>
+        <ModalFooter>
+          <Button variant="flat" onPress={() => setDialogVisible(false)}>
+            取消
+          </Button>
+          <Button
+            color="primary"
+            isLoading={submitLoading}
+            onPress={handleSubmit}
+          >
+            {submitLoading ? "提交中..." : "确定"}
+          </Button>
+        </ModalFooter>
+      </ModalContent>
+    </Modal>
+  );
+}

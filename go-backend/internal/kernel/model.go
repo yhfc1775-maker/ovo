@@ -1,0 +1,974 @@
+package kernel
+
+import (
+	"crypto/tls"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"net/url"
+	"regexp"
+	"strconv"
+	"strings"
+)
+
+type Settings struct {
+	UUID     string `json:"uuid,omitempty"`
+	Username string `json:"username,omitempty"` // NaïveProxy
+	Flow     string `json:"flow,omitempty"`
+	Password string `json:"password,omitempty"`
+	Method   string `json:"method,omitempty"`
+
+	// Masquerade is the site Hysteria2 serves to non-clients (optional URL).
+	Masquerade string `json:"masquerade,omitempty"`
+	// PortHopping is a UDP range ("20000-30000") the agent redirects to the
+	// Hysteria2 port so clients can hop between ports.
+	PortHopping string `json:"portHopping,omitempty"`
+
+	// VLESS 加密（mlkem768x25519plus）：EncryptionAuth 为空表示禁用，
+	// 取 x25519（服务端存 X25519 私钥）或 mlkem768（服务端存 ML-KEM seed）；
+	// EncryptionSecret 是服务端认证秘密，客户端 encryption 串由它单向派生，不另存。
+	EncryptionAuth   string `json:"encryptionAuth,omitempty"`
+	EncryptionMode   string `json:"encryptionMode,omitempty"`
+	EncryptionSecret string `json:"encryptionSecret,omitempty"`
+}
+
+// HopRange returns the port-hopping range, or 0, 0 when disabled.
+func (in Inbound) HopRange() (int, int) {
+	lo, hi, err := parseHopRange(in.Settings.PortHopping)
+	if err != nil {
+		return 0, 0
+	}
+	return lo, hi
+}
+
+func parseHopRange(spec string) (int, int, error) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return 0, 0, nil
+	}
+	parts := strings.Split(strings.ReplaceAll(spec, ":", "-"), "-")
+	if len(parts) != 2 {
+		return 0, 0, errors.New("端口跳跃格式应为 起始-结束，例如 20000-30000")
+	}
+	lo, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
+	hi, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err1 != nil || err2 != nil || lo < 1024 || hi > 65535 || lo >= hi {
+		return 0, 0, errors.New("端口跳跃范围需在 1024-65535 之间，且起始小于结束")
+	}
+	return lo, hi, nil
+}
+
+type Transport struct {
+	Type        string `json:"type"`
+	Path        string `json:"path,omitempty"`
+	Host        string `json:"host,omitempty"`
+	ServiceName string `json:"serviceName,omitempty"`
+	Mode        string `json:"mode,omitempty"`
+}
+
+type Security struct {
+	Type        string   `json:"type"`
+	SNI         string   `json:"sni,omitempty"`
+	ALPN        []string `json:"alpn,omitempty"`
+	Fingerprint string   `json:"fingerprint,omitempty"`
+
+	// TLS: "self" stores a generated certificate inline, "file" points at
+	// paths that already exist on the node, "acme" lets sing-box obtain a
+	// certificate for SNI (HTTP-01 / TLS-ALPN-01, or DNS-01 when configured).
+	CertMode string `json:"certMode,omitempty"`
+	CertPEM  string `json:"certPem,omitempty"`
+	KeyPEM   string `json:"keyPem,omitempty"`
+	CertFile string `json:"certFile,omitempty"`
+	KeyFile  string `json:"keyFile,omitempty"`
+
+	ACMEEmail string `json:"acmeEmail,omitempty"`
+	// ACMEDNS selects DNS-01 ("cloudflare" / "alidns"); empty uses HTTP-01,
+	// which needs TCP port 80 on the node reachable from the internet.
+	ACMEDNS string `json:"acmeDns,omitempty"`
+	// Cloudflare: API token. AliDNS: AccessKey ID.
+	ACMEDNSKey string `json:"acmeDnsKey,omitempty"`
+	// AliDNS: AccessKey secret.
+	ACMEDNSSecret string `json:"acmeDnsSecret,omitempty"`
+
+	RealityDest       string   `json:"realityDest,omitempty"`
+	RealityPrivateKey string   `json:"realityPrivateKey,omitempty"`
+	RealityPublicKey  string   `json:"realityPublicKey,omitempty"`
+	RealityShortIDs   []string `json:"realityShortIds,omitempty"`
+	// RealityMinClientVer is the oldest client Xray accepts. Xray 26.7.11+
+	// defaults to 26.3.27 when unset, which locks out Mihomo/Clash (they
+	// report 1.8.2) and older mobile clients, so the panel always sets it.
+	RealityMinClientVer string `json:"realityMinClientVer,omitempty"`
+
+	// ShadowTLS v3: SNI is the handshake site, this is the shared secret.
+	ShadowTLSPassword string `json:"shadowTlsPassword,omitempty"`
+}
+
+// Inbound is the kernel-independent description of one listening service.
+type Inbound struct {
+	ID       int64  `json:"id"`
+	Protocol string `json:"protocol"`
+	Listen   string `json:"listen"`
+	// OutboundIPStrategy scopes this inbound's outbound connections to an
+	// IP family ("" / "auto" = no restriction; see egress.go).
+	OutboundIPStrategy string          `json:"outboundIpStrategy,omitempty"`
+	Port               int             `json:"port"`
+	Settings           Settings        `json:"settings"`
+	Transport          Transport       `json:"transport"`
+	Security           Security        `json:"security"`
+	Extra              json.RawMessage `json:"extra,omitempty"`
+	// AcceptProxyProtocol makes the inbound require a PROXY protocol header
+	// (sent by relay forwards) so the kernel sees the real client address.
+	AcceptProxyProtocol bool `json:"acceptProxyProtocol,omitempty"`
+	// ConnIdleSeconds is the per-inbound idle timeout (seconds) for Xray
+	// (policy.levels[].connIdle). 0 = unset/clear: no policy segment is
+	// emitted and Xray's level-0 default (300s, see
+	// DefaultConnIdleSeconds) applies. 0 is accepted at Normalize (and
+	// by the frontend as "clear"); it is only ever *rendered* as
+	// "no segment", never written as an explicit 0 — Xray's official
+	// policy doc gives no semantics for an explicit 0.
+	// -1 = unlimited (UnlimitedConnIdleSentinel): rendered as
+	// UnlimitedConnIdleSeconds (31536000 = 365d); with Xray's (N, 2N]
+	// window the session then closes only after 1–2 years idle, which
+	// is "never" for any real deployment (panel upgrades and node
+	// restarts end sessions sooner). Range is -1, 0..MaxConnIdleSeconds;
+	// Xray itself documents no upper bound (int seconds), the panel
+	// caps at 86400 (24h) so a typo cannot pin dead connections for
+	// days.
+	// Non-Xray kernels have no equivalent and are refused at Normalize.
+	ConnIdleSeconds int `json:"connIdleSeconds,omitempty"`
+	// InplaceUsers is the per-inbound in-place multi-user switch for
+	// Shadowsocks (default off). On: the origin inbound itself carries
+	// its subscriptions as per-user credentials — the top-level password
+	// stays the station identity PSK (iPSK) and each subscription gets
+	// its own user credential (2022: the wire password is iPSK:uPSK and
+	// the client list carries the uPSK; legacy AEAD: the subscription
+	// password verbatim). Enabling it hard-invalidates the old
+	// shared-password links (both kernels reject the bare station key
+	// once users are configured), so subscription links must switch to
+	// the per-user form at the same time. Off: the old single-password
+	// behaviour, unchanged. Set on a non-SS inbound it is rejected at
+	// Normalize (and at the apply-time re-check).
+	InplaceUsers bool `json:"inplaceUsers,omitempty"`
+	// Users are extra clients (subscription users) rendered next to the
+	// inbound's own credentials. Filled in when building a kernel config.
+	Users []User `json:"-"`
+	// Companion marks an SS metering companion inbound: a derived
+	// listener that carries its origin inbound's share subscriptions as
+	// Shadowsocks 2022 multi-user clients so their traffic can be counted
+	// per subscription. Render-time only, filled from the row marker
+	// (NodeInbound.CompanionOf) when building a kernel config.
+	Companion bool `json:"-"`
+	// Via is the proxy the inbound's traffic leaves through (a chained
+	// outbound); nil leaves from the node itself. A Via without a host (its
+	// target was deleted) drops the traffic. Filled in when building a
+	// kernel config.
+	Via *Endpoint `json:"-"`
+	// Split are the inbound's 分流 rules, tried before its default exit;
+	// targets resolved. Filled in when building a kernel config.
+	Split []SplitRule `json:"-"`
+	// UserMarkBase is the socket-mark base this render mints user marks
+	// with (F2-DBL-01: per-agent base, so co-located agents count only
+	// their own kernels' traffic). Set by RenderWith from
+	// RenderOptions.UserMarkBase; 0 means the legacy host-global base.
+	// Render-time only, never persisted.
+	UserMarkBase int64 `json:"-"`
+}
+
+// userMark is this inbound's socket mark for a user (0 when the id does
+// not fit the mark layout).
+func (in Inbound) userMark(id int64) int64 {
+	return UserMarkForAgent(in.UserMarkBase, id)
+}
+
+func (in Inbound) Tag() string {
+	return fmt.Sprintf("in-%d", in.ID)
+}
+
+// Network reports which L4 protocols the inbound listens on, used for nft
+// traffic counters.
+func (in Inbound) Network() string {
+	switch in.Protocol {
+	case ProtocolHysteria2, ProtocolTUIC:
+		return "udp"
+	case ProtocolShadowsocks:
+		if in.Security.Type == SecurityShadowTLS {
+			return "tcp"
+		}
+		return "tcp,udp"
+	case ProtocolNaive:
+		// HTTP/2 over TCP, plus HTTP/3 for clients that enable QUIC.
+		return "tcp,udp"
+	}
+	return "tcp"
+}
+
+const (
+	FlowVision                 = "xtls-rprx-vision"
+	DefaultRealitySNI          = "www.amd.com"
+	DefaultSSMethod            = "2022-blake3-aes-128-gcm"
+	DefaultFingerprint         = "chrome"
+	DefaultTLSCertMode         = CertModeSelf
+	CertModeSelf               = "self"
+	CertModeFile               = "file"
+	CertModeACME               = "acme"
+	ACMEDNSCloudflare          = "cloudflare"
+	ACMEDNSAliDNS              = "alidns"
+	DefaultQUICSNI             = "www.bing.com"
+	DefaultRealityMinClientVer = "1.0.0"
+	// DefaultConnIdleSeconds is Xray's level-0 connIdle default (official
+	// policy doc: "connIdle: Connection idle time limit. Unit is seconds.
+	// Default value is 300"). The panel never writes it explicitly: an
+	// unset field means "Xray default", not "300 written by us".
+	DefaultConnIdleSeconds = 300
+	// MaxConnIdleSeconds is the panel-side cap for the per-inbound idle
+	// timeout. Xray documents no upper bound; 86400 (24h) is the guard
+	// against a mistyped huge value holding dead connections.
+	MaxConnIdleSeconds = 86400
+	// UnlimitedConnIdleSentinel is the stored value meaning "no idle
+	// timeout" (-1). It renders as UnlimitedConnIdleSeconds below.
+	UnlimitedConnIdleSentinel = -1
+	// UnlimitedConnIdleSeconds is the rendered connIdle for an
+	// unlimited inbound: 31536000 seconds (365 days). Xray's idle
+	// close window is (N, 2N], so a session closes only after 1–2
+	// years idle — equivalent to never disconnecting for idle. A
+	// larger value is pointless (panel upgrades and node restarts end
+	// sessions sooner) and unsafe: 2N must stay far from the int32
+	// ceiling (2^31) the value is stored and compared against.
+	UnlimitedConnIdleSeconds = 31536000
+	// maxConnIdleLevel is the highest policy level the panel allocates.
+	// Levels are 1..N per render; the binding constraint is Xray's SS
+	// server config, whose level field is a byte (0-255).
+	maxConnIdleLevel    = 255
+	defaultGRPCService  = "grpc"
+	defaultXHTTPMode    = "auto"
+	maxExtraConfigBytes = 64 * 1024
+)
+
+var ssMethods = []string{
+	"2022-blake3-aes-128-gcm",
+	"2022-blake3-aes-256-gcm",
+	"2022-blake3-chacha20-poly1305",
+	"aes-128-gcm",
+	"aes-256-gcm",
+	"chacha20-ietf-poly1305",
+}
+
+var (
+	shortIDPattern = regexp.MustCompile(`^[0-9a-f]{0,16}$`)
+	hostPattern    = regexp.MustCompile(`^[A-Za-z0-9.-]+$`)
+)
+
+// HasEmptyLabel reports whether host contains an empty DNS label
+// (leading, trailing, or consecutive dots). T-01: `a..b` matches
+// hostPattern yet can never resolve (a DNS zone cannot hold an empty
+// label), so it must be rejected wherever a hostname is validated —
+// the import host, the transport Host, and the SNI. Empty string is
+// not an empty label here; callers handle emptiness separately.
+func HasEmptyLabel(host string) bool {
+	if host == "" {
+		return false
+	}
+	for _, seg := range strings.Split(host, ".") {
+		if seg == "" {
+			return true
+		}
+	}
+	return false
+}
+
+// IsSSMethod reports whether method is a Shadowsocks cipher the panel
+// offers (2022 or legacy AEAD, case-insensitive like SS2022KeyLen).
+func IsSSMethod(method string) bool {
+	for _, m := range ssMethods {
+		if strings.EqualFold(strings.TrimSpace(method), m) {
+			return true
+		}
+	}
+	return false
+}
+func SSMethods() []string {
+	out := make([]string, len(ssMethods))
+	copy(out, ssMethods)
+	return out
+}
+
+// Normalize validates an inbound against a kernel's capabilities, fills
+// defaults and generates any missing credentials. It mutates in place so the
+// caller persists exactly what will be rendered.
+func Normalize(kernelType string, in *Inbound) error {
+	if in == nil {
+		return errors.New("入站不能为空")
+	}
+	info, ok := Lookup(kernelType)
+	if !ok || !info.Implemented {
+		return fmt.Errorf("暂不支持内核 %s", kernelType)
+	}
+	strategy, err := NormalizeOutboundIPStrategy(kernelType, in.OutboundIPStrategy)
+	if err != nil {
+		return err
+	}
+	in.OutboundIPStrategy = strategy
+
+	in.Protocol = strings.ToLower(strings.TrimSpace(in.Protocol))
+	proto, ok := info.protocol(in.Protocol)
+	if !ok {
+		return fmt.Errorf("%s 不支持协议 %s", info.Name, in.Protocol)
+	}
+
+	in.Transport.Type = strings.ToLower(strings.TrimSpace(in.Transport.Type))
+	if in.Transport.Type == "" {
+		// W3/P-001：缺省传输不得恒填 tcp——quic-only 协议（Hysteria2 /
+		// TUIC 的能力格只有 quic）没有 tcp，恒填后只会得到「协议不
+		// 支持传输方式 tcp」的误导报错。有 tcp 仍用 tcp（既有缺省
+		// 不变），没有则用该协议的首个传输（quic-only 协议即其唯一
+		// 传输）。前端预设恒带 quic、UI 不可达，受损面仅 API 直调。
+		in.Transport.Type = TransportTCP
+		if _, ok := proto.transport(TransportTCP); !ok && len(proto.Transports) > 0 {
+			in.Transport.Type = proto.Transports[0].Type
+		}
+	}
+	tcap, ok := proto.transport(in.Transport.Type)
+	if !ok {
+		return fmt.Errorf("%s 协议不支持传输方式 %s", in.Protocol, in.Transport.Type)
+	}
+
+	in.Security.Type = strings.ToLower(strings.TrimSpace(in.Security.Type))
+	if in.Security.Type == "" {
+		in.Security.Type = tcap.Securities[0]
+	}
+	if !containsString(tcap.Securities, in.Security.Type) {
+		return fmt.Errorf("%s + %s 不支持安全层 %s", in.Protocol, in.Transport.Type, in.Security.Type)
+	}
+
+	if in.Port < 1 || in.Port > 65535 {
+		return errors.New("端口必须在 1-65535 之间")
+	}
+	in.Listen = strings.TrimSpace(in.Listen)
+	if in.Listen == "" {
+		in.Listen = "::"
+	}
+	if net.ParseIP(in.Listen) == nil {
+		return errors.New("监听地址必须是 IP")
+	}
+	if err := checkAcceptProxyKernel(kernelType, in); err != nil {
+		return err
+	}
+	if err := checkConnIdleKernel(kernelType, in.ConnIdleSeconds); err != nil {
+		return err
+	}
+	if err := checkInplaceUsersProtocol(in); err != nil {
+		return err
+	}
+
+	if err := normalizeExtra(kernelType, in); err != nil {
+		return err
+	}
+	if err := normalizeTransport(&in.Transport); err != nil {
+		return err
+	}
+	if err := normalizeSettings(in); err != nil {
+		return err
+	}
+	if err := normalizeSecurity(in); err != nil {
+		return err
+	}
+	if in.Security.CertMode == CertModeACME && kernelType != TypeSingbox {
+		return errors.New("自动申请证书（ACME）目前只支持 sing-box 内核")
+	}
+	if err := checkEncryptionKernel(kernelType, in); err != nil {
+		return err
+	}
+	if in.Protocol == ProtocolNaive && in.Security.CertMode == CertModeSelf {
+		// Naive clients verify certificates and self-signed ones are
+		// trivially fingerprinted, which defeats NaïveProxy.
+		return errors.New("NaïveProxy 需要真实证书：请选择自动申请证书或节点上的证书文件")
+	}
+	return nil
+}
+
+// --- Settings 级条件谓词：创建面 Normalize 与下发复检共用单一真源 ---
+
+// checkConnIdleKernel 是空闲超时的合法性谓词：取值范围（-1 不限 /
+// 0 默认 / 1-86400）与内核归属（非 0 值仅 Xray 支持，其他内核没有
+// Xray 式的空闲超时；文案按中性表述，不以某一内核的机理为主语）
+// 同点判定。范围格必须住在本谓词内、不得只留在 Normalize 本体——
+// 创建面 Normalize 与下发复检 CheckSettingsConditions 共用本谓词，
+// 范围格缺位时直写 DB 的越界存量值（999999、-5）会在下发面逐字
+// 渲染进 Xray policy（RR4-F2-02）。
+func checkConnIdleKernel(kernelType string, seconds int) error {
+	if seconds < UnlimitedConnIdleSentinel || seconds > MaxConnIdleSeconds {
+		return fmt.Errorf("空闲超时须为 -1（不限）或 0（默认 %d 秒）或 1-%d 秒的整数", DefaultConnIdleSeconds, MaxConnIdleSeconds)
+	}
+	if seconds != 0 && kernelType != TypeXray {
+		return errors.New("空闲超时（connIdle）仅支持 Xray 内核：其他内核没有 Xray 式的空闲超时，请先切到 Xray 内核")
+	}
+	return nil
+}
+
+// checkAcceptProxyKernel 是 PROXY protocol 接收（AcceptProxyProtocol）
+// 的内核条件谓词：仅 Xray 支持。与其余 Settings 级谓词同形——创建面
+// Normalize 与下发复检 CheckSettingsConditions 共用本谓词一处真源
+// （W3/T-003：此前该格只住在 Normalize 本体，下发复检未覆盖，
+// AcceptProxyProtocol=1 的非 Xray 存量毒行可一路渲染到 sing-box
+// （其 PROXY 接收是全局开关、粒度粗于 Xray 的 per-inbound 字段）
+// 或被 gost 静默忽略，属「创建面拒、下发面放」的谓词覆盖缺口）。
+func checkAcceptProxyKernel(kernelType string, in *Inbound) error {
+	if in.AcceptProxyProtocol && kernelType != TypeXray {
+		return errors.New("获取真实 IP（PROXY protocol）目前只支持 Xray 内核")
+	}
+	return nil
+}
+
+// checkInplaceUsersProtocol is the protocol condition for the in-place
+// multi-user switch: Shadowsocks only. Shared by Normalize and
+// CheckSettingsConditions (same shape as checkConnIdleKernel) so a
+// stored row that somehow carries the switch on another protocol is
+// refused at apply time too, not just at save time.
+func checkInplaceUsersProtocol(in *Inbound) error {
+	if in.InplaceUsers && in.Protocol != ProtocolShadowsocks {
+		return errors.New("原地多用户（inplaceUsers）仅支持 Shadowsocks 入站")
+	}
+	return nil
+}
+
+// checkEncryptionKernel 是 VLESS 加密（ENC）的内核/协议条件：仅 Xray + VLESS。
+func checkEncryptionKernel(kernelType string, in *Inbound) error {
+	if in.Settings.EncryptionEnabled() && (kernelType != TypeXray || in.Protocol != ProtocolVLESS) {
+		return errors.New("VLESS 加密仅支持 Xray 内核的 VLESS 入站")
+	}
+	return nil
+}
+
+// flowConditionError 是 flow（Vision）的组合条件。调用方保证协议为
+// VLESS/VMess 且 Flow 非空（其余协议的 flow 由 normalizeSettings 各分支
+// 清零、不进入本谓词）。
+func flowConditionError(in *Inbound) error {
+	s := &in.Settings
+	if in.Protocol == ProtocolVMess {
+		return errors.New("VMess 不支持 flow（xtls-rprx-vision 仅 VLESS 可用），请清空 flow")
+	}
+	if s.Flow != FlowVision {
+		return fmt.Errorf("不支持的 VLESS flow %s（仅 xtls-rprx-vision 或留空）", s.Flow)
+	}
+	visionOK := in.Transport.Type == TransportTCP && (in.Security.Type != SecurityNone || s.EncryptionEnabled())
+	if !visionOK {
+		return fmt.Errorf("xtls-rprx-vision（Vision 流控）仅支持 VLESS + TCP 传输 + TLS/Reality 安全层（或开启 VLESS 加密），当前为 %s 传输 + %s 安全层且未开启 VLESS 加密：请改用 TCP + TLS/Reality、开启 VLESS 加密，或关闭 Vision 流控", in.Transport.Type, in.Security.Type)
+	}
+	return nil
+}
+
+// CheckSettingsConditions 只读复检入站的 Settings 级条件字段（ENC×内核、
+// ConnIdle×内核、Vision×组合、AcceptProxy×内核、原地多用户×协议），谓词即上方各 helper、
+// 与创建面 Normalize 同源单点。下发面逐入站调用：创建面与备份恢复面均经
+// Normalize 封口，存量毒行不得再经渲染面静默降级或带病下发
+// （R4-C2C-02）。返回首个不成立条件的拒绝原因。
+func CheckSettingsConditions(kernelType string, in *Inbound) error {
+	if err := checkAcceptProxyKernel(kernelType, in); err != nil {
+		return err
+	}
+	if err := checkConnIdleKernel(kernelType, in.ConnIdleSeconds); err != nil {
+		return err
+	}
+	if err := checkInplaceUsersProtocol(in); err != nil {
+		return err
+	}
+	if err := checkEncryptionKernel(kernelType, in); err != nil {
+		return err
+	}
+	if (in.Protocol == ProtocolVLESS || in.Protocol == ProtocolVMess) && in.Settings.Flow != "" {
+		return flowConditionError(in)
+	}
+	return nil
+}
+
+func normalizeExtra(kernelType string, in *Inbound) error {
+	raw := strings.TrimSpace(string(in.Extra))
+	if raw == "" || raw == "null" || raw == "{}" {
+		in.Extra = nil
+		return nil
+	}
+	if len(raw) > maxExtraConfigBytes {
+		return errors.New("高级配置过大")
+	}
+	var obj map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &obj); err != nil {
+		return errors.New("高级配置必须是 JSON 对象")
+	}
+	// F-022: 受保护键在保存期就拒绝，不要等到下发渲染才暴露。
+	if err := validateExtraProtectedKeys(obj); err != nil {
+		return err
+	}
+	if err := validateExtraManagedProxyContainer(obj, in.AcceptProxyProtocol); err != nil {
+		return err
+	}
+	in.Extra = json.RawMessage(raw)
+	// S4: 指定出站 IP 策略时 Extra 不得覆盖 tag/detour（会绕过策略作用域）。
+	return ValidateOutboundIPExtra(kernelType, in.OutboundIPStrategy, in.Extra)
+}
+
+func normalizeTransport(t *Transport) error {
+	t.Path = strings.TrimSpace(t.Path)
+	t.Host = strings.TrimSpace(t.Host)
+	t.ServiceName = strings.TrimSpace(t.ServiceName)
+	t.Mode = strings.TrimSpace(t.Mode)
+	if t.Host != "" && (!hostPattern.MatchString(t.Host) || HasEmptyLabel(t.Host)) {
+		// F-LIVE-01：错误附引坏值原文——备份恢复入站段汇总 warning
+		// 只点名行号/错误、不含坏值，与其余恢复面披露口径不一致。
+		return fmt.Errorf("Host 格式错误：%q", t.Host)
+	}
+	switch t.Type {
+	case TransportTCP, TransportQUIC:
+		t.Path, t.Host, t.ServiceName, t.Mode = "", "", "", ""
+	case TransportWS, TransportXHTTP:
+		if t.Path == "" {
+			t.Path = "/" + RealityShortID()[:8]
+		}
+		if !strings.HasPrefix(t.Path, "/") {
+			t.Path = "/" + t.Path
+		}
+		t.ServiceName = ""
+		if t.Type == TransportWS {
+			t.Mode = ""
+		} else if t.Mode == "" {
+			t.Mode = defaultXHTTPMode
+		} else {
+			// R11X-001（R10X-002 的自建载体邻格）：XHTTP Mode 此前
+			// 仅 TrimSpace——API 直写与备份恢复的大小写变体/集外值
+			// 原样落库，逐字进自建 Clash 面、ShareURI 与 Xray 内
+			// 核/链式配置，毒化整表/整单。与指纹格同形处置、与进
+			// 口面同一合法集（ValidXHTTPMode）：小写愈合落库、集
+			// 外拒绝。空值补 auto 的既有顺序与默认不变（前支）。
+			t.Mode = strings.ToLower(t.Mode)
+			if !ValidXHTTPMode(t.Mode) {
+				return errors.New("xhttp mode 不受支持（仅 auto / packet-up / stream-up / stream-one）")
+			}
+		}
+	case TransportGRPC:
+		if t.ServiceName == "" {
+			t.ServiceName = defaultGRPCService
+		}
+		t.Path, t.Mode = "", ""
+	}
+	return nil
+}
+
+func normalizeSettings(in *Inbound) error {
+	s := &in.Settings
+	s.UUID = strings.TrimSpace(s.UUID)
+	s.Password = strings.TrimSpace(s.Password)
+	s.Method = strings.TrimSpace(s.Method)
+	s.Flow = strings.TrimSpace(s.Flow)
+	s.EncryptionAuth = strings.TrimSpace(s.EncryptionAuth)
+	s.EncryptionMode = strings.TrimSpace(s.EncryptionMode)
+	if s.EncryptionEnabled() {
+		if s.EncryptionAuth != EncryptionAuthX25519 && s.EncryptionAuth != EncryptionAuthMLKEM {
+			return fmt.Errorf("不支持的 VLESS 加密认证方式 %s", s.EncryptionAuth)
+		}
+		switch s.EncryptionMode {
+		case "", EncryptionModeNative, EncryptionModeXorpub, EncryptionModeRandom:
+		default:
+			return fmt.Errorf("不支持的 VLESS 加密外观模式 %s", s.EncryptionMode)
+		}
+		if s.EncryptionMode == "" {
+			s.EncryptionMode = EncryptionModeNative
+		}
+		if s.EncryptionSecret == "" {
+			secret, err := GenerateEncryptionSecret(s.EncryptionAuth)
+			if err != nil {
+				return err
+			}
+			s.EncryptionSecret = secret
+		} else if err := ValidateEncryptionSecret(s.EncryptionAuth, s.EncryptionSecret); err != nil {
+			return err
+		}
+	} else {
+		s.EncryptionMode, s.EncryptionSecret = "", ""
+	}
+	if in.Protocol != ProtocolNaive {
+		s.Username = ""
+	}
+
+	switch in.Protocol {
+	case ProtocolVLESS, ProtocolVMess:
+		if s.UUID == "" {
+			s.UUID = NewUUID()
+		}
+		if !uuidPattern.MatchString(strings.ToLower(s.UUID)) {
+			return errors.New("UUID 格式错误")
+		}
+		s.Password, s.Method = "", ""
+		if s.Flow != "" {
+			// F-L3-01: flow 是 VLESS/VMess 本协议族的自身特性，不是异协议
+			// 外来字段（那些在各协议分支随 UUID/Method 一并清零属字段
+			// 卫生）。此前 flow 在组合不成立时被静默清零，与本函数其他
+			// 非法值（XHTTP mode、fingerprint、SS method 等）显式拒绝
+			// 并点名的口径不一致，也与「不匹配直接拒绝＋明确提示」的
+			// 产品口径相悖：API 直调 VLESS+WS+flow 保存成功但 Vision
+			// 不生效、编辑既有 Vision 入站改传输后 Vision 无声丢失。
+			// 改为三种情形全部显式拒绝：VMess 携带 flow、flow 取值
+			// 非法、VLESS Vision 组合不成立（非 TCP，或安全无且未开
+			// ENC——Vision 需 TLS/Reality 或真实加密层，与导入面
+			// proxy_parse.go、凭据面 credentials.go 同口径）。判定本体
+			// 在 flowConditionError，与下发复检 CheckSettingsConditions
+			// 同源单点。
+			if err := flowConditionError(in); err != nil {
+				return err
+			}
+		}
+	case ProtocolTrojan:
+		if s.Password == "" {
+			s.Password = RandomPassword()
+		}
+		s.UUID, s.Method, s.Flow = "", "", ""
+	case ProtocolShadowsocks:
+		if s.Method == "" {
+			s.Method = DefaultSSMethod
+		}
+		if !containsString(ssMethods, s.Method) {
+			return fmt.Errorf("不支持的加密方式 %s", s.Method)
+		}
+		if s.Password == "" {
+			s.Password = ShadowsocksPassword(s.Method)
+		}
+		if n := SS2022KeyLen(s.Method); n > 0 {
+			// R4X-013: 与导入面同一四形态解码核（Std / RawStd /
+			// URL / RawURL 任一解出恰 N 字节即合法）——此前这里只
+			// 认 Std 单形态，误拒其余三种合法密钥。复用
+			// ValidSS2022SingleKey 同时带来单段限定：自建入站密码
+			// 是服务端单密钥，SIP023 冒号多段在此仍拒，不得把
+			// 导入面的多段接受性带入自建面。落库保留原样，线格式
+			// 由渲染侧 NormalizedSS2022Password 归一。
+			if !ValidSS2022SingleKey(s.Method, s.Password) {
+				return fmt.Errorf("%s 的密钥必须是 %d 字节的 base64", s.Method, n)
+			}
+		}
+		s.UUID, s.Flow = "", ""
+	case ProtocolHysteria2, ProtocolAnyTLS:
+		if s.Password == "" {
+			s.Password = RandomPassword()
+		}
+		s.UUID, s.Method, s.Flow = "", "", ""
+		s.Masquerade = strings.TrimSpace(s.Masquerade)
+		if in.Protocol != ProtocolHysteria2 {
+			s.Masquerade = ""
+		}
+		if s.Masquerade != "" {
+			u, err := url.Parse(s.Masquerade)
+			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+				return errors.New("伪装地址必须是 http(s):// 开头的网址")
+			}
+			// 复扫 R-01：伪装地址主机名此前只查 scheme + host 非空，
+			// 空标签（`https://a..b/`）原值落库并渲染进 sing-box
+			// masquerade，节点取伪装内容时 DNS 失败；与 SNI 同口径拒。
+			if HasEmptyLabel(u.Hostname()) {
+				return errors.New("伪装地址主机名格式错误")
+			}
+		}
+	case ProtocolNaive:
+		s.Username = strings.TrimSpace(s.Username)
+		if s.Username == "" {
+			s.Username = "u" + RealityShortID()[:8]
+		}
+		if !naiveUserPattern.MatchString(s.Username) {
+			return errors.New("用户名只能包含字母、数字和 -_，长度 1-32")
+		}
+		if s.Password == "" {
+			s.Password = RandomPassword()
+		}
+		if !pskCharsetPattern.MatchString(s.Password) {
+			return errors.New("密码只能包含字母、数字和 -_，长度 8-64")
+		}
+		s.UUID, s.Method, s.Flow = "", "", ""
+	case ProtocolTUIC:
+		if s.UUID == "" {
+			s.UUID = NewUUID()
+		}
+		if !uuidPattern.MatchString(strings.ToLower(s.UUID)) {
+			return errors.New("UUID 格式错误")
+		}
+		if s.Password == "" {
+			s.Password = RandomPassword()
+		}
+		s.Method, s.Flow = "", ""
+	}
+	if in.Protocol == ProtocolHysteria2 {
+		lo, hi, err := parseHopRange(s.PortHopping)
+		if err != nil {
+			return err
+		}
+		s.PortHopping = ""
+		if lo > 0 {
+			if in.Port >= lo && in.Port <= hi {
+				return errors.New("端口跳跃范围不能包含入站端口本身")
+			}
+			s.PortHopping = fmt.Sprintf("%d-%d", lo, hi)
+		}
+	} else {
+		s.PortHopping = ""
+	}
+	return nil
+}
+
+var naiveUserPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,32}$`)
+
+var semverPattern = regexp.MustCompile(`^\d{1,4}\.\d{1,4}\.\d{1,4}$`)
+
+// pskCharsetPattern is the shared credential charset for password-style
+// secrets whose consumers accept only letters, digits, "-" and "_"
+// (NaïveProxy passwords, ShadowTLS passwords).
+var pskCharsetPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{8,64}$`)
+
+// SnellModeUnshaped keeps Snell v6's encryption but turns traffic shaping
+// off; the zero value ("") is Snell's default shaping. It belongs to the
+// imported-node vocabulary (mihomo / sing-box Snell clients), not to any
+// panel-built inbound.
+const SnellModeUnshaped = "unshaped"
+
+var uuidPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+func normalizeSecurity(in *Inbound) error {
+	sec := &in.Security
+	sec.SNI = strings.TrimSpace(sec.SNI)
+	sec.Fingerprint = strings.TrimSpace(sec.Fingerprint)
+	// R10X-001 自建面同根格：fingerprint 此前仅 TrimSpace——API 直
+	// 写大写值时自建端点的 sing-box 面同毒（utls 原样下发）。与进
+	// 口面同一合法集（ValidClientFingerprint）：小写愈合落库、集
+	// 外拒绝。SecurityNone 分支整体丢弃 Security、本格不涉。
+	if sec.Type != SecurityNone && sec.Fingerprint != "" {
+		sec.Fingerprint = strings.ToLower(sec.Fingerprint)
+		if !ValidClientFingerprint(sec.Fingerprint) {
+			return errors.New("client-fingerprint 不受支持（须为 sing-box uTLS 指纹：chrome / firefox / edge / safari / 360 / qq / ios / android / random / randomized / chrome_psk）")
+		}
+	}
+	if sec.SNI != "" && (!hostPattern.MatchString(sec.SNI) || HasEmptyLabel(sec.SNI)) {
+		// F-LIVE-01：同 normalizeTransport，错误附引坏值原文。
+		return fmt.Errorf("SNI 格式错误：%q", sec.SNI)
+	}
+
+	switch sec.Type {
+	case SecurityNone:
+		*sec = Security{Type: SecurityNone}
+		return nil
+	case SecurityShadowTLS:
+		*sec = Security{Type: SecurityShadowTLS, SNI: sec.SNI, Fingerprint: sec.Fingerprint, ShadowTLSPassword: strings.TrimSpace(sec.ShadowTLSPassword)}
+		if sec.SNI == "" {
+			sec.SNI = DefaultRealitySNI
+		}
+		if sec.Fingerprint == "" {
+			sec.Fingerprint = DefaultFingerprint
+		}
+		if sec.ShadowTLSPassword == "" {
+			sec.ShadowTLSPassword = RandomPassword()
+		}
+		if !pskCharsetPattern.MatchString(sec.ShadowTLSPassword) {
+			return errors.New("ShadowTLS 密码只能包含字母、数字和 -_，长度 8-64")
+		}
+		return nil
+	case SecurityTLS:
+		sec.RealityDest, sec.RealityPrivateKey, sec.RealityPublicKey, sec.RealityShortIDs = "", "", "", nil
+		sec.RealityMinClientVer = ""
+		sec.ShadowTLSPassword = ""
+		quic := in.Protocol == ProtocolHysteria2 || in.Protocol == ProtocolTUIC
+		if quic {
+			sec.ALPN = []string{"h3"}
+		}
+		if sec.SNI == "" && (quic || in.Protocol == ProtocolAnyTLS) {
+			sec.SNI = DefaultQUICSNI
+		}
+		if sec.Fingerprint == "" {
+			sec.Fingerprint = DefaultFingerprint
+		}
+		if sec.CertMode == "" {
+			sec.CertMode = DefaultTLSCertMode
+		}
+		if sec.CertMode != CertModeACME {
+			sec.ACMEEmail, sec.ACMEDNS, sec.ACMEDNSKey, sec.ACMEDNSSecret = "", "", "", ""
+		}
+		switch sec.CertMode {
+		case CertModeSelf:
+			if sec.SNI == "" {
+				return errors.New("TLS 需要填写域名 (SNI)")
+			}
+			sec.CertFile, sec.KeyFile = "", ""
+			if sec.CertPEM == "" || sec.KeyPEM == "" || !certMatchesName(sec.CertPEM, sec.SNI) {
+				cert, key, err := SelfSignedCert(sec.SNI)
+				if err != nil {
+					return fmt.Errorf("生成自签证书失败: %v", err)
+				}
+				sec.CertPEM, sec.KeyPEM = cert, key
+			} else if _, err := tls.X509KeyPair([]byte(sec.CertPEM), []byte(sec.KeyPEM)); err != nil {
+				// F-078: certMatchesName 只保证证书域名/有效期对，不保证
+				// 与私钥配对——错配对原样落库后要到节点内核启动才炸。
+				// 保存期显式拦截（材料是用户主动粘贴的，不静默替换）。
+				return errors.New("证书与私钥不匹配，请确认粘贴的证书与私钥为一对")
+			}
+		case CertModeFile:
+			sec.CertPEM, sec.KeyPEM = "", ""
+			sec.CertFile = strings.TrimSpace(sec.CertFile)
+			sec.KeyFile = strings.TrimSpace(sec.KeyFile)
+			if !strings.HasPrefix(sec.CertFile, "/") || !strings.HasPrefix(sec.KeyFile, "/") {
+				return errors.New("证书和私钥需要填写节点上的绝对路径")
+			}
+		case CertModeACME:
+			sec.CertPEM, sec.KeyPEM, sec.CertFile, sec.KeyFile = "", "", "", ""
+			return normalizeACME(sec)
+		default:
+			return fmt.Errorf("未知证书模式 %s", sec.CertMode)
+		}
+		return nil
+	case SecurityReality:
+		sec.CertMode, sec.CertPEM, sec.KeyPEM, sec.CertFile, sec.KeyFile = "", "", "", "", ""
+		sec.ACMEEmail, sec.ACMEDNS, sec.ACMEDNSKey, sec.ACMEDNSSecret = "", "", "", ""
+		sec.ShadowTLSPassword = ""
+		if sec.SNI == "" {
+			sec.SNI = DefaultRealitySNI
+		}
+		if sec.Fingerprint == "" {
+			sec.Fingerprint = DefaultFingerprint
+		}
+		sec.RealityDest = strings.TrimSpace(sec.RealityDest)
+		if sec.RealityDest == "" {
+			sec.RealityDest = sec.SNI + ":443"
+		}
+		if host, port, err := net.SplitHostPort(sec.RealityDest); err != nil || host == "" {
+			return errors.New("Reality 目标地址格式应为 host:port")
+		} else if HasEmptyLabel(host) {
+			// L1-F-01：RealityDest host 段此前只走 SplitHostPort +
+			// 端口检查，空标签（`a..b:443`）原值落库；与同函数 SNI
+			//（:648）同口径拒。IP 字面量无空标签，不受影响。
+			// F-LIVE-01：错误附引坏值原文（同 SNI/Host 两处）。
+			return fmt.Errorf("Reality 目标地址不正确：%q", sec.RealityDest)
+		} else if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
+			return errors.New("Reality 目标端口错误")
+		}
+		sec.RealityPrivateKey = strings.TrimSpace(sec.RealityPrivateKey)
+		if sec.RealityPrivateKey == "" {
+			priv, pub, err := RealityKeyPair()
+			if err != nil {
+				return fmt.Errorf("生成 Reality 密钥失败: %v", err)
+			}
+			sec.RealityPrivateKey, sec.RealityPublicKey = priv, pub
+		} else {
+			pub, err := RealityPublicKey(sec.RealityPrivateKey)
+			if err != nil {
+				return err
+			}
+			sec.RealityPublicKey = pub
+		}
+		ids := make([]string, 0, len(sec.RealityShortIDs))
+		for _, id := range sec.RealityShortIDs {
+			id = strings.ToLower(strings.TrimSpace(id))
+			if !shortIDPattern.MatchString(id) || len(id)%2 != 0 {
+				return errors.New("Reality shortId 必须是偶数位十六进制（最多 16 位）")
+			}
+			ids = append(ids, id)
+		}
+		if len(ids) == 0 {
+			ids = []string{RealityShortID()}
+		}
+		sec.RealityShortIDs = ids
+		sec.RealityMinClientVer = strings.TrimSpace(sec.RealityMinClientVer)
+		if sec.RealityMinClientVer == "" {
+			sec.RealityMinClientVer = DefaultRealityMinClientVer
+		}
+		if !semverPattern.MatchString(sec.RealityMinClientVer) {
+			return errors.New("最低客户端版本格式应为 x.y.z，例如 1.0.0")
+		}
+		return nil
+	}
+	return fmt.Errorf("未知安全层 %s", sec.Type)
+}
+
+var acmeEmailPattern = regexp.MustCompile(`^[^@\s"]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$`)
+
+func normalizeACME(sec *Security) error {
+	if sec.SNI == "" || net.ParseIP(sec.SNI) != nil || !strings.Contains(sec.SNI, ".") || sec.SNI == DefaultQUICSNI {
+		return errors.New("自动申请证书需要填写解析到该节点的域名")
+	}
+	sec.ACMEEmail = strings.TrimSpace(sec.ACMEEmail)
+	if sec.ACMEEmail != "" {
+		// T-01 同族：acmeEmailPattern 的域名段 `[A-Za-z0-9.-]+` 放行
+		// 空标签（`x@a..b.com`），域名按 `.` 分段判空标签，与主机名
+		// 同口径；文案复用既有邮箱校验。
+		_, domain, _ := strings.Cut(sec.ACMEEmail, "@")
+		if !acmeEmailPattern.MatchString(sec.ACMEEmail) || HasEmptyLabel(domain) {
+			return errors.New("ACME 邮箱格式错误")
+		}
+	}
+	sec.ACMEDNS = strings.ToLower(strings.TrimSpace(sec.ACMEDNS))
+	sec.ACMEDNSKey = strings.TrimSpace(sec.ACMEDNSKey)
+	sec.ACMEDNSSecret = strings.TrimSpace(sec.ACMEDNSSecret)
+	switch sec.ACMEDNS {
+	case "":
+		sec.ACMEDNSKey, sec.ACMEDNSSecret = "", ""
+	case ACMEDNSCloudflare:
+		sec.ACMEDNSSecret = ""
+		if sec.ACMEDNSKey == "" {
+			return errors.New("请填写 Cloudflare API Token")
+		}
+	case ACMEDNSAliDNS:
+		if sec.ACMEDNSKey == "" || sec.ACMEDNSSecret == "" {
+			return errors.New("请填写阿里云 AccessKey ID 和 Secret")
+		}
+	default:
+		return fmt.Errorf("不支持的 DNS 服务商 %s", sec.ACMEDNS)
+	}
+	return nil
+}
+
+// Regenerate replaces every secret of an inbound while keeping its shape.
+func Regenerate(kernelType string, in *Inbound) error {
+	in.Settings.UUID = ""
+	in.Settings.Password = ""
+	in.Settings.EncryptionSecret = ""
+	in.Security.RealityPrivateKey = ""
+	in.Security.RealityPublicKey = ""
+	in.Security.RealityShortIDs = nil
+	in.Security.CertPEM = ""
+	in.Security.KeyPEM = ""
+	in.Security.ShadowTLSPassword = ""
+	return Normalize(kernelType, in)
+}
+
+const maxAllowEntries = 256
+
+// ParseAllowList validates a comma / whitespace separated list of IPs and
+// CIDRs and returns the normalized entries (bare IPs become /32 or /128).
+func ParseAllowList(raw string) ([]string, error) {
+	fields := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == '，' || r == ';' || r == ' ' || r == '\n' || r == '\t' || r == '\r'
+	})
+	if len(fields) > maxAllowEntries {
+		return nil, fmt.Errorf("白名单最多 %d 条", maxAllowEntries)
+	}
+	seen := make(map[string]bool, len(fields))
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		cidr, err := NormalizeAllowEntry(f)
+		if err != nil {
+			return nil, err
+		}
+		if !seen[cidr] {
+			seen[cidr] = true
+			out = append(out, cidr)
+		}
+	}
+	return out, nil
+}
+
+// NormalizeAllowEntry turns an IP or CIDR into canonical CIDR form.
+func NormalizeAllowEntry(entry string) (string, error) {
+	entry = strings.TrimSpace(entry)
+	if ip := net.ParseIP(entry); ip != nil {
+		if v4 := ip.To4(); v4 != nil {
+			return v4.String() + "/32", nil
+		}
+		return ip.String() + "/128", nil
+	}
+	_, ipnet, err := net.ParseCIDR(entry)
+	if err != nil {
+		return "", fmt.Errorf("白名单条目 %q 不是合法的 IP 或网段", entry)
+	}
+	return ipnet.String(), nil
+}

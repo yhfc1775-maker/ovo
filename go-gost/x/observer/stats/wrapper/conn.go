@@ -1,0 +1,306 @@
+package wrapper
+
+import (
+	"errors"
+	"io"
+	"net"
+	"sync"
+	"syscall"
+
+	"github.com/go-gost/core/metadata"
+	"github.com/go-gost/core/observer/stats"
+	xnet "github.com/go-gost/x/internal/net"
+	"github.com/go-gost/x/internal/net/udp"
+)
+
+var (
+	errUnsupport = errors.New("unsupported operation")
+)
+
+type conn struct {
+	net.Conn
+	stats  stats.Stats
+	closed chan struct{}
+	mu     sync.Mutex
+}
+
+// WrapConn wraps a client-facing connection with traffic counting.
+//
+// Counting caliber (A02-003): the counters fed from here are the
+// service-level stats the panel bills against, and they count ALL
+// wire bytes on the client-facing connection — including protocol
+// handshake bytes of handshake-style protocols (SOCKS5 greeting +
+// request/reply, ≈12B per direction per connection; HTTP request
+// line/headers), because counting starts when the listener accepts
+// the connection, before any handler handshake runs. Protocols
+// without a client-side handshake (forward/local) therefore measure
+// pure payload under the same rule. The caliber is uniformly
+// "client-connection wire bytes", NOT per-protocol payload bytes;
+// quota/billing calibration must be read that way.
+func WrapConn(c net.Conn, pStats stats.Stats) net.Conn {
+	if c == nil || pStats == nil {
+		return c
+	}
+
+	pStats.Add(stats.KindTotalConns, 1)
+	pStats.Add(stats.KindCurrentConns, 1)
+
+	return &conn{
+		Conn:   c,
+		stats:  pStats,
+		closed: make(chan struct{}),
+	}
+}
+
+func (c *conn) Read(b []byte) (n int, err error) {
+	n, err = c.Conn.Read(b)
+	c.stats.Add(stats.KindInputBytes, int64(n))
+	return
+}
+
+func (c *conn) Write(b []byte) (n int, err error) {
+	n, err = c.Conn.Write(b)
+	c.stats.Add(stats.KindOutputBytes, int64(n))
+	return
+}
+
+func (c *conn) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	select {
+	case <-c.closed:
+		return nil
+	default:
+		close(c.closed)
+	}
+
+	c.stats.Add(stats.KindCurrentConns, -1)
+	return c.Conn.Close()
+}
+
+func (c *conn) SyscallConn() (rc syscall.RawConn, err error) {
+	if sc, ok := c.Conn.(syscall.Conn); ok {
+		rc, err = sc.SyscallConn()
+		return
+	}
+	err = errUnsupport
+	return
+}
+
+// Raw returns the underlying connection (R18-C5-01): it lets the
+// service layer reach the proxyproto.Conn underneath the wrapper
+// chain to record the raw peer (PeerIP) for the connection log,
+// without the wrappers having to know about PROXY at all.
+func (c *conn) Raw() net.Conn {
+	if r, ok := c.Conn.(interface{ Raw() net.Conn }); ok {
+		return r.Raw()
+	}
+	return c.Conn
+}
+
+// CloseWrite forwards a half-close to the wrapped conn when it
+// supports one. Without this method the embedded net.Conn hides
+// the underlying CloseWrite, Transport's dst.(closeWriter)
+// assertion silently fails, and the end-of-stream signal never
+// reaches the peer: the sibling direction then parks on Read
+// with no bound and the FIN'd leg lingers in CLOSE-WAIT for the
+// sibling's whole remaining lifetime (package K census). Same
+// shape as internal/net's readWriteConn forwarding.
+func (c *conn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return errUnsupport
+}
+
+func (c *conn) CloseRead() error {
+	if cr, ok := c.Conn.(interface{ CloseRead() error }); ok {
+		return cr.CloseRead()
+	}
+	return errUnsupport
+}
+
+func (c *conn) Metadata() metadata.Metadata {
+	if md, ok := c.Conn.(metadata.Metadatable); ok {
+		return md.Metadata()
+	}
+	return nil
+}
+
+type packetConn struct {
+	net.PacketConn
+	stats stats.Stats
+}
+
+func WrapPacketConn(pc net.PacketConn, stats stats.Stats) net.PacketConn {
+	if stats == nil {
+		return pc
+	}
+	return &packetConn{
+		PacketConn: pc,
+		stats:      stats,
+	}
+}
+
+func (c *packetConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+	n, addr, err = c.PacketConn.ReadFrom(p)
+	c.stats.Add(stats.KindInputBytes, int64(n))
+	return
+}
+
+func (c *packetConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	n, err = c.PacketConn.WriteTo(p, addr)
+	c.stats.Add(stats.KindOutputBytes, int64(n))
+	return
+}
+
+func (c *packetConn) Metadata() metadata.Metadata {
+	if md, ok := c.PacketConn.(metadata.Metadatable); ok {
+		return md.Metadata()
+	}
+	return nil
+}
+
+type udpConn struct {
+	net.PacketConn
+	stats stats.Stats
+}
+
+func WrapUDPConn(pc net.PacketConn, stats stats.Stats) udp.Conn {
+	return &udpConn{
+		PacketConn: pc,
+		stats:      stats,
+	}
+}
+
+func (c *udpConn) RemoteAddr() net.Addr {
+	if nc, ok := c.PacketConn.(xnet.RemoteAddr); ok {
+		return nc.RemoteAddr()
+	}
+	return nil
+}
+
+func (c *udpConn) SetReadBuffer(n int) error {
+	if nc, ok := c.PacketConn.(xnet.SetBuffer); ok {
+		return nc.SetReadBuffer(n)
+	}
+	return errUnsupport
+}
+
+func (c *udpConn) SetWriteBuffer(n int) error {
+	if nc, ok := c.PacketConn.(xnet.SetBuffer); ok {
+		return nc.SetWriteBuffer(n)
+	}
+	return errUnsupport
+}
+
+func (c *udpConn) Read(b []byte) (n int, err error) {
+	if nc, ok := c.PacketConn.(io.Reader); ok {
+		n, err = nc.Read(b)
+		if c.stats != nil {
+			c.stats.Add(stats.KindInputBytes, int64(n))
+		}
+		return
+	}
+	err = errUnsupport
+	return
+}
+
+func (c *udpConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+	n, addr, err = c.PacketConn.ReadFrom(p)
+	if c.stats != nil {
+		c.stats.Add(stats.KindInputBytes, int64(n))
+	}
+	return
+}
+
+func (c *udpConn) ReadFromUDP(b []byte) (n int, addr *net.UDPAddr, err error) {
+	if nc, ok := c.PacketConn.(udp.ReadUDP); ok {
+		n, addr, err = nc.ReadFromUDP(b)
+		if c.stats != nil {
+			c.stats.Add(stats.KindInputBytes, int64(n))
+		}
+		return
+	}
+	err = errUnsupport
+	return
+}
+
+func (c *udpConn) ReadMsgUDP(b, oob []byte) (n, oobn, flags int, addr *net.UDPAddr, err error) {
+	if nc, ok := c.PacketConn.(udp.ReadUDP); ok {
+		n, oobn, flags, addr, err = nc.ReadMsgUDP(b, oob)
+		if c.stats != nil {
+			c.stats.Add(stats.KindInputBytes, int64(n))
+		}
+		return
+	}
+	err = errUnsupport
+	return
+}
+
+func (c *udpConn) Write(b []byte) (n int, err error) {
+	if nc, ok := c.PacketConn.(io.Writer); ok {
+		n, err = nc.Write(b)
+		if c.stats != nil {
+			c.stats.Add(stats.KindOutputBytes, int64(n))
+		}
+		return
+	}
+	err = errUnsupport
+	return
+}
+
+func (c *udpConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	n, err = c.PacketConn.WriteTo(p, addr)
+	if c.stats != nil {
+		c.stats.Add(stats.KindOutputBytes, int64(n))
+	}
+	return
+}
+
+func (c *udpConn) WriteToUDP(b []byte, addr *net.UDPAddr) (n int, err error) {
+	if nc, ok := c.PacketConn.(udp.WriteUDP); ok {
+		n, err = nc.WriteToUDP(b, addr)
+		if c.stats != nil {
+			c.stats.Add(stats.KindOutputBytes, int64(n))
+		}
+		return
+	}
+	err = errUnsupport
+	return
+}
+
+func (c *udpConn) WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (n, oobn int, err error) {
+	if nc, ok := c.PacketConn.(udp.WriteUDP); ok {
+		n, oobn, err = nc.WriteMsgUDP(b, oob, addr)
+		if c.stats != nil {
+			c.stats.Add(stats.KindOutputBytes, int64(n))
+		}
+		return
+	}
+	err = errUnsupport
+	return
+}
+
+func (c *udpConn) SyscallConn() (rc syscall.RawConn, err error) {
+	if nc, ok := c.PacketConn.(syscall.Conn); ok {
+		return nc.SyscallConn()
+	}
+	err = errUnsupport
+	return
+}
+
+func (c *udpConn) SetDSCP(n int) error {
+	if nc, ok := c.PacketConn.(xnet.SetDSCP); ok {
+		return nc.SetDSCP(n)
+	}
+	return nil
+}
+
+func (c *udpConn) Metadata() metadata.Metadata {
+	if md, ok := c.PacketConn.(metadata.Metadatable); ok {
+		return md.Metadata()
+	}
+	return nil
+}

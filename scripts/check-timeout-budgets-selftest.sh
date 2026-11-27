@@ -1,0 +1,352 @@
+#!/usr/bin/env bash
+# check-timeout-budgets-selftest.sh — 超时预算门禁的变体自检（B05-001
+# 回归门）：把门禁脚本所需文件镜像到临时目录，先验证未变异镜像 PASS，
+# 再把 C080 行变异回当年的误分类形态（check=class、后端界改回 class
+# 天花板 12s，其余字段——尤其前端真实值 150s——保持不动，使 class
+# 分支自身的断言全部满足），断言门禁必须 FAIL 且点名 C080 与
+# B05-001 规则。若哪天「版本发现禁登 class」规则被误删/改坏，本
+# 自检先红。
+#
+# 另含 R2-C6-02 回归变体：kernel_external literal 锚点漂移
+# （20s→500s）必须 FAIL 且点名 T061——守 literal/const 提取的
+# fail-closed 口径与 T061–T063 锚点 case 不被删改。
+#
+# 另含 RR4-C6-01 回归变体两条：原始字符串伪行遮蔽＋实值漂移
+# （180→999）必须 FAIL 点名 C059、nodeTuneTimeout 实值漂移
+# （30→99）必须 FAIL 点名 T019——守影子树原始字符串置空与两符
+# 号的对账面不被删改（两符号的 Go 编译值钉在
+# timeout_budgets_r8_test.go 的钉表内）。
+#
+# 用法：check-timeout-budgets-selftest.sh（无参数，作用于本仓库）。
+# 退出码：0 = 基线 PASS 且变体被抓；1 = 任一断言不成立。
+set -u
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+GATE="$ROOT/scripts/check-timeout-budgets.sh"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+MIR="$TMP/repo"
+
+mkdir -p "$MIR/doc/audit" \
+  "$MIR/vite-frontend/src/api" "$MIR/vite-frontend/src/utils" \
+  "$MIR/go-backend/internal/app" "$MIR/go-backend/internal/monitoring" \
+  "$MIR/go-backend/internal/health" \
+  "$MIR/go-gost/x/kernel" "$MIR/go-gost/x/socket"
+cp "$ROOT/doc/audit/timeout-budgets.tsv" "$MIR/doc/audit/"
+cp "$ROOT/vite-frontend/src/api/index.ts" \
+   "$ROOT/vite-frontend/src/api/diagnosis-stream.ts" \
+   "$ROOT/vite-frontend/src/api/network.ts" "$MIR/vite-frontend/src/api/"
+cp "$ROOT/vite-frontend/src/utils/version-update.ts" "$MIR/vite-frontend/src/utils/" 2>/dev/null || true
+cp "$ROOT/go-backend/internal/app/app.go" "$MIR/go-backend/internal/app/"
+cp -r "$ROOT/go-backend/internal/http" "$MIR/go-backend/internal/"
+cp "$ROOT/go-backend/internal/monitoring/limits.go" "$MIR/go-backend/internal/monitoring/"
+cp "$ROOT/go-backend/internal/health/checker.go" "$MIR/go-backend/internal/health/"
+cp "$ROOT/go-gost/x/kernel/install.go" "$MIR/go-gost/x/kernel/"
+cp "$ROOT/go-gost/x/socket/websocket_reporter.go" "$MIR/go-gost/x/socket/"
+
+echo "== baseline: unmutated mirror must PASS =="
+if bash "$GATE" "$MIR" > "$TMP/base.log" 2>&1; then
+  echo "OK: baseline PASS"
+else
+  echo "FAIL: baseline mirror did not pass the gate:"
+  cat "$TMP/base.log"
+  exit 1
+fi
+
+echo "== variant: C080 re-misclassified as class must FAIL, naming C080 =="
+python3 - "$MIR/doc/audit/timeout-budgets.tsv" <<'PYEOF'
+import sys
+p = sys.argv[1]
+lines = open(p, encoding='utf-8').read().split('\n')
+for i, l in enumerate(lines):
+    if l.startswith('C080\t'):
+        f = l.split('\t')
+        # 只变分类：后端界/类别/来源/校验方式改回 class 形态；前端值与
+        # 服务端值保持真实登记，使 class 分支断言本身全部满足——能抓
+        # 住这个变体的只剩「版本发现禁登 class」规则。
+        f[11] = '12'; f[12] = 'class'; f[13] = 'class-ceiling'; f[14] = 'class'
+        lines[i] = '\t'.join(f)
+        break
+else:
+    sys.exit('C080 row not found in mirror registry')
+open(p, 'w', encoding='utf-8').write('\n'.join(lines))
+PYEOF
+if bash "$GATE" "$MIR" > "$TMP/var.log" 2>&1; then
+  echo "FAIL: gate PASSED on the C080 class variant — misclassification not caught"
+  exit 1
+fi
+grep -q 'C080' "$TMP/var.log" || { echo "FAIL: gate failed but did not name C080:"; cat "$TMP/var.log"; exit 1; }
+grep -q 'B05-001' "$TMP/var.log" || { echo "FAIL: gate failure does not cite the discovery-class rule (B05-001):"; cat "$TMP/var.log"; exit 1; }
+echo "OK: variant caught, C080 named"
+
+echo "== variant: C113 re-misclassified as class must FAIL, naming C113 =="
+cp "$ROOT/doc/audit/timeout-budgets.tsv" "$MIR/doc/audit/timeout-budgets.tsv"
+python3 - "$MIR/doc/audit/timeout-budgets.tsv" <<'PYEOF'
+import sys
+p = sys.argv[1]
+lines = open(p, encoding='utf-8').read().split('\n')
+for i, l in enumerate(lines):
+    if l.startswith('C113\t'):
+        f = l.split('\t')
+        # 只变分类与登记口径：服务端改回 global、后端界改回 class
+        # 天花板、校验改回 class；前端真实值 330s 保持不动，使 class
+        # 分支自身断言全部满足——能抓住这个变体的只剩「内核下发家
+        # 族禁登小界」规则（handler 体仍直调 applyKernel 且仍以
+        # kernelApplyWriteDeadline 武装，与登记口径脱钩）。
+        f[9] = '120'; f[10] = 'global'
+        f[11] = '12'; f[12] = 'class'; f[13] = 'class-ceiling'; f[14] = 'class'
+        lines[i] = '\t'.join(f)
+        break
+else:
+    sys.exit('C113 row not found in mirror registry')
+open(p, 'w', encoding='utf-8').write('\n'.join(lines))
+PYEOF
+if bash "$GATE" "$MIR" > "$TMP/var2.log" 2>&1; then
+  echo "FAIL: gate PASSED on the C113 class variant — kernel-apply misclassification not caught"
+  exit 1
+fi
+grep -q 'C113' "$TMP/var2.log" || { echo "FAIL: gate failed but did not name C113:"; cat "$TMP/var2.log"; exit 1; }
+grep -q 'B11-001' "$TMP/var2.log" || { echo "FAIL: gate failure does not cite the kernel-apply family rule (B11-001):"; cat "$TMP/var2.log"; exit 1; }
+echo "OK: variant caught, C113 named"
+# 恢复登记表：C113 是最后一个改表变体，后续变体不再复拷原表；
+# 不恢复则其 class/global 变异残留进镜像，R5-D-03b 之类要求
+# PASS 的后置变体会误判为门本身失败（2026-11-14 实证）。
+cp "$ROOT/doc/audit/timeout-budgets.tsv" "$MIR/doc/audit/timeout-budgets.tsv"
+
+# ── 修复轮 9（R9-23/24/25）提取器绑定变异：三构造在修复前提取
+# 输出与基线逐字相同、门全绿（I-C4-08/09/10 实证）；修复后必须
+# 分别以点名/真值/助手行缺失被抓。变异只动镜像 index.ts。
+FE_API="$MIR/vite-frontend/src/api/index.ts"
+
+echo "== variant R9-23: second Network call in one export must FAIL, naming probeNodeLatency =="
+cp "$ROOT/vite-frontend/src/api/index.ts" "$FE_API"
+python3 - "$FE_API" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8').read()
+old = '''export const probeNodeLatency = (ids: number[] = []) =>
+  Network.post<Record<string, InboundProbe>>(
+    "/node/latency/probe",
+    { ids },
+    // R8-T-08：扇出作业按公式放宽（见 latencyProbeTimeout）。
+    { timeout: latencyProbeTimeout(ids.length) },
+  );'''
+new = '''export const probeNodeLatency = (ids: number[] = []) => {
+Network.post("/node/latency/targets", { ids}, { timeout: latencyProbeTimeout(ids.length)});
+
+return Network.post<Record<string, InboundProbe>>(
+"/node/latency/probe",
+{ ids},
+{ timeout: 999_000},
+);
+};'''
+assert old in s, 'probeNodeLatency anchor not found'
+open(p, 'w', encoding='utf-8').write(s.replace(old, new, 1))
+PYEOF
+if bash "$GATE" "$MIR" > "$TMP/var3.log" 2>&1; then
+  echo "FAIL: gate PASSED on the second-call variant — later Network calls still invisible"
+  exit 1
+fi
+grep -q 'probeNodeLatency' "$TMP/var3.log" || { echo "FAIL: gate failed but did not name probeNodeLatency:"; cat "$TMP/var3.log"; exit 1; }
+echo "OK: variant caught, probeNodeLatency named"
+
+echo "== variant R9-24: parameter-shadowed config identifier must FAIL, naming rollbackNode =="
+cp "$ROOT/vite-frontend/src/api/index.ts" "$FE_API"
+python3 - "$FE_API" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8').read()
+old = '''export const rollbackNode = (id: number) =>
+  // R8-T-04：后端界 30s，须破恰等。
+  Network.post("/node/rollback", { id }, { timeout: 45_000 });'''
+new = '''const rollbackCfg = { timeout: 45_000 };
+export const rollbackNode = (id: number, rollbackCfg = { timeout: 999_000 }) =>
+  // R8-T-04：后端界 30s，须破恰等。
+  Network.post("/node/rollback", { id }, rollbackCfg);'''
+assert old in s, 'rollbackNode anchor not found'
+open(p, 'w', encoding='utf-8').write(s.replace(old, new, 1))
+PYEOF
+if bash "$GATE" "$MIR" > "$TMP/var4.log" 2>&1; then
+  echo "FAIL: gate PASSED on the parameter-shadowed config variant — top-level fallback still in effect"
+  exit 1
+fi
+grep -q 'rollbackNode' "$TMP/var4.log" || { echo "FAIL: gate failed but did not name rollbackNode:"; cat "$TMP/var4.log"; exit 1; }
+grep -q '999' "$TMP/var4.log" || { echo "FAIL: gate failure does not show the true value 999:"; cat "$TMP/var4.log"; exit 1; }
+echo "OK: variant caught, rollbackNode named with true value"
+
+echo "== variant R9-25: helper growth term replaced by a static value must FAIL, naming latencyProbeTimeout =="
+cp "$ROOT/vite-frontend/src/api/index.ts" "$FE_API"
+python3 - "$FE_API" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8').read()
+old = 'return Math.min(600_000, Math.max(90_000, waves * 22_600 + 20_000));'
+new = 'return Math.min(600_000, Math.max(90_000, 20_000));'
+assert old in s, 'latencyProbeTimeout anchor not found'
+open(p, 'w', encoding='utf-8').write(s.replace(old, new, 1))
+PYEOF
+if bash "$GATE" "$MIR" > "$TMP/var5.log" 2>&1; then
+  echo "FAIL: gate PASSED on the static growth-term variant — helper dynamic args still unread"
+  exit 1
+fi
+grep -q 'latencyProbeTimeout' "$TMP/var5.log" || { echo "FAIL: gate failed but did not name latencyProbeTimeout:"; cat "$TMP/var5.log"; exit 1; }
+echo "OK: variant caught, latencyProbeTimeout named"
+cp "$ROOT/vite-frontend/src/api/index.ts" "$FE_API"
+
+# ── R2-C6-02 回归变体：literal 后端界锚点漂移必须 FAIL 点名。
+# kernel_external.go 的抓取腿界 20s→500s 后，be_literal_anchor 的
+# 值钉 grep 必然失配、提取为空——旧口径下 strict 漂移比对「空即跳
+# 过」、门全绿（真实界已是前端 60s 的 8 倍仍无人看见）；且
+# T061/T062/T063 出厂时不在锚点 case 内、从未被验。本变体断言修
+# 复后门必须 FAIL 且点名 T061 与「提取为空」fail-closed 结论。
+echo "== variant R2-C6-02: kernel_external literal anchor drift 20s->500s must FAIL, naming T061 =="
+KE_GO="$MIR/go-backend/internal/http/handler/kernel_external.go"
+python3 - "$KE_GO" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8').read()
+old = 'context.WithTimeout(ctx, 20*time.Second)'
+new = 'context.WithTimeout(ctx, 500*time.Second)'
+assert old in s, 'kernel_external WithTimeout anchor not found'
+open(p, 'w', encoding='utf-8').write(s.replace(old, new, 1))
+PYEOF
+if bash "$GATE" "$MIR" > "$TMP/var6.log" 2>&1; then
+  echo "FAIL: gate PASSED on the literal-anchor drift variant — backend bound drift still invisible"
+  exit 1
+fi
+grep -q 'T061' "$TMP/var6.log" || { echo "FAIL: gate failed but did not name T061:"; cat "$TMP/var6.log"; exit 1; }
+grep -q '提取为空' "$TMP/var6.log" || { echo "FAIL: gate failure is not the fail-closed empty-extraction verdict:"; cat "$TMP/var6.log"; exit 1; }
+echo "OK: variant caught, T061 named with fail-closed empty-extraction verdict"
+cp "$ROOT/go-backend/internal/http/handler/kernel_external.go" "$MIR/go-backend/internal/http/handler/kernel_external.go"
+
+# ── RR4-C6-01 回归变体（一）：原始字符串伪行遮蔽＋实值漂移必须
+# FAIL 点名 C059。旧口径下影子树保留原始字符串内容、go_const_s
+# 词法首命中：在 write_deadline.go 顶部原始字符串里写一行
+# 「nodeInstallWriteDeadline = 180 * time.Second」、真身改 999，
+# 首命中取伪值而全绿，且该符号当时不在 Go 值钉表内、无兜底。
+# 修复后影子树置空原始字符串内容，提取只可能命中真身 999；
+# Go 侧钉表亦已补入该符号，双层任一漂移必红。
+echo "== variant RR4-C6-01a: raw-string shadow line + true drift 180->999 must FAIL, naming C059 =="
+WD_GO="$MIR/go-backend/internal/http/handler/write_deadline.go"
+python3 - "$WD_GO" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8').read()
+old = '\tnodeInstallWriteDeadline = 180 * time.Second'
+assert old in s, 'nodeInstallWriteDeadline anchor not found'
+s = s.replace(old, '\tnodeInstallWriteDeadline = 999 * time.Second', 1)
+pkg_end = s.index('\n', s.index('package handler')) + 1
+shadow = '\nvar _ = `\nnodeInstallWriteDeadline = 180 * time.Second\n`\n'
+s = s[:pkg_end] + shadow + s[pkg_end:]
+open(p, 'w', encoding='utf-8').write(s)
+PYEOF
+if bash "$GATE" "$MIR" > "$TMP/var7.log" 2>&1; then
+  echo "FAIL: gate PASSED on the raw-string shadow variant — lexical first-hit extraction still in effect"
+  exit 1
+fi
+grep -q 'C059' "$TMP/var7.log" || { echo "FAIL: gate failed but did not name C059:"; cat "$TMP/var7.log"; exit 1; }
+grep -q '999' "$TMP/var7.log" || { echo "FAIL: gate failure does not show the true value 999 (shadow line still masking):"; cat "$TMP/var7.log"; exit 1; }
+echo "OK: variant caught, C059 named with true value"
+cp "$ROOT/go-backend/internal/http/handler/write_deadline.go" "$WD_GO"
+
+# ── RR4-C6-01 回归变体（二）：T019 后端界 nodeTuneTimeout 实值
+# 漂移必须 FAIL 点名 T019（同面未钉符号已补 Go 值钉，此处验壳门
+# 提取面本身对该符号的对账不缺位）。
+echo "== variant RR4-C6-01b: nodeTuneTimeout drift 30->99 must FAIL, naming T019 =="
+NT_GO="$MIR/go-backend/internal/http/handler/node_tune.go"
+python3 - "$NT_GO" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8').read()
+old = 'const nodeTuneTimeout = 30 * time.Second'
+assert old in s, 'nodeTuneTimeout anchor not found'
+open(p, 'w', encoding='utf-8').write(s.replace(old, 'const nodeTuneTimeout = 99 * time.Second', 1))
+PYEOF
+if bash "$GATE" "$MIR" > "$TMP/var8.log" 2>&1; then
+  echo "FAIL: gate PASSED on the nodeTuneTimeout drift variant — T019 backend bound invisible"
+  exit 1
+fi
+grep -q 'T019' "$TMP/var8.log" || { echo "FAIL: gate failed but did not name T019:"; cat "$TMP/var8.log"; exit 1; }
+echo "OK: variant caught, T019 named"
+cp "$ROOT/go-backend/internal/http/handler/node_tune.go" "$NT_GO"
+
+# ── G-R4-06 回归变体：/tmp 容量前提。阈值抬到不可能满足的值时，
+# 门必须以 exit 2 前提失效明示、且点名容量不足——不得以预算 FAIL
+# （exit 1）形态红（G1-3 前例：/tmp 95% 时 §8 单 FAIL 被误读为预
+# 算漂移）。正常阈值下的基线已由本文件首节覆盖。
+echo "== variant G-R4-06: unsatisfiable /tmp threshold must fail closed with exit 2, naming capacity =="
+OVO_TMP_MIN_KB=999999999 bash "$GATE" "$MIR" > "$TMP/var9.log" 2>&1
+gate_rc=$?
+[ "$gate_rc" -eq 0 ] && { echo "FAIL: gate PASSED with an unsatisfiable /tmp threshold — precondition not enforced"; exit 1; }
+[ "$gate_rc" -eq 2 ] || { echo "FAIL: /tmp precondition failure must exit 2 (premise failure), got $gate_rc:"; cat "$TMP/var9.log"; exit 1; }
+grep -q '可用空间不足' "$TMP/var9.log" || { echo "FAIL: precondition failure does not name the capacity shortfall:"; cat "$TMP/var9.log"; exit 1; }
+grep -q '不要按预算漂移处理' "$TMP/var9.log" || { echo "FAIL: precondition failure does not disclaim the budget-drift reading:"; cat "$TMP/var9.log"; exit 1; }
+echo "OK: variant caught, /tmp precondition named with exit 2"
+
+# ── R5-D-03 回归变体（一）：inode 阈值仍须硬核。阈值抬到不可能
+# 满足的值时，门必须以 exit 2 前提失效明示、且点名 inode 不足
+# ——与 KB 阈值同口径（G-R4-06）。TMPDIR 显式指 /dev/shm（tmpfs
+# 实报 inode 数）；外层 TMPDIR 若在 btrfs 磁盘上，itotal=0 会
+# 走跳过分支、变体不可判定，故此处不用外层 TMPDIR；/tmp 同为
+# tmpfs 但为各 lane 共享 512M，常被并行任务写满（空间腿先
+# 失败会掩盖 inode 腿），/dev/shm 空闲且同样实报 inode。
+echo "== variant R5-D-03a: unsatisfiable inode threshold must fail closed with exit 2, naming inodes =="
+TMPDIR=/dev/shm OVO_TMP_MIN_INODES=999999999 bash "$GATE" "$MIR" > "$TMP/var10.log" 2>&1
+gate_rc=$?
+[ "$gate_rc" -eq 0 ] && { echo "FAIL: gate PASSED with an unsatisfiable inode threshold — precondition not enforced"; exit 1; }
+[ "$gate_rc" -eq 2 ] || { echo "FAIL: inode precondition failure must exit 2 (premise failure), got $gate_rc:"; cat "$TMP/var10.log"; exit 1; }
+grep -q '可用 inode 不足' "$TMP/var10.log" || { echo "FAIL: precondition failure does not name the inode shortfall:"; cat "$TMP/var10.log"; exit 1; }
+grep -q '不要按预算漂移处理' "$TMP/var10.log" || { echo "FAIL: precondition failure does not disclaim the budget-drift reading:"; cat "$TMP/var10.log"; exit 1; }
+echo "OK: variant caught, inode precondition named with exit 2"
+
+# ── R5-D-03 回归变体（二）：btrfs 形态（itotal=0/iavail=0）须
+# 跳过 inode 项、门继续跑到 PASS。df 输出以 PATH 前置的假 df
+# 垫片模拟（只垫 itotal/iavail 两次查询，其余调用透传真 df），
+# 不依赖本机真有 btrfs 挂载、CI 与沙箱同一判定。
+echo "== variant R5-D-03b: btrfs-like df (itotal=0/iavail=0) must skip the inode check and PASS =="
+mkdir -p "$TMP/fakebin"
+cat > "$TMP/fakebin/df" <<'DFEOF'
+#!/usr/bin/env bash
+for a in "$@"; do
+  case "$a" in
+    --output=itotal) printf 'Inodes\n0\n'; exit 0 ;;
+    --output=iavail) printf 'IFree\n0\n'; exit 0 ;;
+  esac
+done
+exec "${REAL_DF:-/usr/bin/df}" "$@"
+DFEOF
+chmod +x "$TMP/fakebin/df"
+export REAL_DF="$(command -v df)"
+PATH="$TMP/fakebin:$PATH" TMPDIR=/dev/shm bash "$GATE" "$MIR" > "$TMP/var11.log" 2>&1
+gate_rc=$?
+[ "$gate_rc" -eq 0 ] || { echo "FAIL: gate must PASS on btrfs-like df (inode check skipped), got $gate_rc:"; cat "$TMP/var11.log"; exit 1; }
+grep -q '跳过 inode 前置检查' "$TMP/var11.log" || { echo "FAIL: gate passed but did not name the inode skip:"; cat "$TMP/var11.log"; exit 1; }
+grep -q 'RESULT: PASS' "$TMP/var11.log" || { echo "FAIL: gate output lacks RESULT: PASS:"; cat "$TMP/var11.log"; exit 1; }
+echo "OK: variant caught, btrfs-like df skips inode check and PASSes"
+echo "== variant D-R7-02: duplicated cell ID must FAIL, naming the cell =="
+cp "$ROOT/doc/audit/timeout-budgets.tsv" "$MIR/doc/audit/timeout-budgets.tsv"
+python3 - "$MIR/doc/audit/timeout-budgets.tsv" <<'PYEOF'
+import sys
+p = sys.argv[1]
+lines = open(p).read().splitlines(keepends=True)
+hit = False
+for i, ln in enumerate(lines):
+    if ln.startswith('#') or ln.startswith('cell\t'):
+        continue
+    f = ln.rstrip('\n').split('\t')
+    if len(f) >= 2 and f[0] == 'C139' and f[1] == 'createNodeGroup':
+        f[0] = 'C100'
+        lines[i] = '\t'.join(f) + '\n'
+        hit = True
+assert hit, 'C139 createNodeGroup row not found in mirror registry'
+open(p, 'w').write(''.join(lines))
+PYEOF
+if bash "$GATE" "$MIR" > "$TMP/var12.log" 2>&1; then
+  echo "FAIL: gate PASSED on the duplicated-cell variant — cell reuse not caught"
+  exit 1
+fi
+grep -q 'C100' "$TMP/var12.log" || { echo "FAIL: gate failed but did not name C100:"; cat "$TMP/var12.log"; exit 1; }
+grep -q 'D-R7-02' "$TMP/var12.log" || { echo "FAIL: gate failure does not cite the cell-uniqueness rule (D-R7-02):"; cat "$TMP/var12.log"; exit 1; }
+echo "OK: variant caught, C100 named"
+
+echo "SELFTEST: PASS"

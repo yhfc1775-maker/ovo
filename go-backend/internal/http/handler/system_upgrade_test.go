@@ -1,0 +1,1051 @@
+package handler
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestSelectComposeAssetUsesIPv6Template(t *testing.T) {
+	exec := &systemUpgradeExecutor{deployDir: "/opt/flvx-panel", backendContainer: "flux-panel-backend"}
+	compose := []byte("networks:\n  gost-network:\n    enable_ipv6: true\n")
+
+	if got := exec.selectComposeAsset(compose); got != "docker-compose-v6.yml" {
+		t.Fatalf("selectComposeAsset() = %q, want %q", got, "docker-compose-v6.yml")
+	}
+}
+
+// U1-004 的后继（1.7.7 KU5）：「开启 GitHub 加速」设置整体移除后，
+// 面板自升级资产的候选 URL 不再由面板配置决定，而是
+// systemUpgradeDownloadURLs 按直选路线序（gitHubRouteOrder）拼全
+// 候选。本用例钉死路线序 → URL 表的映射：直连判活时直连居首、
+// 直连判死时代理居首且直连殿后兜底、无代理排名时只有直连。
+func TestSystemUpgradeDownloadURLsFollowRouteOrder(t *testing.T) {
+	h := &Handler{}
+	originalBase := systemUpgradeReleaseBaseURL
+	systemUpgradeReleaseBaseURL = "https://example.invalid"
+	t.Cleanup(func() { systemUpgradeReleaseBaseURL = originalBase })
+
+	direct := "https://example.invalid/yhfc1775-maker/ovo/releases/download/2.1.9/docker-compose-v4.yml"
+	proxied := "https://proxy.example.com/" + direct
+
+	seedGitHubRoutesForTest(t, false, []string{"https://proxy.example.com"})
+	if got, want := h.systemUpgradeDownloadURLs("2.1.9", "docker-compose-v4.yml"), []string{proxied, direct}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("direct-dead download URLs = %v, want %v", got, want)
+	}
+
+	seedGitHubRoutesForTest(t, true, []string{"https://proxy.example.com"})
+	if got, want := h.systemUpgradeDownloadURLs("2.1.9", "docker-compose-v4.yml"), []string{direct, proxied}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("direct-alive download URLs = %v, want %v", got, want)
+	}
+
+	seedGitHubRoutesForTest(t, true, nil)
+	if got, want := h.systemUpgradeDownloadURLs("2.1.9", "docker-compose-v4.yml"), []string{direct}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("direct-only download URLs = %v, want %v", got, want)
+	}
+}
+
+// U1-004 重写：原测试断言的 1MB 上限（maxSystemUpgradeComposeAssetBytes）在
+// 生产代码中不存在，实际的体积上限是 SecureFetch 的 secureFetchMaxBody（50MB）。
+// 改为走真实路径：本地 HTTP 服务器 + 放行私网 + 临时调小上限，验证
+// downloadReleaseAsset 对超限资产的拒绝。
+func TestDownloadReleaseAssetRejectsOversizedBody(t *testing.T) {
+	// 1.7.7：路线钉为直连-only，资产直接从 stub 基址取。
+	seedGitHubRoutesForTest(t, true, nil)
+
+	big := bytes.Repeat([]byte("a"), 4096)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(big)
+	}))
+	defer srv.Close()
+
+	originalBase := systemUpgradeReleaseBaseURL
+	systemUpgradeReleaseBaseURL = srv.URL
+	t.Cleanup(func() { systemUpgradeReleaseBaseURL = originalBase })
+
+	// 本地服务器是回环地址，需按 D17 策略放行私网；上限临时调小避免真传 50MB。
+	t.Setenv("OVO_FETCH_ALLOW_PRIVATE_NETWORKS", "true")
+	originalMax := secureFetchMaxBody
+	secureFetchMaxBody = 1024
+	t.Cleanup(func() { secureFetchMaxBody = originalMax })
+
+	h := &Handler{}
+	_, _, err := h.downloadReleaseAsset("2.1.9", "docker-compose-v4.yml")
+	if err == nil || !strings.Contains(err.Error(), "response too large") {
+		t.Fatalf("downloadReleaseAsset() error = %v, want SecureFetch oversized error", err)
+	}
+}
+
+func TestSelectComposeAssetUsesIPv6TemplateForYAMLVariants(t *testing.T) {
+	exec := &systemUpgradeExecutor{deployDir: "/opt/flvx-panel", backendContainer: "flux-panel-backend"}
+	for _, compose := range [][]byte{
+		[]byte("networks:\n  gost-network:\n    enable_ipv6:true\n"),
+		[]byte("networks:\n  gost-network:\n    enable_ipv6: True\n"),
+		[]byte("networks:\n  gost-network:\n    enable_ipv6: \"true\"\n"),
+		[]byte("networks:\n  gost-network:\n    enable_ipv6: 'true'\n"),
+		[]byte("networks:\n  gost-network:\n    enable_ipv6: true # comment\n"),
+	} {
+		if got := exec.selectComposeAsset(compose); got != "docker-compose-v6.yml" {
+			t.Fatalf("selectComposeAsset(%q) = %q, want %q", string(compose), got, "docker-compose-v6.yml")
+		}
+	}
+}
+
+func TestSelectComposeAssetFallsBackToIPv4Template(t *testing.T) {
+	exec := &systemUpgradeExecutor{deployDir: "/opt/flvx-panel", backendContainer: "flux-panel-backend"}
+	compose := []byte("services:\n  backend:\n    image: test\n")
+
+	if got := exec.selectComposeAsset(compose); got != "docker-compose-v4.yml" {
+		t.Fatalf("selectComposeAsset() = %q, want %q", got, "docker-compose-v4.yml")
+	}
+}
+
+func TestUpdateEnvVersionReplacesExistingValue(t *testing.T) {
+	dir := t.TempDir()
+	envPath := filepath.Join(dir, ".env")
+	if err := os.WriteFile(envPath, []byte("FLMX_VERSION=2.1.8\nJWT_SECRET=test\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	exec := &systemUpgradeExecutor{deployDir: dir, backendContainer: "flux-panel-backend"}
+	if err := exec.updateEnvVersion(envPath, "2.1.9"); err != nil {
+		t.Fatalf("updateEnvVersion() error = %v", err)
+	}
+
+	data, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+
+	// 双写口径：旧键就地更新为同值、新键缺失补写（不再删行收敛）。
+	want := "FLMX_VERSION=2.1.9\nJWT_SECRET=test\nOVO_VERSION=2.1.9\n"
+	if string(data) != want {
+		t.Fatalf("env content = %q, want %q", string(data), want)
+	}
+}
+
+func TestUpdateEnvVersionAppendsMissingValue(t *testing.T) {
+	dir := t.TempDir()
+	envPath := filepath.Join(dir, ".env")
+	if err := os.WriteFile(envPath, []byte("JWT_SECRET=test\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	exec := &systemUpgradeExecutor{deployDir: dir, backendContainer: "flux-panel-backend"}
+	if err := exec.updateEnvVersion(envPath, "2.1.9"); err != nil {
+		t.Fatalf("updateEnvVersion() error = %v", err)
+	}
+
+	data, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+
+	// 双写口径：两键均缺失时按 OVO、FLUX 序一并补写（脚本面
+	// activate_panel_update_files 同序）。
+	want := "JWT_SECRET=test\nOVO_VERSION=2.1.9\nFLMX_VERSION=2.1.9\n"
+	if string(data) != want {
+		t.Fatalf("env content = %q, want %q", string(data), want)
+	}
+}
+
+func TestUpdateEnvVersionRejectsUnsafeValue(t *testing.T) {
+	for _, version := range []string{"", "2.1.9\nJWT_SECRET=bad", "2.1.9\rbad", "2.1.9\x00bad", "2.1.9\x1fbad"} {
+		t.Run(version, func(t *testing.T) {
+			dir := t.TempDir()
+			envPath := filepath.Join(dir, ".env")
+			original := []byte("JWT_SECRET=test\n")
+			if err := os.WriteFile(envPath, original, 0o644); err != nil {
+				t.Fatalf("WriteFile() error = %v", err)
+			}
+
+			exec := &systemUpgradeExecutor{deployDir: dir, backendContainer: "flux-panel-backend"}
+			if err := exec.updateEnvVersion(envPath, version); err == nil {
+				t.Fatal("expected unsafe version to fail validation")
+			}
+
+			data, err := os.ReadFile(envPath)
+			if err != nil {
+				t.Fatalf("ReadFile() error = %v", err)
+			}
+			if string(data) != string(original) {
+				t.Fatalf("env content changed to %q, want %q", string(data), string(original))
+			}
+		})
+	}
+}
+
+func TestUpdateEnvVersionAcceptsVersionLabels(t *testing.T) {
+	for _, version := range []string{"2.1.9", "2.1.9-beta14", "v-test"} {
+		t.Run(version, func(t *testing.T) {
+			dir := t.TempDir()
+			envPath := filepath.Join(dir, ".env")
+			if err := os.WriteFile(envPath, []byte("JWT_SECRET=test\n"), 0o644); err != nil {
+				t.Fatalf("WriteFile() error = %v", err)
+			}
+
+			exec := &systemUpgradeExecutor{deployDir: dir, backendContainer: "flux-panel-backend"}
+			if err := exec.updateEnvVersion(envPath, version); err != nil {
+				t.Fatalf("updateEnvVersion() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestUpdateEnvVersionPreservesFileMode(t *testing.T) {
+	dir := t.TempDir()
+	envPath := filepath.Join(dir, ".env")
+	if err := os.WriteFile(envPath, []byte("FLMX_VERSION=2.1.8\nJWT_SECRET=test\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	exec := &systemUpgradeExecutor{deployDir: dir, backendContainer: "flux-panel-backend"}
+	if err := exec.updateEnvVersion(envPath, "2.1.9"); err != nil {
+		t.Fatalf("updateEnvVersion() error = %v", err)
+	}
+
+	info, err := os.Stat(envPath)
+	if err != nil {
+		t.Fatalf("Stat() error = %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("env mode = %o, want 0600", got)
+	}
+}
+
+func TestValidateBackendContainerNameRejectsUnsafeValue(t *testing.T) {
+	if err := validateBackendContainerName("flux-panel-backend;rm -rf /"); err == nil {
+		t.Fatal("expected unsafe container name to fail validation")
+	}
+}
+
+func TestBuildHelperRunArgsUsesDetachedContainer(t *testing.T) {
+	exec := &systemUpgradeExecutor{deployDir: "/opt/flvx-panel", backendContainer: "flux-panel-backend"}
+	args, err := exec.buildHelperRunArgs("sha256:abc", "flvx-upgrade-helper")
+	if err != nil {
+		t.Fatalf("buildHelperRunArgs() error = %v", err)
+	}
+	want := []string{
+		"run", "-d", "--rm", "--name", "flvx-upgrade-helper",
+		"--volumes-from", "flux-panel-backend",
+		"-v", "/var/run/docker.sock:/var/run/docker.sock",
+		"-e", "PANEL_DEPLOY_DIR=/opt/flvx-panel",
+		"--entrypoint", "/bin/sh", "sha256:abc",
+		"-c", exec.helperScript(),
+	}
+
+	if !reflect.DeepEqual(args, want) {
+		t.Fatalf("buildHelperRunArgs() = %#v, want %#v", args, want)
+	}
+}
+
+func TestBuildHelperRunArgsRejectsUnsafeBackendContainer(t *testing.T) {
+	exec := &systemUpgradeExecutor{deployDir: "/opt/flvx-panel", backendContainer: "flux-panel-backend;rm -rf /"}
+	if _, err := exec.buildHelperRunArgs("sha256:abc", "flvx-upgrade-helper"); err == nil {
+		t.Fatal("expected unsafe backend container name to fail validation")
+	}
+}
+
+func TestSystemVersionRejectsWrongMethod(t *testing.T) {
+	h := &Handler{}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/system/version", nil)
+	rr := httptest.NewRecorder()
+
+	h.systemVersion(rr, req)
+
+	if !strings.Contains(rr.Body.String(), "请求失败") {
+		t.Fatalf("expected wrong-method response, got %s", rr.Body.String())
+	}
+}
+
+func TestSystemUpgradeRejectsConcurrentRequests(t *testing.T) {
+	h := &Handler{}
+	h.systemUpgradeMu.Lock()
+	defer h.systemUpgradeMu.Unlock()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/system/upgrade", strings.NewReader(`{"channel":"stable"}`))
+	rr := httptest.NewRecorder()
+
+	h.systemUpgrade(rr, req)
+
+	if !strings.Contains(rr.Body.String(), systemUpgradeConflictError) {
+		t.Fatalf("expected conflict message, got %s", rr.Body.String())
+	}
+}
+
+func TestSystemUpgradeFailsFastBeforeMutatingFiles(t *testing.T) {
+	dir := t.TempDir()
+	composePath := filepath.Join(dir, "docker-compose.yml")
+	envPath := filepath.Join(dir, ".env")
+	if err := os.WriteFile(composePath, []byte("services:\n  backend:\n    image: test\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile() compose error = %v", err)
+	}
+	if err := os.WriteFile(envPath, []byte("FLMX_VERSION=2.1.8\nJWT_SECRET=test\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() env error = %v", err)
+	}
+
+	fakeDockerDir := t.TempDir()
+	fakeDockerPath := filepath.Join(fakeDockerDir, "docker")
+	fakeDockerScript := "#!/bin/sh\ncase \"$1\" in\n  --version)\n    echo 'Docker version 27.0.0'\n    exit 0\n    ;;&\n  compose)\n    if [ \"$2\" = version ]; then\n      echo 'Docker Compose version v2.33.0'\n      exit 0\n    fi\n    exit 0\n    ;;&\n  inspect)\n    echo 'No such object: flux-panel-backend' >&2\n    exit 1\n    ;;&\n  *)\n    exit 0\n    ;;&\n esac\n"
+	if err := os.WriteFile(fakeDockerPath, []byte(fakeDockerScript), 0o755); err != nil {
+		t.Fatalf("WriteFile() fake docker error = %v", err)
+	}
+	t.Setenv("PATH", fakeDockerDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(panelDeployDirEnv, dir)
+	t.Setenv(panelBackendContainerEnv, "flux-panel-backend")
+
+	h := &Handler{}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/system/upgrade", strings.NewReader(`{"channel":"stable"}`))
+	rr := httptest.NewRecorder()
+
+	h.systemUpgrade(rr, req)
+
+	if !strings.Contains(rr.Body.String(), "当前环境不支持面板自升级") {
+		t.Fatalf("expected fail-fast capability error, got %s", rr.Body.String())
+	}
+	if _, err := os.Stat(composePath + ".upgrade.bak"); !os.IsNotExist(err) {
+		t.Fatalf("expected no compose backup, got err=%v", err)
+	}
+	if _, err := os.Stat(envPath + ".upgrade.bak"); !os.IsNotExist(err) {
+		t.Fatalf("expected no env backup, got err=%v", err)
+	}
+	composeData, err := os.ReadFile(composePath)
+	if err != nil {
+		t.Fatalf("ReadFile() compose error = %v", err)
+	}
+	if string(composeData) != "services:\n  backend:\n    image: test\n" {
+		t.Fatalf("compose mutated unexpectedly: %q", string(composeData))
+	}
+	envData, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatalf("ReadFile() env error = %v", err)
+	}
+	if string(envData) != "FLMX_VERSION=2.1.8\nJWT_SECRET=test\n" {
+		t.Fatalf("env mutated unexpectedly: %q", string(envData))
+	}
+}
+
+func TestUpgradeBackupUsesStablePathAndRestoreRestoresOriginal(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "docker-compose.yml")
+	if err := os.WriteFile(path, []byte("original"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	exec := &systemUpgradeExecutor{deployDir: dir, backendContainer: "flux-panel-backend"}
+	backupPath, err := exec.backupFile(path)
+	if err != nil {
+		t.Fatalf("backupFile() error = %v", err)
+	}
+	if backupPath != path+".upgrade.bak" {
+		t.Fatalf("backup path = %q, want %q", backupPath, path+".upgrade.bak")
+	}
+	if err := os.WriteFile(path, []byte("mutated"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	if err := exec.restoreBackup(path); err != nil {
+		t.Fatalf("restoreBackup() error = %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if string(data) != "original" {
+		t.Fatalf("restored content = %q, want original", string(data))
+	}
+}
+
+func TestRestoreBackupPreservesOriginalFileMode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	if err := os.WriteFile(path, []byte("FLMX_VERSION=2.1.8\nJWT_SECRET=test\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	exec := &systemUpgradeExecutor{deployDir: dir, backendContainer: "flux-panel-backend"}
+	if _, err := exec.backupFile(path); err != nil {
+		t.Fatalf("backupFile() error = %v", err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("Remove() error = %v", err)
+	}
+	if err := exec.restoreBackup(path); err != nil {
+		t.Fatalf("restoreBackup() error = %v", err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat() error = %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("restored mode = %o, want 0600", got)
+	}
+}
+
+// I-C3-03(b) 钉格（fix10 S5）：.env 族写点（updateEnvVersion 的
+// .env 改写、backupFile 的 .upgrade.bak、restoreBackup 的恢复写）的
+// mode 口径是「继承但封顶 0600」：(继承值 &^ 077) | 0600。此前只继
+// 承不收紧——运维手工建的 0644 .env（含 JWT_SECRET/数据库口令）经
+// 自升级改写后原样保持 0644、长期全局可读，无任何一面纠正。
+func TestUpdateEnvVersionCapsLooseModeAt0600(t *testing.T) {
+	dir := t.TempDir()
+	envPath := filepath.Join(dir, ".env")
+	if err := os.WriteFile(envPath, []byte("FLMX_VERSION=2.1.8\nJWT_SECRET=test\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if err := os.Chmod(envPath, 0o644); err != nil {
+		t.Fatalf("Chmod() error = %v", err)
+	}
+
+	exec := &systemUpgradeExecutor{deployDir: dir, backendContainer: "flux-panel-backend"}
+	if err := exec.updateEnvVersion(envPath, "2.1.9"); err != nil {
+		t.Fatalf("updateEnvVersion() error = %v", err)
+	}
+
+	info, err := os.Stat(envPath)
+	if err != nil {
+		t.Fatalf("Stat() error = %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("env mode after rewrite = %o, want 0600 (inherit-but-cap)", got)
+	}
+	data, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if want := "FLMX_VERSION=2.1.9\nJWT_SECRET=test\nOVO_VERSION=2.1.9\n"; string(data) != want {
+		t.Fatalf("env content = %q, want %q (content bytes must be unchanged by the mode cap)", string(data), want)
+	}
+}
+
+func TestUpgradeBackupCapsLooseModeAt0600(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	if err := os.WriteFile(path, []byte("FLMX_VERSION=2.1.8\nJWT_SECRET=test\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatalf("Chmod() error = %v", err)
+	}
+
+	exec := &systemUpgradeExecutor{deployDir: dir, backendContainer: "flux-panel-backend"}
+	backupPath, err := exec.backupFile(path)
+	if err != nil {
+		t.Fatalf("backupFile() error = %v", err)
+	}
+
+	info, err := os.Stat(backupPath)
+	if err != nil {
+		t.Fatalf("Stat() error = %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf(".upgrade.bak mode = %o, want 0600 (inherit-but-cap)", got)
+	}
+	data, err := os.ReadFile(backupPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if want := "FLMX_VERSION=2.1.8\nJWT_SECRET=test\n"; string(data) != want {
+		t.Fatalf("backup content = %q, want %q", string(data), want)
+	}
+}
+
+func TestRestoreBackupCapsLooseModeAt0600(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	if err := os.WriteFile(path, []byte("FLMX_VERSION=2.1.8\nJWT_SECRET=test\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	exec := &systemUpgradeExecutor{deployDir: dir, backendContainer: "flux-panel-backend"}
+	backupPath, err := exec.backupFile(path)
+	if err != nil {
+		t.Fatalf("backupFile() error = %v", err)
+	}
+	// 模拟一份权限宽松的存量备份（旧口径下 0644 的 .env 备出的
+	// .upgrade.bak 即此形态）：恢复不得把宽松权限带回目标文件。
+	if err := os.Chmod(backupPath, 0o644); err != nil {
+		t.Fatalf("Chmod() error = %v", err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("Remove() error = %v", err)
+	}
+	if err := exec.restoreBackup(path); err != nil {
+		t.Fatalf("restoreBackup() error = %v", err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat() error = %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("restored mode = %o, want 0600 (inherit-but-cap)", got)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if want := "FLMX_VERSION=2.1.8\nJWT_SECRET=test\n"; string(data) != want {
+		t.Fatalf("restored content = %q, want %q", string(data), want)
+	}
+}
+
+// I-C3-02 钉格：自升级的部署文件写点（.env 版本行改写、.upgrade.bak
+// 备份与恢复）全部走原子写（同目录临时文件 + Rename）。可观察契约：
+// 写完内容与权限精确、部署目录不留 .tmp-* 临时残形；原非原子直写
+// helper 已删除，本测试与 TestUpdateEnvVersion*/TestUpgradeBackup*
+// 一起保证覆写语义（双备份路径、失败恢复）不回归。
+func TestUpgradeFileWritesLeaveNoTempResidue(t *testing.T) {
+	dir := t.TempDir()
+	envPath := filepath.Join(dir, ".env")
+	if err := os.WriteFile(envPath, []byte("FLMX_VERSION=2.1.8\nJWT_SECRET=<redacted>\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	exec := &systemUpgradeExecutor{deployDir: dir, backendContainer: "flux-panel-backend"}
+	if _, err := exec.backupFile(envPath); err != nil {
+		t.Fatalf("backupFile() error = %v", err)
+	}
+	if err := exec.updateEnvVersion(envPath, "2.1.9"); err != nil {
+		t.Fatalf("updateEnvVersion() error = %v", err)
+	}
+	if err := exec.restoreBackup(envPath); err != nil {
+		t.Fatalf("restoreBackup() error = %v", err)
+	}
+
+	data, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if want := "FLMX_VERSION=2.1.8\nJWT_SECRET=<redacted>\n"; string(data) != want {
+		t.Fatalf("restored env = %q, want %q (backup/restore roundtrip must be exact)", string(data), want)
+	}
+	info, err := os.Stat(envPath)
+	if err != nil {
+		t.Fatalf("Stat() error = %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("env mode = %o, want 0600", got)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir() error = %v", err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".tmp-") {
+			t.Fatalf("atomic write left temp residue %q in deploy dir", entry.Name())
+		}
+	}
+}
+
+func TestDecodeSystemUpgradeRequestRejectsTruncatedJSON(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/system/check-updates", strings.NewReader(`{"channel":"stable"`))
+	var payload systemUpgradeRequest
+
+	if err := decodeSystemUpgradeRequest(req, &payload); err == nil {
+		t.Fatal("expected truncated JSON to be rejected")
+	}
+}
+
+func TestDecodeSystemUpgradeRequestAllowsEmptyBody(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/system/check-updates", strings.NewReader(""))
+	var payload systemUpgradeRequest
+
+	if err := decodeSystemUpgradeRequest(req, &payload); err != nil {
+		t.Fatalf("expected empty body to be accepted, got %v", err)
+	}
+}
+
+func TestSystemUpgradeVersionDataSurfacesLookupFailureReason(t *testing.T) {
+	data, err := json.Marshal(systemUpgradeVersionData{Reason: "GitHub unavailable"})
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if !strings.Contains(string(data), `"reason":"GitHub unavailable"`) {
+		t.Fatalf("expected reason field in JSON, got %s", string(data))
+	}
+}
+
+// R3-E-01 回归：候选版面板（当前版本 2.1.14-cand）查更新时，
+// HasUpdate 比较须剥 -cand 后缀再比，否则 compareVersions 严格
+// 解析失败、恒报无更新。
+func TestSystemUpgradeVersionDataCandCurrentSeesUpdate(t *testing.T) {
+	cases := []struct {
+		name    string
+		current string
+		latest  string
+		want    bool
+	}{
+		{"cand current below latest", "2.1.13-cand", "2.1.14", true},
+		{"cand current equals latest", "2.1.14-cand", "2.1.14", false},
+		{"cand latest above formal current", "2.1.14", "2.1.15-cand", true},
+		{"formal versions unchanged", "2.1.13", "2.1.14", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			data := systemUpgradeVersionResponse(tc.current, releaseChannelStable, tc.latest, nil, systemUpgradeCapabilityData{})
+			if data.HasUpdate != tc.want {
+				t.Fatalf("systemUpgradeVersionResponse(current=%q, latest=%q).HasUpdate = %v, want %v", tc.current, tc.latest, data.HasUpdate, tc.want)
+			}
+		})
+	}
+}
+
+func TestHelperRunArgsCarryComposeProject(t *testing.T) {
+	exec := &systemUpgradeExecutor{deployDir: "/opt/flvx-panel", backendContainer: "flux-panel-backend", composeProject: "root"}
+	args, err := exec.buildHelperRunArgs("sha256:abc", "helper")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "-e COMPOSE_PROJECT_NAME=root") {
+		t.Fatalf("helper must reuse the running project: %v", args)
+	}
+	exec.composeProject = "bad name;rm"
+	args, _ = exec.buildHelperRunArgs("sha256:abc", "helper")
+	if strings.Contains(strings.Join(args, " "), "-e COMPOSE_PROJECT_NAME=") {
+		t.Fatalf("invalid project names must be dropped: %v", args)
+	}
+}
+
+func TestHelperRunsInHostDeployDir(t *testing.T) {
+	exec := &systemUpgradeExecutor{deployDir: "/opt/flvx-panel", backendContainer: "flux-panel-backend", hostDeployDir: "/root"}
+	args, err := exec.buildHelperRunArgs("sha256:abc", "helper")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	// Compose resolves ./ against the directory it runs in as a host path,
+	// so the helper must work in the host directory itself.
+	if !strings.Contains(joined, "-v /root:/root") || !strings.Contains(joined, "-e PANEL_DEPLOY_DIR=/root") ||
+		strings.Contains(joined, "PANEL_DEPLOY_DIR=/opt/flvx-panel") {
+		t.Fatalf("helper must run in the host deploy dir: %v", args)
+	}
+	exec.hostDeployDir = "/bad dir;x"
+	joined = strings.Join(mustArgs(t, exec), " ")
+	if !strings.Contains(joined, "-e PANEL_DEPLOY_DIR=/opt/flvx-panel") || strings.Contains(joined, "bad dir") {
+		t.Fatalf("unsafe host dirs must be ignored: %v", joined)
+	}
+}
+
+func mustArgs(t *testing.T, e *systemUpgradeExecutor) []string {
+	t.Helper()
+	args, err := e.buildHelperRunArgs("sha256:abc", "helper")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return args
+}
+
+// U1-001 的后继（1.7.7 KU5）：首选路线失败（gh-proxy 类服务对
+// api.github.com 返回 403）时按路线序续切到直连。路线钉死为
+// 「直连判死 + 代理序 [ghfast.example]」，尝试序应为代理 → 直连。
+func TestFetchSystemUpgradeReleasesFallsBackToDirect(t *testing.T) {
+	clearReleasesCacheForTest(t)
+	seedGitHubRoutesForTest(t, false, []string{"https://ghfast.example"})
+
+	originalGet := systemUpgradeHTTPGet
+	defer func() { systemUpgradeHTTPGet = originalGet }()
+	var tried []string
+	systemUpgradeHTTPGet = func(client *http.Client, url string) (*http.Response, error) {
+		tried = append(tried, url)
+		if strings.HasPrefix(url, "https://ghfast.example/") {
+			return &http.Response{
+				StatusCode: http.StatusForbidden,
+				Body:       io.NopCloser(strings.NewReader("Invalid input.")),
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`[{"tag_name":"1.0.10","name":"v","published_at":"2026-10-20T00:00:00Z"}]`)),
+		}, nil
+	}
+
+	h := &Handler{}
+	releases, err := h.fetchSystemUpgradeReleases(50)
+	if err != nil {
+		t.Fatalf("fetchSystemUpgradeReleases() error = %v", err)
+	}
+	if len(releases) != 1 || releases[0].TagName != "1.0.10" {
+		t.Fatalf("releases = %+v, want one 1.0.10 release", releases)
+	}
+	if len(tried) != 2 || !strings.HasPrefix(tried[0], "https://ghfast.example/https://api.github.com/") ||
+		!strings.HasPrefix(tried[1], "https://api.github.com/") {
+		t.Fatalf("tried paths = %v, want proxy first then direct", tried)
+	}
+}
+
+// U1-003/U1-007：状态文件往返与 0600 权限。
+func TestUpgradeStatusRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	exec := &systemUpgradeExecutor{deployDir: dir, backendContainer: "flux-panel-backend"}
+
+	if st := exec.readUpgradeStatus(); st.InProgress {
+		t.Fatalf("no status file should read as not-in-progress, got %+v", st)
+	}
+	want := systemUpgradeStatusData{
+		InProgress: true,
+		Version:    "1.0.10",
+		StartedAt:  time.Now().UTC().Format(time.RFC3339),
+	}
+	if err := exec.writeUpgradeStatus(want); err != nil {
+		t.Fatalf("writeUpgradeStatus() error = %v", err)
+	}
+	if got := exec.readUpgradeStatus(); got != want {
+		t.Fatalf("readUpgradeStatus() = %+v, want %+v", got, want)
+	}
+	info, err := os.Stat(filepath.Join(dir, systemUpgradeStatusFileName))
+	if err != nil {
+		t.Fatalf("Stat() error = %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("status file mode = %o, want 0600", got)
+	}
+}
+
+// U1-003：状态文件显示升级中时 POST /system/upgrade 被拒绝。
+func TestSystemUpgradeRejectsWhenStatusFileInProgress(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(panelDeployDirEnv, dir)
+	exec := &systemUpgradeExecutor{deployDir: dir, backendContainer: "flux-panel-backend"}
+	if err := exec.writeUpgradeStatus(systemUpgradeStatusData{
+		InProgress: true,
+		Version:    "1.0.10",
+		StartedAt:  time.Now().UTC().Format(time.RFC3339),
+	}); err != nil {
+		t.Fatalf("writeUpgradeStatus() error = %v", err)
+	}
+
+	h := &Handler{}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/system/upgrade", strings.NewReader(`{"channel":"stable"}`))
+	rr := httptest.NewRecorder()
+	h.systemUpgrade(rr, req)
+	if !strings.Contains(rr.Body.String(), systemUpgradeConflictError) {
+		t.Fatalf("expected conflict message, got %s", rr.Body.String())
+	}
+}
+
+// U1-007：GET 状态接口无文件时返回 inProgress=false。
+func TestSystemUpgradeStatusHandler(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(panelDeployDirEnv, dir)
+
+	h := &Handler{}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/system/upgrade/status", nil)
+	rr := httptest.NewRecorder()
+	h.systemUpgradeStatus(rr, req)
+	body := rr.Body.String()
+	if !strings.Contains(body, `"inProgress":false`) || !strings.Contains(body, `"code":0`) {
+		t.Fatalf("expected OK envelope with inProgress=false, got %s", body)
+	}
+}
+
+// U1-009：updateEnvVersion 不得误伤 FLMX_VERSION_EXTRA；命中的旧键
+// FLMX_VERSION 行改写时迁为新键 OVO_VERSION（改名迁移）。
+func TestUpdateEnvVersionDoesNotTouchExtraKey(t *testing.T) {
+	dir := t.TempDir()
+	envPath := filepath.Join(dir, ".env")
+	original := "FLMX_VERSION_EXTRA=9.9.9\nFLMX_VERSION=1.0.0\n"
+	if err := os.WriteFile(envPath, []byte(original), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	exec := &systemUpgradeExecutor{deployDir: dir, backendContainer: "flux-panel-backend"}
+	if err := exec.updateEnvVersion(envPath, "1.0.10"); err != nil {
+		t.Fatalf("updateEnvVersion() error = %v", err)
+	}
+	data, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	want := "FLMX_VERSION_EXTRA=9.9.9\nFLMX_VERSION=1.0.10\nOVO_VERSION=1.0.10\n"
+	if string(data) != want {
+		t.Fatalf("env content = %q, want %q", string(data), want)
+	}
+}
+
+// 双写口径（1.9.9，D5）：新旧两键并存的存量 .env 改写后两键同值、
+// 各自就地保留原行位，不再删除 FLMX_VERSION 行收敛为单键。
+func TestUpdateEnvVersionDualWritesBothKeys(t *testing.T) {
+	dir := t.TempDir()
+	envPath := filepath.Join(dir, ".env")
+	original := "FLMX_VERSION=1.0.0\nJWT_SECRET=test\nOVO_VERSION=1.0.0\n"
+	if err := os.WriteFile(envPath, []byte(original), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	exec := &systemUpgradeExecutor{deployDir: dir, backendContainer: "ovo-panel-backend"}
+	if err := exec.updateEnvVersion(envPath, "2.0.0"); err != nil {
+		t.Fatalf("updateEnvVersion() error = %v", err)
+	}
+	data, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	want := "FLMX_VERSION=2.0.0\nJWT_SECRET=test\nOVO_VERSION=2.0.0\n"
+	if string(data) != want {
+		t.Fatalf("env content = %q, want %q", string(data), want)
+	}
+}
+
+// U1-002：helper 脚本必须先健康校验再删备份，且各终态回写状态文件。
+func TestHelperScriptHealthGateAndStatusWrites(t *testing.T) {
+	exec := &systemUpgradeExecutor{deployDir: "/opt/flvx-panel", backendContainer: "flux-panel-backend"}
+	script := exec.helperScript()
+	for _, needle := range []string{"wait_backend_healthy", "write_status", "rolled_back", `"success"`} {
+		if !strings.Contains(script, needle) {
+			t.Fatalf("helper script missing %q", needle)
+		}
+	}
+	healthIdx := strings.Index(script, "if ! wait_backend_healthy")
+	rmIdx := strings.Index(script, "rm -f docker-compose.yml.upgrade.bak")
+	if healthIdx < 0 || rmIdx < 0 || healthIdx > rmIdx {
+		t.Fatalf("backups must be removed only after the health gate")
+	}
+}
+
+// F-028（A7-004）：helper 回滚必须用恢复后的文件重建旧容器并复跑健康
+// 检查；重建后仍不健康时终态必须是 rollback_failed 且保留 .bak，不许
+// 只恢复文件就写 rolled_back 冒充回滚成功。用 stub docker/date/sleep
+// 真跑一遍 helperScript：新后端始终 exited ⇒ 首轮健康检查超时 ⇒ 回滚
+// 应再次 compose up 并以 rollback_failed 收尾。date 桩每次 +%s 跳 +400
+// 让 300s 健康窗口立即超时。
+func TestHelperScriptRollbackRecreatesAndReportsFailure(t *testing.T) {
+	deployDir := t.TempDir()
+	stubDir := t.TempDir()
+	callsPath := filepath.Join(stubDir, "docker-calls.log")
+	counterPath := filepath.Join(stubDir, "date-counter")
+
+	write := func(path, content string, perm os.FileMode) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(content), perm); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", path, err)
+		}
+	}
+	write(filepath.Join(deployDir, "docker-compose.yml"), "new-compose\n", 0o644)
+	write(filepath.Join(deployDir, "docker-compose.yml.upgrade.bak"), "old-compose\n", 0o644)
+	write(filepath.Join(deployDir, ".env"), "FLMX_VERSION=9.9.9\n", 0o600)
+	write(filepath.Join(deployDir, ".env.upgrade.bak"), "FLMX_VERSION=1.0.0\n", 0o600)
+	write(counterPath, "1000", 0o644)
+
+	dockerStub := `#!/bin/sh
+echo "$@" >> "` + callsPath + `"
+case "$*" in
+  "compose pull"*) exit 0 ;;
+  "compose up"*) exit 0 ;;
+  "compose ps"*)
+    case "$*" in
+      *State*) echo "exited" ;;
+      *Name*) echo "backend-1" ;;
+    esac
+    exit 0 ;;
+  "exec"*) exit 1 ;;
+esac
+exit 0
+`
+	write(filepath.Join(stubDir, "docker"), dockerStub, 0o755)
+	dateStub := `#!/bin/sh
+for a in "$@"; do
+  case "$a" in
+    *%s*)
+      n=$(cat "` + counterPath + `")
+      n=$((n + 400))
+      echo "$n" > "` + counterPath + `"
+      echo "$n"
+      exit 0
+      ;;
+  esac
+done
+echo "2026-01-01T00:00:00Z"
+`
+	write(filepath.Join(stubDir, "date"), dateStub, 0o755)
+	write(filepath.Join(stubDir, "sleep"), "#!/bin/sh\nexit 0\n", 0o755)
+
+	executor := &systemUpgradeExecutor{deployDir: deployDir, backendContainer: "flux-panel-backend"}
+	scriptPath := filepath.Join(stubDir, "helper.sh")
+	write(scriptPath, executor.helperScript(), 0o755)
+
+	cmd := exec.Command("sh", scriptPath)
+	cmd.Env = append(os.Environ(),
+		"PATH="+stubDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"PANEL_DEPLOY_DIR="+deployDir,
+		"OVO_UPGRADE_VERSION=9.9.9",
+		"OVO_UPGRADE_STARTED_AT=2026-01-01T00:00:00Z",
+	)
+	out, runErr := cmd.CombinedOutput()
+	if runErr == nil {
+		t.Fatalf("helper script should exit non-zero when the new backend never becomes healthy, output:\n%s", out)
+	}
+
+	calls, err := os.ReadFile(callsPath)
+	if err != nil {
+		t.Fatalf("ReadFile(docker calls) error = %v", err)
+	}
+	if ups := strings.Count(string(calls), "compose up"); ups < 2 {
+		t.Fatalf("rollback must re-run compose up with the restored files; docker calls:\n%s", calls)
+	}
+	status, err := os.ReadFile(filepath.Join(deployDir, ".ovo_upgrade_status.json"))
+	if err != nil {
+		t.Fatalf("ReadFile(status) error = %v", err)
+	}
+	if !strings.Contains(string(status), `"result": "rollback_failed"`) {
+		t.Fatalf("status = %s, want rollback_failed after failed rollback health check", status)
+	}
+	compose, err := os.ReadFile(filepath.Join(deployDir, "docker-compose.yml"))
+	if err != nil {
+		t.Fatalf("ReadFile(compose) error = %v", err)
+	}
+	if string(compose) != "old-compose\n" {
+		t.Fatalf("compose = %q, want restored backup content", compose)
+	}
+	if _, err := os.Stat(filepath.Join(deployDir, "docker-compose.yml.upgrade.bak")); err != nil {
+		t.Fatalf("backup must be preserved after rollback_failed: %v", err)
+	}
+}
+
+// F-139 的后继（1.7.7 KU5）：downloadReleaseAsset 按直选路线序逐个
+// 候选重试整组（资产 + .sha256 同源同次）。本用例路线钉死为
+// 「直连判死 + 代理序 [proxy]」（即代理居首、直连殿后），代理全
+// 502、直连提供正确资产与校验，断言最终成功且代理确实被先试过。
+func TestDownloadReleaseAssetFallsBackToDirectWhenProxyFails(t *testing.T) {
+	content := []byte("services: {}\n")
+	sum := fmt.Sprintf("%x", sha256.Sum256(content))
+	direct := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, ".sha256") {
+			fmt.Fprint(w, sum)
+			return
+		}
+		_, _ = w.Write(content)
+	}))
+	defer direct.Close()
+
+	var proxyHits atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyHits.Add(1)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer proxy.Close()
+
+	seedGitHubRoutesForTest(t, false, []string{proxy.URL})
+
+	originalBase := systemUpgradeReleaseBaseURL
+	systemUpgradeReleaseBaseURL = direct.URL
+	t.Cleanup(func() { systemUpgradeReleaseBaseURL = originalBase })
+	t.Setenv("OVO_FETCH_ALLOW_PRIVATE_NETWORKS", "true")
+
+	h := &Handler{}
+	body, note, err := h.downloadReleaseAsset("9.9.9", "docker-compose-v4.yml")
+	if err != nil {
+		t.Fatalf("代理失败时应降级直连下载资产: %v", err)
+	}
+	// L8-F-02：直连获胜后唯一的异路（代理）已死，第二锚无从复核，
+	// 必须以降级说明交回（单锚继续），不得静默。
+	if !strings.Contains(note, "跨线路锚复核已降级") {
+		t.Fatalf("anchor note = %q, want named degradation (only other route is dead)", note)
+	}
+	if string(body) != string(content) {
+		t.Fatalf("asset body = %q, want %q", body, content)
+	}
+	if proxyHits.Load() == 0 {
+		t.Fatal("应先经代理尝试下载")
+	}
+}
+
+// U1-008：内网代理被拒错误追加中文指引，其他错误原样返回。
+type errPrivateForTest struct{}
+
+func (errPrivateForTest) Error() string { return "private network not allowlisted: 192.168.1.1" }
+
+func TestWrapUpgradeDownloadError(t *testing.T) {
+	if err := wrapUpgradeDownloadError(os.ErrNotExist); err != os.ErrNotExist {
+		t.Fatalf("unrelated error must pass through, got %v", err)
+	}
+	wrapped := wrapUpgradeDownloadError(errPrivateForTest{})
+	if !strings.Contains(wrapped.Error(), "OVO_FETCH_ALLOW_PRIVATE_NETWORKS=true") {
+		t.Fatalf("expected guidance in wrapped error, got %v", wrapped)
+	}
+	if wrapUpgradeDownloadError(nil) != nil {
+		t.Fatal("nil error must stay nil")
+	}
+}
+
+// R8-075：状态查询只读幂等——POST 带 JSON body 与 GET 同形返回状态，
+// 不再以 -1「请求失败」收口；其他 method 仍拒绝。
+func TestSystemUpgradeStatusHandlerAcceptsPostWithBody(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(panelDeployDirEnv, dir)
+
+	h := &Handler{}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/system/upgrade/status", strings.NewReader(`{}`))
+	rr := httptest.NewRecorder()
+	h.systemUpgradeStatus(rr, req)
+	body := rr.Body.String()
+	if !strings.Contains(body, `"inProgress":false`) || !strings.Contains(body, `"code":0`) {
+		t.Fatalf("POST with body: expected OK envelope with inProgress=false, got %s", body)
+	}
+
+	req = httptest.NewRequest(http.MethodDelete, "/api/v1/system/upgrade/status", nil)
+	rr = httptest.NewRecorder()
+	h.systemUpgradeStatus(rr, req)
+	if !strings.Contains(rr.Body.String(), `"code":-1`) {
+		t.Fatalf("DELETE: expected -1 envelope, got %s", rr.Body.String())
+	}
+}
+
+// R8-003：降级点名须随状态落盘、透传 helper 环境变量（JSON 转义后的
+// 内容），且 helper 脚本回写终态时保留 anchorNote 字段。
+func TestSystemUpgradeAnchorNotePlumbing(t *testing.T) {
+	note := "跨线路锚复核已降级：升级校验锚复核不可用（其他线路均未给出校验值），按单锚继续"
+	exec := &systemUpgradeExecutor{
+		deployDir:         "/opt/flvx-panel",
+		backendContainer:  "flux-panel-backend",
+		upgradeVersion:    "1.9.5",
+		upgradeStartedAt:  "2026-11-02T00:00:00Z",
+		upgradeAnchorNote: note,
+	}
+	args, err := exec.buildHelperRunArgs("sha256:abc", "flvx-upgrade-helper")
+	if err != nil {
+		t.Fatalf("buildHelperRunArgs() error = %v", err)
+	}
+	raw, err := json.Marshal(note)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	wantEnv := "OVO_UPGRADE_ANCHOR_NOTE=" + string(raw[1:len(raw)-1])
+	found := false
+	for _, a := range args {
+		if a == wantEnv {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("buildHelperRunArgs() missing %q in %#v", wantEnv, args)
+	}
+	if script := exec.helperScript(); !strings.Contains(script, "anchorNote") || !strings.Contains(script, "OVO_UPGRADE_ANCHOR_NOTE") {
+		t.Fatal("helper script must preserve anchorNote on status rewrite")
+	}
+
+	// 状态落盘/读回往返保留点名。
+	dir := t.TempDir()
+	exec2 := &systemUpgradeExecutor{deployDir: dir, backendContainer: "flux-panel-backend"}
+	if err := exec2.writeUpgradeStatus(systemUpgradeStatusData{
+		InProgress: true, Version: "1.9.5", StartedAt: "2026-11-02T00:00:00Z", AnchorNote: note,
+	}); err != nil {
+		t.Fatalf("writeUpgradeStatus() error = %v", err)
+	}
+	if got := exec2.readUpgradeStatus().AnchorNote; got != note {
+		t.Fatalf("readUpgradeStatus().AnchorNote = %q, want %q", got, note)
+	}
+}

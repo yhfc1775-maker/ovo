@@ -1,0 +1,169 @@
+# Error Codes & Handling
+
+## Response Code Field
+
+| code | Meaning | Action |
+|------|---------|--------|
+| `0` | Success | Use `data` field |
+| `-1` | Business error | Show `msg` to user |
+| `-2` | Server/DB error | Retry or report bug |
+| `-3` | Target address validation failed (monitoring SSRF check) | Check the target URL/host |
+| `401` | Unauthorized | Token expired/invalid, re-login |
+| `403` | Forbidden | Need admin privileges |
+| `409` | Same request already in progress | Retry shortly |
+| `429` | Rate limited | Wait and retry; read `Retry-After: 60` |
+
+> Historical code: `500` was once the parameter-error code. Since F-08, envelope parameter errors are unified under `-1` and `500` has no emission point.
+
+## Common Error Messages (Chinese)
+
+| msg | Cause | Solution |
+|-----|-------|----------|
+| 账号或密码错误 | Wrong credentials | Check username/password |
+| 无效的token或token已过期 | Token expired/invalid | Re-login |
+| 权限不足 | Need admin | Use admin account (role_id: 0) |
+| 端口已被占用 | Port in use | Choose different port or delete conflicting forward |
+| 流量已超额，禁止开启转发 | Out of traffic | Contact admin or upgrade plan |
+| 节点离线 | Node offline | Check node status, run install command |
+| 用户名已存在 | Username taken | Choose different username |
+| 请求参数错误 | Invalid request | Check request body format |
+| 转发数量已达上限 | Forward limit reached | Delete unused forwards or contact admin |
+| 无权限 | No access to the resource | Contact admin to get access assigned |
+
+## Error Handling Pattern
+
+### JavaScript/TypeScript
+
+```typescript
+async function callApi<T>(endpoint: string, data: object): Promise<T> {
+  const res = await fetch(`${BASE_URL}${endpoint}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": TOKEN,
+    },
+    body: JSON.stringify(data),
+  });
+
+  const result = await res.json();
+
+  if (result.code === 0) {
+    return result.data;
+  }
+
+  switch (result.code) {
+    case 401:
+      // Token expired - clear and retry
+      TOKEN = null;
+      throw new Error("登录已过期，请重新登录");
+    case 403:
+      throw new Error("权限不足，需要管理员权限");
+    case -2:
+      throw new Error("服务器错误，请稍后重试");
+    default:
+      throw new Error(result.msg || "操作失败");
+  }
+}
+```
+
+### Python
+
+```python
+def call_api(endpoint: str, data: dict = None) -> dict:
+    global TOKEN
+    
+    headers = {"Content-Type": "application/json"}
+    if TOKEN:
+        headers["Authorization"] = TOKEN
+    
+    resp = requests.post(f"{BASE_URL}{endpoint}", headers=headers, json=data or {})
+    result = resp.json()
+    
+    if result["code"] == 0:
+        return result.get("data")
+    
+    if result["code"] == 401:
+        TOKEN = None
+        raise Exception("登录已过期，请重新登录")
+    elif result["code"] == 403:
+        raise Exception("权限不足，需要管理员权限")
+    elif result["code"] == -2:
+        raise Exception("服务器错误，请稍后重试")
+    else:
+        raise Exception(result["msg"] or "操作失败")
+```
+
+### Bash
+
+```bash
+call_api() {
+  local endpoint="$1"
+  local data="$2"
+  
+  local response
+  response=$(curl -s -X POST "${OVO_BASE_URL}${endpoint}" \
+    -H "Authorization: ${TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "$data")
+  
+  local code
+  code=$(echo "$response" | jq -r '.code')
+  
+  if [ "$code" == "0" ]; then
+    echo "$response" | jq '.data'
+    return 0
+  fi
+  
+  local msg
+  msg=$(echo "$response" | jq -r '.msg')
+  
+  case "$code" in
+    401) echo "Error: 登录已过期" >&2 ;;
+    403) echo "Error: 权限不足" >&2 ;;
+    -2)  echo "Error: 服务器错误" >&2 ;;
+    *)   echo "Error: $msg" >&2 ;;
+  esac
+  
+  return 1
+}
+```
+
+## Retry Logic with Auto Re-login
+
+```typescript
+async function callApiWithRetry<T>(
+  endpoint: string, 
+  data: object,
+  maxRetries = 1
+): Promise<T> {
+  let lastError: Error;
+  
+  for (let i = 0; i <= maxRetries; i++) {
+    try {
+      if (!TOKEN) {
+        await login();
+      }
+      return await callApi<T>(endpoint, data);
+    } catch (error) {
+      lastError = error;
+      if (error.message.includes("过期") || error.message.includes("expired")) {
+        TOKEN = null;  // Force re-login on next attempt
+        continue;
+      }
+      throw error;
+    }
+  }
+  
+  throw lastError!;
+}
+```
+
+## Validation Errors
+
+When request validation fails, the API returns code -1 with specific messages:
+
+| Scenario | Error Message |
+|----------|--------------|
+| Missing required field | `请求参数错误` or field-specific message |
+| Username length out of range | `用户名长度必须为 1-100 个字符` |
+| Password too short | `密码至少6位` |

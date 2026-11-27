@@ -1,0 +1,73 @@
+import * as React from "react";
+import { cva, type VariantProps } from "class-variance-authority";
+
+import { cn } from "@/lib/utils";
+
+const alertVariants = cva(
+  "relative w-full rounded-lg border px-4 py-3 text-sm",
+  {
+    variants: {
+      variant: {
+        default: "glass-card border-default-200 text-foreground",
+        // Round 4: semantic alerts ride the tint trays (opaque in both
+        // themes; the old -50 tints kept their light shade in dark mode
+        // and washed the light text out).
+        destructive: "border-danger-200 tray-danger",
+        success: "border-success-200 tray-success",
+        warning: "border-warning-200 tray-warning",
+      },
+    },
+    defaultVariants: {
+      variant: "default",
+    },
+  },
+);
+
+function Alert({
+  className,
+  variant,
+  ...props
+}: React.ComponentProps<"div"> & VariantProps<typeof alertVariants>) {
+  return (
+    <div
+      className={cn(alertVariants({ className, variant }))}
+      data-slot="alert"
+      role="alert"
+      {...props}
+    />
+  );
+}
+
+function AlertTitle({
+  className,
+  children,
+  ...props
+}: React.ComponentProps<"h5">) {
+  return (
+    <h5
+      className={cn(
+        "mb-1 font-semibold leading-none tracking-tight",
+        className,
+      )}
+      data-slot="alert-title"
+      {...props}
+    >
+      {children}
+    </h5>
+  );
+}
+
+function AlertDescription({
+  className,
+  ...props
+}: React.ComponentProps<"div">) {
+  return (
+    <div
+      className={cn("text-sm", className)}
+      data-slot="alert-description"
+      {...props}
+    />
+  );
+}
+
+export { Alert, AlertDescription, AlertTitle };

@@ -1,0 +1,662 @@
+name: Build and Push Images
+
+env:
+  # F-123: 原残留 VERSION "2.0.7-beta" 已删除——本 workflow 只由 tag 与
+  # workflow_dispatch 触发，分支触发分支（唯一消费者）不可达。
+  REGISTRY: ghcr.io
+
+on:
+  push:
+    tags:
+      - '[0-9]*'  # 匹配 2.0.8, 2.0.8-beta 等格式
+  # 手动发版：在 Actions 页面填写版本号，release 时会在当前提交上创建同名 tag
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（如 3.0.0，不带 v）'
+        required: true
+        type: string
+
+jobs:
+  check-version:
+    name: Check Version and Decide Build
+    runs-on: ubuntu-latest
+    # F-125: 与 build-vite/build-go-backend 对齐，收敛默认权限。
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      should_build: ${{ steps.version.outputs.should_build }}
+      should_build_gost: ${{ steps.version.outputs.should_build_gost }}
+      is_tag: ${{ steps.version.outputs.is_tag }}
+      image_owner: ${{ steps.version.outputs.image_owner }}
+      push_latest: ${{ steps.version.outputs.push_latest }}
+      dual_push_legacy: ${{ steps.version.outputs.dual_push_legacy }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      # R4-F7-01: SCRIPT_VERSION bump linkage gate. The tree-state
+      # gates only check the stamp's format and repo==asset equality;
+      # nothing required the stamp to move when the script body
+      # changed, which is exactly how RR-F7-01 shipped unbumped.
+      # This checkout has full history + tags (fetch-depth: 0), so
+      # the diff-side check runs here: body changed vs the previous
+      # release tag without a strictly greater stamp fails the
+      # release before any build starts.
+      - name: Check panel_install.sh version stamp bump
+        run: bash scripts/check-script-version-bump.sh
+
+      # R2-X2-01: 「只给 main 已绿提交打 tag」中「属 main」一半的机
+      # 械门。此前 verify（reusable ci-build）只证明该提交能过门、
+      # 不证明它在 main 上，发版归属靠仓外约定（见下方 verify 的
+      # C4-02 注）。本步在产出任何发版决策前断言归属：tag push 要
+      # 求被打 tag 的提交是 origin/main 的祖先；workflow_dispatch
+      # 要求触发 ref 本身就是 main（手动发版会在当前提交上建 tag，
+      # 从其他分支 dispatch 等于给非 main 提交发版）。任一不成立即
+      # 红：check-version 失败、无任何输出，后续 build/create-
+      # release 全部 needs 本 job，自然停摆。
+      - name: Verify release commit is on main
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            if [[ "${{ github.ref }}" != "refs/heads/main" ]]; then
+              echo "::error::workflow_dispatch 发版必须从 main 分支触发（当前 ref: ${{ github.ref }}）"
+              exit 1
+            fi
+          fi
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "::error::发版提交 $GITHUB_SHA 不在 main 上（不是 origin/main 的祖先），拒绝发版"
+            exit 1
+          fi
+          echo "✅ Release commit $GITHUB_SHA is on main"
+
+      - name: Determine version and build strategy
+        id: version
+        run: |
+          # 镜像 owner 需要小写
+          IMAGE_OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "image_owner=$IMAGE_OWNER" >> $GITHUB_OUTPUT
+
+          # F-123: 本 workflow 的 on: 只有 tag push 与 workflow_dispatch，
+          # 原 else 分支（分支触发 + env.VERSION + should_build=false 的
+          # GOST-only 更新路径）不可达，已删除；其 GOST-only 更新 job
+          # 的触发条件（is_tag == 'false'）因此恒假，已随 X-P3-33
+          # （J-S1 backlog）整体移除。
+          # Tag 或手动触发：使用 tag 名 / 填写的版本号，全量构建并发版
+          VERSION="${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}"
+          if [[ ! "$VERSION" =~ ^[0-9][0-9A-Za-z.-]*$ ]]; then
+            echo "::error::版本号必须以数字开头，例如 3.0.0"
+            exit 1
+          fi
+          echo "🏷️ Release version: $VERSION"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "is_tag=true" >> $GITHUB_OUTPUT
+          echo "should_build=true" >> $GITHUB_OUTPUT
+          echo "should_build_gost=true" >> $GITHUB_OUTPUT
+          # R3-C4-04: the floating GHCR :latest tag is reserved for
+          # plain dotted-numeric versions. The test is the exact same
+          # regex create-release's J-02 guard uses to decide
+          # PRERELEASE_FLAG, so the two can never disagree: a
+          # prerelease-shaped version (1.9.7-beta, -rc, ...) publishes
+          # its Release as a prerelease AND pushes only its versioned
+          # image tags, never overwriting :latest (the repo compose
+          # files default to ${OVO_VERSION:-latest}, so a beta in
+          # :latest would silently reach direct compose users).
+          if [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
+            echo "push_latest=true" >> $GITHUB_OUTPUT
+          else
+            echo "push_latest=false" >> $GITHUB_OUTPUT
+          fi
+          # 改名过渡双推的机械止点：旧仓 ovo-flux-panel-backend 随
+          # 1.9.8 起双推、至 2.0.0 止（含），2.0.1 起停推。判定本
+          # 体在 scripts/dual-push-legacy.sh（唯一判定源，边界格由
+          # scripts/dual-push-legacy-selftest.sh 钉住，XC4-B2）——
+          # 此前判定只以内联 bash 存在于本文件，改坏无任何本地门
+          # 会红；此处只负责调用并把结论经 dual_push_legacy 输出
+          # 给 build-go-backend，止点由判定执行、不靠发版人记得。
+          DUAL_PUSH_LEGACY="$(bash scripts/dual-push-legacy.sh "$VERSION")"
+          echo "dual_push_legacy=$DUAL_PUSH_LEGACY" >> $GITHUB_OUTPUT
+          echo "🚚 Legacy repo dual-push (ovo-flux-panel-backend): $DUAL_PUSH_LEGACY (version $VERSION vs cutoff 2.0.0)"
+
+  # C4-02（第三轮再审计）：发版路径门禁前置校验。本 workflow 的触发
+  # （tag push + workflow_dispatch）与 ci-build（分支 push + PR）不相交，
+  # 改前本 workflow 的 job 里只有 build-agent 跑一门
+  # check-agent-image-tools，其余 21 门、Go 全量测试、PG 契约、安装
+  # 脚本套件与 e2e API 子集在发版路径上都没有执行点——给从未过 CI 的
+  # 提交打 tag（或从任意分支 workflow_dispatch）可直达发版构建。此
+  # job 以 reusable workflow 原样调用 ci-build.yml 的全部 job 定义
+  # （不复制步骤、与分支 CI 零漂移），下方四个 build job 与
+  # create-release 全部 needs 它，发版路径绕不过去。被调用 workflow
+  # 的 job 不引用任何自定义 secret，checkout 只需 contents: read。
+  verify:
+    name: Verify (full CI gate suite via ci-build)
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci-build.yml
+
+  build-gost:
+    name: Build & Compress GOST Binary
+    needs: [check-version, verify]
+    if: needs.check-version.outputs.should_build_gost == 'true'
+    runs-on: ubuntu-latest
+    # F-125: 只读源码 + artifact 上传（走 Actions runtime，不需要
+    # contents: write），收敛默认权限。
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          # F-007: 与三处 go.mod（1.25）及 ci-build 对齐（原 1.23 会让
+          # go.mod toolchain 检查直接失败或悄悄降格构建）。
+          go-version: '1.25'
+
+      - name: Cache Go modules
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('go-gost/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Install UPX
+        env:
+          # A8-02: 钉死官方 release 资产的 sha256（自官方 GitHub Release
+          # v4.2.1 下载实测，解压后 upx --version 自报 4.2.1）。
+          # UPX 官方未为该资产提供独立 checksum 文件，故在此钉死校验，
+          # 不符即红，禁止未校验的可执行文件进入发布构建。
+          UPX_SHA256: "936e67a23d72338dad3304526a29f405e44e440a9983bbdb2566657d015cc56d"
+        run: |
+          wget -q https://github.com/upx/upx/releases/download/v4.2.1/upx-4.2.1-amd64_linux.tar.xz
+          echo "${UPX_SHA256}  upx-4.2.1-amd64_linux.tar.xz" | sha256sum -c -
+          tar -xf upx-4.2.1-amd64_linux.tar.xz
+          sudo mv upx-4.2.1-amd64_linux/upx /usr/local/bin/
+          rm -rf upx-4.2.1-amd64_linux*
+
+      - name: Build GOST binary (AMD64)
+        working-directory: ./go-gost
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w -X main.version=${{ needs.check-version.outputs.version }}" -o gost-amd64
+
+      - name: Build GOST binary (ARM64)
+        working-directory: ./go-gost
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w -X main.version=${{ needs.check-version.outputs.version }}" -o gost-arm64
+
+      - name: Assert stamped version (E-04)
+        working-directory: ./go-gost
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          # E-04: the -X main.version stamp is injected by the two build
+          # steps above (its value is the release tag, via
+          # check-version). Read it back from the freshly built binaries
+          # before they are compressed and uploaded, so a build that
+          # silently loses the stamp (a broken ldflags line, a hand-built
+          # product bypassing CI — the traffic-fix-integrate string that
+          # the panel's version gates rejected in V3/V4) fails here
+          # instead of shipping a version the panel refuses to serve.
+          # The assertion runs BEFORE UPX on purpose: arm64 cannot
+          # execute on this runner, and `go version -m` cannot read the
+          # build info of a UPX-packed binary; UPX is lossless, so a
+          # stamp verified here survives compression unchanged.
+          ./gost-amd64 -V | grep -F "gost ${VERSION} "
+          go version -m gost-arm64 | grep -F "main.version=${VERSION}"
+
+      - name: Compress with UPX
+        working-directory: ./go-gost
+        run: |
+          upx --best --lzma gost-amd64
+          upx --best --lzma gost-arm64
+
+      - name: Generate SHA256 checksums
+        working-directory: ./go-gost
+        run: |
+          sha256sum gost-amd64 > gost-amd64.sha256
+          sha256sum gost-arm64 > gost-arm64.sha256
+
+      - name: Upload GOST AMD64 artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gost-binary-amd64
+          path: ./go-gost/gost-amd64
+
+      - name: Upload GOST ARM64 artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gost-binary-arm64
+          path: ./go-gost/gost-arm64
+
+      - name: Upload GOST AMD64 checksum artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gost-checksum-amd64
+          path: ./go-gost/gost-amd64.sha256
+
+      - name: Upload GOST ARM64 checksum artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gost-checksum-arm64
+          path: ./go-gost/gost-arm64.sha256
+
+  build-vite:
+    name: Build & Push Vite Frontend
+    needs: [check-version, verify]
+    if: needs.check-version.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare build args
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          {
+            echo "VITE_GITHUB_REPO=https://github.com/${{ github.repository }}"
+            echo "VITE_APP_VERSION=$VERSION"
+          } > ./vite-frontend/.env.production
+
+      - name: Build and push Vite Docker images
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          OWNER="${{ needs.check-version.outputs.image_owner }}"
+
+          # R3-C4-04: prereleases push only the versioned tag;
+          # :latest moves solely on plain dotted-numeric versions
+          # (check-version's push_latest, same test as J-02).
+          TAGS=(-t "${{ env.REGISTRY }}/${OWNER}/ovo-vite-frontend:${VERSION}")
+          if [ "${{ needs.check-version.outputs.push_latest }}" = "true" ]; then
+            TAGS+=(-t "${{ env.REGISTRY }}/${OWNER}/ovo-vite-frontend:latest")
+          fi
+
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --push \
+            "${TAGS[@]}" \
+            ./vite-frontend
+          # Public packages are a release prerequisite, checked without credentials.
+          curl -fsS "https://ghcr.io/token?service=ghcr.io&scope=repository:${OWNER}/ovo-vite-frontend:pull" >/dev/null
+
+  build-go-backend:
+    name: Build & Push Go Backend
+    needs: [check-version, verify]
+    if: needs.check-version.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          # F-007: 同 build-gost，与 go.mod/ci-build 的 1.25 对齐。
+          go-version: '1.25'
+
+      - name: Cache Go dependencies
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-backend-${{ hashFiles('go-backend/go.sum') }}
+          restore-keys: ${{ runner.os }}-go-backend-
+
+      - name: Download dependencies
+        working-directory: ./go-backend
+        run: go mod download
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Go backend Docker images
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          OWNER="${{ needs.check-version.outputs.image_owner }}"
+
+          # R3-C4-04: same conditional :latest as build-vite.
+          TAGS=(-t "${{ env.REGISTRY }}/${OWNER}/ovo-panel-backend:${VERSION}")
+          if [ "${{ needs.check-version.outputs.push_latest }}" = "true" ]; then
+            TAGS+=(-t "${{ env.REGISTRY }}/${OWNER}/ovo-panel-backend:latest")
+          fi
+
+          # 改名过渡双推：后端镜像已迁至 ovo-panel-backend 新仓，旧仓
+          # ovo-flux-panel-backend 以同构建同 tag 并行推送，供改名前
+          # 的 compose 继续拉取。窗口由 check-version 的 dual_push_legacy
+          # 输出机械执行：版本 ≤2.0.0 时为 true（本段生效），2.0.1 起
+          # 为 false、本段自动跳过，旧仓就此停推，无需人工删段。
+          if [ "${{ needs.check-version.outputs.dual_push_legacy }}" = "true" ]; then
+            TAGS+=(-t "${{ env.REGISTRY }}/${OWNER}/ovo-flux-panel-backend:${VERSION}")
+            if [ "${{ needs.check-version.outputs.push_latest }}" = "true" ]; then
+              TAGS+=(-t "${{ env.REGISTRY }}/${OWNER}/ovo-flux-panel-backend:latest")
+            fi
+          fi
+
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg GITHUB_REPO=${{ github.repository }} \
+            --push \
+            "${TAGS[@]}" \
+            ./go-backend
+          # Public packages are a release prerequisite, checked without credentials.
+          curl -fsS "https://ghcr.io/token?service=ghcr.io&scope=repository:${OWNER}/ovo-panel-backend:pull" >/dev/null
+
+  build-agent:
+    name: Build & Push Agent Image
+    needs: [check-version, verify]
+    if: needs.check-version.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # AG-03：构建前先过镜像工具集门——工具包是 agent 在容器内
+      # 的 exec 依赖，缺包构建仍成功、真机才炸，必须在推镜像前红。
+      - name: Check agent image tools
+        run: bash scripts/check-agent-image-tools.sh
+
+      # 节点容器安装形态（Docker / Docker Compose）的 agent 镜像：
+      # 已进 create-release 的 needs（C4-F03）—— 发版说明与面板生
+      # 成的容器安装命令都引用此版本镜像，构建失败必须阻断发版，
+      # 不再靠发版执行者人工核对 GHCR 兜底。
+      - name: Build and push Agent Docker images
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          OWNER="${{ needs.check-version.outputs.image_owner }}"
+
+          # R3-C4-04: same conditional :latest as build-vite.
+          TAGS=(-t "${{ env.REGISTRY }}/${OWNER}/ovo-agent:${VERSION}")
+          if [ "${{ needs.check-version.outputs.push_latest }}" = "true" ]; then
+            TAGS+=(-t "${{ env.REGISTRY }}/${OWNER}/ovo-agent:latest")
+          fi
+
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg VERSION=${VERSION} \
+            --push \
+            "${TAGS[@]}" \
+            ./go-gost
+          # Public packages are a release prerequisite, checked without credentials.
+          curl -fsS "https://ghcr.io/token?service=ghcr.io&scope=repository:${OWNER}/ovo-agent:pull" >/dev/null
+
+  create-release:
+    name: Create Release (Tag Only)
+    needs: [check-version, verify, build-gost, build-vite, build-go-backend, build-agent]
+    if: needs.check-version.outputs.is_tag == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Download GOST AMD64 binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: gost-binary-amd64
+          path: ./artifacts/amd64
+
+      - name: Download GOST ARM64 binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: gost-binary-arm64
+          path: ./artifacts/arm64
+
+      - name: Download GOST AMD64 checksum
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: gost-checksum-amd64
+          path: ./artifacts/
+
+      - name: Download GOST ARM64 checksum
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: gost-checksum-arm64
+          path: ./artifacts/
+
+      - name: Prepare release files
+
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          OWNER="${{ needs.check-version.outputs.image_owner }}"
+          REPO="${{ github.repository }}"
+
+          # 移动二进制文件
+          mv ./artifacts/amd64/gost-amd64 ./artifacts/gost-amd64
+          mv ./artifacts/arm64/gost-arm64 ./artifacts/gost-arm64
+
+          # 复制并修改 docker-compose 文件
+          cp docker-compose-v4.yml ./artifacts/docker-compose-v4.yml
+          cp docker-compose-v6.yml ./artifacts/docker-compose-v6.yml
+
+          # 替换镜像地址为 GHCR
+          sed -i "s|image: .*panel-backend:[^[:space:]]*|image: ${{ env.REGISTRY }}/${OWNER}/ovo-panel-backend:${VERSION}|g" ./artifacts/docker-compose-v4.yml
+          sed -i "s|image: .*vite-frontend:[^[:space:]]*|image: ${{ env.REGISTRY }}/${OWNER}/ovo-vite-frontend:${VERSION}|g" ./artifacts/docker-compose-v4.yml
+          sed -i "s|image: .*panel-backend:[^[:space:]]*|image: ${{ env.REGISTRY }}/${OWNER}/ovo-panel-backend:${VERSION}|g" ./artifacts/docker-compose-v6.yml
+          sed -i "s|image: .*vite-frontend:[^[:space:]]*|image: ${{ env.REGISTRY }}/${OWNER}/ovo-vite-frontend:${VERSION}|g" ./artifacts/docker-compose-v6.yml
+          # R2-C4-02: 与下方 REPO/PINNED 注入同形的后验断言——镜像行
+          # 格式漂移时 sed 会静默空转，未定版的 compose（仍是
+          # ${OVO_VERSION:-latest} 原形）不得随发版资产发出。两文件
+          # 各自钉死 backend/frontend 两行已改写到本版镜像。
+          grep -q "ovo-panel-backend:${VERSION}" ./artifacts/docker-compose-v4.yml && grep -q "ovo-vite-frontend:${VERSION}" ./artifacts/docker-compose-v4.yml
+          grep -q "ovo-panel-backend:${VERSION}" ./artifacts/docker-compose-v6.yml && grep -q "ovo-vite-frontend:${VERSION}" ./artifacts/docker-compose-v6.yml
+
+          # 复制并修改安装脚本
+          cp install.sh ./artifacts/install.sh
+          cp panel_install.sh ./artifacts/panel_install.sh
+
+          # 替换仓库地址和版本号
+          # Point the installers at this repository's releases, whatever
+          # upstream name the checked-in scripts carry.
+          sed -i -E "s|^REPO=\"[^\"]*\"|REPO=\"${REPO}\"|" ./artifacts/install.sh ./artifacts/panel_install.sh
+          grep -q "^REPO=\"${REPO}\"" ./artifacts/install.sh && grep -q "^REPO=\"${REPO}\"" ./artifacts/panel_install.sh
+          # F-123: 原两行 sed "s|2.0.7-beta|...|" 已删除——两个脚本中
+          # 均无该字面量（版本注入走下方 PINNED_VERSION），属失效替换。
+
+          # 注入固定版本号，使从 Release 页下载的脚本只安装该版本
+          sed -i "s|^PINNED_VERSION=\"\"|PINNED_VERSION=\"${VERSION}\"|" ./artifacts/install.sh
+          sed -i "s|^PINNED_VERSION=\"\"|PINNED_VERSION=\"${VERSION}\"|" ./artifacts/panel_install.sh
+          # LANE1: 注入失效（字面量漂移等）时构建必须红——未定版资产一旦
+          # 发出，客户端自更新的定版一致校验会拒绝接管且旧通道无从察觉。
+          grep -q "^PINNED_VERSION=\"${VERSION}\"" ./artifacts/install.sh && grep -q "^PINNED_VERSION=\"${VERSION}\"" ./artifacts/panel_install.sh
+
+          # L2-30: SCRIPT_VERSION 是 panel_install.sh 自更新的短路键，
+          # 仓库内为手工字面量、无注入。发版资产必须与仓库副本逐字一
+          # 致且格式合法（YYYYMMDD.NN），漂移/丢失即构建红——旧流程对
+          # 该字面量零门禁，漏 bump 或被 sed 误伤时自更新静默失效。
+          # （格式与唯一性由 scripts/check-doc-consistency.sh 第 11 项
+          # 在 CI 常设门硬核。）
+          SV_REPO=$(grep -o '^SCRIPT_VERSION="[^"]*"' panel_install.sh | head -n1)
+          SV_ARTIFACT=$(grep -o '^SCRIPT_VERSION="[^"]*"' ./artifacts/panel_install.sh | head -n1)
+          test -n "$SV_REPO" && test "$SV_REPO" = "$SV_ARTIFACT" && printf '%s' "$SV_REPO" | grep -qE '^SCRIPT_VERSION="[0-9]{8}\.[0-9]{2}"$'
+
+          # R5-B5B D19: 为下载资产发布 .sha256（panel_install.sh 校验用）。
+          cd ./artifacts
+          for f in docker-compose-v4.yml docker-compose-v6.yml install.sh panel_install.sh; do
+            sha256sum "$f" | awk '{print $1}' > "$f.sha256"
+          done
+          cd -
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          # F-119: Node 版本统一为 22（与出厂 Dockerfile、deploy-docs、
+          # ci-build 对齐）。
+          node-version: '22'
+
+      - name: Build skill package tarball
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          # R2-C4-01（原 npm 断言的延续）：发版提交须先把三处版本字面量
+          # bump 到待发版本；tarball 文件名取自 package.json，版本不
+          # 对即红，绝不发出贴错版本标签的包。
+          PKG_VERSION=$(node -p "require('./skills/ovo-api/package.json').version")
+          test "$PKG_VERSION" = "$VERSION"
+          (cd skills/ovo-api && npm pack --pack-destination ../../artifacts)
+          test -f "./artifacts/ovo-skill-api-${VERSION}.tgz"
+          tar tzf "./artifacts/ovo-skill-api-${VERSION}.tgz" | grep -q '^package/SKILL.md$'
+          (cd ./artifacts && sha256sum "ovo-skill-api-${VERSION}.tgz" > "ovo-skill-api-${VERSION}.tgz.sha256")
+
+      - name: Verify release installer on Alpine OpenRC
+        run: docker run --rm -v "$PWD:/workspace:ro" alpine:3.22@sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f sh /workspace/test-install-scripts-alpine.sh /workspace/artifacts/install.sh
+
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          OWNER="${{ needs.check-version.outputs.image_owner }}"
+
+          # J-02: 非纯数字 tag（beta/alpha/rc 等）须以 prerelease 身份发布，
+          # 否则 /releases/latest 会指向测试版，脚本稳定渠道将静默装上 beta。
+          if [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
+            PRERELEASE_FLAG=()
+          else
+            PRERELEASE_FLAG=(--prerelease)
+          fi
+
+          # 获取 commit 信息
+          COMMIT_MSG=$(git log -1 --pretty=format:"%s")
+          COMMIT_AUTHOR=$(git log -1 --pretty=format:"%an")
+          COMMIT_DATE=$(git log -1 --pretty=format:"%ai")
+
+          # 创建 release（J S-3 防范：重跑时 Release 已存在则跳过 create，
+          # 后续 --clobber 上传步照常执行、覆盖同名资产，保持重跑幂等）
+          if gh release view "${VERSION}" --repo ${{ github.repository }} >/dev/null 2>&1; then
+            echo "ℹ️ Release ${VERSION} 已存在，跳过 create，直接上传资产"
+          else
+          gh release create "${VERSION}" "${PRERELEASE_FLAG[@]}" \
+            --target "${{ github.sha }}" \
+            --title "Release ${VERSION}" \
+            --notes "## What's Changed
+
+          Rename the complete d73af7b2 content snapshot to OVO 2.1.34. Preserve three-generation deployment recognition, existing credentials, resource identities and rollback. Fix demo API gaps and expired-session remounts; publish anonymous, checksummed installation assets.
+
+          ## Release assets (14)
+
+          - gost-amd64
+          - gost-arm64
+          - gost-amd64.sha256
+          - gost-arm64.sha256
+          - install.sh
+          - panel_install.sh
+          - install.sh.sha256
+          - panel_install.sh.sha256
+          - docker-compose-v4.yml
+          - docker-compose-v6.yml
+          - docker-compose-v4.yml.sha256
+          - docker-compose-v6.yml.sha256
+          - ovo-skill-api-${VERSION}.tgz
+          - ovo-skill-api-${VERSION}.tgz.sha256
+
+          ## 📝 Release Information
+
+          - **Version**: ${VERSION}
+          - **Commit**: [\`${GITHUB_SHA:0:7}\`](https://github.com/${{ github.repository }}/commit/${{ github.sha }})
+          - **Author**: ${COMMIT_AUTHOR}
+          - **Date**: ${COMMIT_DATE}
+          - **Message**: ${COMMIT_MSG}
+
+          ## 📦 Docker Images
+
+          \`\`\`bash
+          # Backend
+          docker pull ${{ env.REGISTRY }}/${OWNER}/ovo-panel-backend:${VERSION}
+
+          # Frontend
+          docker pull ${{ env.REGISTRY }}/${OWNER}/ovo-vite-frontend:${VERSION}
+
+          # Agent (node container install form)
+          docker pull ${{ env.REGISTRY }}/${OWNER}/ovo-agent:${VERSION}
+          \`\`\`
+
+          ## 🚀 Quick Install
+
+          **Panel (安装此版本 ${VERSION}):**
+          \`\`\`bash
+          curl -L https://github.com/${{ github.repository }}/releases/download/${VERSION}/panel_install.sh -o panel_install.sh && curl -L https://github.com/${{ github.repository }}/releases/download/${VERSION}/panel_install.sh.sha256 -o panel_install.sh.sha256 && sha256sum -c panel_install.sh.sha256 && chmod +x panel_install.sh && ./panel_install.sh
+          \`\`\`
+
+          **Node (安装此版本 ${VERSION}):**
+          \`\`\`bash
+          curl -L https://github.com/${{ github.repository }}/releases/download/${VERSION}/install.sh -o install.sh && curl -L https://github.com/${{ github.repository }}/releases/download/${VERSION}/install.sh.sha256 -o install.sh.sha256 && sha256sum -c install.sh.sha256 && chmod +x install.sh && ./install.sh
+          \`\`\`
+
+          **安装最新版:**
+          \`\`\`bash
+          # 面板端
+          curl -L https://github.com/${{ github.repository }}/releases/latest/download/panel_install.sh -o panel_install.sh && curl -L https://github.com/${{ github.repository }}/releases/latest/download/panel_install.sh.sha256 -o panel_install.sh.sha256 && sha256sum -c panel_install.sh.sha256 && chmod +x panel_install.sh && ./panel_install.sh
+          # 节点端
+          curl -L https://github.com/${{ github.repository }}/releases/latest/download/install.sh -o install.sh && curl -L https://github.com/${{ github.repository }}/releases/latest/download/install.sh.sha256 -o install.sh.sha256 && sha256sum -c install.sh.sha256 && chmod +x install.sh && ./install.sh
+          \`\`\`" \
+            --repo ${{ github.repository }}
+          fi
+
+          # 上传所有文件到 release
+          echo "📤 上传 GOST 二进制文件..."
+          gh release upload "${VERSION}" ./artifacts/gost-amd64 --clobber
+          gh release upload "${VERSION}" ./artifacts/gost-arm64 --clobber
+
+          echo "📤 上传 GOST 校验文件..."
+          gh release upload "${VERSION}" ./artifacts/gost-amd64.sha256 --clobber
+          gh release upload "${VERSION}" ./artifacts/gost-arm64.sha256 --clobber
+
+          echo "📤 上传安装脚本..."
+          gh release upload "${VERSION}" ./artifacts/install.sh --clobber
+          gh release upload "${VERSION}" ./artifacts/panel_install.sh --clobber
+          # 生成安装脚本的校验文件（panel_install.sh 强制校验）
+          (cd ./artifacts && sha256sum install.sh > install.sh.sha256)
+          (cd ./artifacts && sha256sum panel_install.sh > panel_install.sh.sha256)
+          gh release upload "${VERSION}" ./artifacts/install.sh.sha256 --clobber
+          gh release upload "${VERSION}" ./artifacts/panel_install.sh.sha256 --clobber
+
+          echo "📤 上传 Docker Compose 配置文件..."
+          gh release upload "${VERSION}" ./artifacts/docker-compose-v4.yml --clobber
+          gh release upload "${VERSION}" ./artifacts/docker-compose-v6.yml --clobber
+          # 生成 Compose 文件的校验文件
+          (cd ./artifacts && sha256sum docker-compose-v4.yml > docker-compose-v4.yml.sha256)
+          (cd ./artifacts && sha256sum docker-compose-v6.yml > docker-compose-v6.yml.sha256)
+          gh release upload "${VERSION}" ./artifacts/docker-compose-v4.yml.sha256 --clobber
+          gh release upload "${VERSION}" ./artifacts/docker-compose-v6.yml.sha256 --clobber
+
+          echo "📤 上传技能包..."
+          gh release upload "${VERSION}" ./artifacts/ovo-skill-api-${VERSION}.tgz --clobber
+          gh release upload "${VERSION}" ./artifacts/ovo-skill-api-${VERSION}.tgz.sha256 --clobber
+
+          echo "✅ Release ${VERSION} 创建完成"
+

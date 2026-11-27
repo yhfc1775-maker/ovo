@@ -1,0 +1,1200 @@
+package handler
+
+import (
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+	"strings"
+	"time"
+
+	"go-backend/internal/http/response"
+	"go-backend/internal/store/model"
+	"go-backend/internal/store/repo"
+)
+
+const tunnelDeletePreviewSampleLimit = 5
+
+const (
+	tunnelDeleteActionReplace        = "replace"
+	tunnelDeleteActionDeleteForwards = "delete_forwards"
+)
+
+var (
+	errInvalidTunnelDeleteTarget = errors.New("invalid tunnel delete target")
+)
+
+type tunnelDeleteForwardPreviewItem struct {
+	ID       int64  `json:"id"`
+	Name     string `json:"name"`
+	UserID   int64  `json:"userId"`
+	UserName string `json:"userName"`
+	InPort   int    `json:"inPort"`
+}
+
+type tunnelDeletePreviewData struct {
+	TunnelID       int64                            `json:"tunnelId"`
+	TunnelName     string                           `json:"tunnelName"`
+	ForwardCount   int                              `json:"forwardCount"`
+	SampleForwards []tunnelDeleteForwardPreviewItem `json:"sampleForwards"`
+}
+
+type tunnelBatchDeletePreviewData struct {
+	TunnelCount       int                       `json:"tunnelCount"`
+	TotalForwardCount int                       `json:"totalForwardCount"`
+	Items             []tunnelDeletePreviewData `json:"items"`
+	// B06-005：逐条口径——混入的不存在/坏 id 挂在这里（与 batch-delete
+	// 的 failures 同型），有效条目仍照常进 Items，不再整批失败。
+	Failures []batchFailureDetail `json:"failures,omitempty"`
+}
+
+type tunnelDeleteWithForwardsRequest struct {
+	ID             int64  `json:"id"`
+	Action         string `json:"action"`
+	TargetTunnelID int64  `json:"targetTunnelId"`
+}
+
+type tunnelBatchDeleteWithForwardsRequest struct {
+	IDs            []int64 `json:"ids"`
+	Action         string  `json:"action"`
+	TargetTunnelID int64   `json:"targetTunnelId"`
+}
+
+type tunnelDeleteWithForwardsResult struct {
+	ForwardCount        int      `json:"forwardCount"`
+	MigratedCount       int      `json:"migratedCount"`
+	DeletedForwardCount int      `json:"deletedForwardCount"`
+	PortAdjustedCount   int      `json:"portAdjustedCount"`
+	Warnings            []string `json:"warnings,omitempty"`
+	// FIX-CASCADE（E1-01）：墓碑转发的终局/保留计数（加法字段）。
+	PendingDeleteFinalizedCount int `json:"pendingDeleteFinalizedCount,omitempty"`
+	PendingDeleteRetainedCount  int `json:"pendingDeleteRetainedCount,omitempty"`
+}
+
+type tunnelBatchDeleteWithForwardsResult struct {
+	SuccessCount        int                  `json:"successCount"`
+	FailCount           int                  `json:"failCount"`
+	Failures            []batchFailureDetail `json:"failures,omitempty"`
+	DeletedForwardCount int                  `json:"deletedForwardCount"`
+	MigratedCount       int                  `json:"migratedCount"`
+	PortAdjustedCount   int                  `json:"portAdjustedCount"`
+	Warnings            []string             `json:"warnings,omitempty"`
+	// FIX-CASCADE（E1-01）：墓碑转发的终局/保留聚合计数。
+	PendingDeleteFinalizedCount int `json:"pendingDeleteFinalizedCount,omitempty"`
+	PendingDeleteRetainedCount  int `json:"pendingDeleteRetainedCount,omitempty"`
+}
+
+// applyPendingOutcome 把一次级联的墓碑终局/保留分流计入复合
+// 删除回执（FIX-CASCADE / E1-01）。
+func (r *tunnelDeleteWithForwardsResult) applyPendingOutcome(outcome *repo.TunnelCascadeOutcome) {
+	if r == nil || outcome == nil {
+		return
+	}
+	r.Warnings = append(r.Warnings, outcome.RuntimeWarnings...)
+	r.PendingDeleteFinalizedCount += len(outcome.FinalizedPendingForwardIDs)
+	r.PendingDeleteRetainedCount += len(outcome.RetainedPendingForwardIDs)
+}
+
+type tunnelForwardMigrationPlan struct {
+	forward        *forwardRecord
+	oldPorts       []forwardPortRecord
+	targetTunnelID int64
+	targetPort     int
+	keptNodeIDs    []int64
+	removedNodeIDs []int64
+	portAdjusted   bool
+	// X-P2-4 ②：托管中转转发按目标隧道出口集重算的 RemoteAddr
+	// （remoteAddrChanged=false 时沿用现址）。
+	newRemoteAddr     string
+	remoteAddrChanged bool
+}
+
+func (h *Handler) tunnelDeletePreview(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+
+	id := idFromBody(r, w)
+	if id <= 0 {
+		return
+	}
+
+	preview, err := h.buildTunnelDeletePreview(id)
+	if err != nil {
+		if strings.Contains(err.Error(), "不存在") {
+			response.WriteJSON(w, response.ErrDefault("隧道不存在"))
+			return
+		}
+		respondInternalError(w, "tunnelDeletePreview", err)
+		return
+	}
+
+	response.WriteJSON(w, response.OK(preview))
+}
+
+func (h *Handler) tunnelBatchDeletePreview(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+
+	var req struct {
+		IDs []int64 `json:"ids"`
+	}
+	if err := decodeJSON(r.Body, &req); err != nil || len(req.IDs) == 0 {
+		response.WriteJSON(w, response.ErrDefault("请求参数错误"))
+		return
+	}
+	// R10-08：本面自有解析不走 idsFromBody，同口径计数帽（见
+	// maxBatchIDs；按提交条数计）。
+	if !checkBatchIDsCap(w, len(req.IDs)) {
+		return
+	}
+
+	preview, err := h.buildTunnelBatchDeletePreview(req.IDs)
+	if err != nil {
+		if strings.Contains(err.Error(), "不存在") {
+			response.WriteJSON(w, response.ErrDefault(err.Error()))
+			return
+		}
+		response.WriteJSON(w, response.Err(-2, err.Error()))
+		return
+	}
+
+	response.WriteJSON(w, response.OK(preview))
+}
+
+func (h *Handler) tunnelDeleteWithForwards(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+
+	var req tunnelDeleteWithForwardsRequest
+	if err := decodeJSON(r.Body, &req); err != nil || req.ID <= 0 {
+		response.WriteJSON(w, response.ErrDefault("请求参数错误"))
+		return
+	}
+
+	action, err := normalizeTunnelDeleteAction(req.Action)
+	if err != nil {
+		response.WriteJSON(w, response.ErrDefault("请求参数错误"))
+		return
+	}
+	if action == tunnelDeleteActionReplace {
+		if _, _, authErr := userRoleFromRequest(r); authErr != nil {
+			response.WriteJSON(w, response.Err(401, "无效的token或token已过期"))
+			return
+		}
+	}
+
+	result, failures, err := h.processTunnelDeleteWithForwards(req.ID, action, req.TargetTunnelID)
+	if err != nil {
+		if err == errInvalidTunnelDeleteTarget {
+			response.WriteJSON(w, response.ErrDefault("目标隧道不能为空"))
+			return
+		}
+		if strings.Contains(err.Error(), "目标隧道不能与当前隧道相同") {
+			response.WriteJSON(w, response.ErrDefault("目标隧道不能与当前隧道相同"))
+			return
+		}
+		if strings.Contains(err.Error(), "目标隧道不存在") {
+			response.WriteJSON(w, response.ErrDefault("目标隧道不存在"))
+			return
+		}
+		if strings.Contains(err.Error(), "目标隧道已禁用") {
+			response.WriteJSON(w, response.ErrDefault("目标隧道已禁用"))
+			return
+		}
+		if strings.Contains(err.Error(), "隧道不存在") {
+			response.WriteJSON(w, response.ErrDefault("隧道不存在"))
+			return
+		}
+		respondInternalError(w, "tunnelDeleteWithForwards", err)
+		return
+	}
+	if len(failures) > 0 {
+		// T-001：failures 分支此前丢弃 result.Warnings（白名单
+		// 刷新失败等警告随部分失败一并丢失），同波补齐。
+		response.WriteJSON(w, response.R{
+			Code: -2,
+			Msg:  "部分规则迁移失败",
+			TS:   time.Now().UnixMilli(),
+			Data: batchOperationResult{SuccessCount: 0, FailCount: len(failures), Failures: failures, Warnings: result.Warnings},
+		})
+		return
+	}
+
+	response.WriteJSON(w, response.OK(result))
+}
+
+func (h *Handler) tunnelBatchDeleteWithForwards(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+
+	var req tunnelBatchDeleteWithForwardsRequest
+	if err := decodeJSON(r.Body, &req); err != nil || len(req.IDs) == 0 {
+		response.WriteJSON(w, response.ErrDefault("请求参数错误"))
+		return
+	}
+
+	action, err := normalizeTunnelDeleteAction(req.Action)
+	if err != nil {
+		response.WriteJSON(w, response.ErrDefault("请求参数错误"))
+		return
+	}
+	if action == tunnelDeleteActionReplace {
+		if _, _, authErr := userRoleFromRequest(r); authErr != nil {
+			response.WriteJSON(w, response.Err(401, "无效的token或token已过期"))
+			return
+		}
+	}
+
+	normalizedIDs := normalizeTunnelIDs(req.IDs)
+	if len(normalizedIDs) == 0 {
+		response.WriteJSON(w, response.ErrDefault("请求参数错误"))
+		return
+	}
+	// R10-08：本面自有解析不走 idsFromBody，归一（过滤＋去重）后
+	// 同口径计数帽（见 maxBatchIDs）。
+	if !checkBatchIDsCap(w, len(normalizedIDs)) {
+		return
+	}
+
+	if action == tunnelDeleteActionReplace {
+		// R3 B06-002：与单条入口共用完整校验
+		// validateTunnelDeleteReplaceTargetFull 做循环前预检（形态 +
+		// 目标存在性 + 启用状态；传 tunnelID=0 时自身互斥分支不可达，
+		// 目标与删除列表的互斥由下方逐 id 检查；执行侧逐隧道再做含
+		// 自身的完整校验）。
+		if err := h.validateTunnelDeleteReplaceTargetFull(0, req.TargetTunnelID); err != nil {
+			if err == errInvalidTunnelDeleteTarget {
+				response.WriteJSON(w, response.ErrDefault("目标隧道不能为空"))
+				return
+			}
+			response.WriteJSON(w, response.ErrDefault(err.Error()))
+			return
+		}
+		for _, id := range normalizedIDs {
+			if id == req.TargetTunnelID {
+				response.WriteJSON(w, response.ErrDefault("目标隧道不能包含在删除列表中"))
+				return
+			}
+		}
+	}
+
+	result := tunnelBatchDeleteWithForwardsResult{}
+	for _, tunnelID := range normalizedIDs {
+		tunnelName, _ := h.repo.GetTunnelName(tunnelID)
+		singleResult, failures, processErr := h.processTunnelDeleteWithForwards(tunnelID, action, req.TargetTunnelID)
+		if processErr != nil {
+			result.FailCount++
+			result.Failures = appendBatchFailure(result.Failures, tunnelID, tunnelName, processErr)
+			continue
+		}
+		// T-001：单条警告（白名单刷新失败等）须在 failures 分支
+		// 亦汇总——此前 continue 在聚合前丢弃。
+		if len(singleResult.Warnings) > 0 {
+			result.Warnings = append(result.Warnings, singleResult.Warnings...)
+		}
+		if len(failures) > 0 {
+			result.FailCount++
+			result.Failures = appendBatchFailureReason(
+				result.Failures,
+				tunnelID,
+				tunnelName,
+				summarizeTunnelDeleteRuleFailures(failures),
+			)
+			continue
+		}
+
+		result.SuccessCount++
+		result.DeletedForwardCount += singleResult.DeletedForwardCount
+		result.MigratedCount += singleResult.MigratedCount
+		result.PortAdjustedCount += singleResult.PortAdjustedCount
+		result.PendingDeleteFinalizedCount += singleResult.PendingDeleteFinalizedCount
+		result.PendingDeleteRetainedCount += singleResult.PendingDeleteRetainedCount
+		// T-001：单条警告已在上方 failures 检查前统一汇总（两路
+		// 均覆盖），此处不再重复追加。
+	}
+
+	response.WriteJSON(w, response.OK(result))
+}
+
+func (h *Handler) buildTunnelDeletePreview(tunnelID int64) (*tunnelDeletePreviewData, error) {
+	if _, err := h.getTunnelRecord(tunnelID); err != nil {
+		return nil, err
+	}
+
+	tunnelName, err := h.repo.GetTunnelName(tunnelID)
+	if err != nil {
+		return nil, err
+	}
+
+	forwards, err := h.listForwardsByTunnel(tunnelID)
+	if err != nil {
+		return nil, err
+	}
+
+	samples := make([]tunnelDeleteForwardPreviewItem, 0, minInt(len(forwards), tunnelDeletePreviewSampleLimit))
+	for i, forward := range forwards {
+		if i >= tunnelDeletePreviewSampleLimit {
+			break
+		}
+		ports, portsErr := h.listForwardPorts(forward.ID)
+		if portsErr != nil {
+			return nil, portsErr
+		}
+		inPort := 0
+		if len(ports) > 0 {
+			inPort = ports[0].Port
+		}
+		samples = append(samples, tunnelDeleteForwardPreviewItem{
+			ID:       forward.ID,
+			Name:     forward.Name,
+			UserID:   forward.UserID,
+			UserName: forward.UserName,
+			InPort:   inPort,
+		})
+	}
+
+	return &tunnelDeletePreviewData{
+		TunnelID:       tunnelID,
+		TunnelName:     tunnelName,
+		ForwardCount:   len(forwards),
+		SampleForwards: samples,
+	}, nil
+}
+
+func (h *Handler) buildTunnelBatchDeletePreview(ids []int64) (*tunnelBatchDeletePreviewData, error) {
+	normalizedIDs := normalizeTunnelIDs(ids)
+	items := make([]tunnelDeletePreviewData, 0, len(normalizedIDs))
+	failures := make([]batchFailureDetail, 0)
+	totalForwardCount := 0
+	for _, id := range normalizedIDs {
+		preview, err := h.buildTunnelDeletePreview(id)
+		if err != nil {
+			// B06-005：改为逐条收集——单个坏 id（如隧道不存在）只挂
+			// failures，不再整批放弃；与 batch-delete 的逐条回执口径
+			// 一致，确认弹窗能打开并让用户修正选择。
+			failures = appendBatchFailure(failures, id, "", err)
+			continue
+		}
+		items = append(items, *preview)
+		totalForwardCount += preview.ForwardCount
+	}
+	return &tunnelBatchDeletePreviewData{
+		TunnelCount:       len(items),
+		TotalForwardCount: totalForwardCount,
+		Items:             items,
+		Failures:          failures,
+	}, nil
+}
+
+func normalizeTunnelDeleteAction(action string) (string, error) {
+	normalized := strings.TrimSpace(action)
+	if normalized == "" {
+		return tunnelDeleteActionDeleteForwards, nil
+	}
+	if normalized != tunnelDeleteActionReplace && normalized != tunnelDeleteActionDeleteForwards {
+		return "", errors.New("invalid tunnel delete action")
+	}
+	return normalized, nil
+}
+
+func normalizeTunnelIDs(ids []int64) []int64 {
+	seen := make(map[int64]struct{}, len(ids))
+	out := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
+func summarizeTunnelDeleteRuleFailures(failures []batchFailureDetail) string {
+	if len(failures) == 0 {
+		return "未知错误"
+	}
+	parts := make([]string, 0, minInt(len(failures), 3))
+	for i, failure := range failures {
+		if i >= 3 {
+			break
+		}
+		name := strings.TrimSpace(failure.Name)
+		if name == "" {
+			name = fmt.Sprintf("规则 #%d", failure.ID)
+		}
+		parts = append(parts, fmt.Sprintf("%s: %s", name, strings.TrimSpace(failure.Reason)))
+	}
+	if len(failures) > 3 {
+		parts = append(parts, fmt.Sprintf("另有 %d 条规则失败", len(failures)-3))
+	}
+	return strings.Join(parts, "；")
+}
+
+func (h *Handler) processTunnelDeleteWithForwards(tunnelID int64, action string, targetTunnelID int64) (tunnelDeleteWithForwardsResult, []batchFailureDetail, error) {
+	// R2X-008（E2-01）：收集时机是关键——必须在删 relay 行之前按
+	// tunnel→forward→relay 收集 inbound 集（照 tunnelDelete 先收集
+	// 模式）；删除/迁移后 relay 与转发已消失，收集源不复存在。
+	affectedInboundIDs := h.inboundIDsForTunnel(tunnelID)
+	preview, err := h.buildTunnelDeletePreview(tunnelID)
+	if err != nil {
+		return tunnelDeleteWithForwardsResult{}, nil, err
+	}
+
+	result := tunnelDeleteWithForwardsResult{ForwardCount: preview.ForwardCount}
+	// B06-002：replace 的目标校验必须先于一切删除动作、无转发时同样
+	// 执行。旧实现把校验放在 ForwardCount>0 分支之后，无转发隧道的
+	// replace 请求（不带 target）越过校验被当作普通删除执行并报
+	// 成功。单条与批量入口最终都经本函数执行，此处即统一校验点
+	//（批量入口另有循环前预检，口径一致）。
+	// R3 B06-002：统一校验点必须是完整校验——目标存在性 + 启用状态。
+	// 此前此处只验形态（target>0、≠自身），存在性/状态校验仍留在
+	// processTunnelDeleteReplaceAction 内、仅 ForwardCount>0 才到达，
+	// 无转发 replace 到不存在/已禁用目标照样删隧道报成功。
+	if action == tunnelDeleteActionReplace {
+		if err := h.validateTunnelDeleteReplaceTargetFull(tunnelID, targetTunnelID); err != nil {
+			return tunnelDeleteWithForwardsResult{}, nil, err
+		}
+	}
+	if preview.ForwardCount == 0 {
+		outcome, err := h.deleteTunnelAndCleanupWithOutcome(tunnelID)
+		if err != nil {
+			// R5X-004(c)：无转发分支收集集恒空、补刷为空转，仍保留
+			// 调用使「本函数内 deleteTunnelAndCleanup 的失败返回必
+			// 补刷」成为可机械核查的不变量（与 delete 分支同形）。
+			// T-001：补偿刷新失败时错误须点名（%w 包装保持
+			// 调用方 err == / strings.Contains 判型）。
+			if failed, pending := h.refreshInboundWhitelists(affectedInboundIDs); len(failed) > 0 || len(pending) > 0 {
+				err = fmt.Errorf("%w；%s", err, strings.Join(whitelistRefreshNotes(failed, pending), "；"))
+			}
+			return tunnelDeleteWithForwardsResult{}, nil, err
+		}
+		// T-001：刷新失败进结果 warnings——删除本身已落库成功，
+		// 但内核仍按旧名单放行。
+		if failed, pending := h.refreshInboundWhitelists(affectedInboundIDs); len(failed) > 0 || len(pending) > 0 {
+			result.Warnings = append(result.Warnings, whitelistRefreshNotes(failed, pending)...)
+		}
+		result.applyPendingOutcome(outcome)
+		return result, nil, nil
+	}
+
+	if action == tunnelDeleteActionDeleteForwards {
+		result.DeletedForwardCount = preview.ForwardCount
+		outcome, err := h.deleteTunnelAndCleanupWithOutcome(tunnelID)
+		if err != nil {
+			// R5X-004(c)：deleteTunnelAndCleanup 内部清理逐条落库，
+			// 中止时已有转发/relay 实际删除——失败返回前以删前收集
+			// 集按现行 DB 补刷（与成功路径同集、幂等）。同文件
+			// replace 分支的两条回滚返回已由 R4X-003 补刷，此处对
+			// 齐 delete 分支；批量版经本函数逐隧道调用、同受覆盖。
+			// T-001：补偿刷新失败时错误须点名（%w 包装保持
+			// 调用方 err == / strings.Contains 判型）。
+			if failed, pending := h.refreshInboundWhitelists(affectedInboundIDs); len(failed) > 0 || len(pending) > 0 {
+				err = fmt.Errorf("%w；%s", err, strings.Join(whitelistRefreshNotes(failed, pending), "；"))
+			}
+			return tunnelDeleteWithForwardsResult{}, nil, err
+		}
+		// T-001：刷新失败进结果 warnings——删除本身已落库成功，
+		// 但内核仍按旧名单放行。
+		if failed, pending := h.refreshInboundWhitelists(affectedInboundIDs); len(failed) > 0 || len(pending) > 0 {
+			result.Warnings = append(result.Warnings, whitelistRefreshNotes(failed, pending)...)
+		}
+		result.applyPendingOutcome(outcome)
+		return result, nil, nil
+	}
+
+	// replace 目标已在本函数入口完整校验（B06-002 / R3 B06-002，
+	// 见上方 validateTunnelDeleteReplaceTargetFull），此处直接进入
+	// 迁移执行（函数内存在性/状态复查为纵深防御）。
+	return h.processTunnelDeleteReplaceAction(tunnelID, targetTunnelID, result)
+}
+
+// validateTunnelDeleteReplaceTarget 是 delete-with-forwards 的 replace
+// 目标形态校验（B06-002）：目标必填、不得等于被删隧道自身。
+func validateTunnelDeleteReplaceTarget(tunnelID, targetTunnelID int64) error {
+	if targetTunnelID <= 0 {
+		return errInvalidTunnelDeleteTarget
+	}
+	if targetTunnelID == tunnelID {
+		return errors.New("目标隧道不能与当前隧道相同")
+	}
+	return nil
+}
+
+// validateTunnelDeleteReplaceTargetFull 是 replace 目标的完整校验
+// （R3 B06-002）：形态校验之上补目标存在性 + 启用状态。执行侧
+// （processTunnelDeleteWithForwards 在 ForwardCount 判断之前）与批量
+// 入口的循环前预检共用本校验，保证无转发时也执行、单条/批量同口径。
+func (h *Handler) validateTunnelDeleteReplaceTargetFull(tunnelID, targetTunnelID int64) error {
+	if err := validateTunnelDeleteReplaceTarget(tunnelID, targetTunnelID); err != nil {
+		return err
+	}
+	targetTunnel, err := h.getTunnelRecord(targetTunnelID)
+	if err != nil {
+		return errors.New("目标隧道不存在")
+	}
+	if targetTunnel.Status != 1 {
+		return errors.New("目标隧道已禁用")
+	}
+	return nil
+}
+
+func (h *Handler) processTunnelDeleteReplaceAction(tunnelID, targetTunnelID int64, result tunnelDeleteWithForwardsResult) (tunnelDeleteWithForwardsResult, []batchFailureDetail, error) {
+	// R2X-008：迁移执行前（转发仍在源隧道上时）收集受影响入站，
+	// 迁移 + 删隧道完成后刷新——allow 应含目标隧道拨号节点、不含源隧道。
+	affectedInboundIDs := h.inboundIDsForTunnel(tunnelID)
+	targetTunnel, err := h.getTunnelRecord(targetTunnelID)
+	if err != nil {
+		return tunnelDeleteWithForwardsResult{}, nil, errors.New("目标隧道不存在")
+	}
+	if targetTunnel.Status != 1 {
+		return tunnelDeleteWithForwardsResult{}, nil, errors.New("目标隧道已禁用")
+	}
+
+	plans, failures, err := h.planTunnelDeleteForwardMigrations(tunnelID, targetTunnelID)
+	if err != nil {
+		return tunnelDeleteWithForwardsResult{}, nil, err
+	}
+	if len(failures) > 0 {
+		return tunnelDeleteWithForwardsResult{}, failures, nil
+	}
+
+	portAdjustedCount := 0
+	warnings, execErr, execFailure := h.executeTunnelDeleteForwardMigrations(plans)
+	for _, plan := range plans {
+		if plan.portAdjusted {
+			portAdjustedCount++
+		}
+	}
+	if execErr != nil {
+		failures = append(failures, execFailure)
+		// R4X-003(a)（verdicts §3 统一收尾）：迁移执行失败已在
+		// execute 层回滚全部已完成计划（单计划内部四回滚点亦经此
+		// 返回收口），但回滚只恢复 DB + gost 服务，allow 不随之纠正
+		// ——窗口内任何一次按暂态 DB 现算的下发都会把错误 allow 驻留
+		// 在落地节点。此处按执行前收集集统一补刷一次（与成功路径
+		// 对称，幂等），不逐回滚点打补丁。
+		// T-001：补偿刷新失败进结果 warnings（单/批入口的
+		// failures 分支此前丢弃 result.Warnings，已同波补齐、
+		// 见两入口的 failures 处理）。
+		if failed, pending := h.refreshInboundWhitelists(affectedInboundIDs); len(failed) > 0 || len(pending) > 0 {
+			result.Warnings = append(result.Warnings, whitelistRefreshNotes(failed, pending)...)
+		}
+		return result, failures, nil
+	}
+
+	outcome, err := h.deleteTunnelAndCleanupWithOutcome(tunnelID)
+	if err != nil {
+		if rbErr := h.rollbackTunnelForwardMigrationPlans(plans); rbErr != nil {
+			err = fmt.Errorf("%w；补偿下发未确认: %v", err, rbErr)
+		}
+		// R18-R3-F1-03: TLS legacy warnings are logged + queued
+		// for repush inside redeployTunnelAndForwards; this
+		// receipt-less rollback only needs the error swallowed.
+		_, _ = h.redeployTunnelAndForwards(tunnelID)
+		// R4X-003(b)：删源隧道失败回滚同理——迁移已把转发搬到目标
+		// 隧道并按目标口径下发过服务，回滚后须按回滚后 DB 补刷一次
+		// 白名单（redeploy 只重下发隧道运行时与转发服务、不含
+		// applyKernel），否则 allow 停留在迁移后口径。
+		// T-001：补偿刷新失败时错误须点名（%w 包装保持
+		// 调用方 err == / strings.Contains 判型）。
+		if failed, pending := h.refreshInboundWhitelists(affectedInboundIDs); len(failed) > 0 || len(pending) > 0 {
+			err = fmt.Errorf("%w；%s", err, strings.Join(whitelistRefreshNotes(failed, pending), "；"))
+		}
+		return tunnelDeleteWithForwardsResult{}, nil, err
+	}
+	// T-001：刷新失败进结果 warnings——迁移与删除本身已落库
+	// 成功，但内核仍按旧名单放行。
+	if failed, pending := h.refreshInboundWhitelists(affectedInboundIDs); len(failed) > 0 || len(pending) > 0 {
+		result.Warnings = append(result.Warnings, whitelistRefreshNotes(failed, pending)...)
+	}
+	result.applyPendingOutcome(outcome)
+
+	result.MigratedCount = len(plans)
+	result.PortAdjustedCount = portAdjustedCount
+	if len(warnings) > 0 {
+		result.Warnings = append(result.Warnings, warnings...)
+	}
+	return result, nil, nil
+}
+
+func (h *Handler) planTunnelDeleteForwardMigrations(sourceTunnelID, targetTunnelID int64) ([]tunnelForwardMigrationPlan, []batchFailureDetail, error) {
+	forwards, err := h.listForwardsByTunnel(sourceTunnelID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	entryNodes, err := h.tunnelEntryNodeIDs(targetTunnelID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(entryNodes) == 0 {
+		return nil, nil, errors.New("目标隧道缺少入口节点")
+	}
+
+	plans := make([]tunnelForwardMigrationPlan, 0, len(forwards))
+	failures := make([]batchFailureDetail, 0)
+	reservedPorts := make(map[int64]map[int]bool)
+
+	for _, forward := range forwards {
+		plan, planErr := h.planSingleTunnelDeleteForwardMigration(&forward, targetTunnelID, entryNodes, reservedPorts)
+		if planErr != nil {
+			failures = appendBatchFailure(failures, forward.ID, forward.Name, planErr)
+			continue
+		}
+		plans = append(plans, plan)
+	}
+
+	return plans, failures, nil
+}
+
+func (h *Handler) planSingleTunnelDeleteForwardMigration(forward *forwardRecord, targetTunnelID int64, targetEntryNodes []int64, reservedPorts map[int64]map[int]bool) (tunnelForwardMigrationPlan, error) {
+	if forward == nil {
+		return tunnelForwardMigrationPlan{}, errors.New("转发不存在")
+	}
+
+	oldPorts, err := h.listForwardPorts(forward.ID)
+	if err != nil {
+		return tunnelForwardMigrationPlan{}, err
+	}
+	if len(oldPorts) == 0 {
+		return tunnelForwardMigrationPlan{}, errors.New("转发入口端口不存在")
+	}
+
+	minPort := h.repo.GetMinForwardPort(forward.ID)
+	targetPort := 0
+	if minPort.Valid {
+		targetPort = int(minPort.Int64)
+	}
+	if targetPort <= 0 {
+		picked, pickErr := h.pickTunnelPort(targetTunnelID)
+		if pickErr != nil {
+			return tunnelForwardMigrationPlan{}, pickErr
+		}
+		targetPort = picked
+	}
+
+	hasCustomInIP := false
+	for _, oldPort := range oldPorts {
+		if strings.TrimSpace(oldPort.InIP) != "" {
+			hasCustomInIP = true
+			break
+		}
+	}
+	if hasCustomInIP && len(targetEntryNodes) > 1 {
+		return tunnelForwardMigrationPlan{}, errors.New("多入口隧道的转发不支持保留自定义监听IP，请先手动调整该规则")
+	}
+
+	// C-F3-01：保留节点（同属源/目标隧道入口集）逐节点沿用现口，
+	// targetPort（规范口）只用于真正新增的节点行；校验与本次迁移
+	// 内的端口预留同样逐节点按实际落库口径走，不再以单值口对全部
+	// 目标入口节点一刀切（异口转发的非 min 行曾被静默改口、且任意
+	// 迁移会先在单值校验处被误拒）。
+	oldPortByNode := forwardPortByNode(oldPorts)
+	for _, nodeID := range targetEntryNodes {
+		node, nodeErr := h.getNodeRecord(nodeID)
+		if nodeErr != nil {
+			return tunnelForwardMigrationPlan{}, nodeErr
+		}
+		nodePort := forwardEntryPort(oldPortByNode, nodeID, targetPort)
+		if err := validateLocalNodePort(node, nodePort); err != nil {
+			return tunnelForwardMigrationPlan{}, err
+		}
+		if err := h.validateForwardPortAvailability(node, nodePort, forward.ID); err != nil {
+			return tunnelForwardMigrationPlan{}, err
+		}
+		if reservedOnNode, ok := reservedPorts[nodeID]; ok && reservedOnNode[nodePort] {
+			return tunnelForwardMigrationPlan{}, fmt.Errorf("目标隧道入口节点端口 %d 已被本次迁移中的其他规则占用", nodePort)
+		}
+	}
+
+	for _, nodeID := range targetEntryNodes {
+		reservedOnNode := reservedPorts[nodeID]
+		if reservedOnNode == nil {
+			reservedOnNode = make(map[int]bool)
+			reservedPorts[nodeID] = reservedOnNode
+		}
+		reservedOnNode[forwardEntryPort(oldPortByNode, nodeID, targetPort)] = true
+	}
+
+	oldNodeIDs := forwardPortNodeIDs(oldPorts)
+	newNodeIDs := uniqueInt64s(targetEntryNodes)
+	removedNodeIDs := diffInt64s(oldNodeIDs, newNodeIDs)
+	keptNodeIDs := diffInt64s(oldNodeIDs, removedNodeIDs)
+
+	// portAdjusted 的「迁移前口」取 handler 侧规范口（MIN，
+	// pickForwardPortFromRecords，与 GetMinForwardPort 同义；转发
+	// 列表 inPort 是 assembleForwardIngress 的首行口定义，异口时
+	// 与规范口可不等，两定义分工现状见 LEDGER4 路 A 报告）。
+	previousPort := pickForwardPortFromRecords(oldPorts)
+
+	// D-F3-02：portAdjusted 改按「规范口漂移」判定——迁移后行集
+	// 的规范口与迁移前规范口不一致即计数。逐节点保口下保留行永
+	// 不改口，但 MIN 行所在节点随源隧道删除退出、且目标入口集无
+	// 新增节点时，行集 MIN 被动漂移（如 {15000, 35000} 迁到只含
+	// 35000 行节点的隧道后规范口变 35000）；旧口径拿迁移前 MIN
+	// 与同为迁移前 MIN 的 targetPort 比对恒等、漂移永不计数。
+	// 新增节点按 targetPort（＝迁移前规范口）落行，不产生漂移。
+	migratedPort := 0
+	for _, nodeID := range targetEntryNodes {
+		nodePort := forwardEntryPort(oldPortByNode, nodeID, targetPort)
+		if nodePort > 0 && (migratedPort == 0 || nodePort < migratedPort) {
+			migratedPort = nodePort
+		}
+	}
+
+	// X-P2-4 ②：托管中转转发按目标隧道出口集重算 RemoteAddr，随迁移
+	// 落库并经 sync 重下发，不再只改端口沿用旧址；重算失败（如目标
+	// 隧道出口集违反落地单出口规则）该转发迁移失败。
+	targetTunnel, terr := h.getTunnelRecord(targetTunnelID)
+	if terr != nil {
+		return tunnelForwardMigrationPlan{}, terr
+	}
+	newRemoteAddr, remoteAddrChanged, retargetErr := h.recomputedRelayRemoteAddr(forward, targetTunnel)
+	if retargetErr != nil {
+		return tunnelForwardMigrationPlan{}, retargetErr
+	}
+
+	// RR4-F3-01（BC-26 写面全集第六面）：迁移落库走 UpdateForwardTunnel
+	// （＋托管中转的 UpdateForward），不经 forwardUpdate 的策略门——
+	// 多目标 fifo/rand 迁入 realm 隧道后被 RenderRealm 静默改写为
+	// roundrobin，且迁入后经更新面改任何字段都会被门拦下、形成只进
+	// 不改的死角。与批量换隧道面同口径：plan 层以重算后的有效
+	// RemoteAddr 过 validateRealmForwardStrategy，命中即该条迁移
+	// 失败点名（单删/批删共用本 plan 链，两入口同覆）。
+	effectiveRemoteAddr := forward.RemoteAddr
+	if remoteAddrChanged {
+		effectiveRemoteAddr = newRemoteAddr
+	}
+	if err := validateRealmForwardStrategy(targetTunnel, effectiveRemoteAddr, forward.Strategy); err != nil {
+		return tunnelForwardMigrationPlan{}, err
+	}
+
+	return tunnelForwardMigrationPlan{
+		forward:           forward,
+		oldPorts:          oldPorts,
+		targetTunnelID:    targetTunnelID,
+		targetPort:        targetPort,
+		keptNodeIDs:       keptNodeIDs,
+		removedNodeIDs:    removedNodeIDs,
+		portAdjusted:      previousPort > 0 && migratedPort > 0 && previousPort != migratedPort,
+		newRemoteAddr:     newRemoteAddr,
+		remoteAddrChanged: remoteAddrChanged,
+	}, nil
+}
+
+func (h *Handler) executeTunnelDeleteForwardMigrations(plans []tunnelForwardMigrationPlan) ([]string, error, batchFailureDetail) {
+	warnings := make([]string, 0)
+	completed := make([]tunnelForwardMigrationPlan, 0, len(plans))
+
+	for _, plan := range plans {
+		migrationWarnings, err := h.applyTunnelDeleteForwardMigration(plan)
+		if err != nil {
+			if rbErr := h.rollbackTunnelForwardMigrationPlans(completed); rbErr != nil {
+				err = fmt.Errorf("%w；补偿下发未确认: %v", err, rbErr)
+			}
+			return warnings, err, batchFailureDetail{ID: plan.forward.ID, Name: plan.forward.Name, Reason: normalizeBatchFailureReason(errString(err))}
+		}
+		warnings = append(warnings, migrationWarnings...)
+		completed = append(completed, plan)
+	}
+
+	return warnings, nil, batchFailureDetail{}
+}
+
+func (h *Handler) applyTunnelDeleteForwardMigration(plan tunnelForwardMigrationPlan) ([]string, error) {
+	if plan.forward == nil {
+		return nil, errors.New("转发不存在")
+	}
+
+	if err := h.repo.UpdateForwardTunnel(plan.forward.ID, plan.targetTunnelID, time.Now().UnixMilli()); err != nil {
+		return nil, err
+	}
+	if plan.remoteAddrChanged {
+		// F03: the migrated target is recomputed from the new tunnel's
+		// exits, so the policy is recomputed from it as well — a relay
+		// frozen "public" that lands on loopback must come out "any",
+		// or the re-sync guard fail-closes the migrated relay.
+		policy, perr := h.forwardTargetPolicyForRetarget(plan.forward, plan.newRemoteAddr)
+		if perr != nil {
+			if rbErr := h.rollbackForwardMutation(plan.forward, plan.oldPorts); rbErr != nil {
+				perr = fmt.Errorf("%w；补偿下发未确认: %v", perr, rbErr)
+			}
+			return nil, perr
+		}
+		if err := h.repo.UpdateForward(plan.forward.ID, plan.forward.Name, plan.targetTunnelID, plan.newRemoteAddr, plan.forward.Strategy, time.Now().UnixMilli(), plan.forward.SpeedID, plan.forward.MaxConn, plan.forward.IPMaxConn, plan.forward.IPSpeedID, 0, plan.forward.ProxyProtocolReceive, plan.forward.ProxyProtocolSend, policy); err != nil {
+			if rbErr := h.rollbackForwardMutation(plan.forward, plan.oldPorts); rbErr != nil {
+				err = fmt.Errorf("%w；补偿下发未确认: %v", err, rbErr)
+			}
+			return nil, err
+		}
+	}
+	if err := h.replaceForwardPorts(plan.forward.ID, plan.targetTunnelID, plan.targetPort, "", plan.oldPorts); err != nil {
+		if rbErr := h.rollbackForwardMutation(plan.forward, plan.oldPorts); rbErr != nil {
+			err = fmt.Errorf("%w；补偿下发未确认: %v", err, rbErr)
+		}
+		return nil, err
+	}
+
+	updatedForward, err := h.getForwardRecord(plan.forward.ID)
+	if err != nil {
+		if rbErr := h.rollbackForwardMutation(plan.forward, plan.oldPorts); rbErr != nil {
+			err = fmt.Errorf("%w；补偿下发未确认: %v", err, rbErr)
+		}
+		return nil, err
+	}
+
+	warnings := make([]string, 0)
+	if len(plan.keptNodeIDs) > 0 {
+		for _, nodeID := range plan.keptNodeIDs {
+			if delErr := h.deleteForwardServicesOnNodeBatch(plan.forward, nodeID); delErr != nil {
+				nodeLabel := fmt.Sprintf("%d", nodeID)
+				if n, nErr := h.getNodeRecord(nodeID); nErr == nil && n != nil && strings.TrimSpace(n.Name) != "" {
+					nodeLabel = strings.TrimSpace(n.Name)
+				}
+				warnings = append(warnings, fmt.Sprintf("节点 %s 清理旧转发监听失败: %v", nodeLabel, delErr))
+			}
+		}
+		time.Sleep(tunnelServiceBindRetryDelay)
+	}
+
+	// R20-X-01 ①：传更新前快照 plan.forward（本路径只改 RemoteAddr、
+	// 限流值原样透传，失势判定恒为否；传快照为将来口径变化留口子）。
+	syncWarnings, err := h.syncForwardServicesWithWarnings(updatedForward, "UpdateService", true, plan.forward)
+	if err != nil {
+		if rbErr := h.rollbackForwardMutation(plan.forward, plan.oldPorts); rbErr != nil {
+			err = fmt.Errorf("%w；补偿下发未确认: %v", err, rbErr)
+		}
+		return nil, err
+	}
+	warnings = append(warnings, syncWarnings...)
+
+	if len(plan.removedNodeIDs) > 0 {
+		for _, nodeID := range plan.removedNodeIDs {
+			if delErr := h.deleteForwardServicesOnNodeBatch(plan.forward, nodeID); delErr != nil {
+				nodeLabel := fmt.Sprintf("%d", nodeID)
+				if n, nErr := h.getNodeRecord(nodeID); nErr == nil && n != nil && strings.TrimSpace(n.Name) != "" {
+					nodeLabel = strings.TrimSpace(n.Name)
+				}
+				warnings = append(warnings, fmt.Sprintf("节点 %s 清理旧隧道残留服务失败: %v", nodeLabel, delErr))
+			}
+		}
+	}
+
+	return warnings, nil
+}
+
+func (h *Handler) rollbackTunnelForwardMigrationPlans(plans []tunnelForwardMigrationPlan) error {
+	var failures []error
+	for i := len(plans) - 1; i >= 0; i-- {
+		plan := plans[i]
+		if err := h.rollbackForwardMutation(plan.forward, plan.oldPorts); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	return errors.Join(failures...)
+}
+
+// cleanupTunnelForwardsDataPlane 是 F-002 的修复核心：删隧道前先枚举其
+// 全部转发，逐条走与单条 forwardDelete 相同的数据面清理，再允许删库。
+//
+// 此前所有删隧道入口都只清隧道自身的 chain/service 并直接 DB 级联：
+// gost 转发服务收不到 DeleteService，孤儿监听继续转发且脱离计数/配额；
+// nft 转发连 pending 台账被级联一并删除，孤儿规则永不重试。
+//
+// R1 X-P1-1（E-01，BC-01，按 V-02）起区分失败类别（relay.md 承诺口径）：
+//   - 节点离线/不可达（isNodeUnreachableError）：删库继续、接口成功。
+//     gost 转发删行即登记待清理——节点重连后 agent 上报的配置经
+//     cleanNodeConfigs 孤儿对账（DB 中已无此转发）撤掉残留监听；
+//     nft 转发留在 pending-delete 台账（转发行为墓碑，DeleteTunnelCascade
+//     保留之），由后台退避重试（runNftPendingDeleteRetryLoop）收敛。
+//   - 在线真实失败（节点明确回失败等非离线错误）：仍中止删隧道，
+//     F-002 防孤儿目标不丢。
+//   - nft：先把全部转发标 pending 并登记台账，再对入口节点 reconcile
+//     一次；成功后逐条删转发行（DeleteForwardCascade 会一并清台账/
+//     计数/绑定）。
+//
+// R19-X-01：返回已删转发清单（数据面 + 删库两步均完成的转发），供
+// 删隧道行失败时回执披露——deleteTunnelByID 失败点此前返裸 err，
+// 运维看不到清理已删的转发。nft 离线早返形返回 nil（库行仍保留、
+// 未删）；已删项不回滚，只披露。
+func (h *Handler) cleanupTunnelForwardsDataPlane(tunnelID int64) ([]model.ForwardRecord, error) {
+	forwards, err := h.repo.ListForwardsByTunnel(tunnelID)
+	if err != nil {
+		return nil, err
+	}
+	return h.cleanupForwardsDataPlane(tunnelID, forwards, "隧道", true)
+}
+
+// cleanupForwardsDataPlane cleans the data plane for an explicit list of
+// forwards that all belong to one tunnel, then deletes their DB rows.
+// It returns the forwards whose data-plane cleanup AND db delete both
+// completed (for R19-X-01 failure disclosure by callers); the nft
+// offline early-return yields nil because those rows are retained.
+// scope names the owning object in abort messages ("隧道" / "用户").
+// offlineTolerant 为 true（仅删隧道路径）时，离线/不可达类失败按
+// X-P1-1 待清理语义放行删库；为 false（删用户路径）时维持 F-002 硬门。
+// R18-X-01（F-01）：逐条清理是前进式操作——中途硬失败时，靠前的转发
+// 已实际删除（数据面 + 库），回执只称「隧道未删除」会误导运维以为
+// 什么都没删。失败返回必须披露已删转发数与标识（名/ID）；已删项不
+// 回滚（与现有不回滚语义一致），只补披露。deleted 只含已完成
+// 「数据面 + 删库」两步的转发；当前条数据面已清但删库失败时另行说明。
+// R19-X-01：同款披露补齐 nft 分支——Mark 失败点披露已标记数（规则
+// 尚未下线），删库失败点披露已删数并注明「规则已下线、库行已删」。
+func formatForwardDeleteLabel(fwd model.ForwardRecord) string {
+	name := strings.TrimSpace(fwd.Name)
+	if name == "" {
+		return fmt.Sprintf("#%d", fwd.ID)
+	}
+	return fmt.Sprintf("%s(#%d)", name, fwd.ID)
+}
+
+// formatForwardDeleteLabels 将转发清单转为「名(#ID)」标识串（无名只标 #ID），
+// 以「、」连接。
+func formatForwardDeleteLabels(forwards []model.ForwardRecord) string {
+	labels := make([]string, 0, len(forwards))
+	for _, fwd := range forwards {
+		labels = append(labels, formatForwardDeleteLabel(fwd))
+	}
+	return strings.Join(labels, "、")
+}
+
+// formatDeletedForwardsSummary 汇总已删转发：恒含已删数，>0 时附标识。
+func formatDeletedForwardsSummary(deleted []model.ForwardRecord) string {
+	if len(deleted) == 0 {
+		return "已删除 0 条转发"
+	}
+	return fmt.Sprintf("已删除 %d 条转发：%s", len(deleted), formatForwardDeleteLabels(deleted))
+}
+
+// formatMarkedForwardsSummary 汇总已标记待删除的转发：恒含已标记数，
+// >0 时附标识（R19-X-01 nft 分支 Mark 失败点）。
+func formatMarkedForwardsSummary(marked []model.ForwardRecord) string {
+	if len(marked) == 0 {
+		return "已标记 0 条转发待删除"
+	}
+	return fmt.Sprintf("已标记 %d 条转发待删除：%s", len(marked), formatForwardDeleteLabels(marked))
+}
+
+// formatTunnelDeleteFailureSummary 汇总删隧道行失败时的已删转发；
+// 清理后库中仍残留的转发（如 nft 离线待清理形，库行仍保留）另行注明
+// 未删除。deleted 清单为准（来自清理函数本身的追踪），残留核对读库
+// 失败时只报已删汇总、不虚构残留数。
+func (h *Handler) formatTunnelDeleteFailureSummary(tunnelID int64, deleted []model.ForwardRecord) string {
+	summary := formatDeletedForwardsSummary(deleted)
+	remaining, err := h.repo.ListForwardsByTunnel(tunnelID)
+	if err != nil || len(remaining) == 0 {
+		return summary
+	}
+	return fmt.Sprintf("%s；其余 %d 条转发未删除、数据库记录仍保留：%s", summary, len(remaining), formatForwardDeleteLabels(remaining))
+}
+
+// forwardDeleteDisclosureError 是转发级联删除失败的定型回执错：
+// msg 为用户可见的披露（已删／已标记数与标识、数据面状态），不含
+// 仓储或数据面原错；cause 为底层原错，只进日志。Error() 只回
+// msg，故经 appendBatchFailure／回执格式化等 err.Error() 路径亦
+// 只见披露。R19-X-01／R18-X-01：逐条清理是前进式操作，中途硬失
+// 败时靠前的转发已实际删除，回执必须披露已删项、不得只称「未删
+// 除」。R2-A01：TestR19F01 三格的定型恢复。
+type forwardDeleteDisclosureError struct {
+	msg   string
+	cause error
+}
+
+func (e *forwardDeleteDisclosureError) Error() string { return e.msg }
+func (e *forwardDeleteDisclosureError) Unwrap() error { return e.cause }
+
+// respondForwardDeleteDisclosureError 是转发级联删除失败的调用点
+// 分流：披露错原样回执（并把原错记日志）、其余失败走通用文案。
+// 门禁口径：msg 字段访问天然沉默，与 kernelVersionGateError 的
+// errors.As 分流同形。
+func respondForwardDeleteDisclosureError(w http.ResponseWriter, op string, tunnelID int64, err error) {
+	respondForwardDeleteDisclosureErrorWithNote(w, op, tunnelID, err, "")
+}
+
+// respondForwardDeleteDisclosureErrorWithNote 同上，但回执尾部追加
+// 操作者须知的定型说明 note（T-001：补偿白名单刷新失败点名）：
+// 披露支追加在披露文案后，泛化支经 respondInternalErrorWithNote
+// 追加；note 为空时与 respondForwardDeleteDisclosureError 逐字同。
+func respondForwardDeleteDisclosureErrorWithNote(w http.ResponseWriter, op string, tunnelID int64, err error, note string) {
+	var de *forwardDeleteDisclosureError
+	if errors.As(err, &de) {
+		log.Printf("%s: forward cleanup failed tunnel_id=%d cause=%v", op, tunnelID, de.cause)
+		msg := de.msg
+		if note != "" {
+			msg += "；" + note
+		}
+		response.WriteJSON(w, response.Err(-2, msg))
+		return
+	}
+	// R3-GEN-04：mixed 状态定型拒绝（mixedNftForwardStateRejection）
+	// 与披露支同码同形原样回——拒绝语义为「隧道未删除、先编辑隧道
+	// 去掉多余入口」，在其余回执面（forward 系守卫点）均原文存续，
+	// 此前独在删除面被泛化。note 同口径尾随。
+	var mixed *mixedNftForwardStateRejection
+	if errors.As(err, &mixed) {
+		log.Printf("%s: mixed nft forward state rejected tunnel_id=%d: %s", op, tunnelID, mixed.msg)
+		msg := mixed.msg
+		if note != "" {
+			msg += "；" + note
+		}
+		response.WriteJSON(w, response.Err(-2, msg))
+		return
+	}
+	respondInternalErrorWithNote(w, op, err, note)
+}
+
+func (h *Handler) cleanupForwardsDataPlane(tunnelID int64, forwards []model.ForwardRecord, scope string, offlineTolerant bool) ([]model.ForwardRecord, error) {
+	if len(forwards) == 0 {
+		return nil, nil
+	}
+	nftMode, entryNodeIDs, err := h.tunnelUsesNftables(tunnelID)
+	if err != nil {
+		return nil, err
+	}
+	if nftMode {
+		if len(entryNodeIDs) == 0 {
+			return nil, &forwardDeleteDisclosureError{msg: "nftables 转发缺少入口节点"}
+		}
+		// R35-FIX-F01：遗留/竞态混合态下拒绝级联删除而不是标记
+		// pending 后删库报成功（gost/realm 服务会残留监听）；隧道
+		// 删除失败、转发保留，管理员先编辑隧道去掉 nft/多余入口。
+		if err := h.rejectMixedNftForwardState(tunnelID, nftMode, entryNodeIDs); err != nil {
+			return nil, err
+		}
+		nodeID := entryNodeIDs[0]
+		now := time.Now()
+		var marked []model.ForwardRecord
+		for i := range forwards {
+			if err := h.repo.MarkForwardPendingDelete(forwards[i].ID, nodeID, now); err != nil {
+				// R19-X-01（L2 §1a 邻接点）：reconcile 尚未执行，规则
+				// 未下线；此前转发仅已标记待删除、库行仍保留。披露
+				// 已标记数与标识，不回滚已标记项。
+				return nil, &forwardDeleteDisclosureError{
+					msg:   fmt.Sprintf("转发 %s 标记待删除失败，%s未删除；%s；该转发未标记、规则未下线", formatForwardDeleteLabel(forwards[i]), scope, formatMarkedForwardsSummary(marked)),
+					cause: err,
+				}
+			}
+			marked = append(marked, forwards[i])
+		}
+		if err := h.reconcileNftablesNodeByRequest(nodeID); err != nil {
+			if offlineTolerant && isNodeUnreachableError(err) {
+				// X-P1-1：转发已入 pending-delete 台账，删库继续；
+				// 转发墓碑行由台账重试收敛，隧道级联不得清台账。
+				log.Printf("tunnel delete: node unreachable, %d nft forwards left in pending-delete ledger tunnel_id=%d node_id=%d err=%v", len(forwards), tunnelID, nodeID, err)
+				return nil, nil
+			}
+			return nil, &forwardDeleteDisclosureError{
+				msg:   fmt.Sprintf("节点不可达，%d 条转发已加入待清理队列，后台将自动重试，%s未删除", len(forwards), scope),
+				cause: err,
+			}
+		}
+		var deleted []model.ForwardRecord
+		for i := range forwards {
+			if err := h.deleteForwardByID(forwards[i].ID); err != nil {
+				// 同 forwardDelete 的 D6：数据面已变更（规则已下线），
+				// DB 删除失败记日志，靠后续对账收敛。
+				log.Printf("forward delete: db delete after nft reconcile failed tunnel_id=%d forward_id=%d err=%v", tunnelID, forwards[i].ID, err)
+				// R19-X-01：reconcile 已成功、全部规则已下线；此前
+				// 转发库行已删。失败返回必须披露已删转发数与标识；
+				// 本条规则已下线、数据库记录仍保留（不回滚）。
+				summary := formatDeletedForwardsSummary(deleted)
+				if len(deleted) > 0 {
+					summary += "（规则已下线、库行已删）"
+				}
+				return deleted, &forwardDeleteDisclosureError{
+					msg:   fmt.Sprintf("转发 %s 数据库删除失败，%s未删除；%s；该转发规则已下线、数据库记录仍保留", formatForwardDeleteLabel(forwards[i]), scope, summary),
+					cause: err,
+				}
+			}
+			deleted = append(deleted, forwards[i])
+		}
+		return deleted, nil
+	}
+	var deleted []model.ForwardRecord
+	for i := range forwards {
+		fwd := forwards[i]
+		if err := h.controlForwardServices(&fwd, "DeleteService", true); err != nil {
+			if offlineTolerant && isNodeUnreachableError(err) {
+				// X-P1-1：节点离线时删行即完成面板侧删除；残留监听由
+				// 节点重连后的配置上报孤儿对账（cleanNodeConfigs）撤销。
+				log.Printf("tunnel delete: node offline, forward marked for reconnect cleanup tunnel_id=%d forward_id=%d err=%v", tunnelID, fwd.ID, err)
+				if delErr := h.deleteForwardByID(fwd.ID); delErr != nil {
+					// R18-X-01：离线分支删库失败亦为硬失败，披露已删项；
+					// 本条数据面未动（节点离线、残留监听待重连对账）。
+					return deleted, &forwardDeleteDisclosureError{
+						msg:   fmt.Sprintf("转发 %s 数据库删除失败，%s未删除；%s；该转发数据面未清理（节点离线，待重连对账）", formatForwardDeleteLabel(fwd), scope, formatDeletedForwardsSummary(deleted)),
+						cause: delErr,
+					}
+				}
+				deleted = append(deleted, fwd)
+				continue
+			}
+			// R18-X-01：数据面硬失败，中止前披露此前已删转发。
+			return deleted, &forwardDeleteDisclosureError{
+				msg:   fmt.Sprintf("转发 %s 数据面清理失败，%s未删除；%s", formatForwardDeleteLabel(fwd), scope, formatDeletedForwardsSummary(deleted)),
+				cause: err,
+			}
+		}
+		if err := h.deleteForwardByID(fwd.ID); err != nil {
+			// R18-X-01：删库失败亦为硬失败，披露已删项；本条数据面
+			// 服务已清理、数据库记录仍保留（不回滚）。
+			return deleted, &forwardDeleteDisclosureError{
+				msg:   fmt.Sprintf("转发 %s 数据库删除失败，%s未删除；%s；该转发数据面服务已清理、数据库记录仍保留", formatForwardDeleteLabel(fwd), scope, formatDeletedForwardsSummary(deleted)),
+				cause: err,
+			}
+		}
+		deleted = append(deleted, fwd)
+	}
+	return deleted, nil
+}
+
+func (h *Handler) deleteTunnelAndCleanup(tunnelID int64) error {
+	_, err := h.deleteTunnelAndCleanupWithOutcome(tunnelID)
+	return err
+}
+
+// deleteTunnelAndCleanupWithOutcome 是 deleteTunnelAndCleanup 的
+// 结果变体：把级联的墓碑终局/保留分流带回供复合删除回执点名
+// （FIX-CASCADE / E1-01）。
+func (h *Handler) deleteTunnelAndCleanupWithOutcome(tunnelID int64) (*repo.TunnelCascadeOutcome, error) {
+	deleted, err := h.cleanupTunnelForwardsDataPlane(tunnelID)
+	if err != nil {
+		return nil, err
+	}
+	var cleanupWarnings []string
+	if err := h.cleanupTunnelRuntime(tunnelID); err != nil {
+		cleanupWarnings = append(cleanupWarnings, "隧道运行时清理未确认: "+err.Error())
+	}
+	outcome, err := h.deleteTunnelByIDWithOutcome(tunnelID)
+	if err != nil {
+		// R19-X-01：清理已返回 nil，名下转发已删（deleted 清单为准；
+		// nft 离线待清理形的残留转发库行仍保留，由
+		// formatTunnelDeleteFailureSummary 另行注明）。删隧道行失败
+		// 须披露已删转发数与标识，已删项不回滚。
+		return nil, fmt.Errorf("隧道删除失败：%w；%s；隧道记录仍保留", err, h.formatTunnelDeleteFailureSummary(tunnelID, deleted))
+	}
+	if outcome == nil {
+		outcome = &repo.TunnelCascadeOutcome{}
+	}
+	outcome.RuntimeWarnings = append(outcome.RuntimeWarnings, cleanupWarnings...)
+	return outcome, nil
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}

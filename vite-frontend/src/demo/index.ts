@@ -1,0 +1,1960 @@
+import type {
+  AxiosAdapter,
+  AxiosResponse,
+  InternalAxiosRequestConfig,
+} from "axios";
+
+import axios from "axios";
+import toast from "react-hot-toast";
+
+import { getRoleIdFromToken } from "@/utils/jwt";
+import { getToken } from "@/utils/session";
+
+/**
+ * The online demo (VITE_DEMO=true builds, published with the docs): the
+ * panel runs without a backend. Every API call is answered in the browser
+ * from responses recorded on a panel seeded with sample data
+ * (fixtures.json); changes report success but are not kept.
+ */
+export const IS_DEMO = import.meta.env.VITE_DEMO === "true";
+
+type Entry = {
+  key: string;
+  res: { code: number; msg: string; data?: unknown };
+};
+type Fixtures = {
+  recordedAt: number;
+  admin: Record<string, Entry[]>;
+  user: Record<string, Entry[]>;
+};
+
+export type DemoRole = "admin" | "user";
+
+// The panel reads the role and expiry from the JWT payload; the demo's
+// tokens carry them unsigned (nothing checks a signature here).
+const demoToken = (sub: number, roleId: number, user: string) =>
+  `demo.${btoa(JSON.stringify({ sub: String(sub), role_id: roleId, user, exp: 4102444800, iat: 1760000000 }))}.demo`;
+
+// N-002 会话模型：localStorage 只存 token 与显示用 name，角色一律从 JWT
+// 解析（getRoleIdFromToken），不再有上游的 role_id/admin 独立键。
+const SESSIONS: Record<DemoRole, Record<string, string>> = {
+  admin: {
+    token: demoToken(1, 0, "admin@user"),
+    name: "admin@user",
+  },
+  user: {
+    token: demoToken(2, 1, "xiaoming"),
+    name: "xiaoming",
+  },
+};
+
+const writeSession = (role: DemoRole) => {
+  // 清掉旧版本残留键，防止被篡改值在 demo 里继续生效（与 writeLoginSession 同口径）。
+  localStorage.removeItem("role_id");
+  localStorage.removeItem("admin");
+  for (const [k, v] of Object.entries(SESSIONS[role]))
+    localStorage.setItem(k, v);
+};
+
+export function demoRole(): DemoRole {
+  const token = getToken();
+
+  return token && getRoleIdFromToken(token) === 0 ? "admin" : "user";
+}
+
+/** Signs in as the demo admin or the demo user (and reloads). */
+export function switchDemoRole(role: DemoRole) {
+  writeSession(role);
+  window.location.hash = "#/dashboard";
+  window.location.reload();
+}
+
+/**
+ * Writes report success without a stored result; the first word of the
+ * last path segment tells them apart ("latest-results" is a read).
+ * 词表按我方接口复核过：上游词表之外补 set（user-subscription/set、
+ * user-inbound/set）、upgrade（node/upgrade、system/upgrade）、
+ * tune（node/tune）。node/tune 例外（RR-C5-05）：其 status 读与各
+ * 动作都回带状态对象、由 tuneAnswer 先于词表合成回答，词表仅兜底；
+ * 同理 tunnel/delete-preview 与 tunnel/batch-delete-preview 是带
+ * 数据的预览读、由 deletePreviewAnswer 先于词表合成（见下两函数）。
+ * R4-C5-01/02/03 同族：node/install、subscription/template/refresh、
+ * backup/import、inbound/import、inbound/import/preview、backup/export、
+ * subscription/source/refresh、monitor/services/run 的回执
+ * 均由 receiptAnswer 先于词表按真实形状合成（见该函数头注）。
+ * 其中 inbound/import/preview 是带数据的预览读（与
+ * tunnel/delete-preview 同理：isWrite("preview") 为 false，词表
+ * 不会把它判成写），不合成会落到未录制回退拿 data: []，前端
+ * parsePreview 在 res.data.nodes.map 上抛错。
+ * RR4-C5-02/I03 续：user/login（登录表单实读 data，词表 data:null 与
+ * 之相撞）与 backup/import-auto-backup 两端点（导入/恢复后的有状态
+ * 快照面）同入 receiptAnswer 合成；config/get 按键合成（录制优先、
+ * 未录制键查 config/list 录制）由 configGetAnswer 在 answer() 内于
+ * 录制回放之前单独一步处理（RR4-C5-03）。
+ */
+const WRITE_WORDS = new Set(
+  "create save update delete remove assign reset toggle import install control regenerate pause resume redeploy batch force run refresh split rollback test dismiss restore export reconcile clear login register finish begin verify set upgrade tune".split(
+    " ",
+  ),
+);
+const isWrite = (segment: string) =>
+  WRITE_WORDS.has(segment.split("-")[0]) ||
+  segment === "check-status" ||
+  // R4X-016: the only camelCase last segment in the API surface; the
+  // first-word rule cannot see "update" inside it, so register the
+  // full segment like check-status above.
+  segment === "updatePassword";
+
+/** Measurements: answered from the recorded lists, by id. */
+const PROBES: Record<string, [list: string, field: string]> = {
+  "inbound/probe": ["inbound/list", "probe"],
+  "node/latency/probe": ["node/list", "latency"],
+  "inbound/relay/probe": ["inbound/relay/list", "latency"],
+};
+const ALIASES: Record<string, string> = { "node/route/probe": "node/route" };
+
+/**
+ * Diagnosis (R3X-032 g/h): synthesized, not recorded. A seeded panel has
+ * no agents, so a recorded forward/tunnel diagnose POST could only ever
+ * be a failure payload — and the streaming variant bypasses axios
+ * entirely (diagnosis-stream.ts already reports fallback in demo
+ * builds, landing on this POST). Build one successful result from the
+ * recorded lists instead, shaped like the real payloads
+ * (ForwardDiagnosisApiData / TunnelDiagnosisApiData).
+ */
+function diagnoseAnswer(
+  bare: string,
+  body: unknown,
+  book: Record<string, Entry[]>,
+) {
+  const forward = bare === "forward/diagnose";
+  const tunnel = bare === "tunnel/diagnose";
+
+  if (!forward && !tunnel) return null;
+  let req: Record<string, unknown> = {};
+
+  try {
+    req = (typeof body === "string" ? JSON.parse(body) : body) ?? {};
+  } catch {
+    req = {};
+  }
+  const id = Number(forward ? req.forwardId : req.tunnelId);
+  const listOf = (k: string) =>
+    (book[k]?.[0]?.res.data ?? []) as Array<Record<string, unknown>>;
+  const nodes = listOf("node/list");
+  const tunnels = listOf("tunnel/list");
+  const item =
+    listOf(forward ? "forward/list" : "tunnel/list").find(
+      (i) => Number(i.id) === id,
+    ) ?? {};
+  const name = String(item.name ?? (forward ? "演示转发" : "演示隧道"));
+  const tunnelOf = forward
+    ? tunnels.find((t) => Number(t.id) === Number(item.tunnelId))
+    : item;
+  const entryNodeId = Number(
+    (tunnelOf?.inNodeId as Array<{ nodeId?: number }> | undefined)?.[0]?.nodeId,
+  );
+  const nodeName =
+    nodes.find((n) => Number(n.id) === entryNodeId)?.name ??
+    name.split("→")[0]?.trim() ??
+    name;
+  const target = String(
+    forward
+      ? (item.remoteAddr ?? "")
+      : tunnelOf?.probeTargetHost
+        ? `${tunnelOf.probeTargetHost}:${tunnelOf.probeTargetPort || 443}`
+        : "",
+  );
+  const [targetIp, targetPort] = target.split(":");
+  // UDP-family chain segments (kcp/udp/quic) cannot be measured by the
+  // panel's UDP probe: since R6-L4-01 the real payload marks such rows
+  // unverified (success=false, averageTime/packetLoss null) instead of
+  // fabricating numbers. Mirror that shape (the panel's
+  // markDiagnosisItemUnverified) when the diagnosed tunnel rides one,
+  // so the demo shows the neutral unverified presentation.
+  const chainProtocols = [
+    ...((tunnelOf?.inNodeId as Array<{ protocol?: string }> | undefined) ?? []),
+    ...((tunnelOf?.outNodeId as Array<{ protocol?: string }> | undefined) ??
+      []),
+  ].map((e) => String(e.protocol ?? "").toLowerCase());
+  const udpProtocol = forward
+    ? undefined
+    : chainProtocols.find((p) => p === "kcp" || p === "udp" || p === "quic");
+  const baseResult = {
+    success: true,
+    description: forward ? "转发目标连通性" : "隧道连通性",
+    nodeName: String(nodeName),
+    nodeId: String(entryNodeId || item.id || id || ""),
+    targetIp: targetIp || "203.0.113.11",
+    targetPort: Number(targetPort) || 443,
+    message: "连接正常（演示合成数据）",
+    averageTime: 24,
+    packetLoss: 0,
+    // The diagnosis modals group rows by chain position; without
+    // fromChainType a row belongs to no group and never renders.
+    fromChainType: 1,
+    fromInx: 0,
+  };
+  const result = udpProtocol
+    ? {
+        ...baseResult,
+        success: false,
+        unverified: true,
+        averageTime: null,
+        packetLoss: null,
+        message: "UDP 无法实测连通性（无通用回声协议），本项未验证",
+        protocol: udpProtocol,
+      }
+    : baseResult;
+  const data = forward
+    ? { forwardName: name, timestamp: Date.now(), results: [result] }
+    : {
+        tunnelName: name,
+        tunnelType: Number(item.type) === 1 ? "端口转发" : "隧道转发",
+        timestamp: Date.now(),
+        results: [result],
+      };
+
+  return { code: 0, msg: "操作成功", data, ts: Date.now() };
+}
+
+/** Admin package data mirrors seedInitialAdmin and the handler's eleven-key forward projection. */
+function userPackageAnswer(bare: string, book: Record<string, Entry[]>) {
+  if (bare !== "user/package" || demoRole() !== "admin") return null;
+  const recorded = book["forward/list"]?.[0]?.res.data;
+  if (!Array.isArray(recorded)) console.warn("[demo] user/package: missing forward/list recording");
+  const forwards = ((Array.isArray(recorded) ? recorded : []) as Array<Record<string, unknown>>)
+    .filter((f) => Number(f.userId) === 1)
+    .map((f) => ({
+      id: f.id, name: f.name, tunnelId: f.tunnelId, tunnelName: f.tunnelName,
+      inIp: f.inIp ?? null, inPort: f.inPort ?? null, remoteAddr: f.remoteAddr,
+      inFlow: f.inFlow, outFlow: f.outFlow, status: f.status, createdTime: f.createdTime,
+    }));
+  return { code: 0, msg: "操作成功", data: {
+    userInfo: {
+      id: 1, name: "admin@user", user: "admin@user", status: 1,
+      flow: 99999, flowMiB: 0, inFlow: 0, outFlow: 0, num: 99999,
+      expTime: 2727251700000, flowResetTime: 1,
+      createdTime: 1748914865000, updatedTime: 1754011744252,
+    },
+    tunnelPermissions: [], forwards, statisticsFlows: [],
+  }, ts: Date.now() };
+}
+
+/** Node actions use recorded identities and explicit demo receipts. */
+function nodeActionAnswer(bare: string, config: InternalAxiosRequestConfig, book: Record<string, Entry[]>) {
+  if (!["node/connlog", "node/connlog-readiness", "node/connlog-repush", "node/restart"].includes(bare)) return null;
+  let body: Record<string, unknown> = {};
+  try { body = typeof config.data === "string" ? JSON.parse(config.data) : (config.data ?? {}); } catch { /* empty read body */ }
+  const query = new URLSearchParams((config.url ?? "").split("?")[1] ?? "");
+  const id = Number(body.nodeId ?? body.id ?? config.params?.nodeId ?? query.get("nodeId"));
+  const rows = (book["node/list"]?.[0]?.res.data ?? []) as Array<Record<string, unknown>>;
+  const node = rows.find((n) => Number(n.id) === id);
+  if (!node) return { code: -1, msg: "节点不存在", data: null, ts: Date.now() };
+  const enabled = Number(node.connLogEnabled ?? 0) === 1;
+  let data: unknown;
+  if (bare === "node/connlog") data = { rows: [], total: 0, enabled, dropped: 0, retentionDays: 7 };
+  else if (bare === "node/connlog-readiness") data = {
+    nodeId: id, agentVersion: String(node.version ?? ""), agentSupport: "unknown", agentMinVersion: "2.1.5",
+    masterEnabled: enabled, connLogEnabled: enabled ? 1 : 0, online: Number(node.status) === 1,
+    forwardMode: String(node.forwardMode ?? ""),
+    lastPush: { status: "unknown", pushedAt: null, source: "demo", note: "演示数据" },
+    lastRowAt: null, readiness: enabled ? "unknown" : "off", reason: "演示站不采集实时连接日志", reasons: [],
+  };
+  else if (bare === "node/connlog-repush") data = { nodeId: id, redeployed: false, tunnelCount: 0, forwardCount: 0 };
+  else data = { id, status: "dispatched", message: "演示操作成功；演示站不会重启节点" };
+  return { code: 0, msg: bare === "node/restart" ? "演示操作成功" : "操作成功", data, ts: Date.now() };
+}
+
+/**
+ * Tunnel delete previews (RR-C5-05): data-carrying POSTs whose last
+ * segment starts with "delete", so the wordlist judges them writes
+ * and answers data:null — but both pages fail closed on a null
+ * preview, and the write answer's msg is "操作成功", so the demo
+ * showed an error toast reading 操作成功 and the delete dialogs
+ * never opened. Synthesize the previews from the recorded lists
+ * instead, in the backend's exact shapes
+ * (tunnel_delete_resolution.go): single {tunnelId, tunnelName,
+ * forwardCount, sampleForwards}, batch {tunnelCount,
+ * totalForwardCount, items, failures?}; the sample is capped at 5,
+ * the backend's tunnelDeletePreviewSampleLimit.
+ */
+function deletePreviewAnswer(
+  bare: string,
+  body: unknown,
+  book: Record<string, Entry[]>,
+) {
+  const single = bare === "tunnel/delete-preview";
+  const batch = bare === "tunnel/batch-delete-preview";
+
+  if (!single && !batch) return null;
+  let req: Record<string, unknown> = {};
+
+  try {
+    req = (typeof body === "string" ? JSON.parse(body) : body) ?? {};
+  } catch {
+    req = {};
+  }
+  const listOf = (k: string) =>
+    (book[k]?.[0]?.res.data ?? []) as Array<Record<string, unknown>>;
+  const tunnels = listOf("tunnel/list");
+  const forwards = listOf("forward/list");
+  const previewOf = (t: Record<string, unknown>) => {
+    const own = forwards.filter((f) => Number(f.tunnelId) === Number(t.id));
+
+    return {
+      tunnelId: Number(t.id),
+      tunnelName: String(t.name ?? ""),
+      forwardCount: own.length,
+      sampleForwards: own.slice(0, 5).map((f) => ({
+        id: Number(f.id),
+        name: String(f.name ?? ""),
+        userId: Number(f.userId ?? 0),
+        userName: String(f.userName ?? ""),
+        inPort: Number(f.inPort ?? 0),
+      })),
+    };
+  };
+
+  if (single) {
+    const t = tunnels.find((x) => Number(x.id) === Number(req.id));
+
+    if (!t) return null;
+
+    return { code: 0, msg: "操作成功", data: previewOf(t), ts: Date.now() };
+  }
+  const ids = Array.isArray(req.ids) ? req.ids.map(Number) : [];
+  const items: ReturnType<typeof previewOf>[] = [];
+  const failures: Array<{ id: number; reason: string }> = [];
+
+  for (const id of ids) {
+    const t = tunnels.find((x) => Number(x.id) === id);
+
+    if (t) items.push(previewOf(t));
+    else failures.push({ id, reason: "隧道不存在" });
+  }
+  const data: Record<string, unknown> = {
+    tunnelCount: items.length,
+    totalForwardCount: items.reduce((n, i) => n + i.forwardCount, 0),
+    items,
+  };
+
+  if (failures.length) data.failures = failures;
+
+  return { code: 0, msg: "操作成功", data, ts: Date.now() };
+}
+
+/**
+ * Node tune (RR-C5-05): every call to node/tune — the "status" read
+ * included — returns the agent's tune status object, but the
+ * wordlist only sees the segment "tune" and answers data:null, so
+ * the dialog waited on its spinner forever. A seeded panel has no
+ * agents, so synthesize one status in the agent's current shape
+ * (four-face model: {faces, congestion, qdisc}, see the 2026-11
+ * tuning rework): all four faces applied, BBR/FQ active. Probe
+ * calls get a canned probe result (median RTT + reference leg).
+ * The synthesize is stateless — face actions return the same
+ * all-applied status, which is all the demo modal needs.
+ */
+function tuneAnswer(bare: string, configData?: unknown) {
+  if (bare !== "node/tune") return null;
+  let action = "";
+
+  try {
+    action =
+      (
+        (typeof configData === "string"
+          ? JSON.parse(configData)
+          : configData) as { action?: string } | undefined
+      )?.action ?? "";
+  } catch {
+    action = "";
+  }
+  if (action === "probe") {
+    return {
+      code: 0,
+      msg: "操作成功",
+      data: {
+        rttMedianMs: 42,
+        rttSamples: 18,
+        rttAvailable: true,
+        rttSource: "tcp_info_median",
+        rttMinMs: 12,
+        rttP95Ms: 96,
+        rttMaxMs: 140,
+        panelRttMs: 38,
+        panelRttAvailable: true,
+        panelRttSent: 10,
+        panelRttReceived: 9,
+        panelRttLossRate: 0.1,
+        panelRttMinMs: 30,
+        panelRttP95Ms: 57,
+        panelRttMaxMs: 57,
+        panelRttJitterMs: 4.5,
+        warnings: [],
+      },
+      ts: Date.now(),
+    };
+  }
+  const data = {
+    faces: { ipv4: true, bbr: true, kernel: true, nic: true },
+    congestion: "bbr",
+    qdisc: "fq",
+    warnings: [],
+  };
+
+  return { code: 0, msg: "操作成功", data, ts: Date.now() };
+}
+
+/**
+ * Node swap (设置 Swap 对话框): node/swap-info 与 node/swap-set 由本
+ * 函数先于词表合成——种子面板没有真 agent，录制只能是失败包，而
+ * 「swap-set」按首词规则也不命中 WRITE_WORDS。内存态保存当前
+ * /swapfile 大小（种子 2 GB、已用 312 MB）：info 按契约形状回现状，
+ * set 回 before→after 并更新内存态，弹窗在演示里可完整走通；刷新
+ * 即还原（演示写边界，与全站一致，不落 localStorage）。
+ * Registered in scripts/demo/README.md.
+ */
+let demoSwap = { sizeMB: 2048, usedMB: 312 };
+
+function swapAnswer(bare: string, configData?: unknown) {
+  if (bare === "node/swap-info") {
+    const data = {
+      totalMB: demoSwap.sizeMB,
+      usedMB: demoSwap.usedMB,
+      entries:
+        demoSwap.sizeMB > 0
+          ? [
+              {
+                name: "/swapfile",
+                type: "file",
+                sizeMB: demoSwap.sizeMB,
+                usedMB: demoSwap.usedMB,
+              },
+            ]
+          : [],
+      diskFreeMB: 51200,
+      memTotalMB: 4096,
+      managedFilePresent: demoSwap.sizeMB > 0,
+      fileSizeMB: demoSwap.sizeMB,
+    };
+
+    return { code: 0, msg: "操作成功", data, ts: Date.now() };
+  }
+  if (bare === "node/swap-set") {
+    let sizeGB = NaN;
+
+    try {
+      sizeGB = Number(
+        (
+          (typeof configData === "string"
+            ? JSON.parse(configData)
+            : configData) as { sizeGB?: unknown } | undefined
+        )?.sizeGB,
+      );
+    } catch {
+      sizeGB = NaN;
+    }
+    if (!Number.isInteger(sizeGB) || sizeGB < 1 || sizeGB > 32) {
+      return {
+        code: -1,
+        msg: "大小必须是 1–32 的整数 GB",
+        data: null,
+        ts: Date.now(),
+      };
+    }
+    const before = { totalMB: demoSwap.sizeMB, usedMB: demoSwap.usedMB };
+
+    demoSwap = {
+      sizeMB: sizeGB * 1024,
+      usedMB: Math.min(demoSwap.usedMB, sizeGB * 1024),
+    };
+
+    return {
+      code: 0,
+      msg: "操作成功",
+      data: {
+        before,
+        after: { totalMB: demoSwap.sizeMB, usedMB: demoSwap.usedMB },
+        sizeGB,
+      },
+      ts: Date.now(),
+    };
+  }
+
+  return null;
+}
+
+const parseBody = (body: unknown): Record<string, unknown> => {
+  try {
+    return (typeof body === "string" ? JSON.parse(body) : body) ?? {};
+  } catch {
+    return {};
+  }
+};
+
+/**
+ * Node display groups (feature overlay): the recorded fixtures
+ * predate the node display-group label, so the adapter seeds labels
+ * onto the recorded nodes and keeps this feature's later changes —
+ * node/update carrying displayGroup, group-order saves through the
+ * config endpoints, and (v2) the batch move + group create/rename/
+ * delete endpoints — in localStorage. The collapsed-section list
+ * (`node_display_group_collapsed`) rides the same overlay: answered
+ * on config/list + config/get, persisted on config writes. This is the one demo
+ * surface whose writes survive a reload, deliberately: the feature
+ * is pure presentation state, and trying it IS the demo's purpose.
+ * Fidelity boundaries: state is per-browser; the recorded fixtures
+ * are never edited; a node created in the demo still does not join
+ * the recorded list (the demo-wide write boundary), so labels are
+ * only triable on the recorded nodes. Registered in
+ * scripts/demo/README.md.
+ */
+const DEMO_NODE_GROUPS_KEY = "ovo-demo-node-groups-v1";
+const DEMO_GROUP_ORDER_CONFIG_KEY = "node_display_group_order";
+const DEMO_GROUP_COLLAPSED_CONFIG_KEY = "node_display_group_collapsed";
+const DEMO_GROUP_SEED_LABELS: Record<number, string> = {
+  1: "落地节点",
+  2: "落地节点",
+  3: "备用节点",
+  5: "中转节点",
+  6: "中转节点",
+};
+const DEMO_GROUP_SEED_ORDER = ["落地节点", "中转节点", "备用节点"];
+
+type DemoNodeGroupState = {
+  labels: Record<string, string>;
+  order: string[] | null;
+  collapsed: string[] | null;
+};
+
+function loadDemoNodeGroupState(): DemoNodeGroupState {
+  try {
+    const raw = localStorage.getItem(DEMO_NODE_GROUPS_KEY);
+
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<DemoNodeGroupState>;
+
+      return {
+        labels:
+          parsed.labels && typeof parsed.labels === "object"
+            ? (parsed.labels as Record<string, string>)
+            : {},
+        order: Array.isArray(parsed.order)
+          ? parsed.order.filter((x): x is string => typeof x === "string")
+          : null,
+        collapsed: Array.isArray(parsed.collapsed)
+          ? parsed.collapsed.filter((x): x is string => typeof x === "string")
+          : null,
+      };
+    }
+  } catch {
+    // Corrupt or unavailable storage: fall back to the seed state.
+  }
+
+  return { labels: {}, order: null, collapsed: null };
+}
+
+function saveDemoNodeGroupState(state: DemoNodeGroupState) {
+  try {
+    localStorage.setItem(DEMO_NODE_GROUPS_KEY, JSON.stringify(state));
+  } catch {
+    // Storage unavailable: the feature still works until reload.
+  }
+}
+
+function parseDemoGroupOrderValue(value: unknown): string[] {
+  if (typeof value !== "string") return [];
+  try {
+    const parsed: unknown = JSON.parse(value);
+
+    if (!Array.isArray(parsed)) return [];
+
+    return parsed
+      .filter((x): x is string => typeof x === "string")
+      .map((x) => x.trim())
+      .filter((x) => x !== "");
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Collapsed-list values mirror the page parser: entries are
+ * trimmed and deduped, and a single "" entry (the ungrouped
+ * section) is meaningful and kept.
+ */
+function parseDemoGroupCollapsedValue(value: unknown): string[] {
+  if (typeof value !== "string") return [];
+  try {
+    const parsed: unknown = JSON.parse(value);
+
+    if (!Array.isArray(parsed)) return [];
+    const seen = new Set<string>();
+    const out: string[] = [];
+
+    for (const item of parsed) {
+      if (typeof item !== "string") continue;
+      const label = item.trim();
+
+      if (!seen.has(label)) {
+        seen.add(label);
+        out.push(label);
+      }
+    }
+
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+function demoGroupAnswer(
+  bare: string,
+  body: unknown,
+  book: Record<string, Entry[]>,
+) {
+  const state = loadDemoNodeGroupState();
+  const effectiveOrder = state.order ?? DEMO_GROUP_SEED_ORDER;
+
+  if (bare === "node/list") {
+    const recorded = (book["node/list"] ?? [])[0];
+
+    if (!recorded) return null;
+    const res = structuredClone(recorded.res);
+    const data = res.data as Array<Record<string, unknown>> | undefined;
+
+    if (Array.isArray(data)) {
+      for (const node of data) {
+        const id = Number(node.id);
+
+        node.displayGroup =
+          state.labels[String(id)] ?? DEMO_GROUP_SEED_LABELS[id] ?? "";
+      }
+    }
+
+    return res;
+  }
+  if (bare === "config/list") {
+    const recorded = (book["config/list"] ?? [])[0];
+
+    if (!recorded) return null;
+    const res = structuredClone(recorded.res);
+
+    if (res.data && typeof res.data === "object") {
+      (res.data as Record<string, unknown>)[DEMO_GROUP_ORDER_CONFIG_KEY] =
+        JSON.stringify(effectiveOrder);
+      (res.data as Record<string, unknown>)[DEMO_GROUP_COLLAPSED_CONFIG_KEY] =
+        JSON.stringify(state.collapsed ?? []);
+    }
+
+    return res;
+  }
+  const req = parseBody(body);
+
+  if (bare === "config/get" && req.name === DEMO_GROUP_ORDER_CONFIG_KEY) {
+    return {
+      code: 0,
+      msg: "操作成功",
+      data: {
+        name: DEMO_GROUP_ORDER_CONFIG_KEY,
+        value: JSON.stringify(effectiveOrder),
+      },
+      ts: Date.now(),
+    };
+  }
+  if (bare === "config/get" && req.name === DEMO_GROUP_COLLAPSED_CONFIG_KEY) {
+    return {
+      code: 0,
+      msg: "操作成功",
+      data: {
+        name: DEMO_GROUP_COLLAPSED_CONFIG_KEY,
+        value: JSON.stringify(state.collapsed ?? []),
+      },
+      ts: Date.now(),
+    };
+  }
+  if (
+    bare === "config/update-single" &&
+    req.name === DEMO_GROUP_ORDER_CONFIG_KEY
+  ) {
+    state.order = parseDemoGroupOrderValue(req.value);
+    saveDemoNodeGroupState(state);
+
+    return { code: 0, msg: "操作成功", data: null, ts: Date.now() };
+  }
+  if (
+    bare === "config/update-single" &&
+    req.name === DEMO_GROUP_COLLAPSED_CONFIG_KEY
+  ) {
+    state.collapsed = parseDemoGroupCollapsedValue(req.value);
+    saveDemoNodeGroupState(state);
+
+    return { code: 0, msg: "操作成功", data: null, ts: Date.now() };
+  }
+  if (
+    bare === "config/update" &&
+    (typeof req[DEMO_GROUP_ORDER_CONFIG_KEY] === "string" ||
+      typeof req[DEMO_GROUP_COLLAPSED_CONFIG_KEY] === "string")
+  ) {
+    if (typeof req[DEMO_GROUP_ORDER_CONFIG_KEY] === "string") {
+      state.order = parseDemoGroupOrderValue(req[DEMO_GROUP_ORDER_CONFIG_KEY]);
+    }
+    if (typeof req[DEMO_GROUP_COLLAPSED_CONFIG_KEY] === "string") {
+      state.collapsed = parseDemoGroupCollapsedValue(
+        req[DEMO_GROUP_COLLAPSED_CONFIG_KEY],
+      );
+    }
+    saveDemoNodeGroupState(state);
+
+    return { code: 0, msg: "操作成功", data: null, ts: Date.now() };
+  }
+  if (bare === "node/update" && typeof req.displayGroup === "string") {
+    const id = Number(req.id);
+
+    if (Number.isFinite(id) && id > 0) {
+      state.labels[String(id)] = req.displayGroup.trim();
+      saveDemoNodeGroupState(state);
+    }
+
+    return {
+      code: 0,
+      msg: "操作成功",
+      data: { id: Date.now() % 100000, ...req },
+      ts: Date.now(),
+    };
+  }
+
+  // v2 group surfaces (node/batch-set-group, node/group/*): mirror
+  // the real backend's semantics (handler/node_display_group.go) —
+  // the order list doubles as the group registry (empty groups
+  // exist), rename/delete cascade through member labels, and the
+  // batch receipt counts per item honestly (unknown ids fail by
+  // name, never silently succeed).
+  const fail = (msg: string) => ({ code: -1, msg, ts: Date.now() });
+  const recordedNodeIds = (): number[] => {
+    const recorded = (book["node/list"] ?? [])[0];
+    const data = recorded?.res.data as
+      | Array<Record<string, unknown>>
+      | undefined;
+
+    return Array.isArray(data) ? data.map((n) => Number(n.id)) : [];
+  };
+  const effectiveLabel = (id: number): string =>
+    state.labels[String(id)] ?? DEMO_GROUP_SEED_LABELS[id] ?? "";
+  const groupExists = (name: string): boolean => {
+    if (effectiveOrder.includes(name)) return true;
+
+    return recordedNodeIds().some((id) => effectiveLabel(id) === name);
+  };
+  const groupNameError = (name: string, exclude = ""): string | null => {
+    if (!name) return "分组名称不能为空";
+    if ([...name].length > 100) return "分组标签长度不能超过100个字符";
+    if (name === "未分组") return "「未分组」是保留名称，不能用作分组名";
+    if (name !== exclude && groupExists(name)) {
+      return `分组「${name}」已存在`;
+    }
+
+    return null;
+  };
+
+  if (bare === "node/batch-set-group") {
+    const ids = Array.isArray(req.ids)
+      ? req.ids.map((x) => Number(x)).filter((n) => Number.isFinite(n))
+      : [];
+
+    if (ids.length === 0) return fail("ids不能为空");
+    const group = typeof req.group === "string" ? req.group.trim() : "";
+
+    if ([...group].length > 100) {
+      return fail("分组标签长度不能超过100个字符");
+    }
+    const known = new Set(recordedNodeIds());
+    const failures: Array<{ id: number; reason: string }> = [];
+    let successCount = 0;
+
+    for (const id of new Set(ids)) {
+      if (!known.has(id)) {
+        failures.push({ id, reason: "节点不存在" });
+        continue;
+      }
+      state.labels[String(id)] = group;
+      successCount += 1;
+    }
+    saveDemoNodeGroupState(state);
+
+    return {
+      code: 0,
+      msg: "操作成功",
+      data: { successCount, failCount: failures.length, failures },
+      ts: Date.now(),
+    };
+  }
+  if (bare === "node/group/create") {
+    const name = typeof req.name === "string" ? req.name.trim() : "";
+    const err = groupNameError(name);
+
+    if (err) return fail(err);
+    const order = [...effectiveOrder, name];
+
+    state.order = order;
+    saveDemoNodeGroupState(state);
+
+    return {
+      code: 0,
+      msg: "操作成功",
+      data: { name, order },
+      ts: Date.now(),
+    };
+  }
+  if (bare === "node/group/rename") {
+    const oldName = typeof req.oldName === "string" ? req.oldName.trim() : "";
+    const newName = typeof req.newName === "string" ? req.newName.trim() : "";
+
+    if (!oldName) return fail("分组名称不能为空");
+    if (!groupExists(oldName)) return fail("分组不存在");
+    const err = groupNameError(newName, oldName);
+
+    if (err) return fail(err);
+    if (newName === oldName) return fail("新名称与原名称相同");
+    let updatedCount = 0;
+
+    for (const id of recordedNodeIds()) {
+      if (effectiveLabel(id) === oldName) {
+        state.labels[String(id)] = newName;
+        updatedCount += 1;
+      }
+    }
+    const order = effectiveOrder.includes(oldName)
+      ? effectiveOrder.map((g) => (g === oldName ? newName : g))
+      : [...effectiveOrder, newName];
+
+    state.order = order;
+    saveDemoNodeGroupState(state);
+
+    return {
+      code: 0,
+      msg: "操作成功",
+      data: { oldName, newName, updatedCount, order },
+      ts: Date.now(),
+    };
+  }
+  if (bare === "node/group/delete") {
+    const name = typeof req.name === "string" ? req.name.trim() : "";
+
+    if (!name) return fail("分组名称不能为空");
+    if (!groupExists(name)) return fail("分组不存在");
+    let updatedCount = 0;
+
+    for (const id of recordedNodeIds()) {
+      if (effectiveLabel(id) === name) {
+        state.labels[String(id)] = "";
+        updatedCount += 1;
+      }
+    }
+    const order = effectiveOrder.filter((g) => g !== name);
+
+    state.order = order;
+    saveDemoNodeGroupState(state);
+
+    return {
+      code: 0,
+      msg: "操作成功",
+      data: { name, updatedCount, order },
+      ts: Date.now(),
+    };
+  }
+
+  return null;
+}
+
+const listOf = (book: Record<string, Entry[]>, k: string) =>
+  (book[k]?.[0]?.res.data ?? []) as Array<Record<string, unknown>>;
+
+/**
+ * Data-carrying action POSTs (R4-C5-01/02/03 + I01/I02): the wordlist
+ * judges these writes and answers data:null (or, for save, an echo of
+ * the request body), but their pages consume a real receipt — a null
+ * receipt makes node/install and template/refresh error-toast the
+ * write answer's own msg ("操作成功"), leaves the import receipt
+ * panels permanently empty, and breaks the backup export blob path.
+ * Synthesize each receipt in the backend's exact shape:
+ *  - node/install: one sample command per mode (a real panel embeds
+ *    the node's secret and the panel address; the demo shows the
+ *    shape with placeholder values, labelled as synthesized);
+ *  - subscription/template/refresh: the recorded template row, with
+ *    the fetch error cleared and lastFetch re-stamped;
+ *  - backup/import: counts derived from the submitted file itself
+ *    (the visitor picks a real backup file; its segment arrays are
+ *    in the request body), with the removed group segments counted
+ *    as *Ignored and named in importWarnings in the backend's own
+ *    wording — a zero-skip receipt for current-format files;
+ *  - inbound/import: one created id per non-empty pasted line;
+ *  - inbound/import/preview: one preview row per parsable pasted
+ *    line (same line classification as inbound/import), in the
+ *    real inboundImportPreviewResult shape (fingerprint / nodes /
+ *    errors); a lone subscription URL has no nodes without a fetch
+ *    (the demo has no network), so it errors instead of inventing
+ *    one — never fabricate a node, and never surface a credential
+ *    (only host, port, fragment name and the plugin name, never
+ *    its options, are read off a link);
+ *  - subscription/source/refresh: a zero-change sync result;
+ *  - monitor/services/run: one successful result row (the demo has
+ *    no agents, but "ran and failed" would be a false claim — the
+ *    recorded definitions/results make a success row the honest
+ *    sample);
+ * backup/export is not an envelope at all: it returns a download
+ * marker the adapter turns into an attachment response (see
+ * demoAdapter), carrying a backup file assembled from the recorded
+ * lists in the real BackupData envelope (version "1.0"). The
+ * configs segment is deliberately not synthesized — the recorded
+ * config rows are real panel configuration and a demo download
+ * must not carry them out.
+ */
+
+function installAnswer(bare: string, body: unknown) {
+  if (bare !== "node/install") return null;
+  const req = parseBody(body);
+  const mode = String(req.mode ?? "script");
+  const head =
+    "# 演示站合成的示例命令：真实面板会生成带该节点密钥与面板地址的一次性命令";
+  const data =
+    mode === "docker"
+      ? `${head}\ndocker run -d --name ovo-agent --network host --cap-add NET_ADMIN${req.privileged === true ? " --privileged" : ""} --restart unless-stopped ghcr.io/example/ovo-agent:latest`
+      : mode === "docker-compose"
+        ? `${head}\n# 面板生成 docker-compose.yaml（服务 ovo-agent，network_mode: host）后执行\ndocker compose up -d`
+        : `${head}\ncurl -fsSL https://example.com/ovo/install.sh | bash -s -- --addr https://panel.example.com --secret <节点密钥>`;
+
+  return { code: 0, msg: "操作成功", data, ts: Date.now() };
+}
+
+function templateRefreshAnswer(
+  bare: string,
+  body: unknown,
+  book: Record<string, Entry[]>,
+) {
+  if (bare !== "subscription/template/refresh") return null;
+  const req = parseBody(body);
+  const items = listOf(book, "subscription/template/list");
+  const item = items.find((i) => Number(i.id) === Number(req.id)) ?? items[0];
+
+  if (!item) return null;
+
+  return {
+    code: 0,
+    msg: "操作成功",
+    data: { ...structuredClone(item), lastError: "", lastFetch: Date.now() },
+    ts: Date.now(),
+  };
+}
+
+const IMPORT_COUNT_KEYS = [
+  "usersImported",
+  "nodesImported",
+  "tunnelsImported",
+  "forwardsImported",
+  "userTunnelsImported",
+  "speedLimitsImported",
+  "tunnelGroupsIgnored",
+  "userGroupsIgnored",
+  "permissionsIgnored",
+  "configsImported",
+  "inboundsImported",
+  "userInboundsImported",
+  "inboundKernelsImported",
+  "inboundRelaysImported",
+  "inboundCountersImported",
+  "inboundSubscriptionsImported",
+  "inboundSubscriptionCountersImported",
+  "inboundSourcesImported",
+  "inboundShieldsImported",
+  "inboundNodeGroupsIgnored",
+  "inboundTemplatesImported",
+  "inboundLegacyUsersImported",
+  "monitorPermissionsImported",
+  "userSubscriptionsImported",
+  "serviceMonitorsImported",
+  "passkeysImported",
+  "nodeSSHConfigsImported",
+];
+
+function importReceipt(counts: Record<string, number>, warnings: string[]) {
+  const data: Record<string, unknown> = {};
+
+  for (const k of IMPORT_COUNT_KEYS) data[k] = counts[k] ?? 0;
+  data.userSubscriptionsSkipped = 0;
+  if (warnings.length) data.importWarnings = warnings;
+
+  return { code: 0, msg: "操作成功", data, ts: Date.now() };
+}
+
+/**
+ * RR4-C5-I03：导入前自动备份在真实面是服务端状态——本地导入
+ * 先把导入前状态落服务端快照（留存 24h，仅管理员经 status /
+ * download 两端点取用）。演示无服务端：导入/恢复合成时把「导入前」
+ * 的录制状态按 export 形状留一份在页面会话内，使状态面与下载入口在
+ * 演示里同样可达；整页刷新后模块状态重置、回落录制的 exists:false
+ * （保真边界见 scripts/demo/README.md 盲区登记 RR4 续行）。
+ */
+let importAutoBackup: { at: number; content: string } | null = null;
+
+const rememberImportAutoBackup = (book: Record<string, Entry[]>) => {
+  const snapshot = exportAnswer("backup/export", {}, book) as {
+    __demoDownload?: { content: string };
+  } | null;
+
+  if (snapshot?.__demoDownload)
+    importAutoBackup = {
+      at: Date.now(),
+      content: snapshot.__demoDownload.content,
+    };
+};
+
+function importAutoBackupStatusAnswer(bare: string) {
+  if (bare !== "backup/import-auto-backup/status") return null;
+  // 本会话尚未导入/恢复过：回落录制（exists:false），不冒充有快照。
+  if (!importAutoBackup) return null;
+
+  return {
+    code: 0,
+    msg: "操作成功",
+    data: {
+      exists: true,
+      // 真实面 expiresAt 为 unix 秒（快照生成时刻 + 24h）。
+      expiresAt: Math.floor(importAutoBackup.at / 1000) + 24 * 3600,
+    },
+    ts: Date.now(),
+  };
+}
+
+function importAutoBackupDownloadAnswer(bare: string) {
+  if (bare !== "backup/import-auto-backup") return null;
+  // 与真实面无快照口径一致：错误信封、无 attachment，消费端据此抛
+  // 出该文案而不是把信封存成文件（演示传输层恒 200，code 用 -2 对齐）。
+  if (!importAutoBackup)
+    return { code: -2, msg: "暂无可下载的导入前自动备份", ts: Date.now() };
+  const d = new Date(importAutoBackup.at);
+  const p = (n: number) => String(n).padStart(2, "0");
+  const stamp = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+
+  return {
+    __demoDownload: {
+      filename: `auto_backup_${stamp}.json`,
+      content: importAutoBackup.content,
+    },
+  };
+}
+
+function backupImportAnswer(
+  bare: string,
+  body: unknown,
+  book: Record<string, Entry[]>,
+) {
+  if (bare !== "backup/import") return null;
+  rememberImportAutoBackup(book);
+  const req = parseBody(body);
+  const types = Array.isArray(req.types) ? req.types.map(String) : [];
+  const on = (t: string) => types.length === 0 || types.includes(t);
+  const len = (v: unknown) => (Array.isArray(v) ? v.length : 0);
+  const counts: Record<string, number> = {};
+
+  if (on("users")) counts.usersImported = len(req.users);
+  if (on("nodes")) {
+    counts.nodesImported = len(req.nodes);
+    counts.nodeSSHConfigsImported = len(req.nodeSSHConfigs);
+  }
+  if (on("tunnels")) counts.tunnelsImported = len(req.tunnels);
+  if (on("forwards")) counts.forwardsImported = len(req.forwards);
+  if (on("userTunnels")) counts.userTunnelsImported = len(req.userTunnels);
+  if (on("speedLimits")) counts.speedLimitsImported = len(req.speedLimits);
+  if (on("configs"))
+    counts.configsImported =
+      req.configs && typeof req.configs === "object"
+        ? Object.keys(req.configs).length
+        : 0;
+  if (on("userInbounds")) counts.userInboundsImported = len(req.userInbounds);
+  if (on("monitorPermissions"))
+    counts.monitorPermissionsImported = len(req.monitorPermissions);
+  if (on("userSubscriptions"))
+    counts.userSubscriptionsImported = len(req.userSubscriptions);
+  if (on("serviceMonitors"))
+    counts.serviceMonitorsImported = len(req.serviceMonitors);
+  if (on("passkeys")) counts.passkeysImported = len(req.passkeys);
+  if (on("inbounds")) {
+    const inb = (req.inbounds ?? {}) as Record<string, unknown>;
+
+    counts.inboundKernelsImported = len(inb.kernels);
+    counts.inboundsImported = len(inb.inbounds);
+    counts.inboundRelaysImported = len(inb.relays);
+    counts.inboundCountersImported = len(inb.counters);
+    counts.inboundSubscriptionsImported = len(inb.subscriptions);
+    counts.inboundSubscriptionCountersImported = len(inb.subscriptionCounters);
+    counts.inboundSourcesImported = len(inb.sources);
+    counts.inboundShieldsImported = len(inb.shields);
+    counts.inboundTemplatesImported = len(inb.templates);
+    counts.inboundLegacyUsersImported = len(inb.users);
+    counts.inboundNodeGroupsIgnored = len(inb.nodeGroups);
+  }
+  // The removed group segments are noted on every import that
+  // carries them, whatever segment set was selected (the backend's
+  // noteRemovedGroupSegments口径), in its own warning wording.
+  counts.tunnelGroupsIgnored = len(req.tunnelGroups);
+  counts.userGroupsIgnored = len(req.userGroups);
+  counts.permissionsIgnored = len(req.permissions);
+  const warnings: string[] = [];
+
+  if (counts.tunnelGroupsIgnored)
+    warnings.push(
+      `备份恢复：隧道分组功能已移除，备份中的 tunnelGroups 段（${counts.tunnelGroupsIgnored} 条）已忽略未恢复`,
+    );
+  if (counts.userGroupsIgnored)
+    warnings.push(
+      `备份恢复：用户分组功能已移除，备份中的 userGroups 段（${counts.userGroupsIgnored} 条）已忽略未恢复`,
+    );
+  if (counts.permissionsIgnored)
+    warnings.push(
+      `备份恢复：分组权限功能已移除，备份中的 permissions 段（${counts.permissionsIgnored} 条）已忽略未恢复`,
+    );
+  if (counts.inboundNodeGroupsIgnored)
+    warnings.push(
+      `备份恢复：节点组功能已移除，备份中的 nodeGroups 段（${counts.inboundNodeGroupsIgnored} 条）已忽略未恢复`,
+    );
+
+  return importReceipt(counts, warnings);
+}
+
+// RR4-C5-I02：真实面逐行解析（kernel.ParseImport 的 parseLines）、失败
+// 行入 errors 点名、零创建回 code:-1「没有导入任何节点」。演示不做真
+// 解析，但按同一口径做最低限度形态校验：注释/分节行跳过不计、支持的
+// 分享链接协议与 Surge 行（name = type, …）计 created、其余行按真实
+// 文案计 errors，不得再对无效输入报假成功。
+const IMPORT_LINK_SCHEMES = new Set(
+  "ss vmess vless trojan hysteria2 hy2 tuic anytls naive naive+https socks socks5".split(
+    " ",
+  ),
+);
+
+function inboundImportAnswer(bare: string, body: unknown) {
+  if (bare !== "inbound/import") return null;
+  const req = parseBody(body);
+  const text = String(req.links ?? "").trim();
+
+  if (!req.previewFingerprint) {
+    return {
+      code: -1,
+      msg: "请先解析预览后再确认导入",
+      data: { created: [], errors: [] },
+      ts: Date.now(),
+    };
+  }
+  if (String(req.previewFingerprint) !== demoPreviewFingerprint(text)) {
+    return {
+      code: -1,
+      msg: "订阅内容已变化，请重新解析预览",
+      data: { created: [], errors: [] },
+      ts: Date.now(),
+    };
+  }
+  const rawLines = String(req.links ?? "").split(/\r?\n/);
+  const created: number[] = [];
+  const errors: string[] = [];
+
+  rawLines.forEach((raw, i) => {
+    const line = raw.trim();
+
+    if (
+      !line ||
+      line.startsWith("#") ||
+      line.startsWith("//") ||
+      line.startsWith(";") ||
+      (line.startsWith("[") && line.endsWith("]"))
+    )
+      return;
+    const schemeEnd = line.indexOf("://");
+
+    if (schemeEnd > 0) {
+      const scheme = line.slice(0, schemeEnd).toLowerCase();
+
+      if (IMPORT_LINK_SCHEMES.has(scheme)) {
+        created.push(9001 + created.length);
+      } else if (scheme === "http" || scheme === "https") {
+        // 与真实面逐字同文案；整框只粘一条订阅地址时真实面会去拉取
+        // 内容导入（演示无网络），该行按已受理计、不入 errors。
+        if (rawLines.filter((l) => l.trim()).length === 1) {
+          created.push(9001 + created.length);
+        } else {
+          errors.push(
+            `第 ${i + 1} 行：http(s):// 是订阅地址，请单独粘贴在输入框里`,
+          );
+        }
+      } else {
+        errors.push(`第 ${i + 1} 行：暂不支持 ${scheme}:// 链接`);
+      }
+    } else if (line.includes("=")) {
+      created.push(9001 + created.length);
+    } else {
+      errors.push(`第 ${i + 1} 行：无法识别的格式`);
+    }
+  });
+
+  if (created.length === 0) {
+    return {
+      code: -1,
+      msg: `没有导入任何节点${errors.length ? `：${errors[0]}` : ""}`,
+      data: { created, errors },
+      ts: Date.now(),
+    };
+  }
+
+  return {
+    code: 0,
+    msg: "操作成功",
+    data: { created, errors },
+    ts: Date.now(),
+  };
+}
+
+// PR #30: the import dialog is two-step — 解析预览 first, 确认导入
+// second — so the preview call needs its own synthesized receipt, in
+// the real inboundImportPreviewResult shape (fingerprint / nodes /
+// errors). It shares inboundImportAnswer's line classification
+// (comment/section lines skipped, supported share-link schemes and
+// Surge rows count, anything else errors in the backend's wording),
+// but it must NOT fabricate nodes it cannot derive: a lone
+// subscription URL has no nodes without a fetch (the demo has no
+// network), so it errors instead of inventing one, and a share link
+// whose address cannot be parsed errors the same way. No credential
+// ever enters the answer: only host, port, fragment name and the
+// plugin name (never its options) are read off a link.
+const PREVIEW_PROTOCOL_LABELS: Record<string, string> = {
+  ss: "Shadowsocks",
+  vmess: "VMess",
+  vless: "VLESS",
+  trojan: "Trojan",
+  hysteria2: "Hysteria2",
+  hy2: "Hysteria2",
+  tuic: "TUIC",
+  anytls: "AnyTLS",
+  naive: "NaiveProxy",
+  "naive+https": "NaiveProxy",
+  socks: "SOCKS5",
+  socks5: "SOCKS5",
+};
+
+// Deterministic demo fingerprint for the pasted text (the confirm
+// answer does not verify it; it only has to be stable so the preview
+// the dialog shows and the confirm it sends agree).
+const demoPreviewFingerprint = (text: string) => {
+  let hash = 0x811c9dc5;
+
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+
+  return `demo-${hash.toString(16).padStart(8, "0")}`;
+};
+
+const previewProtocol = (scheme: string) =>
+  scheme === "hy2"
+    ? "hysteria2"
+    : scheme === "socks"
+      ? "socks5"
+      : scheme.startsWith("naive")
+        ? "naive"
+        : scheme;
+
+function previewLinkNode(line: string): Record<string, unknown> | null {
+  const schemeEnd = line.indexOf("://");
+
+  if (schemeEnd <= 0) return null;
+  const scheme = line.slice(0, schemeEnd).toLowerCase();
+
+  if (!IMPORT_LINK_SCHEMES.has(scheme)) return null;
+
+  const protocol = previewProtocol(scheme);
+  const label = PREVIEW_PROTOCOL_LABELS[scheme] ?? scheme.toUpperCase();
+  // vmess:// carries a base64 JSON body, not a host:port URL.
+  if (scheme === "vmess") {
+    try {
+      const raw = line
+        .slice(schemeEnd + 3)
+        .split("#")[0]
+        .replace(/-/g, "+")
+        .replace(/_/g, "/");
+      const decoded = JSON.parse(
+        atob(raw + "=".repeat((4 - (raw.length % 4)) % 4)),
+      ) as Record<string, unknown>;
+      const address = String(decoded.add ?? "");
+      const port = Number(decoded.port ?? 0);
+
+      if (!address || !Number.isInteger(port) || port < 1 || port > 65535)
+        return null;
+
+      const name = String(decoded.ps ?? "").trim() || `${address}:${port}`;
+
+      return {
+        identityKey: `${address}:${port}|${protocol}|demo`,
+        name,
+        protocol,
+        address,
+        port,
+        description: label,
+      };
+    } catch {
+      return null;
+    }
+  }
+  let url: URL;
+
+  try {
+    url = new URL(line);
+  } catch {
+    return null;
+  }
+  const address = url.hostname;
+  const port = Number(url.port);
+
+  if (!address || !Number.isInteger(port) || port < 1 || port > 65535)
+    return null;
+  let name = "";
+
+  try {
+    name = decodeURIComponent(url.hash.slice(1)).trim();
+  } catch {
+    name = url.hash.slice(1).trim();
+  }
+  if (!name) name = `${address}:${port}`;
+  let description = label;
+  const plugin = url.searchParams.get("plugin");
+
+  // Only the plugin name (e.g. v2ray-plugin) is display material;
+  // its options may carry secrets and are never read.
+  if (plugin) description += ` + ${plugin.split(";")[0].trim().toLowerCase()}`;
+
+  return {
+    identityKey: `${address}:${port}|${protocol}|demo`,
+    name,
+    protocol,
+    address,
+    port,
+    description,
+  };
+}
+
+function previewSurgeNode(line: string): Record<string, unknown> | null {
+  const eq = line.indexOf("=");
+
+  if (eq <= 0) return null;
+  const name = line.slice(0, eq).trim();
+  const parts = line
+    .slice(eq + 1)
+    .split(",")
+    .map((p) => p.trim());
+  const scheme = (parts[0] ?? "").toLowerCase();
+
+  if (!IMPORT_LINK_SCHEMES.has(scheme) || !parts[1]) return null;
+  const port = Number(parts[2]);
+
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+  const protocol = previewProtocol(scheme);
+
+  return {
+    identityKey: `${parts[1]}:${port}|${protocol}|demo`,
+    name: name || `${parts[1]}:${port}`,
+    protocol,
+    address: parts[1],
+    port,
+    description: PREVIEW_PROTOCOL_LABELS[scheme] ?? scheme.toUpperCase(),
+  };
+}
+
+function inboundImportPreviewAnswer(bare: string, body: unknown) {
+  if (bare !== "inbound/import/preview") return null;
+  const req = parseBody(body);
+  const text = String(req.links ?? "").trim();
+  const rawLines = String(req.links ?? "").split(/\r?\n/);
+  const nonEmpty = rawLines.filter((l) => l.trim()).length;
+  const nodes: Array<Record<string, unknown>> = [];
+  const errors: string[] = [];
+
+  rawLines.forEach((raw, i) => {
+    const line = raw.trim();
+
+    if (
+      !line ||
+      line.startsWith("#") ||
+      line.startsWith("//") ||
+      line.startsWith(";") ||
+      (line.startsWith("[") && line.endsWith("]"))
+    )
+      return;
+    const schemeEnd = line.indexOf("://");
+
+    if (schemeEnd > 0) {
+      const scheme = line.slice(0, schemeEnd).toLowerCase();
+
+      if (IMPORT_LINK_SCHEMES.has(scheme)) {
+        const node = previewLinkNode(line);
+
+        if (node) nodes.push(node);
+        else errors.push(`第 ${i + 1} 行：无法识别的格式`);
+      } else if (scheme === "http" || scheme === "https") {
+        // The real preview fetches a lone subscription URL; the demo
+        // has no network, so it cannot invent nodes for it.
+        errors.push(
+          nonEmpty === 1
+            ? `第 ${i + 1} 行：演示站无法拉取订阅地址内容，请粘贴节点链接`
+            : `第 ${i + 1} 行：http(s):// 是订阅地址，请单独粘贴在输入框里`,
+        );
+      } else {
+        errors.push(`第 ${i + 1} 行：暂不支持 ${scheme}:// 链接`);
+      }
+    } else if (line.includes("=")) {
+      const node = previewSurgeNode(line);
+
+      if (node) nodes.push(node);
+      else errors.push(`第 ${i + 1} 行：无法识别的格式`);
+    } else {
+      errors.push(`第 ${i + 1} 行：无法识别的格式`);
+    }
+  });
+
+  return {
+    code: 0,
+    msg: "操作成功",
+    data: {
+      fingerprint: demoPreviewFingerprint(text),
+      nodes,
+      errors,
+    },
+    ts: Date.now(),
+  };
+}
+
+function sourceRefreshAnswer(
+  bare: string,
+  body: unknown,
+  book: Record<string, Entry[]>,
+) {
+  if (bare !== "subscription/source/refresh") return null;
+  const req = parseBody(body);
+  const source = listOf(book, "subscription/source/list").find(
+    (s) => Number(s.id) === Number(req.id),
+  ) ?? { id: Number(req.id) || 0 };
+  const result = {
+    added: 0,
+    updated: 0,
+    removed: 0,
+    kept: 0,
+    keptUnknown: 0,
+    keptStale: 0,
+    shielded: 0,
+    status: "ok",
+    truncated: 0,
+    errors: [],
+  };
+
+  return { code: 0, msg: "操作成功", data: { source, result }, ts: Date.now() };
+}
+
+function serviceRunAnswer(
+  bare: string,
+  body: unknown,
+  book: Record<string, Entry[]>,
+) {
+  if (bare !== "monitor/services/run") return null;
+  const req = parseBody(body);
+  const id = Number(req.id);
+  const def = listOf(book, "monitor/services").find((m) => Number(m.id) === id);
+
+  return {
+    code: 0,
+    msg: "操作成功",
+    data: {
+      id: Date.now() % 100000,
+      monitorId: id,
+      nodeId: Number(def?.nodeId ?? 0),
+      timestamp: Date.now(),
+      success: 1,
+      latencyMs: 26,
+      statusCode: 0,
+      errorMessage: "",
+    },
+    ts: Date.now(),
+  };
+}
+
+function exportAnswer(
+  bare: string,
+  body: unknown,
+  book: Record<string, Entry[]>,
+) {
+  if (bare !== "backup/export") return null;
+  const req = parseBody(body);
+  const types = Array.isArray(req.types) ? req.types.map(String) : [];
+  const on = (t: string) => types.length === 0 || types.includes(t);
+  const data: Record<string, unknown> = {
+    version: "1.0",
+    exportedAt: Date.now(),
+  };
+  const put = (type: string, key: string, fixture: string) => {
+    if (!on(type)) return;
+    const rows = book[fixture]?.[0]?.res.data;
+
+    if (Array.isArray(rows) && rows.length) data[key] = structuredClone(rows);
+  };
+
+  put("users", "users", "user/list");
+  put("nodes", "nodes", "node/list");
+  put("tunnels", "tunnels", "tunnel/list");
+  put("forwards", "forwards", "forward/list");
+  put("userTunnels", "userTunnels", "tunnel/user/list");
+  put("speedLimits", "speedLimits", "speed-limit/list");
+  put("userSubscriptions", "userSubscriptions", "user-subscription/list");
+  put("serviceMonitors", "serviceMonitors", "monitor/services");
+  if (on("inbounds")) {
+    data.inbounds = {
+      kernels: structuredClone(listOf(book, "kernel/list")),
+      inbounds: structuredClone(listOf(book, "inbound/list")),
+      relays: structuredClone(listOf(book, "inbound/relay/list")),
+      sources: structuredClone(listOf(book, "subscription/source/list")),
+      templates: structuredClone(listOf(book, "subscription/template/list")),
+    };
+  }
+
+  return {
+    __demoDownload: {
+      filename: "backup.json",
+      content: JSON.stringify(data, null, 2),
+    },
+  };
+}
+
+/**
+ * RR4-C5-02：user/login 在词表里是写，但登录表单是它 data 的真实消费
+ * 端——performLogin 无守卫读 requirePasswordChange 并把 token/name 交
+ * writeLoginSession 落会话，词表的 data:null 回答会让演示站登出后的
+ * 登录提交崩进 catch、误报「网络错误」。按真实 LoginResponse 形状合
+ * 成：演示用户名登入为演示普通用户，其余登入为演示管理员，会话 token
+ * 即 installDemo 自签的那套演示 token。
+ */
+function loginAnswer(bare: string, body: unknown) {
+  if (bare !== "user/login") return null;
+  const req = parseBody(body);
+  const role: DemoRole = req.username === SESSIONS.user.name ? "user" : "admin";
+
+  return {
+    code: 0,
+    msg: "操作成功",
+    data: {
+      token: SESSIONS[role].token,
+      role_id: role === "admin" ? 0 : 1,
+      name: SESSIONS[role].name,
+      requirePasswordChange: false,
+    },
+    ts: Date.now(),
+  };
+}
+
+/**
+ * Batch-operation receipts (E2-03): every batch endpoint returns a typed
+ * BatchOperationResult receipt from the real backend, but the generic
+ * write branch below answers data:null for all of them (their last
+ * segments match no save|create|update echo word) — tunnel
+ * batch-redeploy then throws on null.failCount (false failure), tunnel /
+ * forward / inbound batch deletes toast "成功删除 0 项", and node
+ * batch-upgrade fabricates success from the selection count. Synthesize
+ * the receipt in the backend's exact shape from the submitted ids: all
+ * requested items succeed (the demo has no agents that could fail them).
+ * node/batch-upgrade has its own shape (data.results[] of
+ * {id, success, message}), synthesized per id.
+ */
+const BATCH_RESULT_ENDPOINTS = new Set([
+  "forward/batch-delete",
+  "forward/batch-pause",
+  "forward/batch-resume",
+  "forward/batch-redeploy",
+  "forward/batch-change-tunnel",
+  "node/batch-delete",
+  "tunnel/batch-redeploy",
+  "tunnel/batch-delete-with-forwards",
+  "inbound/batch-delete",
+  "inbound/batch-toggle",
+]);
+
+function batchAnswer(bare: string, body: unknown) {
+  if (bare === "node/batch-upgrade") {
+    const req = parseBody(body);
+    const ids = Array.isArray(req.ids) ? req.ids : [];
+
+    return {
+      code: 0,
+      msg: "操作成功",
+      data: {
+        results: ids.map((id) => ({
+          id: Number(id),
+          success: true,
+          message: "升级命令已下发",
+        })),
+      },
+      ts: Date.now(),
+    };
+  }
+
+  if (!BATCH_RESULT_ENDPOINTS.has(bare)) return null;
+
+  const req = parseBody(body);
+  const rawIds =
+    bare === "forward/batch-change-tunnel" ? req.forwardIds : req.ids;
+  const count = Array.isArray(rawIds) ? rawIds.length : 0;
+  const data: Record<string, unknown> = {
+    successCount: count,
+    failCount: 0,
+    failures: [],
+    pendingCount: 0,
+    pending: [],
+    warnings: [],
+  };
+
+  if (bare === "tunnel/batch-delete-with-forwards") {
+    data.deletedForwardCount = 0;
+    data.migratedCount = 0;
+    data.portAdjustedCount = 0;
+  }
+
+  if (bare === "node/batch-delete" && req.uninstall) {
+    data.uninstalledCount = count;
+    data.uninstallPendingCount = 0;
+    data.uninstallUnsupportedCount = 0;
+    data.uninstallWarnings = [];
+  }
+
+  return { code: 0, msg: "操作成功", data, ts: Date.now() };
+}
+
+function receiptAnswer(
+  bare: string,
+  body: unknown,
+  book: Record<string, Entry[]>,
+) {
+  return (
+    loginAnswer(bare, body) ??
+    installAnswer(bare, body) ??
+    templateRefreshAnswer(bare, body, book) ??
+    backupImportAnswer(bare, body, book) ??
+    inboundImportPreviewAnswer(bare, body) ??
+    inboundImportAnswer(bare, body) ??
+    sourceRefreshAnswer(bare, body, book) ??
+    serviceRunAnswer(bare, body, book) ??
+    batchAnswer(bare, body) ??
+    importAutoBackupStatusAnswer(bare) ??
+    importAutoBackupDownloadAnswer(bare) ??
+    exportAnswer(bare, body, book)
+  );
+}
+
+/**
+ * RR4-C5-03：config/get 是按键查询，录制册只录了被问过的键——旧回退
+ * 在未命中时回放册中第一条，使任何未录制键名都吃到无关的「配置不存
+ * 在」（延迟测试点弹窗因此在演示站恒报加载失败，而演示自己的
+ * config/list 录制里该键明明已配置）。口径：录制逐字优先（真实命中
+ * 行与真实「配置不存在」都不被合成覆盖）；未录制的键按 config/list
+ * 录制值合成命中行；list 里也没有的键才按真实面回「配置不存在」。
+ */
+function configGetAnswer(
+  bare: string,
+  body: unknown,
+  key: string,
+  book: Record<string, Entry[]>,
+) {
+  if (bare !== "config/get") return null;
+  const recorded = (book["config/get"] ?? []).find((e) => e.key === key);
+
+  if (recorded) return structuredClone(recorded.res);
+  const name = parseBody(body).name;
+  const list = (book["config/list"]?.[0]?.res.data ?? {}) as Record<
+    string,
+    unknown
+  >;
+
+  if (typeof name === "string" && typeof list[name] === "string") {
+    return {
+      code: 0,
+      msg: "操作成功",
+      data: { name, value: list[name] },
+      ts: Date.now(),
+    };
+  }
+
+  return { code: -1, msg: "配置不存在", ts: Date.now() };
+}
+
+const canon = (body: unknown) => {
+  if (body === undefined || body === null || body === "") return "";
+  try {
+    const value = typeof body === "string" ? JSON.parse(body) : body;
+
+    return JSON.stringify(sortKeys(value));
+  } catch {
+    return String(body);
+  }
+};
+
+function sortKeys(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(sortKeys);
+  if (v && typeof v === "object") {
+    return Object.fromEntries(
+      Object.keys(v as object)
+        .sort()
+        .map((k) => [k, sortKeys((v as Record<string, unknown>)[k])]),
+    );
+  }
+
+  return v;
+}
+
+/**
+ * Moves recorded times (last seen, expiry, chart windows) forward by the
+ * time since the recording, so the demo always looks current.
+ */
+function shiftTimes(v: unknown, recordedAt: number, delta: number): unknown {
+  if (typeof v === "number") {
+    return v > 1.6e12 && Math.abs(v - recordedAt) < 400 * 86400000
+      ? v + delta
+      : v;
+  }
+  if (Array.isArray(v)) return v.map((x) => shiftTimes(x, recordedAt, delta));
+  if (v && typeof v === "object") {
+    return Object.fromEntries(
+      Object.entries(v as object).map(([k, x]) => [
+        k,
+        shiftTimes(x, recordedAt, delta),
+      ]),
+    );
+  }
+
+  return v;
+}
+
+let fixtures: Fixtures | null = null;
+
+// The check is inline so other builds drop the recording entirely.
+const loadFixtures = async (): Promise<Fixtures> =>
+  import.meta.env.VITE_DEMO === "true"
+    ? ((await import("./fixtures.json")).default as Fixtures)
+    : { recordedAt: 0, admin: {}, user: {} };
+let lastNotice = 0;
+
+async function answer(config: InternalAxiosRequestConfig) {
+  fixtures ??= await loadFixtures();
+  const raw = (config.url ?? "").replace(/^https?:\/\/[^/]+/, "");
+  const path = raw.replace(/^\/?(api\/v1\/)?/, "");
+  let bare = path.split("?")[0];
+
+  bare = ALIASES[bare] ?? bare;
+  const key = canon(config.data);
+  const book = fixtures[demoRole()];
+  const entries =
+    book[path] ??
+    book[bare] ??
+    Object.entries(book).find(([p]) => p.split("?")[0] === bare)?.[1];
+  const last = bare.split("/").pop() ?? "";
+  const write = isWrite(last);
+  const delta = Math.max(0, Date.now() - fixtures.recordedAt);
+
+  const diagnosis = diagnoseAnswer(bare, config.data, book);
+
+  if (diagnosis) return diagnosis;
+  const delPreview = deletePreviewAnswer(bare, config.data, book);
+
+  if (delPreview) return delPreview;
+  const tune = tuneAnswer(bare, config.data);
+
+  if (tune) return tune;
+  const swap = swapAnswer(bare, config.data);
+
+  if (swap) return swap;
+  const pkg = userPackageAnswer(bare, book);
+  if (pkg) return shiftTimes(pkg, fixtures.recordedAt, delta);
+  const nodeAction = nodeActionAnswer(bare, config, book);
+  if (nodeAction) return nodeAction;
+  const grp = demoGroupAnswer(bare, config.data, book);
+
+  if (grp) {
+    // Only the cloned recordings carry recorded timestamps worth
+    // shifting; the synthesized config/write answers are current.
+    return bare === "node/list" || bare === "config/list"
+      ? shiftTimes(grp, fixtures.recordedAt, delta)
+      : grp;
+  }
+  const receipt = receiptAnswer(bare, config.data, book);
+
+  if (receipt) return receipt;
+  const cfgGet = configGetAnswer(bare, config.data, key, book);
+
+  if (cfgGet) return shiftTimes(cfgGet, fixtures.recordedAt, delta);
+  if (PROBES[bare]) {
+    const [list, field] = PROBES[bare];
+    const ids: number[] = JSON.parse(String(config.data || "{}")).ids ?? [];
+    const items = (book[list]?.[0]?.res.data ?? []) as Array<
+      Record<string, unknown>
+    >;
+    const data = Object.fromEntries(
+      items
+        .filter((i) => ids.length === 0 || ids.includes(Number(i.id)))
+        .filter((i) => i[field])
+        .map((i) => [String(i.id), i[field]]),
+    );
+
+    await new Promise((r) => setTimeout(r, 600));
+
+    return shiftTimes(
+      { code: 0, msg: "操作成功", data },
+      fixtures.recordedAt,
+      delta,
+    );
+  }
+  if (entries?.length && !write) {
+    const hit = entries.find((e) => e.key === key) ?? entries[0];
+
+    return shiftTimes(structuredClone(hit.res), fixtures.recordedAt, delta);
+  }
+  if (write) {
+    if (Date.now() - lastNotice > 4000) {
+      lastNotice = Date.now();
+      toast("演示站不会保存修改，刷新后还原", { icon: "ℹ️", id: "demo-write" });
+    }
+    let echo: unknown = null;
+
+    if (/^(save|create|update)$/.test(last)) {
+      try {
+        const body =
+          typeof config.data === "string"
+            ? JSON.parse(config.data)
+            : config.data;
+
+        echo = { id: Date.now() % 100000, ...body };
+      } catch {
+        echo = null;
+      }
+    }
+
+    return { code: 0, msg: "操作成功", data: echo, ts: Date.now() };
+  }
+
+  // Not recorded: an empty answer most pages render as "nothing yet". The
+  // CI check (scripts/demo/check.mjs) fails on this warning, so new pages
+  // get recorded (scripts/demo/README.md).
+  // eslint-disable-next-line no-console
+  console.warn(`[demo] not recorded: ${bare}`);
+
+  return { code: 0, msg: "操作成功", data: [], ts: Date.now() };
+}
+
+const demoAdapter: AxiosAdapter = async (config) => {
+  const data = await answer(config);
+  // backup/export answers with a download marker, not an envelope:
+  // the export path keys on Content-Disposition: attachment and
+  // saves the blob (api/index.ts exportBackup, D5-01口径) — mirror
+  // the real response's status, headers and filename exactly.
+  const download = (
+    data as { __demoDownload?: { filename: string; content: string } }
+  )?.__demoDownload;
+
+  if (download) {
+    return {
+      data: new Blob([download.content], { type: "application/json" }),
+      status: 200,
+      statusText: "OK",
+      headers: {
+        "content-disposition": `attachment; filename=${download.filename}`,
+        "content-type": "application/json",
+      },
+      config,
+      request: {},
+    } as AxiosResponse;
+  }
+
+  return {
+    data,
+    status: 200,
+    statusText: "OK",
+    headers: {},
+    config,
+    request: {},
+  } as AxiosResponse;
+};
+
+/** Answers the API in the browser and signs in as the demo admin. */
+export function installDemo() {
+  axios.defaults.adapter = demoAdapter;
+  if (!localStorage.getItem("token")?.startsWith("demo")) {
+    writeSession("admin");
+  }
+}
+
+/**
+ * The node page and monitoring get live metrics over a WebSocket; the demo
+ * plays plausible ones for the demo nodes instead.
+ */
+export function startDemoRealtime(
+  onMessage: (m: Record<string, unknown>) => void,
+) {
+  let stopped = false;
+  let timer = 0;
+  const totals: Record<number, [number, number]> = {};
+
+  void (async () => {
+    fixtures ??= await loadFixtures();
+    const nodes = (fixtures.admin["node/list"]?.[0]?.res.data ?? []) as Array<{
+      id: number;
+    }>;
+    const tick = () => {
+      if (stopped) return;
+      const t = Date.now() / 1000;
+
+      for (const n of nodes) {
+        const wave = 0.5 + 0.5 * Math.sin(t / 40 + n.id);
+        const inSpeed = Math.round(
+          (8 + 40 * wave + 6 * Math.random()) * 131072,
+        );
+        const outSpeed = Math.round(inSpeed * (0.9 + 0.2 * Math.random()));
+        const [inTotal, outTotal] = totals[n.id] ?? [
+          n.id * 7.3e11,
+          n.id * 6.9e11,
+        ];
+
+        totals[n.id] = [inTotal + inSpeed * 3, outTotal + outSpeed * 3];
+        onMessage({ id: n.id, type: "status", data: 1 });
+        onMessage({
+          id: n.id,
+          type: "metric",
+          data: {
+            cpuUsage: Math.round((6 + 30 * wave + 5 * Math.random()) * 10) / 10,
+            memoryUsage: Math.round((32 + 12 * wave) * 10) / 10,
+            diskUsage: 23.5,
+            netInBytes: totals[n.id][0],
+            netOutBytes: totals[n.id][1],
+            netInSpeed: inSpeed,
+            netOutSpeed: outSpeed,
+            load1: Math.round((0.2 + 1.2 * wave) * 100) / 100,
+            load5: Math.round((0.3 + wave) * 100) / 100,
+            load15: Math.round((0.4 + 0.8 * wave) * 100) / 100,
+            tcpConns: Math.round(120 + 500 * wave),
+            udpConns: Math.round(12 + 50 * wave),
+            uptime: 86400 * 21 + Math.round(t % 86400),
+          },
+        });
+      }
+      timer = window.setTimeout(tick, 3000);
+    };
+
+    tick();
+  })();
+
+  return () => {
+    stopped = true;
+    window.clearTimeout(timer);
+  };
+}

@@ -1,0 +1,583 @@
+package kernel
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"strings"
+)
+
+// Chained outbounds: an inbound whose Via is set sends its traffic on
+// through another proxy (a node of this panel or an imported one) instead
+// of leaving from the node itself. Each kernel only dials the next hop, so
+// longer chains are built by chaining the target inbound in turn.
+
+func chainTag(in Inbound) string { return fmt.Sprintf("via-%d", in.ID) }
+
+func chainUserTag(in Inbound, userID int64) string {
+	return fmt.Sprintf("via-%d-u%d", in.ID, userID)
+}
+
+// chainBlocked reports a chained inbound whose target is gone; its traffic
+// is dropped rather than leaked out of the node's own address.
+func (in Inbound) chainBlocked() bool { return in.Via != nil && in.Via.Host == "" }
+
+// countedUsers returns the inbound's users whose traffic carries a mark.
+func (in Inbound) countedUsers() []int64 {
+	if !in.SupportsUsers() {
+		return nil
+	}
+	var ids []int64
+	for _, u := range in.Users {
+		if in.userMark(u.ID) != 0 {
+			ids = append(ids, u.ID)
+		}
+	}
+	return ids
+}
+
+// CheckChain reports whether a kernel can dial the given endpoint as a
+// chained outbound.
+func CheckChain(kernelType string, via Endpoint) error {
+	return CheckChainWith(kernelType, via, RenderOptions{})
+}
+
+// CheckChainWith is CheckChain for a kernel with the given options (what
+// its version supports).
+func CheckChainWith(kernelType string, via Endpoint, opts RenderOptions) error {
+	via.Name = "check"
+	switch kernelType {
+	case TypeSingbox:
+		if via.Proxy == nil && via.Inbound.Protocol == ProtocolSnell && !opts.SingboxSnell {
+			return errors.New("sing-box 1.14 及以上才能连接 Snell 节点，请先更新内核")
+		}
+		// R9X-005：Naive 出站是 sing-box 1.13 才有的类型（1.12.17 对
+		// naive 出站 exit 1、二分实测），自建与导入目标同门点名拒绝；
+		// 此前无门保存成功、下发后节点整单 FATAL。
+		if IsNaiveEndpoint(via) && !opts.SingboxNaive {
+			return errors.New("sing-box 1.13 及以上才能连接 Naive 节点，请先更新内核")
+		}
+		_, err := singboxChainOutboundsWith(via, "check", 0, opts.SingboxSnell, opts.SingboxNaive)
+		return err
+	case TypeXray:
+		_, err := xrayChainOutbound(via, "check", 0)
+		return err
+	}
+	info, _ := Lookup(kernelType)
+	name := info.Name
+	if name == "" {
+		name = kernelType
+	}
+	return fmt.Errorf("%s 内核不支持链式出站", name)
+}
+
+// ---- sing-box ----
+
+// singboxChainOutbounds renders the outbounds that dial the chain target;
+// a non-zero mark goes on the one that opens the socket.
+func singboxChainOutbounds(via Endpoint, tag string, mark int64, snell bool) ([]interface{}, error) {
+	return singboxChainOutboundsWith(via, tag, mark, snell, true)
+}
+
+// singboxChainOutboundsWith is singboxChainOutbounds with the Naive
+// version gate (R9X-005): a Naive target renders only when the dialing
+// sing-box is 1.13+.
+func singboxChainOutboundsWith(via Endpoint, tag string, mark int64, snell, naive bool) ([]interface{}, error) {
+	via.Name = tag
+	obs, ok := singboxOutboundsWith(via, snell, naive)
+	if !ok {
+		return nil, fmt.Errorf("sing-box 无法连接 %s 类型的出站节点", chainTargetLabel(via))
+	}
+	out := make([]interface{}, 0, len(obs))
+	for _, o := range obs {
+		if _, detour := o["detour"]; !detour && mark != 0 {
+			o["routing_mark"] = mark
+		}
+		out = append(out, obj(o))
+	}
+	return out, nil
+}
+
+// singboxInboundTags lists the tags a panel inbound's connections carry; a
+// ShadowTLS front hands them to its loopback Shadowsocks backend.
+func singboxInboundTags(in Inbound) []string {
+	if backend := singboxShadowTLSBackendTag(in); backend != "" {
+		return []string{in.Tag(), backend}
+	}
+	return []string{in.Tag()}
+}
+
+// singboxShadowTLSBackendTag is the tag of the inbound a ShadowTLS front
+// detours to, or "" when the inbound has no front.
+func singboxShadowTLSBackendTag(in Inbound) string {
+	if in.Security.Type != SecurityShadowTLS {
+		return ""
+	}
+	switch in.Protocol {
+	case ProtocolShadowsocks:
+		return in.Tag() + "-ss"
+	}
+	return ""
+}
+
+// singboxChainRoutes returns the outbounds, route rules and rule-set tags of
+// the chained and split-routed inbounds. The rules must precede the per-user
+// direct rules.
+func singboxChainRoutes(inbounds []Inbound, snell bool) ([]interface{}, []interface{}, []string, error) {
+	return singboxChainRoutesWith(inbounds, snell, true)
+}
+
+// singboxChainRoutesWith is singboxChainRoutes with the Naive version
+// gate (R9X-005) threaded through chain and 分流 targets.
+func singboxChainRoutesWith(inbounds []Inbound, snell, naive bool) ([]interface{}, []interface{}, []string, error) {
+	var outbounds, rules []interface{}
+	var sets []string
+	for _, in := range inbounds {
+		if !in.routed() {
+			continue
+		}
+		tags := singboxInboundTags(in)
+		if in.splitRequiresSniff() {
+			rules = append(rules, obj{"inbound": tags, "action": "sniff"})
+		}
+		obs, rs, ss, err := singboxSplitRoutesWith(in, snell, naive)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		outbounds, rules, sets = append(outbounds, obs...), append(rules, rs...), append(sets, ss...)
+		if in.Via == nil {
+			continue
+		}
+		if in.chainBlocked() {
+			rules = append(rules, obj{"inbound": tags, "action": "reject"})
+			continue
+		}
+		for _, id := range in.countedUsers() {
+			tag := chainUserTag(in, id)
+			obs, err := singboxChainOutboundsWith(*in.Via, tag, in.userMark(id), snell, naive)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("入站 %d: %v", in.ID, err)
+			}
+			outbounds = append(outbounds, obs...)
+			rules = append(rules, obj{"inbound": tags, "auth_user": []string{User{ID: id}.Name()}, "outbound": tag})
+		}
+		tag := chainTag(in)
+		obs, err = singboxChainOutboundsWith(*in.Via, tag, 0, snell, naive)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("入站 %d: %v", in.ID, err)
+		}
+		outbounds = append(outbounds, obs...)
+		rules = append(rules, obj{"inbound": tags, "outbound": tag})
+	}
+	return outbounds, rules, sets, nil
+}
+
+// ---- Xray ----
+
+// xrayChainRoutes is singboxChainRoutes for Xray. levels carries the
+// per-inbound connIdle policy levels: chain outbounds stamp the level
+// on their account user (see xrayChainOutbound), and split-direct
+// matches leave through the idle outbounds (see xraySplitRoutes).
+// idleEmitted is the set of inbounds this render emits idle outbounds
+// for (see idleOutboundSet), threaded through so a split-direct rule
+// never references an idle outbound that was not emitted.
+func xrayChainRoutes(inbounds []Inbound, levels map[int64]int, idleEmitted map[int64]bool) ([]interface{}, []interface{}, error) {
+	var outbounds, rules []interface{}
+	for _, in := range inbounds {
+		if !in.routed() {
+			continue
+		}
+		obs, rs, err := xraySplitRoutes(in, levels, idleEmitted)
+		if err != nil {
+			return nil, nil, err
+		}
+		outbounds, rules = append(outbounds, obs...), append(rules, rs...)
+		if in.Via == nil {
+			continue
+		}
+		tags := []string{in.Tag()}
+		if in.chainBlocked() {
+			rules = append(rules, obj{"type": "field", "inboundTag": tags, "outboundTag": "block"})
+			continue
+		}
+		for _, id := range in.countedUsers() {
+			tag := chainUserTag(in, id)
+			ob, err := xrayChainOutbound(*in.Via, tag, levels[in.ID])
+			if err != nil {
+				return nil, nil, fmt.Errorf("入站 %d: %v", in.ID, err)
+			}
+			ob["streamSettings"].(obj)["sockopt"] = obj{"mark": in.userMark(id)}
+			outbounds = append(outbounds, ob)
+			rules = append(rules, obj{"type": "field", "inboundTag": tags, "user": []string{User{ID: id}.Email()}, "outboundTag": tag})
+		}
+		tag := chainTag(in)
+		ob, err := xrayChainOutbound(*in.Via, tag, levels[in.ID])
+		if err != nil {
+			return nil, nil, fmt.Errorf("入站 %d: %v", in.ID, err)
+		}
+		outbounds = append(outbounds, ob)
+		rules = append(rules, obj{"type": "field", "inboundTag": tags, "outboundTag": tag})
+	}
+	return outbounds, rules, nil
+}
+
+// chainTarget is the client side of a chain target, flattened from either
+// a panel inbound or an imported proxy.
+type chainTarget struct {
+	Protocol string // vless, vmess, trojan, shadowsocks, socks, http
+	Host     string
+	Port     int
+
+	UUID string
+	Flow string
+	// Encryption 是 VLESS 加密的客户端串（链式出站 user 的 encryption 字段）。
+	Encryption string
+	Cipher     string // VMess security / Shadowsocks method
+	Username   string
+	Password   string
+
+	Network     string // tcp, ws, httpupgrade, grpc, xhttp
+	Path        string
+	HostHeader  string
+	ServiceName string
+	Mode        string
+
+	Security    string // none, tls, reality
+	SNI         string
+	ALPN        []string
+	Fingerprint string
+	// PinSHA256 replaces CA verification (self-signed certificates); Xray
+	// no longer accepts allowInsecure.
+	PinSHA256      string
+	RealityPublic  string
+	RealityShortID string
+	// RealityDest / RealitySpiderX carry the client-link Reality
+	// params realityDest / spx (L5-F-01): user-supplied, validated
+	// values from an imported proxy. A self-built inbound never fills
+	// them — its Security.RealityDest is the server-side decoy target
+	// (probe forwarding), not a client dial value, and must not leak
+	// into the chain outbound.
+	RealityDest    string
+	RealitySpiderX string
+}
+
+// HasVLESSEncryption reports whether the endpoint carries VLESS
+// encryption (ENC): a self-built inbound with encryption enabled, or an
+// imported proxy whose encryption is set and not "none".
+func (e Endpoint) HasVLESSEncryption() bool {
+	if e.Proxy != nil {
+		return hasVLESSEncryption(e.Proxy)
+	}
+	return e.Inbound.Settings.EncryptionEnabled()
+}
+
+func chainTargetLabel(e Endpoint) string {
+	if e.Proxy != nil {
+		return DescribeProxy(e.Proxy)
+	}
+	parts := []string{e.Inbound.Protocol}
+	if t := e.Inbound.Transport.Type; t != "" && t != TransportTCP {
+		parts = append(parts, t)
+	}
+	if s := e.Inbound.Security.Type; s != "" && s != SecurityNone {
+		parts = append(parts, s)
+	}
+	return strings.Join(parts, " + ")
+}
+
+func chainTargetFromInbound(e Endpoint) (chainTarget, error) {
+	in := e.Inbound
+	t := chainTarget{Host: strings.Trim(e.Host, "[]"), Port: e.Port}
+	switch in.Protocol {
+	case ProtocolVLESS:
+		t.Protocol, t.UUID, t.Flow = "vless", in.Settings.UUID, in.Settings.Flow
+		if in.Settings.EncryptionEnabled() {
+			enc, err := in.Settings.EncryptionString()
+			if err != nil {
+				return t, err
+			}
+			t.Encryption = enc
+		}
+	case ProtocolVMess:
+		t.Protocol, t.UUID, t.Cipher = "vmess", in.Settings.UUID, "auto"
+	case ProtocolTrojan:
+		t.Protocol, t.Password = "trojan", in.Settings.Password
+	case ProtocolShadowsocks:
+		if in.Security.Type == SecurityShadowTLS {
+			return t, errors.New("Xray 无法连接 ShadowTLS 节点，请改用 sing-box 内核")
+		}
+		// GATE-F1：自建目标同订阅口径归一（导入目标经 forEndpoint 已归一）。
+		// R10X-015（X-E-01）：改经 Segments 逐段归一；自建 SS 服务端
+		// 两落点维持单段 helper；对一切可达输入
+		// （Normalize 单段限定）Segments ≡ 单段形、行为逐字不变，
+		// 多段仅在直调渲染函数时逐段归一（解码字节不变）。
+		t.Protocol, t.Cipher, t.Password = "shadowsocks", in.Settings.Method,
+			NormalizedSS2022PasswordSegments(in.Settings.Method, in.Settings.Password)
+		return t, nil
+	default:
+		return t, fmt.Errorf("Xray 无法连接 %s 节点，请改用 sing-box 内核", in.Protocol)
+	}
+	tr := in.Transport
+	t.Network = firstNonEmptyString(tr.Type, TransportTCP)
+	t.Path, t.HostHeader, t.ServiceName, t.Mode = tr.Path, tr.Host, tr.ServiceName, tr.Mode
+
+	sec := in.Security
+	t.Security = firstNonEmptyString(sec.Type, SecurityNone)
+	if t.Security != SecurityNone {
+		t.SNI, t.ALPN, t.Fingerprint = sec.SNI, sec.ALPN, sec.Fingerprint
+	}
+	switch {
+	case t.Security == SecurityReality:
+		t.RealityPublic = sec.RealityPublicKey
+		if len(sec.RealityShortIDs) > 0 {
+			t.RealityShortID = sec.RealityShortIDs[0]
+		}
+	case e.selfSigned():
+		pin, err := certSHA256(sec.CertPEM)
+		if err != nil {
+			return t, err
+		}
+		t.PinSHA256 = pin
+	}
+	return t, nil
+}
+
+func chainTargetFromProxy(e Endpoint) (chainTarget, error) {
+	p := e.Proxy.forEndpoint(e)
+	// R7X-001：Xray 本体 SS 方法集是双客户端共同集的真子集（8/18）；
+	// 共同集内、子集外的合法 cipher 先行点名拒绝（错误须明确点名
+	// cipher，沿协议×内核规则与既有同型门文案口径），不得下发必被
+	// Xray exit 23 的配置。chacha20 不经此分支：其既有处置（单面集
+	// 格经下方统一谓词拒绝）逐字不变。
+	if p.Type() == "ss" {
+		if cipher := p.str("cipher"); ValidSSCipher(cipher) && !ssCipherMihomoOnly(cipher) && !ValidSSCipherForXrayChain(cipher) {
+			return chainTarget{}, fmt.Errorf("Xray 无法连接 %s 节点：Xray 不支持 Shadowsocks 加密方法 %s，请改用 sing-box 内核或更换加密方法", DescribeProxy(e.Proxy), cipher)
+		}
+	}
+	// R6X-003（+R6X-001 链式面格）：链式 Xray 面此前无存量守卫，
+	// Reality pbk/sid、VLESS flow/encryption、SS2022 key、SS cipher
+	// 双拒格坏存量原样透传、Xray 整单 exit 23。入口先过统一谓词
+	// validImportedProxyFields（面参数 xray-chain：单面 chacha20 非
+	// mihomo 面不放行——Xray 实测 unknown cipher method exit 23；
+	// R7X-001 起同档含 Xray SS 子集门，与上方点名分支同一点生效），
+	// 不过即面板侧报错、不产出可下发配置；保存期 CheckChainWith
+	// 经 xrayChainOutbound 同点生效。自建目标 chainTargetFromInbound
+	// 字段经 Normalize 把关，不经此谓词。
+	if !validImportedProxyFields(p, ssFaceXrayChain) {
+		return chainTarget{}, fmt.Errorf("Xray 无法连接 %s 节点（凭据不合规），请修正节点或改用 sing-box 内核", DescribeProxy(e.Proxy))
+	}
+	t := chainTarget{Host: p.str("server"), Port: e.Port}
+	unsupported := fmt.Errorf("Xray 无法连接 %s 节点，请改用 sing-box 内核", DescribeProxy(e.Proxy))
+	switch p.Type() {
+	case "vless":
+		t.Protocol, t.UUID, t.Flow = "vless", p.str("uuid"), p.str("flow")
+		if enc := p.str("encryption"); enc != "" && enc != "none" {
+			t.Encryption = enc
+		}
+	case "vmess":
+		t.Protocol, t.UUID, t.Cipher = "vmess", p.str("uuid"), firstNonEmptyString(p.str("cipher"), "auto")
+	case "trojan":
+		t.Protocol, t.Password = "trojan", p.str("password")
+	case "ss":
+		if p.str("plugin") != "" {
+			return t, unsupported
+		}
+		// R8X-003-S1（B8-S1 立案）：SIP023 多段密码逐段归一——
+		// forEndpoint 只归一单段（NormalizedSS2022Password 对多段
+		// 原样返回），多段非规范形（RawURL 无填充段）此前原样透传
+		// 至 Xray、整单 exit 23（decode key: illegal base64 data）。
+		// sing-box / Clash 订阅面与 sing-box 链式面均经
+		// NormalizedSS2022PasswordSegments 逐段归一，本面同 helper
+		// 补齐：解码字节不变、规范形为不动点；坏段已由上方统一
+		// 谓词先行拒绝，不可达段在此原样返回亦无敞口。进口存储与
+		// 订阅面既有归一/原样口径不动（修复只限本链式面）。
+		t.Protocol, t.Cipher, t.Password = "shadowsocks", p.str("cipher"),
+			NormalizedSS2022PasswordSegments(p.str("cipher"), p.str("password"))
+		return t, nil
+	case "socks5":
+		t.Protocol, t.Username, t.Password = "socks", p.str("username"), p.str("password")
+	case "http":
+		t.Protocol, t.Username, t.Password = "http", p.str("username"), p.str("password")
+	default:
+		return t, unsupported
+	}
+
+	host, path, service, mode := transportFields(p)
+	t.HostHeader, t.Path, t.ServiceName, t.Mode = host, path, service, mode
+	switch n := p.network(); n {
+	case "tcp", "grpc", "xhttp":
+		t.Network = n
+	case "ws":
+		t.Network = TransportWS
+		if p.sub("ws-opts").flag("v2ray-http-upgrade") {
+			t.Network = "httpupgrade"
+		}
+	default:
+		return t, unsupported
+	}
+	if t.Protocol == "socks" || t.Protocol == "http" {
+		if t.Network != TransportTCP {
+			return t, unsupported
+		}
+	}
+
+	t.Security = SecurityNone
+	if p.usesTLS() {
+		t.Security = SecurityTLS
+		t.SNI = p.serverName()
+		t.ALPN = p.strs("alpn")
+		t.Fingerprint = p.str("client-fingerprint")
+		if ro := p.sub("reality-opts"); len(ro) > 0 {
+			t.Security = SecurityReality
+			t.RealityPublic, t.RealityShortID = ro.str("public-key"), ro.str("short-id")
+			// L5-F-01：导入链接带来的 dest/spx 透传给 Xray 链式出站
+			// （realitySettings 的同名字段）。自建目标不填这两项
+			// （见 chainTarget 注释），此处只搬运导入值。
+			t.RealityDest, t.RealitySpiderX = ro.str("dest"), ro.str("spider-x")
+		} else if p.flag("skip-cert-verify") {
+			// Mihomo's fingerprint is the certificate's SHA-256.
+			t.PinSHA256 = p.str("fingerprint")
+			if t.PinSHA256 == "" {
+				return t, errors.New("该节点跳过了证书验证，Xray 已不支持，请改用 sing-box 内核")
+			}
+		}
+	}
+	return t, nil
+}
+
+// xrayChainOutbound renders the Xray outbound that dials a chain target.
+func xrayChainOutbound(e Endpoint, tag string, level int) (obj, error) {
+	var t chainTarget
+	var err error
+	if e.Proxy != nil {
+		t, err = chainTargetFromProxy(e)
+	} else {
+		t, err = chainTargetFromInbound(e)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if t.Host == "" || t.Port <= 0 {
+		return nil, errors.New("出站节点缺少地址")
+	}
+
+	// level is the source inbound's connIdle policy level (0 = unset).
+	// VLESS/VMess/Trojan/SS outbound clients install their idle timer
+	// from their account user's level (upstream: vless/outbound,
+	// vmess/outbound, trojan/client and shadowsocks/client all read
+	// request.User.Level / user.Level) — without it a chained idle
+	// inbound's sessions run the level-0 default, exactly like the
+	// direct freedom exit did before the dedicated outbounds.
+	// SOCKS/HTTP chain targets carry no level field on their users, so
+	// their exits stay on level 0 (known limitation, see the connIdle
+	// report).
+	var settings obj
+	switch t.Protocol {
+	case "vless":
+		user := obj{"id": t.UUID, "encryption": "none"}
+		if t.Encryption != "" {
+			user["encryption"] = t.Encryption
+		}
+		if t.Flow != "" {
+			user["flow"] = t.Flow
+		}
+		if level > 0 {
+			user["level"] = level
+		}
+		settings = obj{"vnext": []interface{}{obj{"address": t.Host, "port": t.Port, "users": []interface{}{user}}}}
+	case "vmess":
+		user := obj{"id": t.UUID, "security": t.Cipher}
+		if level > 0 {
+			user["level"] = level
+		}
+		settings = obj{"vnext": []interface{}{obj{"address": t.Host, "port": t.Port,
+			"users": []interface{}{user}}}}
+	case "trojan":
+		server := obj{"address": t.Host, "port": t.Port, "password": t.Password}
+		if level > 0 {
+			server["level"] = level
+		}
+		settings = obj{"servers": []interface{}{server}}
+	case "shadowsocks":
+		server := obj{"address": t.Host, "port": t.Port, "method": t.Cipher, "password": t.Password}
+		if level > 0 {
+			server["level"] = level
+		}
+		settings = obj{"servers": []interface{}{server}}
+	case "socks", "http":
+		server := obj{"address": t.Host, "port": t.Port}
+		if t.Username != "" {
+			server["users"] = []interface{}{obj{"user": t.Username, "pass": t.Password}}
+		}
+		settings = obj{"servers": []interface{}{server}}
+	}
+
+	stream := obj{"network": firstNonEmptyString(t.Network, TransportTCP)}
+	switch t.Network {
+	case TransportWS, "httpupgrade":
+		s := obj{"path": firstNonEmptyString(t.Path, "/")}
+		if t.HostHeader != "" {
+			s["host"] = t.HostHeader
+		}
+		stream[t.Network+"Settings"] = s
+	case TransportGRPC:
+		stream["grpcSettings"] = obj{"serviceName": t.ServiceName}
+	case TransportXHTTP:
+		s := obj{"path": firstNonEmptyString(t.Path, "/"), "mode": canonicalXHTTPMode(t.Mode)}
+		if t.HostHeader != "" {
+			s["host"] = t.HostHeader
+		}
+		stream["xhttpSettings"] = s
+	}
+	switch t.Security {
+	case SecurityTLS:
+		tls := obj{}
+		if t.SNI != "" {
+			tls["serverName"] = t.SNI
+		}
+		if len(t.ALPN) > 0 {
+			tls["alpn"] = t.ALPN
+		}
+		if t.Fingerprint != "" {
+			tls["fingerprint"] = t.Fingerprint
+		}
+		if t.PinSHA256 != "" {
+			tls["pinnedPeerCertSha256"] = t.PinSHA256
+		}
+		stream["security"] = SecurityTLS
+		stream["tlsSettings"] = tls
+	case SecurityReality:
+		r := obj{
+			"serverName":  t.SNI,
+			"fingerprint": firstNonEmptyString(t.Fingerprint, DefaultFingerprint),
+			"publicKey":   t.RealityPublic,
+		}
+		if t.RealityShortID != "" {
+			r["shortId"] = t.RealityShortID
+		}
+		// L5-F-01：导入链接的 dest/spx（仅导入目标携带，自建目标
+		// 永不填）透传入客户端 realitySettings。Xray 忽略未知/
+		// 未用字段，故无此值的旧目标行为逐字不变。
+		if t.RealityDest != "" {
+			r["dest"] = t.RealityDest
+		}
+		if t.RealitySpiderX != "" {
+			r["spiderX"] = t.RealitySpiderX
+		}
+		stream["security"] = SecurityReality
+		stream["realitySettings"] = r
+	}
+	return obj{"tag": tag, "protocol": t.Protocol, "settings": settings, "streamSettings": stream}, nil
+}
+
+// certSHA256 is the hex SHA-256 of the first certificate in a PEM bundle.
+func certSHA256(certPEM string) (string, error) {
+	block, _ := pem.Decode([]byte(certPEM))
+	if block == nil || block.Type != "CERTIFICATE" {
+		return "", errors.New("出站节点的自签证书损坏")
+	}
+	sum := sha256.Sum256(block.Bytes)
+	return hex.EncodeToString(sum[:]), nil
+}

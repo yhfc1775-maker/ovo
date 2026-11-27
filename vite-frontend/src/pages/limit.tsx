@@ -1,0 +1,625 @@
+import { useState, useMemo } from "react";
+import toast from "react-hot-toast";
+import { LayoutGrid, List } from "lucide-react";
+
+import { StaggerList, StaggerItem } from "@/components/animated-page";
+import { PageShell } from "@/components/page-kit";
+import { SearchBar } from "@/components/search-bar";
+import { Card, CardBody, CardHeader } from "@/shadcn-bridge/heroui/card";
+import { Button } from "@/shadcn-bridge/heroui/button";
+import { Input } from "@/shadcn-bridge/heroui/input";
+import {
+  Modal,
+  ModalContent,
+  ModalHeader,
+  ModalBody,
+  ModalFooter,
+} from "@/shadcn-bridge/heroui/modal";
+import { Chip } from "@/shadcn-bridge/heroui/chip";
+import { Switch } from "@/shadcn-bridge/heroui/switch";
+import {
+  Table,
+  TableHeader,
+  TableColumn,
+  TableBody,
+  TableRow,
+  TableCell,
+} from "@/shadcn-bridge/heroui/table";
+import {
+  createSpeedLimit,
+  updateSpeedLimit,
+  deleteSpeedLimit,
+} from "@/api";
+import { useSpeedLimits } from "@/api/query-hooks";
+import { PageLoadingState } from "@/components/page-state";
+import { useLocalStorageState } from "@/hooks/use-local-storage-state";
+import { useIdemKey, useRotateIdemKeyOnCreateOpen } from "@/hooks/useIdemKey";
+
+interface SpeedLimitRule {
+  id: number;
+  name: string;
+  speed: number;
+  status: number;
+  /** 与后端一致：毫秒时间戳；updatedTime 未更新过为 null（F-140）。 */
+  createdTime: number;
+  updatedTime: number | null;
+}
+
+interface SpeedLimitForm {
+  id?: number;
+  name: string;
+  speed: number;
+  status: number;
+}
+
+// R7X-004：限速改/删回执的 data.warnings 消费（回执第三段）——与
+// forward.tsx 同范式逐条 ⚠️ 透出（如 nftables 隧道面「限速不生效」），
+// 此前 limit 页只报成功、warnings 在前端被丢弃。
+function toastResyncWarnings(res: unknown) {
+  const warnings = (res as { data?: { warnings?: unknown } })?.data?.warnings;
+
+  if (!Array.isArray(warnings)) return;
+  warnings
+    .map((item) => (typeof item === "string" ? item.trim() : ""))
+    .filter((item) => item)
+    .forEach((warning) => {
+      toast(warning, { icon: "⚠️", duration: 5000 });
+    });
+}
+
+export default function LimitPage({
+  embedded = false,
+}: {
+  embedded?: boolean;
+}) {
+  // React Query for speed limits (replaces manual loadData)
+  const { data: rulesRes, isLoading: loading, error, refetch } = useSpeedLimits();
+  const rules = rulesRes?.code === 0 ? (rulesRes.data || []) : [];
+  const rulesLoadFailed = !!error || (rulesRes && rulesRes.code !== 0);
+
+  const [searchKeyword, setSearchKeyword] = useLocalStorageState(
+    "limit-search-keyword",
+    "",
+  );
+  const [isSearchVisible, setIsSearchVisible] = useState(false);
+  const [viewMode, setViewMode] = useLocalStorageState<"list" | "grid">(
+    "limit-view-mode",
+    "grid",
+  );
+
+  const filteredRules = useMemo(() => {
+    if (!searchKeyword.trim()) return rules;
+    const lowerKeyword = searchKeyword.toLowerCase();
+
+    return rules.filter(
+      (r: SpeedLimitRule) => r.name && r.name.toLowerCase().includes(lowerKeyword),
+    );
+  }, [rules, searchKeyword]);
+
+  // 模态框状态
+  const [modalOpen, setModalOpen] = useState(false);
+  const [deleteModalOpen, setDeleteModalOpen] = useState(false);
+  const [isEdit, setIsEdit] = useState(false);
+  const [submitLoading, setSubmitLoading] = useState(false);
+  const [deleteLoading, setDeleteLoading] = useState(false);
+  const [ruleToDelete, setRuleToDelete] = useState<SpeedLimitRule | null>(null);
+
+  // 表单状态
+  const [form, setForm] = useState<SpeedLimitForm>({
+    name: "",
+    speed: 100,
+    status: 1,
+  });
+
+  // 表单验证错误
+  const [errors, setErrors] = useState<{ [key: string]: string }>({});
+
+  // 表单验证
+  const validateForm = (): boolean => {
+    const newErrors: { [key: string]: string } = {};
+
+    if (!form.name.trim()) {
+      newErrors.name = "请输入规则名称";
+    } else if ([...form.name].length > 100) {
+      // FT-10 同族（普查差额）：与后端 speedLimitCreate 同口径——非空＋
+      // ≤100 字符（按 rune 计），此前前端单方面收紧为 2-50。
+      newErrors.name = "规则名称长度不能超过100个字符";
+    }
+
+    if (!form.speed || form.speed < 1) {
+      newErrors.speed = "请输入有效的速度限制（≥1 Mbps）";
+    }
+
+    setErrors(newErrors);
+
+    return Object.keys(newErrors).length === 0;
+  };
+
+  // 新增规则
+  const handleAdd = () => {
+    setIsEdit(false);
+    setForm({
+      name: "",
+      speed: 100,
+      status: 1,
+    });
+    setErrors({});
+    setModalOpen(true);
+  };
+
+  // 编辑规则
+  const handleEdit = (rule: SpeedLimitRule) => {
+    setIsEdit(true);
+    setForm({
+      id: rule.id,
+      name: rule.name,
+      speed: rule.speed,
+      status: rule.status,
+    });
+    setErrors({});
+    setModalOpen(true);
+  };
+
+  // 显示删除确认
+  const handleDelete = (rule: SpeedLimitRule) => {
+    setRuleToDelete(rule);
+    setDeleteModalOpen(true);
+  };
+
+  // 确认删除规则
+  const confirmDelete = async () => {
+    if (!ruleToDelete || deleteLoading) return;
+
+    setDeleteLoading(true);
+    try {
+      const res = await deleteSpeedLimit(ruleToDelete.id);
+
+      if (res.code === 0) {
+        toastResyncWarnings(res);
+        toast.success("删除成功");
+        setDeleteModalOpen(false);
+        // 手动 refetch 刷新本页限速列表（无自动失效；限速增删不改转发行数据）
+        refetch();
+      } else {
+        toast.error(res.msg || "删除失败");
+      }
+    } catch {
+      toast.error("删除失败");
+    } finally {
+      setDeleteLoading(false);
+    }
+  };
+
+  // R2X-004：创建表单幂等键（同表单复用、成功轮换）。
+  const { idemKey, rotateIdemKey } = useIdemKey();
+
+  // R3X-027：创建弹窗打开（上升沿且新建模式）时轮换幂等键；窗内重试仍复用同键。
+  useRotateIdemKeyOnCreateOpen(modalOpen, !isEdit, rotateIdemKey);
+
+  // 提交表单
+  const handleSubmit = async () => {
+    if (!validateForm()) return;
+
+    setSubmitLoading(true);
+    try {
+      let res: { code: number; msg: string };
+      const payload = {
+        id: form.id,
+        name: form.name,
+        speed: form.speed,
+        status: form.status,
+      };
+
+      if (isEdit) {
+        res = await updateSpeedLimit(payload);
+      } else {
+        const createData = {
+          name: payload.name,
+          speed: payload.speed,
+          status: payload.status,
+        };
+
+        res = await createSpeedLimit(createData, idemKey);
+      }
+
+      if (res.code === 0) {
+        if (!isEdit) rotateIdemKey();
+        if (isEdit) toastResyncWarnings(res);
+        toast.success(isEdit ? "修改成功" : "创建成功");
+        setModalOpen(false);
+        // 手动 refetch 刷新本页限速列表（无自动失效）
+        refetch();
+      } else {
+        toast.error(res.msg || "操作失败");
+      }
+    } catch {
+      toast.error("操作失败");
+    } finally {
+      setSubmitLoading(false);
+    }
+  };
+
+  if (loading) {
+    return <PageLoadingState message="正在加载..." />;
+  }
+
+  return (
+    <PageShell embedded={embedded}>
+      <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between mb-6 gap-3">
+        <div className="flex-1 max-w-sm flex items-center gap-2">
+          <SearchBar
+            isVisible={isSearchVisible}
+            placeholder="搜索规则名称"
+            value={searchKeyword}
+            onChange={setSearchKeyword}
+            onClose={() => setIsSearchVisible(false)}
+            onOpen={() => setIsSearchVisible(true)}
+          />
+        </div>
+
+        <div className="flex items-center gap-2">
+          <Button
+            isIconOnly
+            size="sm"
+            variant="flat"
+            onPress={() => setViewMode(viewMode === "list" ? "grid" : "list")}
+          >
+            {viewMode === "list" ? (
+              <LayoutGrid className="w-4 h-4" />
+            ) : (
+              <List className="w-4 h-4" />
+            )}
+          </Button>
+          <Button
+            className="font-semibold"
+            color="primary"
+            size="sm"
+            variant="solid"
+            onPress={handleAdd}
+          >
+            新增
+          </Button>
+        </div>
+      </div>
+
+      {/* R2-C3-01：刷新失败时旧数据保留展示，横幅点名是旧数据＋重试入口。 */}
+      {!loading && rulesLoadFailed && rules.length > 0 && (
+        <div className="mb-4 flex flex-wrap items-center gap-2 rounded-xl bg-danger-50 px-3 py-2">
+          <p className="text-xs font-semibold text-danger-700">
+            限速规则刷新失败，当前显示的是上次成功加载的数据，不是最新状态。
+          </p>
+          <Button
+            color="danger"
+            size="sm"
+            variant="flat"
+            onPress={() => refetch()}
+          >
+            重新加载
+          </Button>
+        </div>
+      )}
+
+      {/* 统一卡片网格 */}
+      {filteredRules.length > 0 ? (
+        viewMode === "list" ? (
+          <Card>
+            <Table
+              aria-label="限速规则列表"
+              className="overflow-x-auto min-w-full"
+              classNames={{
+                wrapper:
+                  "bg-transparent p-0 shadow-none border-none overflow-auto rounded-[24px]",
+                th: "bg-transparent text-foreground font-semibold text-sm border-b border-white/20 py-3 uppercase tracking-wider first:rounded-tl-[24px] last:rounded-tr-[24px]",
+                td: "py-3 border-b border-divider/50 group-data-[last=true]:border-b-0",
+                tr: "hover:bg-white/40 transition-colors",
+              }}
+            >
+              <TableHeader>
+                <TableColumn>规则名称</TableColumn>
+                <TableColumn>速度限制</TableColumn>
+                <TableColumn>操作</TableColumn>
+              </TableHeader>
+              <TableBody items={filteredRules}>
+                {(rule) => (
+                  <TableRow key={rule.id}>
+                    <TableCell>
+                      <div className="flex items-center gap-2">
+                        <div
+                          className={`shrink-0 w-2 h-2 rounded-full ${
+                            rule.status === 1 ? "bg-success" : "bg-default-300"
+                          }`}
+                        />
+                        <span className="font-medium text-foreground text-sm">
+                          {rule.name}
+                        </span>
+                      </div>
+                    </TableCell>
+                    <TableCell>
+                      <span className="text-sm font-mono text-foreground">
+                        {rule.speed} Mbps
+                      </span>
+                    </TableCell>
+                    <TableCell>
+                      <div className="flex flex-wrap items-center gap-1.5 min-w-max">
+                        <Button
+                          className="h-6 px-2 min-w-0 text-xs font-semibold bg-indigo-500/10 text-indigo-700 hover:bg-indigo-500/20"
+                          size="sm"
+                          variant="flat"
+                          onPress={() => handleEdit(rule)}
+                        >
+                          编辑
+                        </Button>
+                        <Button
+                          className="h-6 px-2 min-w-0 text-xs font-semibold bg-rose-500/10 text-rose-700 hover:bg-rose-500/20"
+                          size="sm"
+                          variant="flat"
+                          onPress={() => handleDelete(rule)}
+                        >
+                          删除
+                        </Button>
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                )}
+              </TableBody>
+            </Table>
+          </Card>
+        ) : (
+          <StaggerList className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-4">
+            {filteredRules.map((rule: SpeedLimitRule) => (
+              <StaggerItem key={rule.id}>
+                <Card className="shadow-sm overflow-hidden h-full">
+                  <CardHeader className="pb-2 md:pb-2">
+                    <div className="flex justify-between items-start w-full">
+                      <div>
+                        <h3 className="font-semibold text-foreground">
+                          {rule.name}
+                        </h3>
+                      </div>
+                      <Chip
+                        color={rule.status === 1 ? "success" : "danger"}
+                        size="sm"
+                        variant="flat"
+                      >
+                        {rule.status === 1 ? "启用" : "停用"}
+                      </Chip>
+                    </div>
+                  </CardHeader>
+                  <CardBody className="pt-0 pb-3 md:pt-0 md:pb-3">
+                    <div className="space-y-3">
+                      <div className="flex justify-between items-center">
+                        <span className="text-small text-foreground">
+                          速度限制
+                        </span>
+                        <Chip color="secondary" size="sm" variant="flat">
+                          {rule.speed} Mbps
+                        </Chip>
+                      </div>
+                    </div>
+
+                    <div className="flex gap-2 mt-4">
+                      <Button
+                        className="flex-1"
+                        color="primary"
+                        size="sm"
+                        startContent={
+                          <svg
+                            aria-hidden="true"
+                            className="w-4 h-4"
+                            fill="currentColor"
+                            viewBox="0 0 20 20"
+                          >
+                            <path d="M13.586 3.586a2 2 0 112.828 2.828l-.793.793-2.828-2.828.793-.793zM11.379 5.793L3 14.172V17h2.828l8.38-8.379-2.83-2.828z" />
+                          </svg>
+                        }
+                        variant="flat"
+                        onPress={() => handleEdit(rule)}
+                      >
+                        编辑
+                      </Button>
+                      <Button
+                        className="flex-1"
+                        color="danger"
+                        size="sm"
+                        startContent={
+                          <svg
+                            aria-hidden="true"
+                            className="w-4 h-4"
+                            fill="currentColor"
+                            viewBox="0 0 20 20"
+                          >
+                            <path
+                              clipRule="evenodd"
+                              d="M9 2a1 1 0 000 2h2a1 1 0 100-2H9z"
+                              fillRule="evenodd"
+                            />
+                            <path
+                              clipRule="evenodd"
+                              d="M10 18a8 8 0 100-16 8 8 0 000 16zM8 7a1 1 0 012 0v4a1 1 0 11-2 0V7zM12 7a1 1 0 012 0v4a1 1 0 11-2 0V7z"
+                              fillRule="evenodd"
+                            />
+                          </svg>
+                        }
+                        variant="flat"
+                        onPress={() => handleDelete(rule)}
+                      >
+                        删除
+                      </Button>
+                    </div>
+                  </CardBody>
+                </Card>
+              </StaggerItem>
+            ))}
+          </StaggerList>
+        )
+      ) : (
+        /* 空状态：R2-C3-01——加载失败改判失败态＋重试，不得再用「暂无」假陈述 */
+        <Card className="shadow-sm">
+          <CardBody className="text-center py-20 flex flex-col items-center justify-center min-h-[240px]">
+            <h3 className="text-xl font-medium text-foreground tracking-tight mb-2">
+              {rulesLoadFailed && rules.length === 0
+                ? "限速规则加载失败"
+                : "暂无限速规则"}
+            </h3>
+            <p className="text-foreground text-sm max-w-xs mx-auto leading-relaxed">
+              {rulesLoadFailed && rules.length === 0
+                ? "没能从面板取到限速规则，不能据此判断是否已有规则；请检查网络后重试。"
+                : "还没有创建任何限速规则，点击上方按钮开始创建"}
+            </p>
+            {rulesLoadFailed && rules.length === 0 && (
+              <Button
+                className="mt-4"
+                color="danger"
+                size="sm"
+                variant="flat"
+                onPress={() => refetch()}
+              >
+                重新加载
+              </Button>
+            )}
+          </CardBody>
+        </Card>
+      )}
+
+      {/* 新增/编辑模态框 */}
+      <Modal
+        backdrop="blur"
+        classNames={{
+          base: "!w-[calc(100%-32px)] !mx-auto sm:!w-full rounded-2xl overflow-hidden",
+        }}
+        isOpen={modalOpen}
+        placement="center"
+        scrollBehavior="inside"
+        size="2xl"
+        onOpenChange={setModalOpen}
+      >
+        <ModalContent>
+          {(onClose) => (
+            <>
+              <ModalHeader className="flex flex-col gap-1">
+                <h2 className="text-xl font-bold">
+                  {isEdit ? "编辑限速规则" : "新增限速规则"}
+                </h2>
+                <p className="text-small text-foreground">
+                  {isEdit ? "修改现有限速规则的配置信息" : "创建新的限速规则"}
+                </p>
+              </ModalHeader>
+              <ModalBody>
+                <div className="space-y-4">
+                  <Input
+                    errorMessage={errors.name}
+                    isInvalid={!!errors.name}
+                    label="规则名称"
+                    placeholder="请输入限速规则名称"
+                    value={form.name}
+                    variant="bordered"
+                    onChange={(e) =>
+                      setForm((prev) => ({ ...prev, name: e.target.value }))
+                    }
+                  />
+
+                  <Input
+                    endContent={
+                      <div className="pointer-events-none flex items-center">
+                        <span className="text-foreground text-small">Mbps</span>
+                      </div>
+                    }
+                    errorMessage={errors.speed}
+                    isInvalid={!!errors.speed}
+                    label="速度限制"
+                    placeholder="请输入速度限制"
+                    type="number"
+                    value={form.speed.toString()}
+                    variant="bordered"
+                    onChange={(e) =>
+                      setForm((prev) => ({
+                        ...prev,
+                        speed: parseInt(e.target.value) || 0,
+                      }))
+                    }
+                  />
+
+                  <div className="flex items-center gap-2">
+                    <Switch
+                      isSelected={form.status === 1}
+                      size="sm"
+                      onValueChange={(on) =>
+                        setForm((prev) => ({
+                          ...prev,
+                          status: on ? 1 : 0,
+                        }))
+                      }
+                    />
+                    <span className="text-sm text-default-800">启用此规则</span>
+                    <span className="text-xs font-semibold text-foreground">
+                      停用后规则不再生效，可随时重新启用
+                    </span>
+                  </div>
+                </div>
+              </ModalBody>
+              <ModalFooter>
+                <Button variant="light" onPress={onClose}>
+                  取消
+                </Button>
+                <Button
+                  color="primary"
+                  isLoading={submitLoading}
+                  onPress={handleSubmit}
+                >
+                  {isEdit ? "保存修改" : "创建规则"}
+                </Button>
+              </ModalFooter>
+            </>
+          )}
+        </ModalContent>
+      </Modal>
+
+      {/* 删除确认模态框 */}
+      <Modal
+        backdrop="blur"
+        classNames={{
+          base: "!w-[calc(100%-32px)] !mx-auto sm:!w-full rounded-2xl overflow-hidden",
+        }}
+        isOpen={deleteModalOpen}
+        placement="center"
+        scrollBehavior="inside"
+        size="2xl"
+        onOpenChange={setDeleteModalOpen}
+      >
+        <ModalContent>
+          {(onClose) => (
+            <>
+              <ModalHeader className="flex flex-col gap-1">
+                <h2 className="text-lg font-bold text-danger-700">确认删除</h2>
+              </ModalHeader>
+              <ModalBody>
+                <p className="text-foreground">
+                  确定要删除限速规则{" "}
+                  <span className="font-semibold text-foreground">
+                    &quot;{ruleToDelete?.name}&quot;
+                  </span>{" "}
+                  吗？
+                </p>
+                <p className="text-small text-foreground mt-2">
+                  此操作无法撤销，删除后该规则将永久消失。
+                </p>
+              </ModalBody>
+              <ModalFooter>
+                <Button variant="light" onPress={onClose}>
+                  取消
+                </Button>
+                <Button
+                  color="danger"
+                  isLoading={deleteLoading}
+                  onPress={confirmDelete}
+                >
+                  确认删除
+                </Button>
+              </ModalFooter>
+            </>
+          )}
+        </ModalContent>
+      </Modal>
+    </PageShell>
+  );
+}

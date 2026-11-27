@@ -1,0 +1,363 @@
+package chain
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"time"
+
+	"github.com/go-gost/core/chain"
+	"github.com/go-gost/core/connector"
+	"github.com/go-gost/core/logger"
+	"github.com/go-gost/core/metrics"
+	"github.com/go-gost/core/selector"
+	"github.com/go-gost/x/internal/keepalive"
+	xnet "github.com/go-gost/x/internal/net"
+	"github.com/go-gost/x/internal/net/dialer"
+	"github.com/go-gost/x/internal/net/udp"
+	xmetrics "github.com/go-gost/x/metrics"
+)
+
+var (
+	ErrEmptyRoute = errors.New("empty route")
+)
+
+// emptyRouteError wraps ErrEmptyRoute with the chain name so the error
+// that surfaces at handlers/operators identifies the failing chain on
+// its own (FIX2-C #7 / V6 P3). Previously the bare sentinel forced
+// operators to correlate the Router error with the separate Errorf
+// line Chain.Route logs (the only place naming chain + hop). The hop
+// index stays in that log line; the name now travels with the error.
+// errors.Is(err, ErrEmptyRoute) semantics are unchanged.
+func emptyRouteError(chainer chain.Chainer) error {
+	if namer, ok := chainer.(chainNamer); ok && namer.Name() != "" {
+		return fmt.Errorf("chain %s: %w", namer.Name(), ErrEmptyRoute)
+	}
+	return ErrEmptyRoute
+}
+
+// dialStageError wraps a dial-stage failure — the route was selected,
+// but resolving, transport dialing, handshaking or the final connect
+// failed — with the chain name, the same caliber as emptyRouteError
+// (R2-F3-07). Previously only the route-selection failure named the
+// chain; dial-stage failures surfaced as bare transport errors, so
+// connections dying on a node that just failed (before its marker
+// reached the selection threshold) could not be attributed to their
+// chain from the error alone. errors.Is/As semantics are unchanged
+// (%w). ErrEmptyRoute passes through untouched: emptyRouteError has
+// already named it, wrapping again would double the prefix.
+func dialStageError(chainer chain.Chainer, err error) error {
+	if err == nil || errors.Is(err, ErrEmptyRoute) {
+		return err
+	}
+	if namer, ok := chainer.(chainNamer); ok && namer.Name() != "" {
+		return fmt.Errorf("chain %s: %w", namer.Name(), err)
+	}
+	return err
+}
+
+var (
+	DefaultRoute chain.Route = &defaultRoute{}
+)
+
+// defaultRoute is a Route without nodes.
+type defaultRoute struct{}
+
+func (*defaultRoute) Dial(ctx context.Context, network, address string, opts ...chain.DialOption) (net.Conn, error) {
+	var options chain.DialOptions
+	for _, opt := range opts {
+		opt(&options)
+	}
+
+	netd := dialer.Dialer{
+		Interface: options.Interface,
+		Netns:     options.Netns,
+		Logger:    options.Logger,
+	}
+	if options.SockOpts != nil {
+		netd.Mark = options.SockOpts.Mark
+	}
+
+	return netd.Dial(ctx, network, address)
+}
+
+func (*defaultRoute) Bind(ctx context.Context, network, address string, opts ...chain.BindOption) (net.Listener, error) {
+	var options chain.BindOptions
+	for _, opt := range opts {
+		opt(&options)
+	}
+
+	switch network {
+	case "tcp", "tcp4", "tcp6":
+		addr, err := net.ResolveTCPAddr(network, address)
+		if err != nil {
+			return nil, err
+		}
+		lc := net.ListenConfig{}
+		keepalive.ApplyListenConfig(&lc)
+		return lc.Listen(ctx, network, addr.String())
+	case "udp", "udp4", "udp6":
+		addr, err := net.ResolveUDPAddr(network, address)
+		if err != nil {
+			return nil, err
+		}
+		conn, err := net.ListenUDP(network, addr)
+		if err != nil {
+			return nil, err
+		}
+		logger := logger.Default().WithFields(map[string]any{
+			"network": network,
+			"address": address,
+		})
+		ln := udp.NewListener(conn, &udp.ListenConfig{
+			Backlog:        options.Backlog,
+			ReadQueueSize:  options.UDPDataQueueSize,
+			ReadBufferSize: options.UDPDataBufferSize,
+			TTL:            options.UDPConnTTL,
+			Keepalive:      true,
+			Logger:         logger,
+		})
+		return ln, err
+	default:
+		err := fmt.Errorf("network %s unsupported", network)
+		return nil, err
+	}
+}
+
+func (r *defaultRoute) Nodes() []*chain.Node {
+	return nil
+}
+
+type RouteOptions struct {
+	Chain chain.Chainer
+}
+
+type RouteOption func(*RouteOptions)
+
+func ChainRouteOption(c chain.Chainer) RouteOption {
+	return func(o *RouteOptions) {
+		o.Chain = c
+	}
+}
+
+type chainRoute struct {
+	nodes   []*chain.Node
+	options RouteOptions
+}
+
+func NewRoute(opts ...RouteOption) *chainRoute {
+	var options RouteOptions
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&options)
+		}
+	}
+
+	return &chainRoute{
+		options: options,
+	}
+}
+
+func (r *chainRoute) addNode(nodes ...*chain.Node) {
+	r.nodes = append(r.nodes, nodes...)
+}
+
+func (r *chainRoute) Dial(ctx context.Context, network, address string, opts ...chain.DialOption) (net.Conn, error) {
+	if len(r.Nodes()) == 0 {
+		// Fail closed (D1-H4): an empty chain route means every hop was
+		// unavailable. It must never degrade to a direct connection;
+		// direct dialing is what DefaultRoute (no chain configured) is for.
+		return nil, emptyRouteError(r.options.Chain)
+	}
+
+	var options chain.DialOptions
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&options)
+		}
+	}
+	conn, err := r.connect(ctx, options.Logger)
+	if err != nil {
+		return nil, dialStageError(r.options.Chain, err)
+	}
+
+	cc, err := r.getNode(len(r.Nodes())-1).Options().Transport.Connect(ctx, conn, network, address)
+	if err != nil {
+		if conn != nil {
+			conn.Close()
+		}
+		return nil, dialStageError(r.options.Chain, err)
+	}
+	return cc, nil
+}
+
+func (r *chainRoute) Bind(ctx context.Context, network, address string, opts ...chain.BindOption) (net.Listener, error) {
+	if len(r.Nodes()) == 0 {
+		// Fail closed (D1-H4), same as Dial: never bind directly when a
+		// chain was configured but produced no route.
+		return nil, emptyRouteError(r.options.Chain)
+	}
+
+	var options chain.BindOptions
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&options)
+		}
+	}
+
+	conn, err := r.connect(ctx, options.Logger)
+	if err != nil {
+		return nil, dialStageError(r.options.Chain, err)
+	}
+
+	ln, err := r.getNode(len(r.Nodes())-1).Options().Transport.Bind(ctx,
+		conn, network, address,
+		connector.BacklogBindOption(options.Backlog),
+		connector.MuxBindOption(options.Mux),
+		connector.UDPConnTTLBindOption(options.UDPConnTTL),
+		connector.UDPDataBufferSizeBindOption(options.UDPDataBufferSize),
+		connector.UDPDataQueueSizeBindOption(options.UDPDataQueueSize),
+	)
+	if err != nil {
+		conn.Close()
+		return nil, dialStageError(r.options.Chain, err)
+	}
+
+	return ln, nil
+}
+
+func (r *chainRoute) connect(ctx context.Context, logger logger.Logger) (conn net.Conn, err error) {
+	network := "ip"
+	node := r.nodes[0]
+
+	defer func() {
+		if r.options.Chain != nil {
+			var marker selector.Marker
+			if m, ok := r.options.Chain.(selector.Markable); ok && m != nil {
+				marker = m.Marker()
+			}
+			var name string
+			if cn, _ := r.options.Chain.(chainNamer); cn != nil {
+				name = cn.Name()
+			}
+			// chain error
+			if err != nil {
+				if marker != nil {
+					marker.Mark()
+				}
+				if v := xmetrics.GetCounter(xmetrics.MetricChainErrorsCounter,
+					metrics.Labels{"chain": name, "node": node.Name}); v != nil {
+					v.Inc()
+				}
+				return
+			}
+
+			if marker != nil {
+				marker.Reset()
+			}
+		}
+	}()
+
+	addr, err := xnet.Resolve(ctx, network, node.Addr, node.Options().Resolver, node.Options().HostMapper, logger)
+	marker := node.Marker()
+	if err != nil {
+		if marker != nil {
+			marker.Mark()
+		}
+		return
+	}
+
+	start := time.Now()
+	cc, err := node.Options().Transport.Dial(ctx, addr)
+	if err != nil {
+		if marker != nil {
+			marker.Mark()
+		}
+		return
+	}
+
+	cn, err := node.Options().Transport.Handshake(ctx, cc)
+	if err != nil {
+		cc.Close()
+		if marker != nil {
+			marker.Mark()
+		}
+		return
+	}
+	if marker != nil {
+		marker.Reset()
+	}
+
+	if r.options.Chain != nil {
+		var name string
+		if cn, _ := r.options.Chain.(chainNamer); cn != nil {
+			name = cn.Name()
+		}
+		if v := xmetrics.GetObserver(xmetrics.MetricNodeConnectDurationObserver,
+			metrics.Labels{"chain": name, "node": node.Name}); v != nil {
+			v.Observe(time.Since(start).Seconds())
+		}
+	}
+
+	preNode := node
+	for _, node := range r.nodes[1:] {
+		marker := node.Marker()
+		addr, err = xnet.Resolve(ctx, network, node.Addr, node.Options().Resolver, node.Options().HostMapper, logger)
+		if err != nil {
+			cn.Close()
+			if marker != nil {
+				marker.Mark()
+			}
+			return
+		}
+		cc, err = preNode.Options().Transport.Connect(ctx, cn, "tcp", addr)
+		if err != nil {
+			cn.Close()
+			if marker != nil {
+				marker.Mark()
+			}
+			return
+		}
+		// 包 K：握手失败须关「刚拨出的连接本体」（hsIn）——旧
+		// 实现只关底座 cn，而 Handshake 失败时返回值多为 nil、
+		// 输入连接的所有权仍在本函数；各实现自关口径不一
+		// （tls 自关、ws 不关），不关则该连接在拨号侧漏 fd、
+		// 在对端留下一条开了没人关的会话（tunnel_49 式 2:1 净
+		// 累积的成形点：route 重试再拨一条成功的，失败这条永
+		// 不关）。对已自关的实现重复 Close 幂等安全。
+		hsIn := cc
+		cc, err = node.Options().Transport.Handshake(ctx, hsIn)
+		if err != nil {
+			hsIn.Close()
+			cn.Close()
+			if marker != nil {
+				marker.Mark()
+			}
+			return
+		}
+		if marker != nil {
+			marker.Reset()
+		}
+
+		cn = cc
+		preNode = node
+	}
+
+	conn = cn
+	return
+}
+
+func (r *chainRoute) getNode(index int) *chain.Node {
+	if r == nil || len(r.Nodes()) == 0 || index < 0 || index >= len(r.Nodes()) {
+		return nil
+	}
+	return r.nodes[index]
+}
+
+func (r *chainRoute) Nodes() []*chain.Node {
+	if r != nil {
+		return r.nodes
+	}
+	return nil
+}

@@ -1,0 +1,133 @@
+services:
+  backend:
+    image: ghcr.io/yhfc1775-maker/ovo-panel-backend:${OVO_VERSION:-latest}
+    container_name: ${PANEL_BACKEND_CONTAINER:-ovo-panel-backend}
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+    environment:
+      DB_TYPE: ${DB_TYPE:-sqlite}
+      DB_PATH: /app/data/gost.db
+      DATABASE_URL: ${DATABASE_URL:-}
+      JWT_SECRET: ${JWT_SECRET}
+      # R1-12-01: optional operator-chosen initial admin password,
+      # consumed only when the admin account is first seeded.
+      OVO_ADMIN_PASSWORD: ${OVO_ADMIN_PASSWORD:-}
+      OVO_WEBAUTHN_ORIGIN: ${OVO_WEBAUTHN_ORIGIN:-}
+      SERVER_ADDR: :6365
+      # R6-L8-F-01: 本模板的默认拓扑是 Caddy → 前端 nginx → 后端，
+      # 链上共两跳，可信代理跳数默认即 2（否则登录限流键会收敛到
+      # 前端网关条目、全站共用一桶）。非标准拓扑（如反代直达后端
+      # 端口、单跳）在 .env 里显式设置 OVO_TRUSTED_PROXY_HOPS 覆盖。
+      OVO_TRUSTED_PROXY_HOPS: ${OVO_TRUSTED_PROXY_HOPS:-2}
+      # C4-01: 显式可信代理 CIDR 名单透传（clientip 默认只信回环，
+      # 名单内的对端才可信）；缺省空＝名单为空，按 .env 中该键的
+      # 字段级指引填写（标准拓扑填前端容器子网）。
+      OVO_TRUSTED_PROXIES: ${OVO_TRUSTED_PROXIES:-}
+      TZ: Asia/Shanghai
+      OVO_VERSION: ${OVO_VERSION:-dev}
+      PANEL_DEPLOY_DIR: /opt/ovo-panel
+      PANEL_BACKEND_CONTAINER: ${PANEL_BACKEND_CONTAINER:-ovo-panel-backend}
+      # AI-03：实例 id 须透传进后端进程，后端据此派生本实例的节点
+      # 容器名/数据目录；默认实例 .env 无此键、替换为空，不影响存量。
+      OVO_INSTANCE: ${OVO_INSTANCE:-}
+      # R18-C3-02：每安装唯一身份须透传进后端进程，后端据此与实例
+      # 键一起派生 nft 表名；新装由安装脚本生成落盘 .env，缺键时
+      # 替换为空、走实例键旧口径，不影响存量。
+      OVO_INSTALL_ID: ${OVO_INSTALL_ID:-}
+    ports:
+      - "${BACKEND_PORT}:6365"
+    volumes:
+      - sqlite_data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./:/opt/ovo-panel
+    networks:
+      - gost-network
+    stop_grace_period: 30s
+    stop_signal: SIGTERM
+    healthcheck:
+      test: ["CMD", "sh", "-c", "wget --no-verbose --tries=1 --spider http://localhost:6365/flow/test || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  postgres:
+    image: postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
+    container_name: ${PANEL_POSTGRES_CONTAINER:-ovo-panel-postgres}
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ovo_panel}
+      POSTGRES_USER: ${POSTGRES_USER:-ovo_panel}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ovo_panel_change_me}
+      TZ: Asia/Shanghai
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - gost-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ovo_panel} -d ${POSTGRES_DB:-ovo_panel}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  frontend:
+    image: ghcr.io/yhfc1775-maker/ovo-vite-frontend:${OVO_VERSION:-latest}
+    container_name: ${PANEL_FRONTEND_CONTAINER:-ovo-panel-frontend}
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+    ports:
+      - "${FRONTEND_PORT}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    # F-124: 前端此前无 healthcheck，docker ps / 外部探活看不出 nginx
+    # 是否在服务（后端与 PG 都有）。探针与 backend 同型（busybox wget）。
+    # R1-01: 探针必须用 127.0.0.1 而非 localhost——容器内 localhost 先解析
+    # 到 [::1]，BusyBox wget 失败后不回退 IPv4，而 nginx 只 listen 80
+    # (IPv4)，用 localhost 时 healthcheck 恒失败、容器永久 unhealthy。
+    healthcheck:
+      test: ["CMD", "sh", "-c", "wget --no-verbose --tries=1 --spider http://127.0.0.1/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+    networks:
+      - gost-network
+
+
+volumes:
+  sqlite_data:
+    name: ${OVO_SQLITE_VOLUME:-ovo-sqlite-data}
+    driver: local
+  postgres_data:
+    name: ${OVO_POSTGRES_VOLUME:-ovo-postgres-data}
+    driver: local
+
+
+networks:
+  gost-network:
+    name: ${OVO_NETWORK:-ovo-network}
+    driver: bridge
+    enable_ipv6: true
+    ipam:
+      config:
+        # R2-T02-01: 旧值 172.80.0.0/16 不在 RFC1918 私网段内（172.16.0.0/12
+        # 之外，实为公网地址空间），后端 isTrustedProxyIP 不信任该网段来源，
+        # 登录限流键坍缩为共享桶。新装改用私网段 172.30.0.0/16；存量部署
+        # 不要改在用子网（会重建网络），其影响与处理见 doc/guide/install.md。
+        - subnet: 172.30.0.0/16
+        - subnet: fd00:dead:beef::/48

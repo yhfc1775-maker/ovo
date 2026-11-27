@@ -1,0 +1,847 @@
+import type {
+  KernelApiItem,
+  KernelCapabilitiesApiData,
+  KernelStateApiData,
+  NodeApiItem,
+} from "@/api/types";
+
+import { useEffect, useRef, useState } from "react";
+import toast from "react-hot-toast";
+import { MoreHorizontal } from "lucide-react";
+
+import { ActionSheet } from "./action-sheet";
+import { groupItems } from "./group";
+import { eligibleNodes } from "./inbound-form-modal";
+import { KERNEL_STATUS } from "./presets";
+
+import {
+  controlKernel,
+  getKernelLogs,
+  getKernelVersions,
+  installKernel,
+} from "@/api";
+import { Button } from "@/shadcn-bridge/heroui/button";
+import { Card, CardBody } from "@/shadcn-bridge/heroui/card";
+import { Chip } from "@/shadcn-bridge/heroui/chip";
+import { Input } from "@/shadcn-bridge/heroui/input";
+import {
+  Modal,
+  ModalBody,
+  ModalContent,
+  ModalFooter,
+  ModalHeader,
+} from "@/shadcn-bridge/heroui/modal";
+import { Select, SelectItem } from "@/shadcn-bridge/heroui/select";
+
+const modalBase =
+  "!w-[calc(100%-32px)] !mx-auto sm:!w-full rounded-2xl overflow-hidden";
+
+export interface InstallRequest {
+  nodeId: number;
+  kernelType: string;
+}
+
+interface Props {
+  caps: KernelCapabilitiesApiData | null;
+  kernels: KernelApiItem[];
+  nodes: NodeApiItem[];
+  installRequest: InstallRequest | null;
+  onInstallRequestHandled: () => void;
+  onChanged: () => void;
+  /** IRL-3：初载失败时空状态改判为加载失败（由 KernelsTab 传入）。 */
+  loadFailed?: boolean;
+}
+
+function shortVersion(v: string): string {
+  // Fork 构建带 "-flmx1" 后缀（1.14.4-flmx1）：后缀须保留，否则
+  // fork 与上游 1.14.4 显示相同、无法区分。
+  const m = v.match(/\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?/);
+
+  return m ? m[0] : v;
+}
+
+function releaseLabel(r: {
+  version: string;
+  prerelease: boolean;
+  source?: string;
+}): string {
+  // 发现 1：版本列表须标注来源——fork 构建与回滚用的上游构建底版
+  // 相同（1.14.4-flmx1 / 1.14.4），来源由后端 /kernel/versions
+  // 下发，前端只渲染、不写死版本号。
+  const base = r.prerelease ? `${r.version}（预发布）` : r.version;
+
+  if (r.source === "fork") return `${base}（fork 构建）`;
+
+  if (r.source === "upstream") return `${base}（上游构建）`;
+
+  return base;
+}
+
+export function KernelPanel({
+  caps,
+  kernels,
+  nodes,
+  installRequest,
+  onInstallRequestHandled,
+  onChanged,
+  loadFailed = false,
+}: Props) {
+  const [sheetFor, setSheetFor] = useState<number | null>(null);
+  const [releases, setReleases] = useState<{
+    type: string;
+    items: { version: string; prerelease: boolean; source?: string }[];
+    error: string;
+  } | null>(null);
+  const [customVersion, setCustomVersion] = useState(false);
+  const [installOpen, setInstallOpen] = useState(false);
+  const [installForm, setInstallForm] = useState({
+    nodeId: "",
+    kernelType: "xray",
+    version: "latest",
+  });
+  const [installing, setInstalling] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
+  // F-L6-01：下发入口同步复核。busy/installing 是渲染状态，连点/回车连击在
+  // 渲染提交前存在同目标双发窗口；用按操作键分键的 ref 在下发瞬间拦截，
+  // 键与 busy 字面量同形（install / <id>-<action> / <id>-remove）。
+  const opInFlightRef = useRef<Set<string>>(new Set());
+  const beginOp = (key: string) => {
+    if (opInFlightRef.current.has(key)) return false;
+    opInFlightRef.current.add(key);
+
+    return true;
+  };
+  const endOp = (key: string) => {
+    opInFlightRef.current.delete(key);
+  };
+  const [logsFor, setLogsFor] = useState<KernelApiItem | null>(null);
+  // 日志请求序号：连点两个内核时，迟到的旧日志不得落到新内核标题下
+  const logsSeqRef = useRef(0);
+  const [logs, setLogs] = useState<KernelStateApiData | null>(null);
+  const [logsLoading, setLogsLoading] = useState(false);
+  // IRL-3 同族（普查补入）：日志加载失败与「暂无日志」必须可区分——
+  // 旧实现请求抛错时无任何提示、正文直接落「暂无日志」假空。
+  const [logsError, setLogsError] = useState("");
+  const [removeTarget, setRemoveTarget] = useState<KernelApiItem | null>(null);
+  const [removeFailed, setRemoveFailed] = useState(false);
+  // X-P2-2：被跨内核引用守卫拦下时，后端回传的引用方入站名清单。
+  const [removeReferrers, setRemoveReferrers] = useState<string[]>([]);
+
+  // F-LB-01：安装框默认版本取后端 caps 的 defaultVersion（sing-box
+  // 为 fork 版），再取封闭列表首项，最后才落 latest——sing-box 无
+  // 封闭列表、latest 又会被后端拒绝，默认 latest 等于让用户先撞
+  // 一次拒绝。Xray 无 defaultVersion，仍默认 latest，不受影响。
+  const defaultVersionFor = (kernelType: string) =>
+    caps?.kernels.find((k) => k.type === kernelType)?.defaultVersion ??
+    caps?.kernels.find((k) => k.type === kernelType)?.versions?.[0] ??
+    "latest";
+
+  useEffect(() => {
+    if (!installRequest) return;
+    setInstallForm({
+      nodeId: String(installRequest.nodeId),
+      kernelType: installRequest.kernelType,
+      version: defaultVersionFor(installRequest.kernelType),
+    });
+    setInstallOpen(true);
+    onInstallRequestHandled();
+  }, [installRequest, onInstallRequestHandled]);
+
+  const kernelName = (type: string) => {
+    const info = caps?.kernels.find((k) => k.type === type);
+
+    return info?.relay ? `${info.name}（转发引擎）` : (info?.name ?? type);
+  };
+
+  const openInstall = (nodeId?: number, kernelType = "xray") => {
+    setInstallForm({
+      nodeId: nodeId ? String(nodeId) : "",
+      kernelType,
+      version: defaultVersionFor(kernelType),
+    });
+    setInstallOpen(true);
+  };
+
+  const doInstall = async () => {
+    if (!installForm.nodeId) {
+      toast.error("请选择节点");
+
+      return;
+    }
+    if (!beginOp("install")) return;
+    setInstalling(true);
+    try {
+      const res = await installKernel({
+        nodeId: Number(installForm.nodeId),
+        kernelType: installForm.kernelType,
+        version: installForm.version.trim() || "latest",
+      });
+
+      if (res.code === 0) {
+        toast.success("内核已安装并启动");
+        // R8-005: the envelope warning (e.g. Xray below 26.5.9 has no
+        // built-in private-range block) must be surfaced, never
+        // silently dropped.
+        if (res.warning) {
+          toast(res.warning, { icon: "⚠️", duration: 12000 });
+        }
+        setInstallOpen(false);
+      } else {
+        toast.error(res.msg || "安装失败", { duration: 8000 });
+      }
+      onChanged();
+    } finally {
+      endOp("install");
+      setInstalling(false);
+    }
+  };
+
+  const doControl = async (
+    k: KernelApiItem,
+    action: "start" | "stop" | "restart",
+  ) => {
+    const opKey = `${k.id}-${action}`;
+
+    if (!beginOp(opKey)) return;
+    setBusy(opKey);
+    try {
+      const res = await controlKernel(k.id, action);
+
+      if (res.code === 0) {
+        toast.success("操作成功");
+      } else {
+        toast.error(res.msg || "操作失败");
+      }
+      onChanged();
+    } finally {
+      endOp(opKey);
+      setBusy(null);
+    }
+  };
+
+  const openLogs = async (k: KernelApiItem) => {
+    const seq = (logsSeqRef.current += 1);
+
+    setLogsFor(k);
+    setLogs(null);
+    setLogsError("");
+    setLogsLoading(true);
+    try {
+      const res = await getKernelLogs(k.id);
+
+      if (logsSeqRef.current !== seq) {
+        return;
+      }
+
+      if (res.code === 0) {
+        setLogs(res.data);
+      } else {
+        // IRL-3 同族：失败在弹窗正文内常驻呈现，不再只 toast 后落
+        // 「暂无日志」。
+        setLogsError(res.msg || "获取日志失败");
+      }
+    } catch {
+      if (logsSeqRef.current === seq) {
+        setLogsError("获取日志失败：网络错误");
+      }
+    } finally {
+      if (logsSeqRef.current === seq) {
+        setLogsLoading(false);
+      }
+    }
+  };
+
+  const doRemove = async (force: boolean) => {
+    if (!removeTarget) return;
+    const opKey = `${removeTarget.id}-remove`;
+
+    if (!beginOp(opKey)) return;
+    setBusy(opKey);
+    try {
+      const res = await controlKernel(removeTarget.id, "remove", force);
+
+      if (res.code === 0) {
+        const broken = (res.data as { brokenReferrers?: string[] } | null)
+          ?.brokenReferrers;
+
+        toast.success(
+          broken && broken.length > 0
+            ? `已卸载；${broken.length} 个引用方入站的出站引用已失效`
+            : "已卸载",
+        );
+        setRemoveTarget(null);
+        setRemoveReferrers([]);
+        onChanged();
+      } else {
+        const broken = (res.data as { brokenReferrers?: string[] } | null)
+          ?.brokenReferrers;
+
+        if (broken && broken.length > 0) {
+          setRemoveReferrers(broken);
+        } else {
+          setRemoveFailed(true);
+        }
+        toast.error(res.msg || "卸载失败");
+      }
+    } finally {
+      endOp(opKey);
+      setBusy(null);
+    }
+  };
+
+  const installNodeOptions = eligibleNodes(nodes);
+  const versionListType =
+    installOpen &&
+    !caps?.kernels.find((k) => k.type === installForm.kernelType)?.versions
+      ?.length
+      ? installForm.kernelType
+      : "";
+
+  useEffect(() => {
+    if (!versionListType || releases?.type === versionListType) return;
+    setCustomVersion(false);
+    getKernelVersions(versionListType)
+      .then((res) =>
+        setReleases({
+          type: versionListType,
+          items: res.code === 0 ? res.data || [] : [],
+          error: res.code === 0 ? "" : res.msg || "获取版本列表失败",
+        }),
+      )
+      .catch(() =>
+        setReleases({
+          type: versionListType,
+          items: [],
+          error: "获取版本列表失败",
+        }),
+      );
+  }, [versionListType]);
+
+  const releaseItems =
+    releases?.type === installForm.kernelType ? releases.items : [];
+  const pinnedVersions =
+    caps?.kernels.find((k) => k.type === installForm.kernelType)?.versions ??
+    [];
+
+  const nodeGroups = groupItems(
+    kernels,
+    (k) => String(k.nodeId),
+    (_key, k) => k.nodeName || `节点 ${k.nodeId}`,
+  );
+  const sheetKernel = kernels.find((k) => k.id === sheetFor) ?? null;
+
+  const renderKernel = (k: KernelApiItem) => {
+    const st = KERNEL_STATUS[k.status] ?? {
+      label: k.status,
+      color: "default" as const,
+    };
+
+    return (
+      <div
+        key={k.id}
+        className="flex w-full cursor-pointer items-start gap-3 px-3 py-2.5 text-left transition-colors hover:bg-white/40"
+        role="button"
+        tabIndex={0}
+        onClick={() => setSheetFor(k.id)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            setSheetFor(k.id);
+          }
+        }}
+      >
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2 min-w-0">
+            <span className="shrink-0 font-medium">
+              {kernelName(k.kernelType)}
+            </span>
+            <span className="truncate text-xs font-semibold text-foreground font-mono">
+              {k.installedVersion
+                ? shortVersion(k.installedVersion)
+                : k.version}
+            </span>
+          </div>
+          <div className="text-xs font-semibold text-foreground">{k.inboundCount} 个入站</div>
+          {k.lastError && (
+            <p className="mt-1 text-xs font-semibold text-danger-700 break-all line-clamp-2">
+              {k.lastError}
+            </p>
+          )}
+          {!k.synced && !k.lastError && (
+            <p className="mt-1 text-xs font-semibold text-warning-700">
+              配置尚未同步，节点上线后自动下发
+            </p>
+          )}
+          {k.companionSplitNote && (
+            <p className="mt-1 text-xs font-semibold text-warning-700">
+              {k.companionSplitNote}
+            </p>
+          )}
+        </div>
+        <Chip color={st.color} size="sm" variant="flat">
+          {st.label}
+        </Chip>
+        <MoreHorizontal className="mt-0.5 h-4 w-4 shrink-0 text-foreground" />
+      </div>
+    );
+  };
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-3 gap-2">
+        <p className="text-xs font-semibold text-foreground tray-plate w-fit rounded-full px-2.5 py-1">
+          点击内核可启停、重启、查看日志或卸载
+        </p>
+        <Button
+          color="primary"
+          size="sm"
+          variant="flat"
+          onPress={() => openInstall()}
+        >
+          安装内核
+        </Button>
+      </div>
+
+      {kernels.length === 0 ? (
+        <Card className="shadow-sm">
+          <CardBody className="text-center py-10 text-sm text-foreground flex flex-col items-center justify-center gap-3">
+            {loadFailed ? (
+              <>
+                <p className="font-semibold text-danger-700">
+                  内核列表加载失败
+                </p>
+                <p>
+                  没能从面板取到内核列表，不能据此判断是否已安装内核；请点下方「重新加载」重试。
+                </p>
+                <Button
+                  color="danger"
+                  size="sm"
+                  variant="flat"
+                  onPress={() => onChanged()}
+                >
+                  重新加载
+                </Button>
+              </>
+            ) : (
+              <>
+                还没有在任何节点上安装内核。点击“安装内核”，先在落地节点上安装
+                Xray，再到“入站”里创建节点。
+              </>
+            )}
+          </CardBody>
+        </Card>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3 items-start">
+          {nodeGroups.map((g) => {
+            const online = g.items[0]?.nodeOnline;
+
+            return (
+              <Card key={g.key} className="shadow-sm overflow-hidden">
+                <div className="flex items-center gap-2 px-3 pt-3 pb-2">
+                  <span
+                    className={`h-2 w-2 shrink-0 rounded-full ${
+                      online ? "bg-success" : "bg-default-300"
+                    }`}
+                  />
+                  <span className="min-w-0 flex-1 truncate font-semibold">
+                    {g.title}
+                  </span>
+                  {!online && (
+                    <Chip size="sm" variant="flat">
+                      离线
+                    </Chip>
+                  )}
+                  <Button
+                    size="sm"
+                    variant="light"
+                    onPress={() => openInstall(g.items[0].nodeId)}
+                  >
+                    + 内核
+                  </Button>
+                </div>
+                <div className="divide-y divide-divider border-t border-divider">
+                  {g.items.map(renderKernel)}
+                </div>
+              </Card>
+            );
+          })}
+        </div>
+      )}
+
+      <ActionSheet
+        actions={
+          sheetKernel
+            ? [
+                sheetKernel.enabled
+                  ? {
+                      key: "stop",
+                      label: "停止",
+                      onPress: () => doControl(sheetKernel, "stop"),
+                    }
+                  : {
+                      key: "start",
+                      label: "启动",
+                      color: "success" as const,
+                      onPress: () => doControl(sheetKernel, "start"),
+                    },
+                {
+                  key: "restart",
+                  label: "重启",
+                  disabled: !sheetKernel.enabled,
+                  onPress: () => doControl(sheetKernel, "restart"),
+                },
+                {
+                  key: "logs",
+                  label: "日志",
+                  onPress: () => openLogs(sheetKernel),
+                },
+                // realm's version follows the panel.
+                ...(caps?.kernels.find((k) => k.type === sheetKernel.kernelType)
+                  ?.relay
+                  ? []
+                  : [
+                      {
+                        key: "upgrade",
+                        label: "换版本",
+                        onPress: () =>
+                          openInstall(
+                            sheetKernel.nodeId,
+                            sheetKernel.kernelType,
+                          ),
+                      },
+                    ]),
+                {
+                  key: "remove",
+                  label: "卸载",
+                  color: "danger" as const,
+                  onPress: () => {
+                    setRemoveFailed(false);
+                    setRemoveReferrers([]);
+                    setRemoveTarget(sheetKernel);
+                  },
+                },
+              ]
+            : []
+        }
+        isOpen={Boolean(sheetKernel)}
+        subtitle={
+          sheetKernel &&
+          `${sheetKernel.nodeName || `节点 ${sheetKernel.nodeId}`} · ${
+            sheetKernel.installedVersion
+              ? shortVersion(sheetKernel.installedVersion)
+              : sheetKernel.version
+          } · ${sheetKernel.inboundCount} 个入站`
+        }
+        title={sheetKernel ? kernelName(sheetKernel.kernelType) : ""}
+        onClose={() => setSheetFor(null)}
+      >
+        {sheetKernel?.lastError && (
+          <p className="text-xs font-semibold text-danger-700 break-all">
+            {sheetKernel.lastError}
+          </p>
+        )}
+      </ActionSheet>
+
+      <Modal
+        backdrop="blur"
+        classNames={{ base: modalBase }}
+        isOpen={installOpen}
+        placement="center"
+        onOpenChange={setInstallOpen}
+      >
+        <ModalContent>
+          {(onClose) => (
+            <>
+              <ModalHeader className="flex flex-col gap-1">
+                <h2 className="text-xl font-bold">安装内核</h2>
+                <p className="text-small text-foreground">
+                  节点会从官方 Release 下载并校验
+                  SHA256，首次安装可能需要一两分钟
+                </p>
+              </ModalHeader>
+              <ModalBody>
+                <div className="space-y-3">
+                  <Select
+                    label="节点"
+                    placeholder="选择节点"
+                    selectedKeys={
+                      installForm.nodeId ? [installForm.nodeId] : []
+                    }
+                    onSelectionChange={(keys) =>
+                      setInstallForm((p) => ({
+                        ...p,
+                        nodeId: String(Array.from(keys)[0] ?? ""),
+                      }))
+                    }
+                  >
+                    {installNodeOptions.map((n) => (
+                      <SelectItem
+                        key={String(n.id)}
+                        textValue={
+                          n.status === 1 ? n.name : `${n.name}（离线）`
+                        }
+                      >
+                        {n.status === 1 ? n.name : `${n.name}（离线）`}
+                      </SelectItem>
+                    ))}
+                  </Select>
+                  <Select
+                    disabledKeys={(caps?.kernels ?? [])
+                      .filter((k) => !k.implemented)
+                      .map((k) => k.type)}
+                    label="内核"
+                    selectedKeys={[installForm.kernelType]}
+                    onSelectionChange={(keys) =>
+                      setInstallForm((p) => ({
+                        ...p,
+                        kernelType: String(Array.from(keys)[0] ?? "xray"),
+                        version: defaultVersionFor(
+                          String(Array.from(keys)[0] ?? "xray"),
+                        ),
+                      }))
+                    }
+                  >
+                    {(caps?.kernels ?? [])
+                      .filter((k) => !k.relay)
+                      .map((k) => (
+                        <SelectItem
+                          key={k.type}
+                          textValue={
+                            k.implemented ? k.name : `${k.name}（即将支持）`
+                          }
+                        >
+                          {k.implemented ? k.name : `${k.name}（即将支持）`}
+                        </SelectItem>
+                      ))}
+                  </Select>
+                  {pinnedVersions.length > 0 ? (
+                    <Select
+                      description="官方渠道不提供校验文件，仅开放已核对 SHA256 的版本"
+                      label="版本"
+                      selectedKeys={[
+                        pinnedVersions.includes(installForm.version)
+                          ? installForm.version
+                          : pinnedVersions[0],
+                      ]}
+                      onSelectionChange={(keys) =>
+                        setInstallForm((p) => ({
+                          ...p,
+                          version: String(Array.from(keys)[0] ?? ""),
+                        }))
+                      }
+                    >
+                      {pinnedVersions.map((v) => (
+                        <SelectItem key={v} textValue={v}>
+                          {v}
+                        </SelectItem>
+                      ))}
+                    </Select>
+                  ) : (
+                    <>
+                      {releaseItems.length > 0 && (
+                        <Select
+                          description={
+                            installForm.kernelType === "singbox"
+                              ? "fork 构建含入站返回包队列修复；上游构建无此修复，200 包突发可能丢包"
+                              : "最新版出问题时可以选旧版本；预发布版不建议使用"
+                          }
+                          label="版本"
+                          selectedKeys={[
+                            customVersion
+                              ? "custom"
+                              : installForm.version === "latest" ||
+                                  !installForm.version
+                                ? "latest"
+                                : installForm.version,
+                          ]}
+                          onSelectionChange={(keys) => {
+                            const v = String(Array.from(keys)[0] ?? "latest");
+
+                            setCustomVersion(v === "custom");
+                            if (v !== "custom") {
+                              setInstallForm((p) => ({ ...p, version: v }));
+                            }
+                          }}
+                        >
+                          {[
+                            <SelectItem
+                              key="latest"
+                              textValue="最新版（latest）"
+                            >
+                              最新版（latest）
+                            </SelectItem>,
+                            ...releaseItems.map((r) => (
+                              <SelectItem
+                                key={r.version}
+                                textValue={releaseLabel(r)}
+                              >
+                                {releaseLabel(r)}
+                              </SelectItem>
+                            )),
+                            <SelectItem key="custom" textValue="手动输入…">
+                              手动输入…
+                            </SelectItem>,
+                          ]}
+                        </Select>
+                      )}
+                      {(releaseItems.length === 0 || customVersion) && (
+                        <Input
+                          description={
+                            releases?.error && releaseItems.length === 0
+                              ? `${releases.error}，可手动填写版本号，latest 表示最新版`
+                              : "latest 表示最新版，也可填写具体版本号"
+                          }
+                          label={
+                            releaseItems.length > 0 ? "自定义版本" : "版本"
+                          }
+                          value={installForm.version}
+                          variant="bordered"
+                          onChange={(e) =>
+                            setInstallForm((p) => ({
+                              ...p,
+                              version: e.target.value,
+                            }))
+                          }
+                        />
+                      )}
+                    </>
+                  )}
+                </div>
+              </ModalBody>
+              <ModalFooter>
+                <Button variant="light" onPress={onClose}>
+                  取消
+                </Button>
+                <Button
+                  color="primary"
+                  isLoading={installing}
+                  onPress={doInstall}
+                >
+                  安装
+                </Button>
+              </ModalFooter>
+            </>
+          )}
+        </ModalContent>
+      </Modal>
+
+      <Modal
+        backdrop="blur"
+        classNames={{ base: modalBase }}
+        isOpen={Boolean(logsFor)}
+        placement="center"
+        scrollBehavior="inside"
+        size="4xl"
+        onOpenChange={(open) => !open && setLogsFor(null)}
+      >
+        <ModalContent>
+          {(onClose) => (
+            <>
+              <ModalHeader className="flex flex-col gap-1">
+                <h2 className="text-lg font-bold">
+                  {logsFor?.nodeName} · {kernelName(logsFor?.kernelType ?? "")}{" "}
+                  日志
+                </h2>
+                {logs && (
+                  <p className="text-small text-foreground">
+                    {logs.running ? `运行中 PID ${logs.pid}` : "未运行"}
+                    {logs.restarts > 0
+                      ? ` · 已自动重启 ${logs.restarts} 次`
+                      : ""}
+                  </p>
+                )}
+              </ModalHeader>
+              <ModalBody>
+                <pre className="text-xs font-semibold whitespace-pre-wrap break-all bg-white/40 rounded-xl p-3 max-h-[60vh] overflow-auto">
+                  {logsLoading
+                    ? "加载中..."
+                    : logsError
+                      ? `日志加载失败：${logsError}（可点下方「刷新」重试）`
+                      : (logs?.logs ?? []).join("\n") || "暂无日志"}
+                </pre>
+              </ModalBody>
+              <ModalFooter>
+                <Button
+                  variant="flat"
+                  onPress={() => logsFor && openLogs(logsFor)}
+                >
+                  刷新
+                </Button>
+                <Button variant="light" onPress={onClose}>
+                  关闭
+                </Button>
+              </ModalFooter>
+            </>
+          )}
+        </ModalContent>
+      </Modal>
+
+      <Modal
+        backdrop="blur"
+        classNames={{ base: modalBase }}
+        isOpen={Boolean(removeTarget)}
+        placement="center"
+        onOpenChange={(open) => !open && setRemoveTarget(null)}
+      >
+        <ModalContent>
+          {(onClose) => (
+            <>
+              <ModalHeader>
+                <h2 className="text-lg font-bold text-danger-700">卸载内核</h2>
+              </ModalHeader>
+              <ModalBody>
+                <p className="text-foreground">
+                  确定从{" "}
+                  <span className="font-semibold text-foreground">
+                    {removeTarget?.nodeName}
+                  </span>{" "}
+                  卸载 {kernelName(removeTarget?.kernelType ?? "")} 吗？
+                </p>
+                <p className="text-small text-danger-700">
+                  该内核下的 {removeTarget?.inboundCount ?? 0}{" "}
+                  个入站会一起删除，且无法恢复。
+                </p>
+                {removeReferrers.length > 0 && (
+                  <p className="text-small text-warning-700">
+                    该内核下的入站正被 {removeReferrers.length}{" "}
+                    个入站用作出站代理或分流出口：
+                    {removeReferrers.map((n) => `「${n}」`).join("、")}
+                    。卸载将使这些引用失效，请先解除，或仍要卸载强制执行。
+                  </p>
+                )}
+                {removeFailed && (
+                  <p className="text-small text-warning-700">
+                    节点卸载失败（可能离线）。可以强制删除面板记录，节点上线后会自动清理。
+                  </p>
+                )}
+              </ModalBody>
+              <ModalFooter>
+                <Button variant="light" onPress={onClose}>
+                  取消
+                </Button>
+                {(removeFailed || removeReferrers.length > 0) && (
+                  <Button
+                    color="warning"
+                    isLoading={busy === `${removeTarget?.id}-remove`}
+                    onPress={() => doRemove(true)}
+                  >
+                    {removeReferrers.length > 0 && !removeFailed
+                      ? "仍要卸载"
+                      : "强制删除"}
+                  </Button>
+                )}
+                <Button
+                  color="danger"
+                  isLoading={busy === `${removeTarget?.id}-remove`}
+                  onPress={() => doRemove(false)}
+                >
+                  确认卸载
+                </Button>
+              </ModalFooter>
+            </>
+          )}
+        </ModalContent>
+      </Modal>
+    </div>
+  );
+}

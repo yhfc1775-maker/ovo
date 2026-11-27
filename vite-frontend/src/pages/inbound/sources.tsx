@@ -1,0 +1,739 @@
+import type {
+  RemoteSourceItem,
+  RemoteSourceRole,
+  RemoteSyncResult,
+} from "@/api";
+
+import { useRef, useState } from "react";
+import toast from "react-hot-toast";
+import { FileUp, RefreshCw } from "lucide-react";
+
+import { useIdemKey, useRotateIdemKeyOnCreateOpen } from "@/hooks/useIdemKey";
+import {
+  deleteRemoteSource,
+  previewInboundImport,
+  refreshRemoteSource,
+  saveRemoteSource,
+} from "@/api";
+import { Segmented, ToggleRow } from "@/pages/subscription/controls";
+import { Button } from "@/shadcn-bridge/heroui/button";
+import { Input } from "@/shadcn-bridge/heroui/input";
+import {
+  Modal,
+  ModalBody,
+  ModalContent,
+  ModalFooter,
+  ModalHeader,
+} from "@/shadcn-bridge/heroui/modal";
+import { formatTraffic } from "@/utils/traffic";
+
+const modalBase =
+  "!w-[calc(100%-32px)] !mx-auto sm:!w-full rounded-2xl overflow-hidden";
+
+export const INTERVALS: Array<[string, string]> = [
+  ["0", "手动"],
+  ["6", "6 小时"],
+  ["12", "12 小时"],
+  ["24", "每天"],
+];
+
+export const SOURCE_ROLES: Array<[RemoteSourceRole, string]> = [
+  ["", "普通节点"],
+  ["relay", "中转（前置）"],
+  ["landing", "落地"],
+];
+
+export const ROLE_HINTS: Record<string, string> = {
+  "": "节点直接放进订阅，和自建节点一样用",
+  relay:
+    "机场节点做前置：新建订阅时整个源作为链式代理的中转，自建节点作为落地，节点改名、增删自动跟上",
+  landing: "新建订阅时整个源作为链式代理的落地（出口）",
+};
+
+/** The same limit as the panel's subscription download. */
+const MAX_FILE_BYTES = 5 << 20;
+
+/** Reads an uploaded subscription file as text; null (with a toast) when it can't be used. */
+export async function readSubscriptionFile(file: File): Promise<string | null> {
+  if (file.size > MAX_FILE_BYTES) {
+    toast.error("文件超过 5MB");
+
+    return null;
+  }
+  const text = await file.text();
+
+  if (!text.trim()) {
+    toast.error("文件是空的");
+
+    return null;
+  }
+
+  return text;
+}
+
+interface SourceDraft {
+  id?: number;
+  name: string;
+  url: string;
+  kind: "url" | "file";
+  role: RemoteSourceRole;
+  intervalHours: number;
+  relayOnly: boolean;
+  /** A newly chosen file (file sources). */
+  content?: string;
+  fileName?: string;
+}
+
+const draftOf = (s: RemoteSourceItem): SourceDraft => ({
+  id: s.id,
+  name: s.name,
+  url: s.url,
+  kind: s.kind,
+  role: s.role,
+  intervalHours: s.intervalHours,
+  relayOnly: s.relayOnly,
+});
+
+function ago(ms: number): string {
+  if (!ms) return "还没更新过";
+  const m = Math.floor((Date.now() - ms) / 60000);
+
+  if (m < 1) return "刚刚更新";
+  if (m < 60) return `${m} 分钟前更新`;
+  if (m < 60 * 24) return `${Math.floor(m / 60)} 小时前更新`;
+
+  return `${Math.floor(m / 1440)} 天前更新`;
+}
+
+/** The provider's plan from Subscription-Userinfo, e.g. "已用 12 GB / 200 GB · 2026-12-01 到期". */
+function planText(userinfo: string): string {
+  const v: Record<string, number> = {};
+
+  for (const part of userinfo.split(";")) {
+    const [k, n] = part.split("=").map((x) => x.trim());
+
+    if (k && n && !Number.isNaN(Number(n))) v[k] = Number(n);
+  }
+  const parts: string[] = [];
+
+  if (v.total) {
+    // A-F-02 family: claim a used figure only when the header actually
+    // reported a counter — both counters absent means unreported, not
+    // zero usage.
+    if (v.upload !== undefined || v.download !== undefined) {
+      const used = (v.upload ?? 0) + (v.download ?? 0);
+
+      parts.push(`已用 ${formatTraffic(used)} / ${formatTraffic(v.total)}`);
+    } else {
+      parts.push(`总量 ${formatTraffic(v.total)}`);
+    }
+  }
+  if (v.expire) {
+    parts.push(`${new Date(v.expire * 1000).toLocaleDateString("zh-CN")} 到期`);
+  }
+
+  return parts.join(" · ");
+}
+
+export function syncText(r: RemoteSyncResult): string {
+  const parts = [`新增 ${r.added}`, `更新 ${r.updated}`, `移除 ${r.removed}`];
+
+  if (r.kept) parts.push(`${r.kept} 个已不在订阅里但有中转，已保留`);
+  if (r.keptUnknown)
+    parts.push(
+      `${r.keptUnknown} 个已不在订阅里的节点因中转查询失败无法确认，已保留待下轮确认`,
+    );
+  if (r.keptStale)
+    parts.push(`${r.keptStale} 个未匹配节点因本轮同步不完整，已保留待下轮确认`);
+  if (r.shielded)
+    parts.push(`${r.shielded} 个节点已手工删除屏蔽，本轮同步未恢复`);
+  // C1-05：截断以显式状态字段（status/truncated）呈现，不只靠
+  // errors 文案。
+  if (r.truncated)
+    parts.push(`${r.truncated} 个节点超出单轮同步上限，本轮未同步`);
+  // R3X-025：逐节点同步失败明细（result.errors）必须带出条数 + 首条，
+  // 不得只报计数、把部分失败报成全成功。
+  if (r.errors?.length)
+    parts.push(`另有 ${r.errors.length} 条失败：${r.errors[0]}`);
+
+  return parts.join("，");
+}
+
+/** Remote subscriptions whose nodes are kept as imported landings. */
+export function RemoteSourcesSection({
+  sources,
+  onChanged,
+}: {
+  sources: RemoteSourceItem[];
+  onChanged: () => Promise<void> | void;
+}) {
+  const [draft, setDraft] = useState<SourceDraft | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [refreshing, setRefreshing] = useState<number | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  // A file source being updated from the list's upload button.
+  const reupload = useRef<RemoteSourceItem | null>(null);
+  // F-L6-01：删除订阅源下发的在途标记（见 remove）。
+  const removeInFlightRef = useRef(false);
+  const reuploadInput = useRef<HTMLInputElement>(null);
+
+  const report = (res: {
+    code: number;
+    msg: string;
+    data?: { result?: RemoteSyncResult } | unknown;
+  }) => {
+    const result = (res.data as { result?: RemoteSyncResult } | null)?.result;
+
+    if (res.code !== 0) {
+      toast.error(res.msg || "更新失败");
+
+      return;
+    }
+    // R3X-026：code=0 + 非标准 Msg 是后端告警通道（如公网 http 明文告警），
+    // 须先 ⚠️ 透出原文，再报已保存/已更新，不得丢弃。
+    if (res.msg && res.msg !== "操作成功") {
+      toast(res.msg, { icon: "⚠️", duration: 5000 });
+    }
+    if (result) {
+      // R3X-025：带逐节点失败明细时按 ⚠️ 呈现（明细已在 syncText 内带出）。
+      if (result.errors?.length) {
+        toast(`已更新：${syncText(result)}`, {
+          icon: "⚠️",
+          duration: 5000,
+        });
+      } else {
+        toast.success(`已更新：${syncText(result)}`);
+      }
+    } else {
+      toast.success("已保存");
+    }
+  };
+
+  const refresh = async (s: RemoteSourceItem) => {
+    setRefreshing(s.id);
+    try {
+      const res = await refreshRemoteSource(s.id);
+
+      // R2-02（防静默）：纯中转源同步回执的 warning（其导入节点不可
+      // 订阅）在调用点直读透出（check-warning-consumption 近处读口径）。
+      if (res.warning) {
+        toast(res.warning, { icon: "⚠️", duration: 12000 });
+      }
+      report(res);
+      await onChanged();
+    } finally {
+      setRefreshing(null);
+    }
+  };
+
+  // IMPORT-PREVIEW-01: a save that will sync nodes must carry a preview
+  // receipt — fetch the preview for the URL / file content first and
+  // attach its fingerprint, so the backend mandate never rejects the
+  // save blindly. Null (with a toast) when no preview can be obtained.
+  const previewFingerprintFor = async (
+    links: string,
+  ): Promise<string | null> => {
+    const res = await previewInboundImport(links);
+
+    if (res.code !== 0 || !res.data?.fingerprint) {
+      toast.error(res.msg || "解析预览失败，请检查订阅内容后重试");
+
+      return null;
+    }
+
+    return res.data.fingerprint;
+  };
+
+  // File sources can't be refreshed from the URL; the button on their card
+  // uploads a new file instead (the backend rejects refresh for them).
+  const uploadAgain = async (s: RemoteSourceItem, file: File) => {
+    const content = await readSubscriptionFile(file);
+
+    if (content === null) return;
+    const previewFingerprint = await previewFingerprintFor(content);
+
+    if (previewFingerprint === null) return;
+    setRefreshing(s.id);
+    try {
+      const res = await saveRemoteSource({
+        ...draftOf(s),
+        content,
+        previewFingerprint,
+      });
+
+      // R2-02（防静默）：同 refresh，纯中转源回执 warning 调用点直读。
+      if (res.warning) {
+        toast(res.warning, { icon: "⚠️", duration: 12000 });
+      }
+      report(res);
+      await onChanged();
+    } finally {
+      setRefreshing(null);
+    }
+  };
+
+  // R2X-004：订阅源新建表单幂等键（同表单复用、成功轮换；更新不带键）。
+  const { idemKey, rotateIdemKey } = useIdemKey();
+
+  // R3X-027：创建弹窗打开（上升沿且新建模式）时轮换幂等键；窗内重试仍复用同键。
+  useRotateIdemKeyOnCreateOpen(
+    Boolean(draft),
+    Boolean(draft) && !draft?.id,
+    rotateIdemKey,
+  );
+
+  const save = async () => {
+    if (!draft) return;
+    if (draft.kind === "file" && !draft.id && !draft.content) {
+      toast.error("请选择订阅文件");
+
+      return;
+    }
+    // IMPORT-PREVIEW-01: mirror the backend fetch condition — a save
+    // that will sync nodes must carry a preview receipt. Metadata-only
+    // edits and the file-source relayOnly-only apply path stay
+    // receipt-free (the backend exempts both).
+    const needsPreview =
+      !editing ||
+      draft.kind !== editing.kind ||
+      draft.url !== editing.url ||
+      (draft.kind === "file" && Boolean(draft.content)) ||
+      (draft.relayOnly !== editing.relayOnly &&
+        !(
+          draft.kind === "file" &&
+          editing.kind === "file" &&
+          !draft.content
+        ));
+    let previewFingerprint: string | undefined;
+    if (needsPreview) {
+      const links = draft.kind === "file" ? (draft.content ?? "") : draft.url;
+
+      // Empty input has nothing to preview — leave the receipt off and
+      // let the backend's own validation report the missing URL/file.
+      if (links.trim()) {
+        const fp = await previewFingerprintFor(links);
+
+        if (fp === null) return;
+        previewFingerprint = fp;
+      }
+    }
+    setSaving(true);
+    try {
+      const res = await saveRemoteSource(
+        {
+          id: draft.id,
+          name: draft.name,
+          url: draft.url,
+          kind: draft.kind,
+          role: draft.role,
+          intervalHours: draft.intervalHours,
+          relayOnly: draft.relayOnly,
+          content: draft.kind === "file" ? draft.content : undefined,
+          previewFingerprint,
+        },
+        draft.id ? undefined : idemKey,
+      );
+
+      report(res);
+      // R2-02（防静默）：纯中转源保存回执的 warning（其导入节点不可
+      // 订阅）在调用点直读透出（check-warning-consumption 近处读口径）。
+      if (res.warning) {
+        toast(res.warning, { icon: "⚠️", duration: 12000 });
+      }
+      if (res.code === 0 && !draft.id) rotateIdemKey();
+      // A source whose first fetch failed is still saved; keep the editor
+      // open only when nothing was stored.
+      if (res.code === 0 || res.data) {
+        setDraft(null);
+        await onChanged();
+      }
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const remove = async (keepNodes: boolean) => {
+    // F-L6-01：入口同步复核。deleting 只是渲染状态，连点在渲染提交前可
+    // 对同一订阅源双发删除；ref 在下发瞬间拦截。
+    if (!draft?.id || removeInFlightRef.current) return;
+    removeInFlightRef.current = true;
+    setDeleting(true);
+    try {
+      const res = await deleteRemoteSource(draft.id, keepNodes);
+
+      if (res.code !== 0) {
+        toast.error(res.msg || "删除失败");
+
+        return;
+      }
+      toast.success(
+        keepNodes ? "已删除订阅源，节点保留" : "已删除订阅源和它的节点",
+      );
+      // RR4-C5-01：删源命中订阅引用时，后端在信封 warning 里点名受影响
+      // 订阅（network.ts 合同：must be surfaced, never silently dropped）。
+      // 与 kernel-panel 安装面同口径长时透出，不得只报固定成功文案。
+      if (res.warning) {
+        toast(res.warning, { icon: "⚠️", duration: 12000 });
+      }
+      setDraft(null);
+      await onChanged();
+    } finally {
+      removeInFlightRef.current = false;
+      setDeleting(false);
+    }
+  };
+
+  const editing = sources.find((s) => s.id === draft?.id);
+
+  return (
+    <section className="space-y-2">
+      <div className="flex items-center justify-between">
+        <h2 className="w-fit rounded-lg glass-surface px-2.5 py-1 text-sm font-semibold text-foreground">
+          订阅源
+        </h2>
+        <Button
+          size="sm"
+          variant="light"
+          onPress={() =>
+            setDraft({
+              name: "",
+              url: "",
+              kind: "url",
+              role: "",
+              intervalHours: 12,
+              relayOnly: false,
+            })
+          }
+        >
+          添加
+        </Button>
+      </div>
+      {sources.length === 0 ? (
+        <p className="glass-card rounded-xl px-3 py-4 text-center text-xs font-semibold text-foreground">
+          填机场或别人的订阅链接，或上传订阅文件：节点出现在“入站”里，可以给自建落地做前置中转，也能和自己的落地合并成一个订阅。在“导入”里粘贴订阅地址并打开“定时同步”也会存到这里
+        </p>
+      ) : (
+        <div className="grid grid-cols-1 gap-2 2xl:grid-cols-2">
+          {sources.map((s) => {
+            const plan = planText(s.userinfo);
+
+            return (
+              <div
+                key={s.id}
+                className="glass-card flex cursor-pointer items-center gap-3 rounded-xl px-3 py-2.5 transition-colors hover:bg-white/40"
+                role="button"
+                tabIndex={0}
+                onClick={() => setDraft(draftOf(s))}
+                onKeyDown={(e) => {
+                  if (e.target !== e.currentTarget) return;
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    (e.currentTarget as HTMLElement).click();
+                  }
+                }}
+              >
+                <span
+                  className={`h-2 w-2 shrink-0 rounded-full ${
+                    s.lastError
+                      ? "bg-danger"
+                      : s.lastFetch
+                        ? "bg-success"
+                        : "bg-default-300"
+                  }`}
+                />
+                <div className="min-w-0 flex-1">
+                  <div className="flex min-w-0 items-center gap-1.5">
+                    <span className="truncate font-medium">{s.name}</span>
+                    {s.kind === "file" && (
+                      <span className="shrink-0 rounded-full bg-tray px-1.5 py-0.5 text-[10px] font-semibold text-foreground">
+                        文件
+                      </span>
+                    )}
+                    {s.role && (
+                      <span
+                        className={`shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-semibold ${s.role === "relay" ? "tray-secondary" : "tray-warning"}`}
+                      >
+                        {s.role === "relay" ? "中转" : "落地"}
+                      </span>
+                    )}
+                  </div>
+                  <div className="truncate text-xs font-semibold text-foreground">
+                    {s.nodeCount} 个节点 ·{" "}
+                    {s.kind === "file"
+                      ? s.lastFetch
+                        ? ago(s.lastFetch).replace("更新", "上传")
+                        : "还没上传过"
+                      : ago(s.lastFetch)}
+                    {s.kind === "file"
+                      ? " · 文件源请重新上传更新"
+                      : s.intervalHours
+                        ? ` · 每 ${s.intervalHours} 小时`
+                        : " · 手动更新"}
+                  </div>
+                  {s.lastError ? (
+                    <div className="truncate text-xs font-semibold text-danger-700">
+                      {s.lastError}
+                    </div>
+                  ) : (
+                    plan && (
+                      <div className="truncate text-xs font-semibold text-foreground">
+                        {plan}
+                      </div>
+                    )
+                  )}
+                </div>
+                <div
+                  className="shrink-0"
+                  role="presentation"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <Button
+                    isIconOnly
+                    aria-label={
+                      s.kind === "file"
+                        ? `重新上传 ${s.name}`
+                        : `更新 ${s.name}`
+                    }
+                    isLoading={refreshing === s.id}
+                    size="sm"
+                    variant="flat"
+                    onPress={() => {
+                      if (s.kind !== "file") {
+                        void refresh(s);
+
+                        return;
+                      }
+                      reupload.current = s;
+                      reuploadInput.current?.click();
+                    }}
+                  >
+                    {s.kind === "file" ? (
+                      <FileUp className="h-4 w-4" />
+                    ) : (
+                      <RefreshCw className="h-4 w-4" />
+                    )}
+                  </Button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <input
+        ref={reuploadInput}
+        className="hidden"
+        type="file"
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          const s = reupload.current;
+
+          e.target.value = "";
+          if (file && s) void uploadAgain(s, file);
+        }}
+      />
+
+      <Modal
+        backdrop="blur"
+        classNames={{ base: modalBase }}
+        isOpen={Boolean(draft)}
+        placement="center"
+        scrollBehavior="inside"
+        onOpenChange={(open) => !open && setDraft(null)}
+      >
+        <ModalContent>
+          {(onClose) =>
+            draft && (
+              <>
+                <ModalHeader>
+                  <h2 className="text-lg font-bold">
+                    {draft.id ? "编辑订阅源" : "添加订阅源"}
+                  </h2>
+                </ModalHeader>
+                <ModalBody className="space-y-4">
+                  <Input
+                    label="名称"
+                    placeholder="例如 某某机场"
+                    value={draft.name}
+                    variant="bordered"
+                    onChange={(e) =>
+                      setDraft({ ...draft, name: e.target.value })
+                    }
+                  />
+                  <Segmented
+                    options={[
+                      ["url", "订阅地址"],
+                      ["file", "上传文件"],
+                    ]}
+                    value={draft.kind}
+                    onChange={(kind) =>
+                      setDraft({ ...draft, kind: kind as SourceDraft["kind"] })
+                    }
+                  />
+                  {draft.kind === "url" ? (
+                    <Input
+                      label="订阅地址"
+                      placeholder="https://..."
+                      value={draft.url}
+                      variant="bordered"
+                      onChange={(e) =>
+                        setDraft({ ...draft, url: e.target.value })
+                      }
+                    />
+                  ) : (
+                    <FilePick
+                      fileName={draft.fileName}
+                      hint={
+                        draft.id && editing?.kind === "file"
+                          ? "不选文件就保留现在的节点；选了文件就按新文件更新"
+                          : "订阅文件：Base64 订阅、分享链接、Clash / Mihomo、sing-box、Surge / Loon 节点，最大 5MB"
+                      }
+                      onFile={async (file) => {
+                        const content = await readSubscriptionFile(file);
+
+                        if (content !== null) {
+                          setDraft({
+                            ...draft,
+                            content,
+                            fileName: file.name,
+                            name:
+                              draft.name || file.name.replace(/\.[^.]+$/, ""),
+                          });
+                        }
+                      }}
+                    />
+                  )}
+                  {draft.kind === "url" && (
+                    <div className="space-y-1.5">
+                      <p className="text-sm font-medium">自动更新</p>
+                      <Segmented
+                        options={INTERVALS}
+                        value={String(draft.intervalHours)}
+                        onChange={(v) =>
+                          setDraft({ ...draft, intervalHours: Number(v) })
+                        }
+                      />
+                    </div>
+                  )}
+                  <p className="text-xs font-semibold text-foreground">
+                    {draft.kind === "url" ? "更新" : "重新上传"}
+                    时按名称对上已有节点（名称变了再按地址对）：改了地址就跟着改（中转也跟着改），没了就移除；挂着中转或被链式代理引用的会保留
+                  </p>
+                  <div className="space-y-1.5">
+                    <p className="text-sm font-medium">用途</p>
+                    <Segmented
+                      options={SOURCE_ROLES}
+                      value={draft.role}
+                      onChange={(role) =>
+                        setDraft({
+                          ...draft,
+                          role: role as RemoteSourceRole,
+                        })
+                      }
+                    />
+                    <p className="text-xs font-semibold text-foreground">
+                      {ROLE_HINTS[draft.role]}
+                    </p>
+                  </div>
+                  <ToggleRow
+                    hint="新加进来的节点不直接放进订阅，只通过你自己机器上的转发（中转线路）连接"
+                    id="source-relay-only"
+                    label="只通过我的转发访问"
+                    value={draft.relayOnly}
+                    onChange={(relayOnly) => setDraft({ ...draft, relayOnly })}
+                  />
+                  {editing && (
+                    <p className="text-xs font-semibold text-foreground">
+                      当前 {editing.nodeCount} 个节点 · {ago(editing.lastFetch)}
+                    </p>
+                  )}
+                  {draft.id && (
+                    <div className="space-y-2 rounded-xl border border-danger/30 p-3">
+                      <p className="text-xs font-semibold text-foreground">删除订阅源</p>
+                      <div className="flex flex-wrap gap-2">
+                        <Button
+                          color="danger"
+                          isLoading={deleting}
+                          size="sm"
+                          variant="flat"
+                          onPress={() => remove(false)}
+                        >
+                          连同节点一起删除
+                        </Button>
+                        <Button
+                          isDisabled={deleting}
+                          size="sm"
+                          variant="flat"
+                          onPress={() => remove(true)}
+                        >
+                          只删订阅源，节点留下
+                        </Button>
+                      </div>
+                    </div>
+                  )}
+                </ModalBody>
+                <ModalFooter>
+                  <Button variant="light" onPress={onClose}>
+                    取消
+                  </Button>
+                  <Button color="primary" isLoading={saving} onPress={save}>
+                    {draft.id
+                      ? "保存"
+                      : draft.kind === "file"
+                        ? "添加"
+                        : "添加并更新"}
+                  </Button>
+                </ModalFooter>
+              </>
+            )
+          }
+        </ModalContent>
+      </Modal>
+    </section>
+  );
+}
+
+/** A file picker row: the chosen file's name, or a prompt. */
+export function FilePick({
+  fileName,
+  hint,
+  onFile,
+}: {
+  fileName?: string;
+  hint?: string;
+  onFile: (file: File) => void;
+}) {
+  const input = useRef<HTMLInputElement>(null);
+
+  return (
+    <div className="space-y-1">
+      <button
+        className="flex w-full items-center gap-2 rounded-xl border border-dashed border-divider px-3 py-3 text-left text-sm hover:bg-white/40"
+        type="button"
+        onClick={() => input.current?.click()}
+      >
+        <FileUp className="h-4 w-4 shrink-0 text-foreground" />
+        <span
+          className={`min-w-0 flex-1 truncate ${fileName ? "" : "text-foreground"}`}
+        >
+          {fileName || "选择订阅文件"}
+        </span>
+        {fileName && (
+          <span className="shrink-0 text-xs font-semibold text-primary-700">更换</span>
+        )}
+      </button>
+      {hint && <p className="text-xs font-semibold text-foreground">{hint}</p>}
+      <input
+        ref={input}
+        className="hidden"
+        type="file"
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+
+          e.target.value = "";
+          if (file) onFile(file);
+        }}
+      />
+    </div>
+  );
+}

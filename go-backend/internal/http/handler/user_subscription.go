@@ -1,0 +1,231 @@
+package handler
+
+import (
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	"go-backend/internal/http/response"
+	"go-backend/internal/store/model"
+)
+
+// userSubscriptionList 返回某用户被分配的订阅 ID 列表（仅管理员）。
+// 1.0.12 起"订阅分配"按订阅（而非入站）绑定用户。
+func (h *Handler) userSubscriptionList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+	if _, roleID, err := userRoleFromRequest(r); err != nil || roleID != 0 {
+		response.WriteJSON(w, response.Err(403, "无权限"))
+		return
+	}
+	var req struct {
+		UserID int64 `json:"userId"`
+	}
+	if err := decodeJSON(r.Body, &req); err != nil || req.UserID <= 0 {
+		response.WriteJSON(w, response.ErrDefault("请求参数错误"))
+		return
+	}
+	ids, err := h.repo.ListUserSubscriptionIDs(req.UserID)
+	if err != nil {
+		respondInternalError(w, "userSubscriptionList", err)
+		return
+	}
+	if ids == nil {
+		ids = []int64{}
+	}
+	response.WriteJSON(w, response.OK(map[string]interface{}{
+		"userId":          req.UserID,
+		"subscriptionIds": ids,
+	}))
+}
+
+// userSubscriptionSet 全量替换某用户的订阅分配（仅管理员）。
+// 与旧的按入站分配不同：订阅 ID 必须真实存在，不存在的 ID 直接报错，
+// 避免静默丢弃导致管理员误以为已分配。
+func (h *Handler) userSubscriptionSet(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+	if _, roleID, err := userRoleFromRequest(r); err != nil || roleID != 0 {
+		response.WriteJSON(w, response.Err(403, "无权限"))
+		return
+	}
+	var req struct {
+		UserID          int64   `json:"userId"`
+		SubscriptionIDs []int64 `json:"subscriptionIds"`
+	}
+	if err := decodeJSON(r.Body, &req); err != nil || req.UserID <= 0 {
+		response.WriteJSON(w, response.ErrDefault("请求参数错误"))
+		return
+	}
+	// R10-08：本面不走 idsFromBody 系，下方逐条 GetSubscription
+	// 校验属逐条工作面，提交条数同口径计数帽（见 maxBatchIDs）。
+	if !checkBatchIDsCap(w, len(req.SubscriptionIDs)) {
+		return
+	}
+	// R2X-012: the assigned user must exist too — the subscription side
+	// was already validated below, but a phantom user silently accepted
+	// (and persisted) the assignment.
+	if err := h.repo.ValidateIDsExist("user", []int64{req.UserID}); err != nil {
+		// R2-A01：幻影 ID 定型文案原样回（「用户不存在: [id]」），仓储故障才泛化。
+		respondPhantomIDError(w, "userSubscriptionSet", err)
+		return
+	}
+	seen := make(map[int64]bool, len(req.SubscriptionIDs))
+	for _, id := range req.SubscriptionIDs {
+		if id <= 0 {
+			response.WriteJSON(w, response.ErrDefault(fmt.Sprintf("订阅 ID 无效: %d", id)))
+			return
+		}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		sub, err := h.repo.GetSubscription(id)
+		if err != nil {
+			respondInternalError(w, "userSubscriptionSet", err)
+			return
+		}
+		if sub == nil {
+			response.WriteJSON(w, response.ErrDefault(fmt.Sprintf("订阅不存在（ID %d）", id)))
+			return
+		}
+		// S7（I-F3-06）：墓碑订阅同样拒绝分配——行即将硬删，此时写入
+		// 的分配只是等删除事务清理的悬空行，管理员却会以为已分配。
+		if sub.PendingDelete == 1 {
+			response.WriteJSON(w, response.ErrDefault(fmt.Sprintf("订阅删除中，无法分配（ID %d）", id)))
+			return
+		}
+	}
+	// W3/S-001（后端半）：撤销分配的回执语义——set 是全量替换，被移出
+	// 集合的订阅即「撤销」。撤销前先读现行分配算出被撤销集，成功后在
+	// 回执里点名并附语义提示：订阅认 token 不认人（1.2.0 定案），撤销
+	// 只收回面板内的可见性，已复制出去的链接不会因此失效。此前回执
+	// 是裸 OK(true)，管理员会误以为撤销即断链。
+	currentIDs, err := h.repo.ListUserSubscriptionIDs(req.UserID)
+	if err != nil {
+		respondInternalError(w, "userSubscriptionSet", err)
+		return
+	}
+	var revokedNames []string
+	for _, id := range currentIDs {
+		if seen[id] {
+			continue
+		}
+		name := fmt.Sprintf("ID %d", id)
+		if sub, serr := h.repo.GetSubscription(id); serr == nil && sub != nil && sub.Name != "" {
+			name = "「" + sub.Name + "」"
+		}
+		revokedNames = append(revokedNames, name)
+	}
+	if err := h.repo.SetUserSubscriptions(req.UserID, req.SubscriptionIDs); err != nil {
+		respondInternalError(w, "userSubscriptionSet", err)
+		return
+	}
+	if len(revokedNames) > 0 {
+		response.WriteJSON(w, response.OKWithWarning(true, fmt.Sprintf("已撤销订阅 %s 的分配：撤销只收回面板内的可见性，已经复制出去的订阅链接不会失效；要让已复制的链接失效，请重置或删除对应订阅", strings.Join(revokedNames, "、"))))
+		return
+	}
+	response.WriteJSON(w, response.OK(true))
+}
+
+// userSubscriptionMineView 是"我的订阅"页的精简订阅视图。
+type userSubscriptionMineView struct {
+	ID            int64  `json:"id"`
+	Name          string `json:"name"`
+	Path          string `json:"path"`
+	NodeCount     int    `json:"nodeCount"`
+	UploadBytes   int64  `json:"uploadBytes"`
+	DownloadBytes int64  `json:"downloadBytes"`
+	TrafficLimit  int64  `json:"trafficLimit"`
+	TrafficSince  int64  `json:"trafficSince"`
+	ExpireTime    int64  `json:"expireTime"`
+	OverQuota     bool   `json:"overQuota"`
+	Enabled       bool   `json:"enabled"`
+	// PendingDelete（R1-02-L3）：删除墓碑滞留窗口内用户侧亦须可见
+	// 「删除中」，与管理员列表 subscriptionView.PendingDelete 同口径
+	// ——此前用户侧无此字段，只看到订阅照常列出、链接 404 无提示。
+	PendingDelete bool `json:"pendingDelete"`
+	// MeteringUnsupported（C-07）：与 subscriptionView 同口径——
+	// 非分享订阅或 ID 越界的订阅流量永不计量、限额永不触发，
+	// 用户侧须显式提示「限额不生效」，不许只显示「已用 0／限额」。
+	MeteringUnsupported bool `json:"meteringUnsupported,omitempty"`
+	// AppliedActive／MeteringStatus／MeteringReason／LastReportedAt／
+	// ZeroEndpointReason 与管理员 subscriptionView 同口径（D-02／
+	// D-03／D-06／C-08）：用户侧同样须看到下发实态、未计量原因、
+	// 新鲜度与零端点原因。
+	AppliedActive      int    `json:"appliedActive"`
+	MeteringStatus     string `json:"meteringStatus,omitempty"`
+	MeteringReason     string `json:"meteringReason,omitempty"`
+	LastReportedAt     int64  `json:"lastReportedAt,omitempty"`
+	ZeroEndpointReason string `json:"zeroEndpointReason,omitempty"`
+}
+
+// userSubscriptionMine 返回当前登录用户被分配的订阅（任意登录用户，仅自己的）。
+func (h *Handler) userSubscriptionMine(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+	userID, err := userIDFromRequest(r)
+	if err != nil || userID <= 0 {
+		response.WriteJSON(w, response.ErrDefault("未登录"))
+		return
+	}
+	// 请求体可选：format 指定 NodeCount 的目标格式口径（A5-02/BC-11）。
+	var mineReq struct {
+		Format string `json:"format"`
+	}
+	_ = decodeJSON(r.Body, &mineReq)
+	subs, err := h.repo.ListUserSubscriptions(userID)
+	if err != nil {
+		respondInternalError(w, "userSubscriptionMine: ListUserSubscriptions failed", err)
+		return
+	}
+	rows, err := h.repo.ListNodeInbounds()
+	if err != nil {
+		respondInternalError(w, "userSubscriptionMine: ListNodeInbounds failed", err)
+		return
+	}
+	// B10-001（R1-C08）：mine 返回的每条订阅在「我的订阅」页都以
+	// 独立链接卡片呈现——assignedUrl = path 自带 token、不带 ?user=
+	// （my-subscription.tsx），拉取侧对无 ?user= 的请求不做入站分配
+	// 过滤，端点为订阅全量口径。故计数必须用全量口径（nil
+	// assignments），与卡片实际链接恒等。此前 FIX2-B（V5-1）按
+	// ?user=&sig= 个性化链接口径收紧计数，前提与页面实际呈现的
+	// 链接不符：只走订阅分配（无旧入站分配）的用户恒看到 0。
+	// FIX2-B 的收紧只保留在它真正适用的面——openSubscription 的
+	// ?user= 拉取过滤本身不变，个性化链接实得仍按分配过滤。
+	now := time.Now()
+	// One F4 gate memo for the whole request (Y-01), as in the admin
+	// subscription list.
+	gateMemo := &kernelAppliedMemo{}
+	views := make([]subscriptionView, 0, len(subs))
+	for i := range subs {
+		var s *model.Subscription = &subs[i]
+		// 复用 subscriptionView 保证 path 与 nodeCount（中转过滤后）口径一致。
+		views = append(views, h.subscriptionViewForAssignmentsMemo(s, rows, now, mineReq.Format, nil, gateMemo))
+	}
+	// D-06：回填各订阅计量计数最近上报时刻（批量一次）。
+	h.fillLastReportedAt(views)
+	items := make([]userSubscriptionMineView, 0, len(views))
+	for _, v := range views {
+		items = append(items, userSubscriptionMineView{
+			ID: v.ID, Name: v.Name, Path: v.Path, NodeCount: v.NodeCount,
+			UploadBytes: v.UploadBytes, DownloadBytes: v.DownloadBytes,
+			TrafficLimit: v.TrafficLimit, TrafficSince: v.TrafficSince, ExpireTime: v.ExpireTime,
+			OverQuota: v.OverQuota, Enabled: v.Enabled, PendingDelete: v.PendingDelete,
+			MeteringUnsupported: v.MeteringUnsupported,
+			AppliedActive:       v.AppliedActive, MeteringStatus: v.MeteringStatus,
+			MeteringReason: v.MeteringReason, LastReportedAt: v.LastReportedAt,
+			ZeroEndpointReason: v.ZeroEndpointReason,
+		})
+	}
+	response.WriteJSON(w, response.OK(map[string]interface{}{
+		"subscriptions": items,
+	}))
+}

@@ -1,0 +1,1081 @@
+import { useState } from "react";
+import toast from "react-hot-toast";
+import { useNavigate } from "react-router-dom";
+
+import { copyWithToast } from "@/utils/clipboard";
+import { AnimatedPage } from "@/components/animated-page";
+import { Card, CardBody, CardHeader } from "@/shadcn-bridge/heroui/card";
+import { Button } from "@/shadcn-bridge/heroui/button";
+import {
+  Dropdown,
+  DropdownTrigger,
+  DropdownMenu,
+  DropdownItem,
+} from "@/shadcn-bridge/heroui/dropdown";
+import {
+  Modal,
+  ModalContent,
+  ModalHeader,
+  ModalBody,
+} from "@/shadcn-bridge/heroui/modal";
+import { PageEmptyState, PageLoadingState } from "@/components/page-state";
+import { FlowChartCard } from "@/pages/dashboard/components/flow-chart-card";
+import { MetricCard } from "@/pages/dashboard/components/metric-card";
+import { getAdminFlag, getSessionName } from "@/utils/session";
+import { AdminOverview } from "@/pages/dashboard/admin-overview";
+import { safeLogout } from "@/utils/logout";
+import {
+  formatTraffic,
+  formatFlowLimit,
+  flowLimitBytes,
+} from "@/utils/traffic";
+import {
+  useDashboardData,
+  type DashboardForward as Forward,
+  type DashboardUserTunnel as UserTunnel,
+} from "@/pages/dashboard/use-dashboard-data";
+
+interface AddressItem {
+  id: number;
+  ip: string;
+  address: string;
+  copying: boolean;
+}
+
+/** Admins get the health overview; regular users their traffic and rules. */
+export default function DashboardPage() {
+  return getAdminFlag() ? <AdminOverview /> : <UserDashboard />;
+}
+
+function UserDashboard() {
+  const navigate = useNavigate();
+
+  const handleLogout = () => {
+    safeLogout();
+    toast.success("已退出登录");
+  };
+
+  const {
+    loading,
+    userInfo,
+    userTunnels,
+    forwardList,
+    statisticsFlows,
+    isAdmin,
+  } = useDashboardData();
+  const username = userInfo.name || userInfo.user || getSessionName() || "User";
+
+  const [addressModalOpen, setAddressModalOpen] = useState(false);
+  const [addressModalTitle, setAddressModalTitle] = useState("");
+  const [addressList, setAddressList] = useState<AddressItem[]>([]);
+
+  const formatFlow = formatTraffic;
+
+  const formatNumber = (value: number): string => {
+    // 99999 表示无限制；R11X-011：后端执法 Num>0 才执法、0=不限，
+    // value<=0 并入无限制（与 R10X-006 的 Flow 面并入式同形）。
+    if (value === 99999 || value <= 0) {
+      return "无限制";
+    }
+
+    return value.toString();
+  };
+
+  // 处理24小时流量统计数据
+  const processFlowChartData = () => {
+    // 生成最近24小时的时间数组（从当前小时往前推24小时）
+    const now = new Date();
+    const hours: string[] = [];
+
+    for (let i = 23; i >= 0; i--) {
+      const time = new Date(now.getTime() - i * 60 * 60 * 1000);
+      const hourString = time.getHours().toString().padStart(2, "0") + ":00";
+
+      hours.push(hourString);
+    }
+
+    // 创建数据映射
+    const flowMap = new Map<string, number>();
+
+    statisticsFlows.forEach((item) => {
+      // AP-8：同一小时键只取首见行——后端按时间倒序返回，先到的
+      // 是该小时较新的一行；此前无条件 set 让靠后的旧行覆盖新值，
+      // 图表静默画出陈旧流量。（键本身只有 HH:00、无日期，跨日
+      // 同小时仍会并格，根治须后端补日期字段，非前端可解。）
+      if (!flowMap.has(item.time)) {
+        flowMap.set(item.time, item.flow || 0);
+      }
+    });
+
+    // 生成图表数据，没有数据的小时显示为0
+    return hours.map((hour) => ({
+      time: hour,
+      flow: flowMap.get(hour) || 0,
+      // 格式化显示用的流量值
+      formattedFlow: formatFlow(flowMap.get(hour) || 0),
+    }));
+  };
+
+  const getExpStatus = (expTime?: string | number) => {
+    if (!expTime)
+      return {
+        color: "text-green-700",
+        bg: "bg-green-500/10 border-green-300",
+        text: "永久",
+      };
+
+    const now = new Date();
+    const expDate = new Date(expTime);
+
+    if (isNaN(expDate.getTime())) {
+      return {
+        color: "text-foreground",
+        bg: "bg-default-500/10 border-default-300",
+        text: "无效",
+      };
+    }
+
+    if (expDate < now) {
+      return {
+        color: "text-red-600",
+        bg: "bg-red-500/10 border-red-300",
+        text: "已过期",
+      };
+    }
+
+    const diffTime = expDate.getTime() - now.getTime();
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+
+    if (diffDays <= 7) {
+      return {
+        color: "text-red-600",
+        bg: "bg-red-500/10 border-red-300",
+        text: `${diffDays}天后过期`,
+      };
+    } else if (diffDays <= 30) {
+      return {
+        color: "text-orange-700",
+        bg: "bg-orange-500/10 border-orange-300",
+        text: `${diffDays}天后过期`,
+      };
+    } else {
+      return {
+        color: "text-green-700",
+        bg: "bg-green-500/10 border-green-300",
+        text: `${diffDays}天后过期`,
+      };
+    }
+  };
+
+  const calculateUserTotalUsedFlow = (): number => {
+    // 后端已按计费类型处理流量，前端直接使用入站+出站总和
+    return (userInfo.inFlow || 0) + (userInfo.outFlow || 0);
+  };
+
+  const calculateUsagePercentage = (type: "flow" | "forwards"): number => {
+    if (type === "flow") {
+      const totalUsed = calculateUserTotalUsedFlow();
+      const totalLimit = flowLimitBytes(userInfo.flow || 0, userInfo.flowMiB);
+
+      // 无限制时返回0%
+      if (userInfo.flow === 99999 && !userInfo.flowMiB) return 0;
+
+      return totalLimit > 0 ? Math.min((totalUsed / totalLimit) * 100, 100) : 0;
+    } else if (type === "forwards") {
+      const totalUsed = forwardList.length;
+      const totalLimit = userInfo.num || 0;
+
+      // 无限制时返回0%（R11X-011：num<=0 亦无限制）
+      if (userInfo.num === 99999 || userInfo.num <= 0) return 0;
+
+      return totalLimit > 0 ? Math.min((totalUsed / totalLimit) * 100, 100) : 0;
+    }
+
+    return 0;
+  };
+
+  const getUsageColor = (percentage: number) => {
+    if (percentage >= 90) return "bg-red-500";
+    if (percentage >= 70) return "bg-orange-500";
+
+    return "bg-blue-500";
+  };
+
+  const renderProgressBar = (
+    percentage: number,
+    size: "sm" | "md" = "md",
+    isUnlimited: boolean = false,
+  ) => {
+    const height = size === "sm" ? "h-1.5" : "h-2";
+
+    if (isUnlimited) {
+      return (
+        <div className="w-full">
+          <div
+            className={`w-full bg-gradient-to-r from-primary-200 to-secondary-200 rounded-full ${height}`}
+          >
+            <div
+              className={`${height} bg-gradient-to-r from-primary-700 to-secondary-700 rounded-full w-full opacity-60`}
+            />
+          </div>
+        </div>
+      );
+    }
+
+    return (
+      <div className="w-full">
+        <div
+          className={`w-full bg-default-200 rounded-full ${height}`}
+        >
+          <div
+            className={`${height} rounded-full transition-all duration-300 ${getUsageColor(percentage)}`}
+            style={{ width: `${Math.min(percentage, 100)}%` }}
+          />
+        </div>
+      </div>
+    );
+  };
+
+  const calculateTunnelUsedFlow = (tunnel: UserTunnel): number => {
+    if (!tunnel) return 0;
+    const inFlow = tunnel.inFlow || 0;
+    const outFlow = tunnel.outFlow || 0;
+
+    // 后端已按计费类型处理流量，前端直接使用入站+出站总和
+    return inFlow + outFlow;
+  };
+
+  const calculateTunnelFlowPercentage = (tunnel: UserTunnel): number => {
+    const totalUsed = calculateTunnelUsedFlow(tunnel);
+    const totalLimit = flowLimitBytes(tunnel.flow || 0, tunnel.flowMiB);
+
+    // 无限制时返回0%
+    if (tunnel.flow === 99999 && !tunnel.flowMiB) return 0;
+
+    return totalLimit > 0 ? Math.min((totalUsed / totalLimit) * 100, 100) : 0;
+  };
+
+  const getTunnelUsedForwards = (tunnelId: number): number => {
+    return forwardList.filter((forward) => forward.tunnelId === tunnelId)
+      .length;
+  };
+
+  const calculateTunnelForwardPercentage = (tunnel: UserTunnel): number => {
+    const totalUsed = getTunnelUsedForwards(tunnel.tunnelId);
+    const totalLimit = tunnel.num || 0;
+
+    // 无限制时返回0%（R11X-011：num<=0 亦无限制）
+    if (tunnel.num === 99999 || tunnel.num <= 0) return 0;
+
+    return totalLimit > 0 ? Math.min((totalUsed / totalLimit) * 100, 100) : 0;
+  };
+
+  const formatResetTime = (resetDay?: number): string => {
+    if (resetDay === undefined || resetDay === null) return "";
+    if (resetDay === 0) return "不重置";
+
+    const now = new Date();
+    const currentDay = now.getDate();
+    // 与后端 monthlyResetMoment 同口径：重置日钳制到当月最后一天
+    //（resetDay=31 的 2 月 → 2 月 28/29 日重置，而非 3 月 3 日）。
+    const daysInMonth = (y: number, m: number) =>
+      new Date(y, m + 1, 0).getDate();
+    const clampedDay = (y: number, m: number) =>
+      Math.min(resetDay, daysInMonth(y, m));
+
+    let daysUntilReset: number;
+
+    const thisMonthDay = clampedDay(now.getFullYear(), now.getMonth());
+
+    if (thisMonthDay > currentDay) {
+      daysUntilReset = thisMonthDay - currentDay;
+    } else if (thisMonthDay < currentDay) {
+      const nextMonth = new Date(
+        now.getFullYear(),
+        now.getMonth() + 1,
+        clampedDay(now.getFullYear(), now.getMonth() + 1),
+      );
+      const diffTime = nextMonth.getTime() - now.getTime();
+
+      daysUntilReset = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+    } else {
+      daysUntilReset = 0;
+    }
+
+    if (daysUntilReset === 0) {
+      return "今日重置";
+    } else if (daysUntilReset === 1) {
+      return "明日重置";
+    } else {
+      return `${daysUntilReset}天后重置`;
+    }
+  };
+
+  const groupedForwards = () => {
+    const groups: {
+      [key: string]: { tunnelName: string; forwards: Forward[] };
+    } = {};
+
+    forwardList.forEach((forward) => {
+      const tunnelName = forward.tunnelName || "未知隧道";
+
+      if (!groups[tunnelName]) {
+        groups[tunnelName] = {
+          tunnelName,
+          forwards: [],
+        };
+      }
+      groups[tunnelName].forwards.push(forward);
+    });
+
+    return Object.values(groups);
+  };
+
+  const formatInAddress = (ipString: string, port: number): string => {
+    if (!ipString) return "";
+
+    const items = ipString
+      .split(",")
+      .map((item) => item.trim())
+      .filter((item) => item);
+
+    if (items.length === 0) return "";
+
+    // 检查第一项是否已经包含端口（格式：IP:端口）
+    const firstItem = items[0];
+    const hasPort = /:\d+$/.test(firstItem);
+
+    if (hasPort) {
+      // inIp 已经包含完整的 IP:Port 组合
+      if (items.length === 1) {
+        return items[0];
+      }
+
+      return `${items[0]} (+${items.length - 1}个)`;
+    }
+
+    // inIp 只包含IP，需要添加端口（兼容旧数据）
+    if (!port) return "";
+
+    if (items.length === 1) {
+      const ip = items[0];
+
+      if (ip.includes(":") && !ip.startsWith("[")) {
+        return `[${ip}]:${port}`;
+      } else {
+        return `${ip}:${port}`;
+      }
+    }
+
+    const firstIp = items[0];
+    let formattedFirstIp: string;
+
+    if (firstIp.includes(":") && !firstIp.startsWith("[")) {
+      formattedFirstIp = `[${firstIp}]`;
+    } else {
+      formattedFirstIp = firstIp;
+    }
+
+    return `${formattedFirstIp}:${port} (+${items.length - 1}个)`;
+  };
+
+  const formatRemoteAddress = (remoteAddr: string): string => {
+    if (!remoteAddr) return "";
+
+    const addresses = remoteAddr
+      .split(",")
+      .map((addr) => addr.trim())
+      .filter((addr) => addr);
+
+    if (addresses.length === 0) return "";
+
+    if (addresses.length === 1) {
+      return addresses[0];
+    }
+
+    return `${addresses[0]} (+${addresses.length - 1})`;
+  };
+
+  const hasMultipleIps = (ipString: string): boolean => {
+    if (!ipString) return false;
+    const ips = ipString
+      .split(",")
+      .map((ip) => ip.trim())
+      .filter((ip) => ip);
+
+    return ips.length > 1;
+  };
+
+  const hasMultipleRemoteAddresses = (remoteAddr: string): boolean => {
+    if (!remoteAddr) return false;
+    const addresses = remoteAddr
+      .split(",")
+      .map((addr) => addr.trim())
+      .filter((addr) => addr);
+
+    return addresses.length > 1;
+  };
+
+  const showAddressModal = (ipString: string, port: number, title: string) => {
+    if (!ipString) return;
+
+    const items = ipString
+      .split(",")
+      .map((item) => item.trim())
+      .filter((item) => item);
+
+    if (items.length <= 1) {
+      copyToClipboard(formatInAddress(ipString, port));
+
+      return;
+    }
+
+    // 检查是否已经包含端口
+    const hasPort = /:\d+$/.test(items[0]);
+
+    let formattedList: AddressItem[];
+
+    if (hasPort) {
+      // 已经包含完整的 IP:Port 组合，直接使用
+      formattedList = items.map((item, index) => ({
+        id: index,
+        ip: item,
+        address: item,
+        copying: false,
+      }));
+    } else {
+      // 只包含IP，需要添加端口
+      formattedList = items.map((ip, index) => {
+        let formattedAddress: string;
+
+        if (ip.includes(":") && !ip.startsWith("[")) {
+          formattedAddress = `[${ip}]:${port}`;
+        } else {
+          formattedAddress = `${ip}:${port}`;
+        }
+
+        return {
+          id: index,
+          ip: ip,
+          address: formattedAddress,
+          copying: false,
+        };
+      });
+    }
+
+    setAddressList(formattedList);
+    setAddressModalTitle(`${title} (${items.length}个)`);
+    setAddressModalOpen(true);
+  };
+
+  const showRemoteAddressModal = (remoteAddr: string, title: string) => {
+    if (!remoteAddr) return;
+
+    const addresses = remoteAddr
+      .split(",")
+      .map((addr) => addr.trim())
+      .filter((addr) => addr);
+
+    if (addresses.length <= 1) {
+      copyToClipboard(remoteAddr);
+
+      return;
+    }
+
+    const formattedList = addresses.map((address, index) => {
+      return {
+        id: index,
+        ip: address,
+        address: address,
+        copying: false,
+      };
+    });
+
+    setAddressList(formattedList);
+    setAddressModalTitle(`${title} (${addresses.length}个)`);
+    setAddressModalOpen(true);
+  };
+
+  const copyToClipboard = async (text: string) => {
+    await copyWithToast(text);
+  };
+
+  const copyAddress = async (addressItem: AddressItem) => {
+    try {
+      setAddressList((prev) =>
+        prev.map((item) =>
+          item.id === addressItem.id ? { ...item, copying: true } : item,
+        ),
+      );
+      await copyToClipboard(addressItem.address);
+    } catch {
+      toast.error("复制失败");
+    } finally {
+      setAddressList((prev) =>
+        prev.map((item) =>
+          item.id === addressItem.id ? { ...item, copying: false } : item,
+        ),
+      );
+    }
+  };
+
+  const copyAllAddresses = async () => {
+    if (addressList.length === 0) return;
+    const allAddresses = addressList.map((item) => item.address).join("\n");
+
+    await copyToClipboard(allAddresses);
+  };
+
+  const calculateForwardTotalFlow = (forward: Forward): number => {
+    if (!forward) return 0;
+
+    const inFlow = forward.inFlow || 0;
+    const outFlow = forward.outFlow || 0;
+
+    // forward 行为 raw 统计面（原始字节口径，R5X-013/R6X-006 案 a）：
+    // 此处合计仅为总流量展示，不是计费量——计费量（scaled、经单向
+    // 门控与倍率）只落 user/user_tunnel 行，per-forward 无 scaled 落点，
+    // 不得以「计费」名义展示 raw 合计。
+    return inFlow + outFlow;
+  };
+
+  if (loading) {
+    return (
+      <div className="px-3 lg:px-6 flex-grow pt-2 lg:pt-4">
+        <PageLoadingState message="正在加载数据..." />
+      </div>
+    );
+  }
+
+  return (
+    <AnimatedPage className="px-3 lg:px-6 py-6">
+      {/* 顶部个人状态和下拉菜单 */}
+      <div className="flex justify-between items-center mb-4">
+        <div className="rounded-xl glass-card px-3 py-2">
+          <h1 className="text-lg font-semibold">概览</h1>
+          <p className="text-xs font-semibold text-foreground">
+            {username}，这里是你的流量和转发规则
+          </p>
+        </div>
+        <div className="flex items-center gap-3">
+          <Dropdown placement="bottom-end">
+            <DropdownTrigger>
+              <Button
+                isIconOnly
+                className="rounded-full w-10 h-10 min-w-0 bg-gradient-to-br from-primary-700 to-secondary-700 text-white font-semibold text-sm shadow-sm"
+                variant="solid"
+              >
+                {username.slice(0, 2).toUpperCase()}
+              </Button>
+            </DropdownTrigger>
+            <DropdownMenu aria-label="用户菜单" className="rounded-2xl">
+              <DropdownItem
+                key="profile"
+                startContent={
+                  <svg
+                    className="w-4 h-4"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                    />
+                  </svg>
+                }
+                onPress={() => navigate("/profile")}
+              >
+                个人资料
+              </DropdownItem>
+              <DropdownItem
+                key="logout"
+                className="text-danger-700"
+                color="danger"
+                startContent={
+                  <svg
+                    className="w-4 h-4"
+                    fill="currentColor"
+                    viewBox="0 0 20 20"
+                  >
+                    <path
+                      clipRule="evenodd"
+                      d="M3 3a1 1 0 00-1 1v12a1 1 0 102 0V4a1 1 0 00-1-1zm10.293 9.293a1 1 0 001.414 1.414l3-3a1 1 0 000-1.414l-3-3a1 1 0 10-1.414 1.414L14.586 9H7a1 1 0 100 2h7.586l-1.293 1.293z"
+                      fillRule="evenodd"
+                    />
+                  </svg>
+                }
+                onPress={handleLogout}
+              >
+                退出登录
+              </DropdownItem>
+            </DropdownMenu>
+          </Dropdown>
+        </div>
+      </div>
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-px overflow-hidden rounded-lg border border-divider bg-divider mb-6 lg:mb-8">
+        <MetricCard
+          icon={
+            <svg
+              aria-hidden="true"
+              className="w-4 h-4 lg:w-5 lg:h-5 text-blue-600"
+              fill="currentColor"
+              viewBox="0 0 20 20"
+            >
+              <path d="M3 4a1 1 0 011-1h12a1 1 0 011 1v2a1 1 0 01-1 1H4a1 1 0 01-1-1V4zM3 10a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H4a1 1 0 01-1-1v-6zM14 9a1 1 0 00-1 1v6a1 1 0 001 1h2a1 1 0 001-1v-6a1 1 0 00-1-1h-2z" />
+            </svg>
+          }
+          iconClassName="bg-blue-100"
+          title="总流量"
+          value={formatFlowLimit(userInfo.flow, userInfo.flowMiB)}
+        />
+
+        <MetricCard
+          bottomContent={
+            <div className="mt-1">
+              {renderProgressBar(
+                calculateUsagePercentage("flow"),
+                "sm",
+                // R10X-006（K-001）：99999 哨兵之外，精确限额 <=0（0=不限额，
+                // 与后端执法同读法）同样按无限制形态呈现。
+                (userInfo.flow === 99999 && !userInfo.flowMiB) ||
+                  flowLimitBytes(userInfo.flow || 0, userInfo.flowMiB) <= 0,
+              )}
+              <div className="flex items-center justify-between mt-1">
+                <p className="text-xs font-semibold text-foreground truncate">
+                  {(userInfo.flow === 99999 && !userInfo.flowMiB) ||
+                  flowLimitBytes(userInfo.flow || 0, userInfo.flowMiB) <= 0
+                    ? "无限制"
+                    : `${calculateUsagePercentage("flow").toFixed(1)}%`}
+                </p>
+                {userInfo.flowResetTime !== undefined &&
+                  userInfo.flowResetTime !== null && (
+                    <div className="text-xs font-semibold text-foreground flex items-center gap-1">
+                      <svg
+                        aria-hidden="true"
+                        className="w-3 h-3"
+                        fill="currentColor"
+                        viewBox="0 0 20 20"
+                      >
+                        <path
+                          clipRule="evenodd"
+                          d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-12a1 1 0 10-2 0v4a1 1 0 00.293.707l2.828 2.829a1 1 0 101.415-1.415L11 9.586V6z"
+                          fillRule="evenodd"
+                        />
+                      </svg>
+                      <span className="truncate">
+                        {formatResetTime(userInfo.flowResetTime)}
+                      </span>
+                    </div>
+                  )}
+              </div>
+            </div>
+          }
+          icon={
+            <svg
+              aria-hidden="true"
+              className="w-4 h-4 lg:w-5 lg:h-5 text-green-600"
+              fill="currentColor"
+              viewBox="0 0 20 20"
+            >
+              <path
+                clipRule="evenodd"
+                d="M12 7a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0V8.414l-4.293 4.293a1 1 0 01-1.414 0L8 10.414l-4.293 4.293a1 1 0 01-1.414-1.414l5-5a1 1 0 011.414 0L11 10.586 14.586 7H12z"
+                fillRule="evenodd"
+              />
+            </svg>
+          }
+          iconClassName="bg-green-100"
+          title="已用流量"
+          value={formatFlow(calculateUserTotalUsedFlow())}
+        />
+
+        <MetricCard
+          icon={
+            <svg
+              aria-hidden="true"
+              className="w-4 h-4 lg:w-5 lg:h-5 text-purple-600"
+              fill="currentColor"
+              viewBox="0 0 20 20"
+            >
+              <path
+                clipRule="evenodd"
+                d="M3 17a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm3.293-7.707a1 1 0 011.414 0L9 10.586V3a1 1 0 112 0v7.586l1.293-1.293a1 1 0 111.414 1.414l-3 3a1 1 0 01-1.414 0l-3-3a1 1 0 010-1.414z"
+                fillRule="evenodd"
+              />
+            </svg>
+          }
+          iconClassName="bg-purple-100"
+          title="规则配额"
+          value={formatNumber(userInfo.num || 0)}
+        />
+
+        <MetricCard
+          bottomContent={
+            <div className="mt-1">
+              {renderProgressBar(
+                calculateUsagePercentage("forwards"),
+                "sm",
+                // R11X-011：num<=0 与 99999 同为无限制形态。
+                userInfo.num === 99999 || userInfo.num <= 0,
+              )}
+              <p className="text-xs font-semibold text-foreground mt-1 truncate">
+                {userInfo.num === 99999 || userInfo.num <= 0
+                  ? "无限制"
+                  : `${calculateUsagePercentage("forwards").toFixed(1)}%`}
+              </p>
+            </div>
+          }
+          icon={
+            <svg
+              aria-hidden="true"
+              className="w-4 h-4 lg:w-5 lg:h-5 text-orange-600"
+              fill="currentColor"
+              viewBox="0 0 20 20"
+            >
+              <path
+                clipRule="evenodd"
+                d="M12.586 4.586a2 2 0 112.828 2.828l-3 3a2 2 0 01-2.828 0 1 1 0 00-1.414 1.414 4 4 0 005.656 0l3-3a4 4 0 00-5.656-5.656l-1.5 1.5a1 1 0 101.414 1.414l1.5-1.5zm-5 5a2 2 0 012.828 0 1 1 0 101.414-1.414 4 4 0 00-5.656 0l-3 3a4 4 0 105.656 5.656l1.5-1.5a1 1 0 10-1.414-1.414l-1.5 1.5a2 2 0 11-2.828-2.828l3-3z"
+                fillRule="evenodd"
+              />
+            </svg>
+          }
+          iconClassName="bg-orange-100"
+          title="已用规则"
+          value={forwardList.length}
+        />
+      </div>
+
+      <FlowChartCard
+        chartData={processFlowChartData()}
+        formatFlow={formatFlow}
+        statisticsFlowsCount={statisticsFlows.length}
+      />
+
+      {/* 隧道权限 - 管理员不显示 */}
+      {!isAdmin && (
+        <Card className="mb-6 lg:mb-8">
+          <CardHeader className="pb-3">
+            <div className="flex items-center gap-2">
+              <svg
+                aria-hidden="true"
+                className="w-5 h-5 text-primary-700"
+                fill="currentColor"
+                viewBox="0 0 20 20"
+              >
+                <path
+                  clipRule="evenodd"
+                  d="M12.586 4.586a2 2 0 112.828 2.828l-3 3a2 2 0 01-2.828 0 1 1 0 00-1.414 1.414 4 4 0 005.656 0l3-3a4 4 0 00-5.656-5.656l-1.5 1.5a1 1 0 101.414 1.414l1.5-1.5zm-5 5a2 2 0 012.828 0 1 1 0 101.414-1.414 4 4 0 00-5.656 0l-3 3a4 4 0 105.656 5.656l1.5-1.5a1 1 0 10-1.414-1.414l-1.5 1.5a2 2 0 11-2.828-2.828l3-3z"
+                  fillRule="evenodd"
+                />
+              </svg>
+              <h2 className="text-lg lg:text-xl font-semibold text-foreground">
+                隧道权限
+              </h2>
+              <span className="px-2 py-1 bg-tray text-foreground rounded-full text-xs font-semibold">
+                {userTunnels.length}
+              </span>
+            </div>
+          </CardHeader>
+          <CardBody className="pt-0">
+            {userTunnels.length === 0 ? (
+              <PageEmptyState className="h-48" message="暂无隧道权限" />
+            ) : (
+              <div className="space-y-3">
+                {userTunnels.map((tunnel) => {
+                  const tunnelExpStatus = getExpStatus(tunnel.expTime);
+
+                  return (
+                    <div
+                      key={tunnel.id}
+                      className="border border-gray-200 rounded-lg p-3 lg:p-4 hover:shadow-md transition-shadow"
+                    >
+                      <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3 mb-3">
+                        <div>
+                          <h3 className="font-semibold text-foreground">
+                            {tunnel.tunnelName} ID: {tunnel.id}
+                          </h3>
+                          <div className="flex flex-wrap items-center gap-2 mt-1">
+                            <span
+                              className={`px-2 py-1 rounded-md text-xs font-semibold ${tunnel.tunnelFlow === 1 ? "bg-blue-500/10 text-blue-700" : tunnel.tunnelFlow === 2 ? "bg-orange-500/10 text-orange-700" : "bg-tray text-foreground"}`}
+                            >
+                              {tunnel.tunnelFlow === 1
+                                ? "单向计费"
+                                : tunnel.tunnelFlow === 2
+                                  ? "双向计费"
+                                  : "未知"}
+                            </span>
+                            <span
+                              className={`px-2 py-1 rounded-md text-xs font-semibold border ${tunnelExpStatus.bg} ${tunnelExpStatus.color}`}
+                            >
+                              {tunnelExpStatus.text}
+                            </span>
+                            {tunnel.flowResetTime !== undefined &&
+                              tunnel.flowResetTime !== null && (
+                                <span className="text-xs font-semibold text-foreground">
+                                  {formatResetTime(tunnel.flowResetTime)}
+                                </span>
+                              )}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 lg:gap-4">
+                        <div>
+                          <p className="text-sm text-foreground mb-1">
+                            流量配额
+                          </p>
+                          <p className="font-semibold text-foreground">
+                            {formatFlowLimit(tunnel.flow, tunnel.flowMiB)}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-sm text-foreground mb-1">
+                            已用流量
+                          </p>
+                          <p className="font-semibold text-foreground">
+                            {formatFlow(calculateTunnelUsedFlow(tunnel))}
+                          </p>
+                          <div className="mt-1">
+                            {renderProgressBar(
+                              calculateTunnelFlowPercentage(tunnel),
+                              "sm",
+                              // R10X-006（K-001）：同总流量卡——limit<=0 亦无限制。
+                              (tunnel.flow === 99999 && !tunnel.flowMiB) ||
+                                flowLimitBytes(
+                                  tunnel.flow || 0,
+                                  tunnel.flowMiB,
+                                ) <= 0,
+                            )}
+                          </div>
+                        </div>
+                        <div>
+                          <p className="text-sm text-foreground mb-1">
+                            规则配额
+                          </p>
+                          <p className="font-semibold text-foreground">
+                            {formatNumber(tunnel.num)}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-sm text-foreground mb-1">
+                            已用规则
+                          </p>
+                          <p className="font-semibold text-foreground">
+                            {getTunnelUsedForwards(tunnel.tunnelId)}
+                          </p>
+                          <div className="mt-1">
+                            {renderProgressBar(
+                              calculateTunnelForwardPercentage(tunnel),
+                              "sm",
+                              // R11X-011：num<=0 与 99999 同为无限制形态。
+                              tunnel.num === 99999 || tunnel.num <= 0,
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </CardBody>
+        </Card>
+      )}
+
+      {/* 规则配置 */}
+      <Card>
+        <CardHeader className="pb-3">
+          <div className="flex items-center gap-2">
+            <svg
+              aria-hidden="true"
+              className="w-5 h-5 text-primary-700"
+              fill="currentColor"
+              viewBox="0 0 20 20"
+            >
+              <path
+                clipRule="evenodd"
+                d="M3 17a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm3.293-7.707a1 1 0 011.414 0L9 10.586V3a1 1 0 112 0v7.586l1.293-1.293a1 1 0 111.414 1.414l-3 3a1 1 0 01-1.414 0l-3-3a1 1 0 010-1.414z"
+                fillRule="evenodd"
+              />
+            </svg>
+            <h2 className="text-lg lg:text-xl font-semibold text-foreground">
+              规则配置
+            </h2>
+            <span className="px-2 py-1 bg-tray text-foreground rounded-full text-xs font-semibold">
+              {forwardList.length}
+            </span>
+          </div>
+        </CardHeader>
+        <CardBody className="pt-0">
+          {groupedForwards().length === 0 ? (
+            <div className="text-center py-12">
+              <svg
+                aria-hidden="true"
+                className="w-12 h-12 text-foreground mx-auto mb-4"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  d="M8 9l4-4 4 4m0 6l-4 4-4-4"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={1.5}
+                />
+              </svg>
+              <p className="text-foreground">暂无规则配置</p>
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {groupedForwards().map((group) => (
+                <div
+                  key={group.tunnelName}
+                  className="glass-card rounded-xl p-3 lg:p-4 shadow-sm"
+                >
+                  <div className="flex items-center justify-between mb-3">
+                    <h3 className="font-semibold text-foreground">
+                      {group.tunnelName}
+                    </h3>
+                    <span className="px-2 py-1 tray-primary rounded-md text-sm">
+                      {group.forwards.length} 个规则
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-4">
+                    {group.forwards.map((forward) => (
+                      <div
+                        key={forward.id}
+                        className="glass-card rounded-lg p-3 hover:shadow-md transition-all duration-300"
+                      >
+                        <div className="space-y-3">
+                          <div>
+                            <h4 className="font-medium text-foreground text-sm mb-2 truncate">
+                              {forward.name}
+                            </h4>
+                            <div className="space-y-1">
+                              <button
+                                className={`block px-2 py-1 bg-tray rounded-lg border border-divider font-mono text-xs font-semibold truncate text-foreground transition-all duration-300 ${hasMultipleIps(forward.inIp) ? "cursor-pointer hover:bg-white/40" : ""}`}
+                                disabled={!hasMultipleIps(forward.inIp)}
+                                title={formatInAddress(
+                                  forward.inIp,
+                                  forward.inPort,
+                                )}
+                                type="button"
+                                onClick={() =>
+                                  showAddressModal(
+                                    forward.inIp,
+                                    forward.inPort,
+                                    "入口地址",
+                                  )
+                                }
+                              >
+                                {formatInAddress(forward.inIp, forward.inPort)}
+                              </button>
+                              <div className="text-center text-foreground text-xs font-semibold">
+                                ↓
+                              </div>
+                              <button
+                                className={`block px-2 py-1 bg-tray rounded-lg border border-divider font-mono text-xs font-semibold truncate text-foreground transition-all duration-300 ${hasMultipleRemoteAddresses(forward.remoteAddr) ? "cursor-pointer hover:bg-white/40" : ""}`}
+                                disabled={
+                                  !hasMultipleRemoteAddresses(
+                                    forward.remoteAddr,
+                                  )
+                                }
+                                title={formatRemoteAddress(forward.remoteAddr)}
+                                type="button"
+                                onClick={() =>
+                                  showRemoteAddressModal(
+                                    forward.remoteAddr,
+                                    "出口地址",
+                                  )
+                                }
+                              >
+                                {formatRemoteAddress(forward.remoteAddr)}
+                              </button>
+                            </div>
+                          </div>
+
+                          <div className="pt-2 border-t border-gray-200">
+                            <div className="grid grid-cols-3 gap-1 text-xs font-semibold">
+                              <div className="text-center">
+                                <div className="text-foreground mb-1">上传</div>
+                                <div className="font-medium text-green-700 truncate">
+                                  {formatFlow(forward.inFlow || 0)}
+                                </div>
+                              </div>
+                              <div className="text-center">
+                                <div className="text-foreground mb-1">下载</div>
+                                <div className="font-medium text-orange-700 truncate">
+                                  {formatFlow(forward.outFlow || 0)}
+                                </div>
+                              </div>
+                              <div className="text-center">
+                                <div className="text-foreground mb-1">
+                                  总流量
+                                </div>
+                                <div className="font-medium text-primary-700 truncate">
+                                  {formatFlow(
+                                    calculateForwardTotalFlow(forward),
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </CardBody>
+      </Card>
+
+      {/* 地址列表弹窗 */}
+      <Modal
+        backdrop="blur"
+        isOpen={addressModalOpen}
+        placement="center"
+        scrollBehavior="inside"
+        size="2xl"
+        onClose={() => setAddressModalOpen(false)}
+      >
+        <ModalContent>
+          <ModalHeader className="text-base">{addressModalTitle}</ModalHeader>
+          <ModalBody className="pb-6">
+            <div className="mb-4 text-right">
+              <Button size="sm" onPress={copyAllAddresses}>
+                复制全部
+              </Button>
+            </div>
+
+            <div className="space-y-2 max-h-60 overflow-y-auto scrollbar-hide">
+              {addressList.map((item) => (
+                <div
+                  key={item.id}
+                  className="flex justify-between items-center p-3 border border-default-200 rounded-lg"
+                >
+                  <code className="font-mono text-sm flex-1 mr-3 text-foreground">
+                    {item.address}
+                  </code>
+                  <Button
+                    isLoading={item.copying}
+                    size="sm"
+                    variant="light"
+                    onPress={() => copyAddress(item)}
+                  >
+                    复制
+                  </Button>
+                </div>
+              ))}
+            </div>
+          </ModalBody>
+        </ModalContent>
+      </Modal>
+    </AnimatedPage>
+  );
+}
