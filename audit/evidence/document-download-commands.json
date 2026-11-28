@@ -1,0 +1,132 @@
+[
+  {
+    "file": "README.md",
+    "line": 3,
+    "text": "<img src=\"https://raw.githubusercontent.com/yhfc1775-maker/ovo/main/doc/public/logo.jpg\" width=\"88\" alt=\"OVO\" />"
+  },
+  {
+    "file": "README.md",
+    "line": 48,
+    "text": "curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/panel_install.sh -o panel_install.sh && curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/panel_install.sh.sha256 -o panel_install.sh.sha256 && sha256sum -c panel_install.sh.sha256 && bash panel_install.sh"
+  },
+  {
+    "file": "doc/ai-skill.md",
+    "line": 10,
+    "text": "mkdir -p ~/.agents/skills/ovo-api && curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/ovo-skill-api-2.1.34.tgz -o /tmp/ovo-skill-api-2.1.34.tgz && curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/ovo-skill-api-2.1.34.tgz.sha256 -o /tmp/ovo-skill-api-2.1.34.tgz.sha256 && (cd /tmp && sha256sum -c ovo-skill-api-2.1.34.tgz.sha256) && tar -xzf /tmp/ovo-skill-api-2.1.34.tgz -C ~/.agents/skills/ovo-api --strip-components=1"
+  },
+  {
+    "file": "doc/ai-skill.md",
+    "line": 64,
+    "text": "mkdir -p ~/.agents/skills/ovo-api && curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/ovo-skill-api-2.1.34.tgz -o /tmp/ovo-skill-api-2.1.34.tgz && curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/ovo-skill-api-2.1.34.tgz.sha256 -o /tmp/ovo-skill-api-2.1.34.tgz.sha256 && (cd /tmp && sha256sum -c ovo-skill-api-2.1.34.tgz.sha256) && tar -xzf /tmp/ovo-skill-api-2.1.34.tgz -C ~/.agents/skills/ovo-api --strip-components=1"
+  },
+  {
+    "file": "doc/ai-skill.md",
+    "line": 92,
+    "text": "mkdir -p ~/.agents/skills/ovo-api && curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/ovo-skill-api-2.1.34.tgz -o /tmp/ovo-skill-api-2.1.34.tgz && curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/ovo-skill-api-2.1.34.tgz.sha256 -o /tmp/ovo-skill-api-2.1.34.tgz.sha256 && (cd /tmp && sha256sum -c ovo-skill-api-2.1.34.tgz.sha256) && tar -xzf /tmp/ovo-skill-api-2.1.34.tgz -C ~/.agents/skills/ovo-api --strip-components=1"
+  },
+  {
+    "file": "doc/ai-skill.md",
+    "line": 169,
+    "text": "调用方式: curl -X POST \"$OVO_BASE_URL/api/v1/...\" -H \"Authorization: $TOKEN\""
+  },
+  {
+    "file": "doc/ai-skill.md",
+    "line": 226,
+    "text": "技能包的下载地址就是该版本的 Release 资产，例如 `https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/ovo-skill-api-2.1.34.tgz`，公开下载，并按上方安装命令校验配套的 `.sha256`。"
+  },
+  {
+    "file": "skills/ovo-api/SKILL.md",
+    "line": 29,
+    "text": "| **OpenCode** | `mkdir -p ~/.agents/skills/ovo-api && curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/ovo-skill-api-2.1.34.tgz -o /tmp/ovo-skill-api-2.1.34.tgz && curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/ovo-skill-api-2.1.34.tgz.sha256 -o /tmp/ovo-skill-api-2.1.34.tgz.sha256 && (cd /tmp && sha256sum -c ovo-skill-api-2.1.34.tgz.sha256) && tar -xzf /tmp/ovo-skill-api-2.1.34.tgz -C ~/.agents/skills/ovo-api --strip-components=1` | Auto-loads from `~/.agents/skills/` |"
+  },
+  {
+    "file": "skills/ovo-api/SKILL.md",
+    "line": 80,
+    "text": "curl -X POST \"${OVO_BASE_URL}/api/v1/user/login\" \\"
+  },
+  {
+    "file": "skills/ovo-api/SKILL.md",
+    "line": 164,
+    "text": "### Bash/curl (with auto-login)"
+  },
+  {
+    "file": "skills/ovo-api/SKILL.md",
+    "line": 173,
+    "text": "TOKEN=$(curl -s -X POST \"${BASE_URL}/api/v1/user/login\" \\"
+  },
+  {
+    "file": "skills/ovo-api/SKILL.md",
+    "line": 183,
+    "text": "curl -s -X POST \"${BASE_URL}/api/v1/node/list\" \\"
+  },
+  {
+    "file": "doc/guide/faq.md",
+    "line": 7,
+    "text": "- Ubuntu/Debian 安装 Docker: `curl -fsSL https://get.docker.com | bash`"
+  },
+  {
+    "file": "doc/guide/faq.md",
+    "line": 86,
+    "text": "对接方（脚本、第三方程序、监控探针）**必须解析响应体的 `code` 判成败，不要只看 HTTP 状态**：只看状态会把未授权、越权、限流全部误记为成功，反向代理、CDN 与可用性监控的状态码告警同理。自检方法：不带令牌执行 `curl -s -X POST https://<面板地址>/api/v1/user/list`，返回 HTTP 200 且响应体为 `{\"code\":401,...}` 即为现行契约。"
+  },
+  {
+    "file": "doc/guide/getting-started.md",
+    "line": 8,
+    "text": "curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/panel_install.sh -o panel_install.sh && curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/panel_install.sh.sha256 -o panel_install.sh.sha256 && sha256sum -c panel_install.sh.sha256 && bash panel_install.sh"
+  },
+  {
+    "file": "doc/guide/install.md",
+    "line": 18,
+    "text": "curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/panel_install.sh -o panel_install.sh && curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/panel_install.sh.sha256 -o panel_install.sh.sha256 && sha256sum -c panel_install.sh.sha256 && bash panel_install.sh"
+  },
+  {
+    "file": "doc/guide/install.md",
+    "line": 125,
+    "text": "curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/install.sh -o install.sh && curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/install.sh.sha256 -o install.sh.sha256 && sha256sum -c install.sh.sha256 && bash install.sh"
+  },
+  {
+    "file": "doc/guide/install.md",
+    "line": 128,
+    "text": "Alpine Linux 最小化安装若未包含 `curl`，可使用系统自带的 `wget` 下载（与 curl 版同口径：先取校验文件、`sha256sum -c` 通过后才执行，校验失败不要绕过）："
+  },
+  {
+    "file": "doc/guide/install.md",
+    "line": 131,
+    "text": "curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/install.sh -o install.sh && curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/install.sh.sha256 -o install.sh.sha256 && sha256sum -c install.sh.sha256 && bash install.sh"
+  },
+  {
+    "file": "doc/guide/install.md",
+    "line": 134,
+    "text": "> 校验口径提示：上面两条手抄命令（curl / wget）的脚本与校验文件都走同一条线路、只有单锚（同源校验）；在面板里点「安装」生成的节点安装命令里，**脚本形态**是双锚（脚本与校验文件分走两条不同线路互相复核），但有两条例外、不要按双锚预期：① 实际获胜的是直连 / 面板源线路、且另一条线路没有应答时，命令会**点名降级为单锚**继续，输出里会写明；② **docker / docker-compose 两种容器形态**的生成命令没有脚本校验链，只靠镜像 tag 拉取。能从面板复制命令时优先用生成的命令，并留意输出里对校验形态的点名。"
+  },
+  {
+    "file": "doc/guide/install.md",
+    "line": 254,
+    "text": "curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' -o \"$caddy_key_tmp\" && \\"
+  },
+  {
+    "file": "doc/guide/install.md",
+    "line": 260,
+    "text": "curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' -o \"$caddy_list_tmp\" && \\"
+  },
+  {
+    "file": "doc/guide/passkey.md",
+    "line": 32,
+    "text": "2. 向浏览器实际调用的后端地址发送公开状态请求，例如将以下示例地址替换为自己的 API 地址后运行 `curl -sS -X POST 'https://api.example.com/api/v1/user/passkey/status' -H 'Content-Type: application/json' -d '{}'`。应返回 `code: 0` 且 `data.enabled: true`；若为 `false`，后端尚未接受有效配置。此接口无需登录或提供密码。"
+  },
+  {
+    "file": "doc/guide/subscription.md",
+    "line": 174,
+    "text": "5. 自检：规则部署后，用任意可达网络执行 `curl -sI <一条前置订阅链接> | grep -i cf-cache-status`，显示 `BYPASS` 即缓存规则已生效；也可以在拉不到订阅的网络下实拉一次订阅验证。"
+  },
+  {
+    "file": "doc/guide/upgrade.md",
+    "line": 45,
+    "text": "curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/panel_install.sh -o panel_install.sh && curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/panel_install.sh.sha256 -o panel_install.sh.sha256 && sha256sum -c panel_install.sh.sha256 && bash panel_install.sh"
+  },
+  {
+    "file": "doc/guide/upgrade.md",
+    "line": 68,
+    "text": "curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/panel_install.sh -o panel_install.sh && curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/panel_install.sh.sha256 -o panel_install.sh.sha256 && sha256sum -c panel_install.sh.sha256 && bash panel_install.sh"
+  }
+]

@@ -1,0 +1,219 @@
+{
+  "B1": [
+    {
+      "file": "go-backend/internal/http/handler/handler.go",
+      "name": "login",
+      "line": 762,
+      "end": 896
+    },
+    {
+      "file": "go-backend/internal/http/handler/handler.go",
+      "name": "userLogout",
+      "line": 2491,
+      "end": 2511
+    },
+    {
+      "file": "go-backend/internal/http/handler/handler.go",
+      "name": "updatePassword",
+      "line": 2550,
+      "end": 2679
+    },
+    {
+      "file": "go-backend/internal/http/handler/passkey.go",
+      "name": "passkeyLoginFinish",
+      "line": 335,
+      "end": 429
+    }
+  ],
+  "B2": [
+    {
+      "file": "go-backend/internal/http/handler/control_plane.go",
+      "name": "resolveForwardAccess",
+      "line": 178,
+      "end": 188
+    },
+    {
+      "file": "go-backend/internal/http/handler/control_plane.go",
+      "name": "ensureTunnelPermission",
+      "line": 242,
+      "end": 254
+    },
+    {
+      "file": "go-backend/internal/http/handler/user_inbound.go",
+      "name": "getUserInbounds",
+      "line": 116,
+      "end": 147
+    },
+    {
+      "file": "go-backend/internal/http/handler/user_subscription.go",
+      "name": "userSubscriptionMine",
+      "line": 169,
+      "end": 231
+    }
+  ],
+  "B3": [
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "name": "nodeUpdate",
+      "line": 1173,
+      "end": 1717
+    },
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "name": "nodeDelete",
+      "line": 1915,
+      "end": 2038
+    }
+  ],
+  "B4": [
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "name": "createForwardWithPortRetry",
+      "line": 5797,
+      "end": 5880
+    },
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "name": "applyTunnelRuntime",
+      "line": 9186,
+      "end": 9188
+    }
+  ],
+  "B5": [
+    {
+      "file": "go-backend/internal/http/handler/subscription.go",
+      "name": "rotateSubscriptionCredentials",
+      "line": 1869,
+      "end": 1924
+    }
+  ],
+  "B6": [
+    {
+      "file": "go-backend/internal/http/handler/remote_source.go",
+      "name": "syncRemoteSource",
+      "line": 232,
+      "end": 623
+    },
+    {
+      "file": "go-backend/internal/http/handler/subscription_template.go",
+      "name": "refreshTemplate",
+      "line": 156,
+      "end": 187
+    }
+  ],
+  "B7": [
+    {
+      "file": "go-backend/internal/store/repo/migration_rmshare_v6.go",
+      "name": "migrateV6FederationRemoval",
+      "line": 78,
+      "end": 175
+    }
+  ],
+  "B9": [
+    {
+      "file": "go-backend/internal/http/handler/handler.go",
+      "name": "backupImport",
+      "line": 3183,
+      "end": 3334
+    },
+    {
+      "file": "go-backend/internal/store/repo/repository.go",
+      "name": "ValidateBackupImportUserHashBudget",
+      "line": 3679,
+      "end": 3703
+    }
+  ],
+  "B11": [
+    {
+      "file": "go-backend/internal/http/handler/config_access.go",
+      "name": "getPublicConfigByName",
+      "line": 11,
+      "end": 47
+    },
+    {
+      "file": "go-backend/internal/http/handler/handler.go",
+      "name": "getConfigs",
+      "line": 996,
+      "end": 1032
+    }
+  ],
+  "C4": [
+    {
+      "file": "go-backend/internal/ws/server.go",
+      "name": "disconnectNodeSession",
+      "line": 356,
+      "end": 396
+    },
+    {
+      "file": "go-backend/internal/ws/server.go",
+      "name": "validateNodeSession",
+      "line": 402,
+      "end": 408
+    },
+    {
+      "file": "go-backend/internal/ws/server.go",
+      "name": "handleNode",
+      "line": 787,
+      "end": 1013
+    }
+  ],
+  "C5": [
+    {
+      "file": "go-backend/internal/http/handler/connlog.go",
+      "name": "nodeConnlog",
+      "line": 338,
+      "end": 435
+    }
+  ],
+  "D1": [
+    {
+      "file": "go-gost/x/socket/websocket_reporter.go",
+      "name": "handleReceivedMessage",
+      "line": 1366,
+      "end": 1480
+    },
+    {
+      "file": "go-gost/x/socket/websocket_reporter.go",
+      "name": "routeCommand",
+      "line": 1652,
+      "end": 1877
+    }
+  ],
+  "D2": [
+    {
+      "file": "go-gost/x/socket/restart_schedule.go",
+      "name": "applyRestartSchedule",
+      "line": 227,
+      "end": 366
+    },
+    {
+      "file": "go-gost/x/socket/tuning.go",
+      "name": "handleTuneCommandContext",
+      "line": 1442,
+      "end": 1482
+    }
+  ],
+  "F1": [
+    {
+      "file": "go-backend/internal/http/handler/tunnel_tls.go",
+      "name": "distributeNodeTunnelTLS",
+      "line": 129,
+      "end": 162
+    },
+    {
+      "file": "go-backend/internal/http/handler/tunnel_tls.go",
+      "name": "checkNodeTunnelTLSStatus",
+      "line": 169,
+      "end": 186
+    }
+  ],
+  "F2": [],
+  "F3": [
+    {
+      "file": "go-backend/internal/http/handler/jobs.go",
+      "name": "StartBackgroundJobs",
+      "line": 13,
+      "end": 94
+    }
+  ]
+}

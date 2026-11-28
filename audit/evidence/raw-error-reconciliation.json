@@ -1,0 +1,20 @@
+{
+  "candidateCount": 348,
+  "reviewedCount": 348,
+  "unreviewed": [],
+  "duplicateReviews": 0,
+  "candidateMinusReviewed": [],
+  "reviewedMinusCandidate": [],
+  "classCounts": {
+    "fixed-domain": 77,
+    "repo-guarded": 52,
+    "request-validation": 114,
+    "internal-encoding": 5,
+    "typed-domain": 23,
+    "mixed-storage-reachable": 22,
+    "operational-raw": 42,
+    "template-render-validation": 3,
+    "unreachable-currently": 2,
+    "fixed-http-status": 8
+  }
+}

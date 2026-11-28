@@ -1,0 +1,585 @@
+[
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 7,
+    "contexts": [
+      "=\"description\" content=\"FLMX 使用手册：转发 + 节点搭建面板。搭建节点、新建入站、对接中转、链式代理与订阅设置的完整操作手册（以 2.1.30 实测为准）。\">"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 281,
+    "contexts": [
+      "  <div class=\"side-foot\">本手册内容对照 FLMX 2.1.30 编写；截图均为真实面板截图，取自 094 测试面板（前端 2.1.23 / 后端 2.1.23；页脚红标 2.1.30 是可更新的最新版本，不是当前版本）；图中演示对象拍摄后已删除、节点 IP 已恢复，数据为演示数据。</div>",
+      "  <div class=\"side-foot\">本手册内容对照 FLMX 2.1.30 编写；截图均为真实面板截图，取自 094 测试面板（前端 2.1.23 / 后端 2.1.23；页脚红标 2.1.30 是可更新的最新版本，不是当前版本）；图中演示对象拍摄后已删除、节点 IP 已恢复，数据为演示数据。</div>",
+      " class=\"side-foot\">本手册内容对照 FLMX 2.1.30 编写；截图均为真实面板截图，取自 094 测试面板（前端 2.1.23 / 后端 2.1.23；页脚红标 2.1.30 是可更新的最新版本，不是当前版本）；图中演示对象拍摄后已删除、节点 IP 已恢复，数据为演示数据。</div>",
+      "-foot\">本手册内容对照 FLMX 2.1.30 编写；截图均为真实面板截图，取自 094 测试面板（前端 2.1.23 / 后端 2.1.23；页脚红标 2.1.30 是可更新的最新版本，不是当前版本）；图中演示对象拍摄后已删除、节点 IP 已恢复，数据为演示数据。</div>"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 301,
+    "contexts": [
+      "  <div class=\"feature\"><h3>节点搭建</h3><p>节点页装 Xray / sing-box 内核，用模板新建入站——VLESS + Reality + Vision 一类组合保存即下发生效。</p></div>"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 313,
+    "contexts": [
+      "        <figcaption><b>概览仪表盘</b> —— 登录面板的第一屏（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23；图中为演示数据，拍摄后已清理）。</figcaption>",
+      "        <figcaption><b>概览仪表盘</b> —— 登录面板的第一屏（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23；图中为演示数据，拍摄后已清理）。</figcaption>"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 316,
+    "contexts": [
+      "footer class=\"home-foot\"><span>基于 GPLv3 发布 · 仅供学习研究使用</span><span>FLMX 使用手册 · 以 2.1.30 实测为准</span></footer>"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 329,
+    "contexts": [
+      "<b>概览仪表盘</b> —— 登录后的第一屏。五步走完后回到这里确认：节点在线、落地运行、订阅有效都亮起来，整条链路就通了（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23，演示数据已清理）。</figcaption>",
+      " —— 登录后的第一屏。五步走完后回到这里确认：节点在线、落地运行、订阅有效都亮起来，整条链路就通了（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23，演示数据已清理）。</figcaption>"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 335,
+    "contexts": [
+      " class=\"st\">新建入站</b>在节点上安装 Xray 或 sing-box 内核，再<strong>新建入站</strong>（例如 VLESS + Reality + Vision），点「创建并下发」后入站即出现在落地列表里。见 <a href=\"#/guide/inbound\">新建入站</a>。</li>"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 339,
+    "contexts": [
+      "<div class=\"callout warn\"><span class=\"t\">实测提醒：节点地址别填 127.0.0.1</span><p>在 2.1.30 上实测：节点地址填 <code>127.0.0.1</code> 时，订阅显示 <strong>0 个节点</strong>，并提示“该订阅当前没有可用节点”；把节点 IPv4 改成<strong>公网 IP</strong>后，订阅才有"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 346,
+    "contexts": [
+      "  <li>记下面板版本，后续升级与排障都要对版本（本手册对应 2.1.30）</li>"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 400,
+    "contexts": [
+      "<p>测试面板上的实测状态：<strong>当前版本 2.1.23、最新版本 2.1.30、状态“可升级”</strong>；部署目录 <code>/opt/flmx-panel</code>，后端容器 <code>flmx-panel-backend</code>。你自己的面板以网站配置里显示的为准。<",
+      "<p>测试面板上的实测状态：<strong>当前版本 2.1.23、最新版本 2.1.30、状态“可升级”</strong>；部署目录 <code>/opt/flmx-panel</code>，后端容器 <code>flmx-panel-backend</code>。你自己的面板以网站配置里显示的为准。</p>"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 403,
+    "contexts": [
+      "  <li><b class=\"st\">检查更新</b>在网站配置的面板升级区点<strong>检查更新</strong>，确认检测到的最新版本号（如 2.1.30）。</li>"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 409,
+    "contexts": [
+      "TR/wCSX/2yg/AzGM+KOT0H2H/7ZXr9NKKZBIQNw6Giwrn/2Q==\" alt=\"真实面板截图：检查更新后提示已检查到最新版本 2.1.30，确认面板升级弹窗列出升级前请确认三项，底部有取消与确认升级按钮\">"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 410,
+    "contexts": [
+      "确认框</b> —— 在面板升级区点「立即升级」后弹出这张确认框（这张图拍的就是确认框本身，不是升级区页面）：顶部另有一条 toast 提示“已检查到最新版本 2.1.30”；弹窗写明本次将升级到最新版、升级经 Docker Socket 执行并会短暂中断面板服务，列出三项升级前确认，底部是取消 / 确认升级（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23，演示数据已清理）。</fig",
+      "次将升级到最新版、升级经 Docker Socket 执行并会短暂中断面板服务，列出三项升级前确认，底部是取消 / 确认升级（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23，演示数据已清理）。</figcaption>",
+      " Docker Socket 执行并会短暂中断面板服务，列出三项升级前确认，底部是取消 / 确认升级（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23，演示数据已清理）。</figcaption>"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 434,
+    "contexts": [
+      "r5-node-0241 在列表下方，本图仅露出一半</strong>。离线节点就是长这样，先认清，免得把在线节点误判为故障（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23，演示节点拍摄后已删除）。</figcaption>",
+      " 在列表下方，本图仅露出一半</strong>。离线节点就是长这样，先认清，免得把在线节点误判为故障（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23，演示节点拍摄后已删除）。</figcaption>"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 478,
+    "contexts": [
+      "：选一个节点 + 内核，定协议、传输与安全组合，点「创建并下发」后客户端就能连。本章用实测建出的 <strong>演示-VLESS（VLESS + TCP + Reality + Vision，端口 52668，节点 r5-node-0241）</strong>为例，一步一步走完。</p>"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 482,
+    "contexts": [
+      "  <li><b class=\"st\">选模板</b>弹窗上半部是现成模板：<strong>VLESS + Reality + Vision</strong>（推荐：无需域名和证书，抗探测）、VLESS + XHTTP + Reality、Shadowsocks 2022、Trojan + TLS（自签）、VMess + WS + TLS 等。示例选第一个。<",
+      "是现成模板：<strong>VLESS + Reality + Vision</strong>（推荐：无需域名和证书，抗探测）、VLESS + XHTTP + Reality、Shadowsocks 2022、Trojan + TLS（自签）、VMess + WS + TLS 等。示例选第一个。</li>"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 483,
+    "contexts": [
+      "  <li><b class=\"st\">填名称与端口</b>名称填 <code>演示-VLESS</code>（模板已自动带出「VLESS + Reality + Vision」前缀，名称栏实际为「VLESS + Reality + Vision演示-VLESS」）；端口可以留空随机（从 [20000,60000) 里取），也可以自己指定（只检查是否与已有端口冲突，并放行防火墙）。</li>",
+      "/b>名称填 <code>演示-VLESS</code>（模板已自动带出「VLESS + Reality + Vision」前缀，名称栏实际为「VLESS + Reality + Vision演示-VLESS」）；端口可以留空随机（从 [20000,60000) 里取），也可以自己指定（只检查是否与已有端口冲突，并放行防火墙）。</li>"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 489,
+    "contexts": [
+      "o/wDJL/7ZQfgZjGfFHJ6D7D/9sr1+mlFMgkIG4dDRYVz/2Q==\" alt=\"真实面板截图：新建入站弹窗已选 VLESS 加 Reality 加 Vision 模板（标注推荐：无需域名和证书，抗探测），名称已填 VLESS + Reality + Vision演示-VLESS，端口留空随机，下方是折叠的高级设置\">",
+      "alt=\"真实面板截图：新建入站弹窗已选 VLESS 加 Reality 加 Vision 模板（标注推荐：无需域名和证书，抗探测），名称已填 VLESS + Reality + Vision演示-VLESS，端口留空随机，下方是折叠的高级设置\">"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 490,
+    "contexts": [
+      "  <figcaption><b>新建入站：选好模板、填好名称</b> —— 模板区选中「VLESS + Reality + Vision」，名称栏为「VLESS + Reality + Vision演示-VLESS」（模板自动带出的前缀 + 追加的「演示-VLESS」），端口留空随机；弹窗底部提示“已套用「VLESS + Reality + Vision」",
+      "igcaption><b>新建入站：选好模板、填好名称</b> —— 模板区选中「VLESS + Reality + Vision」，名称栏为「VLESS + Reality + Vision演示-VLESS」（模板自动带出的前缀 + 追加的「演示-VLESS」），端口留空随机；弹窗底部提示“已套用「VLESS + Reality + Vision」：协议、传输与安全等字段在高级设置中，展开可查看或修改”（实拍",
+      " Reality + Vision演示-VLESS」（模板自动带出的前缀 + 追加的「演示-VLESS」），端口留空随机；弹窗底部提示“已套用「VLESS + Reality + Vision」：协议、传输与安全等字段在高级设置中，展开可查看或修改”（实拍 · 094 测试面板，演示数据已清理）。</figcaption>"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 493,
+    "contexts": [
+      "AosFyfzv9n9aPO/2f1qKmlEMgkKjcAQD6UWC5//2Q==\" alt=\"真实面板截图：落地页入站列表有 1 个入站，VLESS + Reality + Vision演示-VLESS，VLESS 加 TCP 加 Reality 加 Vision，端口 52668，节点 r5-node-0241，上传下载 0 B，启用开关开启\">",
+      "2Q==\" alt=\"真实面板截图：落地页入站列表有 1 个入站，VLESS + Reality + Vision演示-VLESS，VLESS 加 TCP 加 Reality 加 Vision，端口 52668，节点 r5-node-0241，上传下载 0 B，启用开关开启\">"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 494,
+    "contexts": [
+      "  <figcaption><b>建好的入站出现在列表里</b> —— 落地页顶部显示“入站 1”：<strong>VLESS + Reality + Vision演示-VLESS · VLESS + TCP + Reality + Vision · 52668 · r5-node-0241</strong>，右侧启用开关已打开。列表同页还有「订阅」与「订阅源」两个标签（实拍 · 0",
+      "里</b> —— 落地页顶部显示“入站 1”：<strong>VLESS + Reality + Vision演示-VLESS · VLESS + TCP + Reality + Vision · 52668 · r5-node-0241</strong>，右侧启用开关已打开。列表同页还有「订阅」与「订阅源」两个标签（实拍 · 094 测试面板；该演示入站拍摄后已删除）。</figcaption>"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 500,
+    "contexts": [
+      "  <tr><td>协议 / 传输 / 安全</td><td>模板套用的组合在这里落成具体字段，可手动改（如 VLESS / TCP / Reality）。</td></tr>"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 504,
+    "contexts": [
+      "  <tr><td>Reality 伪装域名</td><td>Reality 借用的目标站点，<strong>默认 www.amd.com</strong>；要换成你实际可达、支持 TLS 的站点。</td></tr>",
+      "  <tr><td>Reality 伪装域名</td><td>Reality 借用的目标站点，<strong>默认 www.amd.com</strong>；要换成你实际可达、支持 TLS 的站点。</td></tr>"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 550,
+    "contexts": [
+      "  <figcaption><b>导入节点弹窗</b> —— 粘贴链接 / 订阅地址即可导入（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23，演示数据已清理）。</figcaption>",
+      "  <figcaption><b>导入节点弹窗</b> —— 粘贴链接 / 订阅地址即可导入（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23，演示数据已清理）。</figcaption>"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 583,
+    "contexts": [
+      "/strong>，已运行 <strong>1 天 13 小时</strong>。节点是否健康先看卡片这几项，不用等任何监控页（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23）。</figcaption>",
+      " <strong>1 天 13 小时</strong>。节点是否健康先看卡片这几项，不用等任何监控页（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23）。</figcaption>"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 616,
+    "contexts": [
+      "23</code>，延迟 <strong>1 ms</strong>。哪个落地挂了几条中转、每条从哪进、延迟多少，都在这一页（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23，演示线路拍摄后已删除）。</figcaption>",
+      " <strong>1 ms</strong>。哪个落地挂了几条中转、每条从哪进、延迟多少，都在这一页（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23，演示线路拍摄后已删除）。</figcaption>"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 696,
+    "contexts": [
+      "ms；完整目标 www.bing.com:443 是默认目标（文字补充），图面未显示端口</strong>。右上角可手动刷新（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23，演示隧道拍摄后已删除）。</figcaption>",
+      "bing.com:443 是默认目标（文字补充），图面未显示端口</strong>。右上角可手动刷新（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23，演示隧道拍摄后已删除）。</figcaption>"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 722,
+    "contexts": [
+      "<strong>总流量 0 B</strong>，操作有<strong>编辑 / 诊断 / 清零 / 删除</strong>（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23，演示规则拍摄后已删除）。</figcaption>",
+      "0 B</strong>，操作有<strong>编辑 / 诊断 / 清零 / 删除</strong>（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23，演示规则拍摄后已删除）。</figcaption>"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 759,
+    "contexts": [
+      "ong>与<strong>新建订阅</strong>，顶部两个标签是<strong>订阅管理 / 订阅分配</strong>（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23，演示订阅拍摄后已删除）。</figcaption>",
+      ">新建订阅</strong>，顶部两个标签是<strong>订阅管理 / 订阅分配</strong>（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23，演示订阅拍摄后已删除）。</figcaption>"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 793,
+    "contexts": [
+      "<div class=\"callout danger\"><span class=\"t\">最常见原因：节点地址填了 127.0.0.1</span><p>2.1.30 实测复现：节点地址是 <code>127.0.0.1</code> 时，订阅显示 <strong>0 个节点</strong>并出现上面的红字提示；把节点 IPv4 改成<strong>公网 IP</strong>后，订阅<strong>"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 813,
+    "contexts": [
+      "—— 这张图是<strong>还没有选用户</strong>时的样子：在订阅页的「订阅分配」标签里先选定用户，再把订阅指给他（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23，演示数据已清理）。</figcaption>",
+      "ng>还没有选用户</strong>时的样子：在订阅页的「订阅分配」标签里先选定用户，再把订阅指给他（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23，演示数据已清理）。</figcaption>"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 832,
+    "contexts": [
+      "端名直接导入，右侧按钮复制链接。”再往下是删除 / 重置链接和凭据 / 编辑。截图上半部的那段小字就是订阅的流量计量口径说明（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23，演示订阅拍摄后已删除）。</figcaption>",
+      "制链接。”再往下是删除 / 重置链接和凭据 / 编辑。截图上半部的那段小字就是订阅的流量计量口径说明（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23，演示订阅拍摄后已删除）。</figcaption>"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 891,
+    "contexts": [
+      " 1 号</strong>、过期时间 2027-11-26，卡片下有编辑 / 重置。上方“管理员配额（本人）”显示未设置配额（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23，演示用户拍摄后已删除）。</figcaption>",
+      ">、过期时间 2027-11-26，卡片下有编辑 / 重置。上方“管理员配额（本人）”显示未设置配额（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23，演示用户拍摄后已删除）。</figcaption>"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 927,
+    "contexts": [
+      "一块：应用名称、网页角标 Logo（上传后自动转换为 PNG 并持久化保存，建议正方形，统一转 96×96），右侧有实时预览（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23，演示数据已清理）。</figcaption>",
+      " Logo（上传后自动转换为 PNG 并持久化保存，建议正方形，统一转 96×96），右侧有实时预览（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23，演示数据已清理）。</figcaption>"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 961,
+    "contexts": [
+      "x-panel-backend</code>）</strong>，操作是<strong>检查更新 / 立即升级</strong>两步。测试面板上的实测值是当前 2.1.23 → 最新 2.1.30。完整流程与确认弹窗见 <a href=\"#/guide/upgrade\">升级 · 面板自升级</a>。</p>",
+      "end</code>）</strong>，操作是<strong>检查更新 / 立即升级</strong>两步。测试面板上的实测值是当前 2.1.23 → 最新 2.1.30。完整流程与确认弹窗见 <a href=\"#/guide/upgrade\">升级 · 面板自升级</a>。</p>"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 1005,
+    "contexts": [
+      "<a href=\"#/guide/config\">网站配置</a>。旧文档里的 Gist 备份、PostgreSQL 章节对应功能已不在当前版本中，本手册已按 2.1.30 实测删除这些章节。</p></div></details>"
+    ]
+  },
+  {
+    "tree": "independent",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 1021,
+    "contexts": [
+      "oc-foot\" id=\"docFoot\" style=\"display:none\">基于 GPLv3 发布 · 仅供学习研究使用 — FLMX 使用手册（以 2.1.30 实测为准）</footer>"
+    ]
+  },
+  {
+    "tree": "embedded",
+    "file": "doc/public/manual/index.html",
+    "line": 281,
+    "contexts": [
+      "  <div class=\"side-foot\">本手册文字按 OVO 2.1.34 更新；截图均为真实面板截图，取自 094 测试面板（前端 2.1.23 / 后端 2.1.23 历史截图；仅作操作位置参考，2.1.34 行为须复核；页脚红标为拍摄时的更新提示，历史截图不代表当前版本）；图中演示对象拍摄后已删除、节点 IP 已恢复，数据为演示数据。</div>",
+      "iv class=\"side-foot\">本手册文字按 OVO 2.1.34 更新；截图均为真实面板截图，取自 094 测试面板（前端 2.1.23 / 后端 2.1.23 历史截图；仅作操作位置参考，2.1.34 行为须复核；页脚红标为拍摄时的更新提示，历史截图不代表当前版本）；图中演示对象拍摄后已删除、节点 IP 已恢复，数据为演示数据。</div>"
+    ]
+  },
+  {
+    "tree": "embedded",
+    "file": "doc/public/manual/index.html",
+    "line": 301,
+    "contexts": [
+      "  <div class=\"feature\"><h3>节点搭建</h3><p>节点页装 Xray / sing-box 内核，用模板新建入站——VLESS + Reality + Vision 一类组合保存即下发生效。</p></div>"
+    ]
+  },
+  {
+    "tree": "embedded",
+    "file": "doc/public/manual/index.html",
+    "line": 313,
+    "contexts": [
+      "        <figcaption><b>概览仪表盘</b> —— 登录面板的第一屏（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23 历史截图；仅作操作位置参考，2.1.34 行为须复核；图中为演示数据，拍摄后已清理）。</figcaption>",
+      "        <figcaption><b>概览仪表盘</b> —— 登录面板的第一屏（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23 历史截图；仅作操作位置参考，2.1.34 行为须复核；图中为演示数据，拍摄后已清理）。</figcaption>"
+    ]
+  },
+  {
+    "tree": "embedded",
+    "file": "doc/public/manual/index.html",
+    "line": 329,
+    "contexts": [
+      "<b>概览仪表盘</b> —— 登录后的第一屏。五步走完后回到这里确认：节点在线、落地运行、订阅有效都亮起来，整条链路就通了（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23 历史截图；仅作操作位置参考，2.1.34 行为须复核，演示数据已清理）。</figcaption>",
+      " —— 登录后的第一屏。五步走完后回到这里确认：节点在线、落地运行、订阅有效都亮起来，整条链路就通了（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23 历史截图；仅作操作位置参考，2.1.34 行为须复核，演示数据已清理）。</figcaption>"
+    ]
+  },
+  {
+    "tree": "embedded",
+    "file": "doc/public/manual/index.html",
+    "line": 335,
+    "contexts": [
+      " class=\"st\">新建入站</b>在节点上安装 Xray 或 sing-box 内核，再<strong>新建入站</strong>（例如 VLESS + Reality + Vision），点「创建并下发」后入站即出现在落地列表里。见 <a href=\"#/guide/inbound\">新建入站</a>。</li>"
+    ]
+  },
+  {
+    "tree": "embedded",
+    "file": "doc/public/manual/index.html",
+    "line": 367,
+    "contexts": [
+      "curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/panel_install.sh -o panel_install.sh &amp;&amp; curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/panel_install.sh.sha256 -o panel_install.sh.sha256 &amp;&amp; sha256sum -c panel_install.sh.sha256 &amp;&amp; ba",
+      "https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/panel_install.sh.sha256 -o panel_install.sh.sha256 &amp;&amp; sha256sum -c panel_install.sh.sha256 &amp;&amp; bash panel_install.sh</code></pre",
+      "-maker/ovo/releases/download/2.1.34/panel_install.sh.sha256 -o panel_install.sh.sha256 &amp;&amp; sha256sum -c panel_install.sh.sha256 &amp;&amp; bash panel_install.sh</code></pre><button class=\"copy-btn\">复",
+      "s/download/2.1.34/panel_install.sh.sha256 -o panel_install.sh.sha256 &amp;&amp; sha256sum -c panel_install.sh.sha256 &amp;&amp; bash panel_install.sh</code></pre><button class=\"copy-btn\">复制</button></div>",
+      "l.sh.sha256 -o panel_install.sh.sha256 &amp;&amp; sha256sum -c panel_install.sh.sha256 &amp;&amp; bash panel_install.sh</code></pre><button class=\"copy-btn\">复制</button></div>"
+    ]
+  },
+  {
+    "tree": "embedded",
+    "file": "doc/public/manual/index.html",
+    "line": 398,
+    "contexts": [
+      "<p>测试面板上的实测状态：<strong>当前版本 2.1.23、最新版本 拍摄时的更新版本、状态“可升级”</strong>；部署目录 <code>/opt/ovo-panel</code>，后端容器 <code>ovo-panel-backend</code>。你自己的面板以网站配置里显示的为准。<"
+    ]
+  },
+  {
+    "tree": "embedded",
+    "file": "doc/public/manual/index.html",
+    "line": 408,
+    "contexts": [
+      "次将升级到最新版、升级经 Docker Socket 执行并会短暂中断面板服务，列出三项升级前确认，底部是取消 / 确认升级（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23 历史截图；仅作操作位置参考，2.1.34 行为须复核，演示数据已清理）。</figcaption>",
+      " Docker Socket 执行并会短暂中断面板服务，列出三项升级前确认，底部是取消 / 确认升级（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23 历史截图；仅作操作位置参考，2.1.34 行为须复核，演示数据已清理）。</figcaption>"
+    ]
+  },
+  {
+    "tree": "embedded",
+    "file": "doc/public/manual/index.html",
+    "line": 432,
+    "contexts": [
+      "r5-node-0241 在列表下方，本图仅露出一半</strong>。离线节点就是长这样，先认清，免得把在线节点误判为故障（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23 历史截图；仅作操作位置参考，2.1.34 行为须复核，演示节点拍摄后已删除）。</figcaption>",
+      " 在列表下方，本图仅露出一半</strong>。离线节点就是长这样，先认清，免得把在线节点误判为故障（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23 历史截图；仅作操作位置参考，2.1.34 行为须复核，演示节点拍摄后已删除）。</figcaption>"
+    ]
+  },
+  {
+    "tree": "embedded",
+    "file": "doc/public/manual/index.html",
+    "line": 476,
+    "contexts": [
+      "：选一个节点 + 内核，定协议、传输与安全组合，点「创建并下发」后客户端就能连。本章用实测建出的 <strong>演示-VLESS（VLESS + TCP + Reality + Vision，端口 52668，节点 r5-node-0241）</strong>为例，一步一步走完。</p>"
+    ]
+  },
+  {
+    "tree": "embedded",
+    "file": "doc/public/manual/index.html",
+    "line": 480,
+    "contexts": [
+      "  <li><b class=\"st\">选模板</b>弹窗上半部是现成模板：<strong>VLESS + Reality + Vision</strong>（推荐：无需域名和证书，抗探测）、VLESS + XHTTP + Reality、Shadowsocks 2022、Trojan + TLS（自签）、VMess + WS + TLS 等。示例选第一个。<",
+      "是现成模板：<strong>VLESS + Reality + Vision</strong>（推荐：无需域名和证书，抗探测）、VLESS + XHTTP + Reality、Shadowsocks 2022、Trojan + TLS（自签）、VMess + WS + TLS 等。示例选第一个。</li>"
+    ]
+  },
+  {
+    "tree": "embedded",
+    "file": "doc/public/manual/index.html",
+    "line": 481,
+    "contexts": [
+      "  <li><b class=\"st\">填名称与端口</b>名称填 <code>演示-VLESS</code>（模板已自动带出「VLESS + Reality + Vision」前缀，名称栏实际为「VLESS + Reality + Vision演示-VLESS」）；端口可以留空随机（从 [20000,60000) 里取），也可以自己指定（只检查是否与已有端口冲突，并放行防火墙）。</li>",
+      "/b>名称填 <code>演示-VLESS</code>（模板已自动带出「VLESS + Reality + Vision」前缀，名称栏实际为「VLESS + Reality + Vision演示-VLESS」）；端口可以留空随机（从 [20000,60000) 里取），也可以自己指定（只检查是否与已有端口冲突，并放行防火墙）。</li>"
+    ]
+  },
+  {
+    "tree": "embedded",
+    "file": "doc/public/manual/index.html",
+    "line": 487,
+    "contexts": [
+      "  <img src=\"images/manual-07.jpg\" alt=\"真实面板截图：新建入站弹窗已选 VLESS 加 Reality 加 Vision 模板（标注推荐：无需域名和证书，抗探测），名称已填 VLESS + Reality + Vision演示-VLESS，端口留空随机，下方是折叠的高级设置\">",
+      "alt=\"真实面板截图：新建入站弹窗已选 VLESS 加 Reality 加 Vision 模板（标注推荐：无需域名和证书，抗探测），名称已填 VLESS + Reality + Vision演示-VLESS，端口留空随机，下方是折叠的高级设置\">"
+    ]
+  },
+  {
+    "tree": "embedded",
+    "file": "doc/public/manual/index.html",
+    "line": 488,
+    "contexts": [
+      "  <figcaption><b>新建入站：选好模板、填好名称</b> —— 模板区选中「VLESS + Reality + Vision」，名称栏为「VLESS + Reality + Vision演示-VLESS」（模板自动带出的前缀 + 追加的「演示-VLESS」），端口留空随机；弹窗底部提示“已套用「VLESS + Reality + Vision」",
+      "igcaption><b>新建入站：选好模板、填好名称</b> —— 模板区选中「VLESS + Reality + Vision」，名称栏为「VLESS + Reality + Vision演示-VLESS」（模板自动带出的前缀 + 追加的「演示-VLESS」），端口留空随机；弹窗底部提示“已套用「VLESS + Reality + Vision」：协议、传输与安全等字段在高级设置中，展开可查看或修改”（实拍",
+      " Reality + Vision演示-VLESS」（模板自动带出的前缀 + 追加的「演示-VLESS」），端口留空随机；弹窗底部提示“已套用「VLESS + Reality + Vision」：协议、传输与安全等字段在高级设置中，展开可查看或修改”（实拍 · 094 测试面板，演示数据已清理）。</figcaption>"
+    ]
+  },
+  {
+    "tree": "embedded",
+    "file": "doc/public/manual/index.html",
+    "line": 491,
+    "contexts": [
+      "  <img src=\"images/manual-08.jpg\" alt=\"真实面板截图：落地页入站列表有 1 个入站，VLESS + Reality + Vision演示-VLESS，VLESS 加 TCP 加 Reality 加 Vision，端口 52668，节点 r5-node-0241，上传下载 0 B，启用开关开启\">",
+      ".jpg\" alt=\"真实面板截图：落地页入站列表有 1 个入站，VLESS + Reality + Vision演示-VLESS，VLESS 加 TCP 加 Reality 加 Vision，端口 52668，节点 r5-node-0241，上传下载 0 B，启用开关开启\">"
+    ]
+  },
+  {
+    "tree": "embedded",
+    "file": "doc/public/manual/index.html",
+    "line": 492,
+    "contexts": [
+      "  <figcaption><b>建好的入站出现在列表里</b> —— 落地页顶部显示“入站 1”：<strong>VLESS + Reality + Vision演示-VLESS · VLESS + TCP + Reality + Vision · 52668 · r5-node-0241</strong>，右侧启用开关已打开。列表同页还有「订阅」与「订阅源」两个标签（实拍 · 0",
+      "里</b> —— 落地页顶部显示“入站 1”：<strong>VLESS + Reality + Vision演示-VLESS · VLESS + TCP + Reality + Vision · 52668 · r5-node-0241</strong>，右侧启用开关已打开。列表同页还有「订阅」与「订阅源」两个标签（实拍 · 094 测试面板；该演示入站拍摄后已删除）。</figcaption>"
+    ]
+  },
+  {
+    "tree": "embedded",
+    "file": "doc/public/manual/index.html",
+    "line": 498,
+    "contexts": [
+      "  <tr><td>协议 / 传输 / 安全</td><td>模板套用的组合在这里落成具体字段，可手动改（如 VLESS / TCP / Reality）。</td></tr>"
+    ]
+  },
+  {
+    "tree": "embedded",
+    "file": "doc/public/manual/index.html",
+    "line": 502,
+    "contexts": [
+      "  <tr><td>Reality 伪装域名</td><td>Reality 借用的目标站点，<strong>默认 www.amd.com</strong>；要换成你实际可达、支持 TLS 的站点。</td></tr>",
+      "  <tr><td>Reality 伪装域名</td><td>Reality 借用的目标站点，<strong>默认 www.amd.com</strong>；要换成你实际可达、支持 TLS 的站点。</td></tr>"
+    ]
+  },
+  {
+    "tree": "embedded",
+    "file": "doc/public/manual/index.html",
+    "line": 548,
+    "contexts": [
+      "  <figcaption><b>导入节点弹窗</b> —— 粘贴链接 / 订阅地址即可导入（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23 历史截图；仅作操作位置参考，2.1.34 行为须复核，演示数据已清理）。</figcaption>",
+      "  <figcaption><b>导入节点弹窗</b> —— 粘贴链接 / 订阅地址即可导入（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23 历史截图；仅作操作位置参考，2.1.34 行为须复核，演示数据已清理）。</figcaption>"
+    ]
+  },
+  {
+    "tree": "embedded",
+    "file": "doc/public/manual/index.html",
+    "line": 581,
+    "contexts": [
+      "/strong>，已运行 <strong>1 天 13 小时</strong>。节点是否健康先看卡片这几项，不用等任何监控页（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23 历史截图；仅作操作位置参考，2.1.34 行为须复核）。</figcaption>",
+      " <strong>1 天 13 小时</strong>。节点是否健康先看卡片这几项，不用等任何监控页（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23 历史截图；仅作操作位置参考，2.1.34 行为须复核）。</figcaption>"
+    ]
+  },
+  {
+    "tree": "embedded",
+    "file": "doc/public/manual/index.html",
+    "line": 614,
+    "contexts": [
+      "23</code>，延迟 <strong>1 ms</strong>。哪个落地挂了几条中转、每条从哪进、延迟多少，都在这一页（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23 历史截图；仅作操作位置参考，2.1.34 行为须复核，演示线路拍摄后已删除）。</figcaption>",
+      " <strong>1 ms</strong>。哪个落地挂了几条中转、每条从哪进、延迟多少，都在这一页（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23 历史截图；仅作操作位置参考，2.1.34 行为须复核，演示线路拍摄后已删除）。</figcaption>"
+    ]
+  },
+  {
+    "tree": "embedded",
+    "file": "doc/public/manual/index.html",
+    "line": 694,
+    "contexts": [
+      "ms；完整目标 www.bing.com:443 是默认目标（文字补充），图面未显示端口</strong>。右上角可手动刷新（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23 历史截图；仅作操作位置参考，2.1.34 行为须复核，演示隧道拍摄后已删除）。</figcaption>",
+      "bing.com:443 是默认目标（文字补充），图面未显示端口</strong>。右上角可手动刷新（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23 历史截图；仅作操作位置参考，2.1.34 行为须复核，演示隧道拍摄后已删除）。</figcaption>"
+    ]
+  },
+  {
+    "tree": "embedded",
+    "file": "doc/public/manual/index.html",
+    "line": 720,
+    "contexts": [
+      "<strong>总流量 0 B</strong>，操作有<strong>编辑 / 诊断 / 清零 / 删除</strong>（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23 历史截图；仅作操作位置参考，2.1.34 行为须复核，演示规则拍摄后已删除）。</figcaption>",
+      "0 B</strong>，操作有<strong>编辑 / 诊断 / 清零 / 删除</strong>（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23 历史截图；仅作操作位置参考，2.1.34 行为须复核，演示规则拍摄后已删除）。</figcaption>"
+    ]
+  },
+  {
+    "tree": "embedded",
+    "file": "doc/public/manual/index.html",
+    "line": 757,
+    "contexts": [
+      "ong>与<strong>新建订阅</strong>，顶部两个标签是<strong>订阅管理 / 订阅分配</strong>（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23 历史截图；仅作操作位置参考，2.1.34 行为须复核，演示订阅拍摄后已删除）。</figcaption>",
+      ">新建订阅</strong>，顶部两个标签是<strong>订阅管理 / 订阅分配</strong>（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23 历史截图；仅作操作位置参考，2.1.34 行为须复核，演示订阅拍摄后已删除）。</figcaption>"
+    ]
+  },
+  {
+    "tree": "embedded",
+    "file": "doc/public/manual/index.html",
+    "line": 811,
+    "contexts": [
+      "—— 这张图是<strong>还没有选用户</strong>时的样子：在订阅页的「订阅分配」标签里先选定用户，再把订阅指给他（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23 历史截图；仅作操作位置参考，2.1.34 行为须复核，演示数据已清理）。</figcaption>",
+      "ng>还没有选用户</strong>时的样子：在订阅页的「订阅分配」标签里先选定用户，再把订阅指给他（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23 历史截图；仅作操作位置参考，2.1.34 行为须复核，演示数据已清理）。</figcaption>"
+    ]
+  },
+  {
+    "tree": "embedded",
+    "file": "doc/public/manual/index.html",
+    "line": 830,
+    "contexts": [
+      "端名直接导入，右侧按钮复制链接。”再往下是删除 / 重置链接和凭据 / 编辑。截图上半部的那段小字就是订阅的流量计量口径说明（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23 历史截图；仅作操作位置参考，2.1.34 行为须复核，演示订阅拍摄后已删除）。</figcaption>",
+      "制链接。”再往下是删除 / 重置链接和凭据 / 编辑。截图上半部的那段小字就是订阅的流量计量口径说明（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23 历史截图；仅作操作位置参考，2.1.34 行为须复核，演示订阅拍摄后已删除）。</figcaption>"
+    ]
+  },
+  {
+    "tree": "embedded",
+    "file": "doc/public/manual/index.html",
+    "line": 889,
+    "contexts": [
+      " 1 号</strong>、过期时间 2027-11-26，卡片下有编辑 / 重置。上方“管理员配额（本人）”显示未设置配额（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23 历史截图；仅作操作位置参考，2.1.34 行为须复核，演示用户拍摄后已删除）。</figcaption>",
+      ">、过期时间 2027-11-26，卡片下有编辑 / 重置。上方“管理员配额（本人）”显示未设置配额（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23 历史截图；仅作操作位置参考，2.1.34 行为须复核，演示用户拍摄后已删除）。</figcaption>"
+    ]
+  },
+  {
+    "tree": "embedded",
+    "file": "doc/public/manual/index.html",
+    "line": 925,
+    "contexts": [
+      "一块：应用名称、网页角标 Logo（上传后自动转换为 PNG 并持久化保存，建议正方形，统一转 96×96），右侧有实时预览（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23 历史截图；仅作操作位置参考，2.1.34 行为须复核，演示数据已清理）。</figcaption>",
+      " Logo（上传后自动转换为 PNG 并持久化保存，建议正方形，统一转 96×96），右侧有实时预览（实拍 · 094 测试面板，前端 2.1.23 / 后端 2.1.23 历史截图；仅作操作位置参考，2.1.34 行为须复核，演示数据已清理）。</figcaption>"
+    ]
+  },
+  {
+    "tree": "embedded",
+    "file": "doc/public/manual/index.html",
+    "line": 959,
+    "contexts": [
+      "o-panel-backend</code>）</strong>，操作是<strong>检查更新 / 立即升级</strong>两步。测试面板上的实测值是当前 2.1.23 → 最新 拍摄时的更新版本。完整流程与确认弹窗见 <a href=\"#/guide/upgrade\">升级 · 面板自升级</a>。</p>"
+    ]
+  }
+]

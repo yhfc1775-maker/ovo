@@ -1,0 +1,25 @@
+#!/bin/bash
+set -euo pipefail
+source <(awk '/^main\(\)/ {exit} {print}' install.sh)
+probe_root=$(mktemp -d "$PWD/.git/audit-2134/dual-agent.XXXXXX")
+trap 'rm -rf "$probe_root"' EXIT
+INSTALL_DIR="$probe_root/ovo_agent"; LEGACY_INSTALL_DIR="$probe_root/flux_agent"; LEGACY2_INSTALL_DIR="$probe_root/flmx_agent"
+OVO_AGENT_SYSTEMD_SERVICE_FILE="$probe_root/ovo.service"; OVO_AGENT_OPENRC_SERVICE_FILE="$probe_root/ovo.init"
+LEGACY_FLUX_AGENT_SYSTEMD_SERVICE_FILE="$probe_root/flux.service"; LEGACY_FLUX_AGENT_OPENRC_SERVICE_FILE="$probe_root/flux.init"
+LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE="$probe_root/flmx.service"; LEGACY_FLMX_AGENT_OPENRC_SERVICE_FILE="$probe_root/flmx.init"
+SERVICE_MANAGER=systemd
+mkdir -p "$LEGACY_INSTALL_DIR" "$LEGACY2_INSTALL_DIR"
+printf 'flux-binary\n' > "$LEGACY_INSTALL_DIR/flux_agent"
+printf 'flmx-binary\n' > "$LEGACY2_INSTALL_DIR/flmx_agent"
+printf 'flux-unit\n' > "$LEGACY_FLUX_AGENT_SYSTEMD_SERVICE_FILE"
+printf 'flmx-unit\n' > "$LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE"
+ensure_small_host_swap(){ :; }; ensure_service_manager(){ :; }; systemctl(){ :; }; sleep(){ :; }
+guard_agent_dir_ownership_menu(){ :; }
+ovo_agent_service_exists(){ [[ -f "$OVO_AGENT_SYSTEMD_SERVICE_FILE" ]]; }
+legacy_flux_agent_service_exists(){ [[ -f "$LEGACY_FLUX_AGENT_SYSTEMD_SERVICE_FILE" ]]; }
+legacy_flmx_agent_service_exists(){ [[ -f "$LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE" ]]; }
+write_ovo_agent_service(){ printf 'ovo-unit\n' > "$OVO_AGENT_SYSTEMD_SERVICE_FILE"; }
+ovo_agent_health_ok(){ :; }; legacy_flux_agent_health_ok(){ :; }; legacy_flmx_agent_health_ok(){ :; }
+rc=0; update_ovo_agent || rc=$?
+[[ "$rc" != 0 && -f "$INSTALL_DIR/ovo_agent" && -f "$LEGACY_INSTALL_DIR/flux_agent" && -f "$LEGACY_FLUX_AGENT_SYSTEMD_SERVICE_FILE" ]] || { echo 'probe did not reproduce'; exit 1; }
+printf 'REPRODUCED menu update rc=%s: flmx migrated to ovo, flux binary/service remain; second migration rejects occupied ovo target\n' "$rc"

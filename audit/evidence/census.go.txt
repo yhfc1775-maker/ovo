@@ -1,0 +1,26 @@
+//go:build ignore
+
+package main
+
+import("bytes";"encoding/json";"fmt";"go/ast";"go/format";"go/parser";"go/token";"os";"os/exec";"path/filepath";"sort";"strconv";"strings")
+type Function struct {File string `json:"file"`;Name string `json:"name"`;Line int `json:"line"`;End int `json:"end"`;Params []string `json:"params"`;Body string `json:"body"`;Calls []Call `json:"calls"`}
+type Call struct {Name string `json:"name"`;Line int `json:"line"`;Args []string `json:"args"`}
+type Sink struct{File string `json:"file"`;Function string `json:"function"`;Line int `json:"line"`;Sink string `json:"sink"`;Expr string `json:"expr"`;Context string `json:"context"`}
+func expr(fs *token.FileSet,n ast.Node)string{var b bytes.Buffer;format.Node(&b,fs,n);return b.String()}
+func callName(n ast.Expr)string{switch x:=n.(type){case *ast.Ident:return x.Name;case *ast.SelectorExpr:return x.Sel.Name};return ""}
+func main(){root:=os.Args[1];out:=os.Args[2];c:=exec.Command("git","ls-files","-z");c.Dir=root;b,e:=c.Output();if e!=nil{panic(e)};files:=strings.Split(string(b),"\x00");var functions []Function;var sinks []Sink;var regs []Call;stats:=map[string]int{}
+ for _,p:=range files{stats["tracked"]++;if !strings.HasSuffix(p,".go")||strings.HasSuffix(p,"_test.go")||strings.HasSuffix(p,".pb.go"){continue};buf,e:=os.ReadFile(filepath.Join(root,p));if e!=nil{panic(e)};fs:=token.NewFileSet();f,e:=parser.ParseFile(fs,p,buf,0);if e!=nil{panic(e)};lines:=strings.Split(string(buf),"\n");stats["go_source_files"]++
+ decls:=append([]ast.Decl{},f.Decls...);for _,decl:=range f.Decls{if gen,ok:=decl.(*ast.GenDecl);ok{for _,spec:=range gen.Specs{if vs,ok:=spec.(*ast.ValueSpec);ok{for i,val:=range vs.Values{if lit,ok:=val.(*ast.FuncLit);ok&&i<len(vs.Names){decls=append(decls,&ast.FuncDecl{Name:vs.Names[i],Type:lit.Type,Body:lit.Body})}}}}}}
+ for _,d:=range decls{fn,ok:=d.(*ast.FuncDecl);if !ok||fn.Body==nil{continue};v:=Function{File:p,Name:fn.Name.Name,Line:fs.Position(fn.Pos()).Line,End:fs.Position(fn.End()).Line,Body:expr(fs,fn)};for _,field:=range fn.Type.Params.List{for _,name:=range field.Names{v.Params=append(v.Params,name.Name)}}
+ ast.Inspect(fn.Body,func(n ast.Node)bool{
+ if lit,ok:=n.(*ast.CompositeLit);ok && expr(fs,lit.Type)=="response.R" {for _,el:=range lit.Elts{if kv,ok:=el.(*ast.KeyValueExpr);ok && expr(fs,kv.Key)=="Msg" {if _,fixed:=kv.Value.(*ast.BasicLit);!fixed{line:=fs.Position(kv.Pos()).Line;lo:=line-8;if lo<0{lo=0};hi:=line+2;if hi>len(lines){hi=len(lines)};sinks=append(sinks,Sink{p,fn.Name.Name,line,"response.R.Msg",expr(fs,kv.Value),strings.Join(lines[lo:hi],"\n")})}}}}
+ call,ok:=n.(*ast.CallExpr);if !ok{return true};name:=callName(call.Fun);line:=fs.Position(call.Pos()).Line;rec:=Call{Name:name,Line:line};for _,a:=range call.Args{rec.Args=append(rec.Args,expr(fs,a))};v.Calls=append(v.Calls,rec)
+ if(name=="Handle"||name=="HandleFunc")&&len(rec.Args)>0{rec.Name=p+":"+name;regs=append(regs,rec)}
+ sel,ok:=call.Fun.(*ast.SelectorExpr);if !ok{return true};recv:=expr(fs,sel.X);idx:=-1;if recv=="response"{if name=="ErrDefault"{idx=0}else if name=="Err"{idx=1}}else if recv=="http"&&name=="Error"{idx=1};if idx<0||idx>=len(call.Args){return true};msg:=call.Args[idx];if lit,ok:=msg.(*ast.BasicLit);ok&&lit.Kind==token.STRING{return true};lo:=line-8;if lo<0{lo=0};hi:=line+2;if hi>len(lines){hi=len(lines)};sinks=append(sinks,Sink{p,fn.Name.Name,line,recv+"."+name,expr(fs,msg),strings.Join(lines[lo:hi],"\n")});return true
+ });functions=append(functions,v)}
+ }
+ sort.Slice(sinks,func(i,j int)bool{if sinks[i].File==sinks[j].File{return sinks[i].Line<sinks[j].Line};return sinks[i].File<sinks[j].File});stats["tracked"]--;stats["functions"]=len(functions);stats["nonliteral_error_sinks"]=len(sinks);stats["route_registration_sites"]=len(regs)
+ write:=func(name string,v interface{}){b,e:=json.MarshalIndent(v,"","  ");if e!=nil{panic(e)};if e=os.WriteFile(filepath.Join(out,name),append(b,'\n'),0644);e!=nil{panic(e)}};write("functions.json",functions);write("raw-error-candidates.json",sinks);write("registration-sites.json",regs);write("source-counts.json",stats)
+ f,e:=os.Create(filepath.Join(out,"raw-error-contexts.txt"));if e!=nil{panic(e)};for i,s:=range sinks{fmt.Fprintf(f,"%03d %s:%d %s :: %s\n%s\n\n",i+1,s.File,s.Line,s.Function,s.Expr,s.Context)};f.Close()
+ _=strconv.Itoa(0)
+}

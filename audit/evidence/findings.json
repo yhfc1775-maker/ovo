@@ -1,0 +1,172 @@
+[
+  {
+    "id": "F01",
+    "severity": "P2",
+    "title": "内核及转发的混合错误链仍会外泄仓储原文",
+    "file": "go-backend/internal/http/handler/kernel.go",
+    "line": 861,
+    "verification": "overlay 故障注入：删 node_inbound 后 kernelControl(start) 返回 no such table；原始错误门仍 PASS。",
+    "recommendation": "在全部混合 helper 的仓储源标记错误，回执统一分流；对 response.R.Msg 和超过两层调用补门。",
+    "evidence": "handler-probes"
+  },
+  {
+    "id": "F02",
+    "severity": "P3",
+    "title": "运维回执中的内部路径与上游诊断缺少明确分层",
+    "file": "go-backend/internal/http/handler/system_upgrade.go",
+    "line": 4045,
+    "verification": "代码追踪 os.ReadFile、backupFile、helper 的 Error()；348 条候选逐项分类，保留 agent 固定业务回执与内部错误的区别。",
+    "recommendation": "固定操作级错误码与文案，内部原因记日志；保留明确设计的 agent 处置信息，不机械删除全部诊断。",
+    "evidence": "raw-error-reviewed"
+  },
+  {
+    "id": "F03",
+    "severity": "P1",
+    "title": "flux 与 flmx 并存时迁移仍留下旧 agent",
+    "file": "install.sh",
+    "line": 3562,
+    "verification": "临时目录 + init 桩实际调用 update_ovo_agent：flmx→ovo 成功，flux 迁移被目标占用拒绝，rc=1，flux 二进制和服务仍在。",
+    "recommendation": "迁移前检查冲突并制定单一归属/合并计划；同面板两代共存时确保剩余旧服务摘除或在任何迁移动作前拒绝并给出处置步骤。",
+    "evidence": "dual-agent-probe"
+  },
+  {
+    "id": "F04",
+    "severity": "P1",
+    "title": "P-A 的原生 SNI 复用与真实 peer 归属冲突，整项未移植",
+    "file": "doc/PORT-flyx-3.11.0.md",
+    "line": 7,
+    "verification": "隔离复制上游 tag 的 SNI 实现与测试：客户端源 127.0.0.2 在内核侧变成 127.0.0.1；上游 kernel_mux.go:665 原生路由未发送 PROXY。",
+    "recommendation": "逐内核建立可信真实地址/PROXY 输入、日志归属和 nft 计量限速方案，再按上游架构集成并由 Muse 验证全部真机腿。",
+    "evidence": "mux-peer-probe"
+  },
+  {
+    "id": "F05",
+    "severity": "P1",
+    "title": "F-21：默认搭建演示仍以 Reality 开头再对接 IX 中转",
+    "file": "doc/guide/getting-started.md",
+    "line": 3,
+    "verification": "逐处核对两份手册的 Reality 文本/alt/FAQ，查看截图；guide:24、nodes:34、manual:478/482/489 同样以 Reality 为首选。用户要求的 IX 路径不接受 TLS。",
+    "recommendation": "默认贯通教程改为 IEPL VLESS enc，SS2022 为备选；Reality 明确限非 IX 路线，重新录制相应截图与模板演示。",
+    "evidence": "manual-occurrences"
+  },
+  {
+    "id": "F06",
+    "severity": "P2",
+    "title": "独立手册仍为 FLMX 旧版且没有可执行的 ovo 定版安装命令",
+    "file": "upstream/flmx-manual/index.html",
+    "line": 7,
+    "verification": "独立只读 clone f646a3a；全文 2.1.30=14、2.1.23=32、2.1.34=0；安装段:366 使用 example.com 占位且无 SHA256，FAQ:987 仍让用户自换脚本地址。",
+    "recommendation": "由手册仓维护者单独改为 ovo 2.1.34、定版资产和 SHA256，并把旧截图标为适用版本；不在 ovo PR 改该仓库。",
+    "evidence": "manual-occurrences"
+  },
+  {
+    "id": "F07",
+    "severity": "P2",
+    "title": "重建已有 Release 时不会更新正文，M-08 未闭合",
+    "file": ".github/workflows/docker-build.yml",
+    "line": 560,
+    "verification": "代码分支：release view 成功即跳过 create/notes，后续仅 upload --clobber；当前正文含 What’s Changed 和14资产，但不会随重建更新。",
+    "recommendation": "把正文独立生成并对已存在 release 执行 gh release edit --notes-file；新增/重建使用同一模板。",
+    "evidence": "release-workflow"
+  },
+  {
+    "id": "F08",
+    "severity": "P2",
+    "title": "文档流水线只推 gh-pages，未完成 Pages 部署触发链",
+    "file": ".github/workflows/deploy-docs.yml",
+    "line": 130,
+    "verification": "失败运行05:09–05:24持续断言不到版本；Pages API 仅一条06:50:58创建的后续 build。当前 source=gh-pages/、legacy，HTTP200且demo含2.1.34。官方文档说明 GITHUB_TOKEN push 不触发 Pages build。",
+    "recommendation": "改用官方 upload-pages-artifact/deploy-pages 的 Pages 部署链并配置相应权限/环境，或明确调用受支持的 Pages build；不要把推分支当已发布。历史设置变化缺审计日志，不推断操作者。",
+    "evidence": "pages"
+  },
+  {
+    "id": "F09",
+    "severity": "P2",
+    "title": "入站列表对不同节点逐条查询，N+1 未消除",
+    "file": "go-backend/internal/http/handler/kernel.go",
+    "line": 1155,
+    "verification": "GORM Query 回调计数：1条入站→1次node查询；40节点40入站→40次node查询，约0.98ms→9.25ms（本机样本）。",
+    "recommendation": "收集节点ID后分块批量读，复用映射；测试固定查询预算并覆盖缺失节点/数据库故障。",
+    "evidence": "handler-probes"
+  },
+  {
+    "id": "F10",
+    "severity": "P2",
+    "title": "节点和入站列表仍整表读取/整包返回",
+    "file": "go-backend/internal/http/handler/handler.go",
+    "line": 1101,
+    "verification": "nodeList→ListNodes 无分页；inboundList→ListNodeInbounds 整表返回；40入站样本响应32543字节，条目数未限制。",
+    "recommendation": "服务端分页/过滤或摘要与详情拆分，前端虚拟列表；保留全选/批量操作的明确语义。没有把小样本推断为生产超时。",
+    "evidence": "handler-probes"
+  },
+  {
+    "id": "F11",
+    "severity": "P2",
+    "title": "节点新鲜度查询成本随历史指标总量增长",
+    "file": "go-backend/internal/store/repo/repository.go",
+    "line": 7847,
+    "verification": "EXPLAIN 为覆盖索引 node_id 搜索后 GROUP MAX；同8节点每节点100→10000历史行时7轮耗时从218–794µs升到14771–20139µs。",
+    "recommendation": "维护每节点最新时戳，或用有限节点集的有序索引 top-1；加大历史量查询预算测试，避免节点列表扫描保留期全部历史。",
+    "evidence": "repo-probes"
+  },
+  {
+    "id": "F12",
+    "severity": "P2",
+    "title": "SQLite 全量 VACUUM 无上下文预算且占用唯一连接",
+    "file": "go-backend/internal/store/repo/repository_storage.go",
+    "line": 149,
+    "verification": "代码 MaxOpenConns(1)；overlay 在16MiB文件执行 VacuumSQLite，同期SELECT1等待100ms、WaitCount+1；仅证明阻塞机制，未声称生产耗时。",
+    "recommendation": "将旧库转换/全量回收放到明确维护窗口、提供取消和时间预算；在线回收限制批量与让出策略，保留失败日志及回滚空间检查。",
+    "evidence": "repo-probes"
+  },
+  {
+    "id": "F13",
+    "severity": "P2",
+    "title": "超过一小时的指标聚合遗漏资源字段并返回零",
+    "file": "go-backend/internal/store/repo/repository.go",
+    "line": 7784,
+    "verification": "插入 activeSessions=9、agentRSSBytes=4096、conntrackCount=80；短区间保持，>1h同记录返回三者为0；其他新增资源字段也不在SELECT中。",
+    "recommendation": "明确各字段 AVG/MAX/LAST 的聚合口径并补全SQL；缺失字段返回未知而非伪零，覆盖长短区间和PG。",
+    "evidence": "repo-probes"
+  },
+  {
+    "id": "F14",
+    "severity": "P2",
+    "title": "指标新鲜度读取失败被伪装为从未上报/陈旧",
+    "file": "go-backend/internal/http/handler/node_collect_health.go",
+    "line": 38,
+    "verification": "先插入新鲜指标为false；删node_metric后函数虽记 stale markers omitted，仍写 lastMetricAt=0、metricStale=true。",
+    "recommendation": "读失败直接保留未知/省略字段或单独返回采集错误；不能用空map构造确定性陈旧状态。",
+    "evidence": "handler-probes"
+  },
+  {
+    "id": "F15",
+    "severity": "P2",
+    "title": "小时统计把两个合法正数相加成负总量",
+    "file": "go-backend/internal/http/handler/jobs.go",
+    "line": 415,
+    "verification": "overlay 将用户 in_flow=MaxInt64、out_flow=1，执行真实 runStatisticsFlowJob，落库 total_flow=-9223372036854775808。",
+    "recommendation": "总量与增量使用饱和加减；对当前总量/基线/重置分别立边界测试，沿用已有饱和计量 helper。",
+    "evidence": "statistics-overflow-probe"
+  },
+  {
+    "id": "F16",
+    "severity": "P2",
+    "title": "新移植 Mieru 的外部导入未校验复用与握手枚举",
+    "file": "go-backend/internal/kernel/proxy_parse.go",
+    "line": 2025,
+    "verification": "ParseImport 接受 multiplexing=INVALID、handshake-mode=INVALID 并由 ShareURI 原样导出；native normalizeMieru 对应枚举会拒绝。未将其夸大为已验证的客户端整包失败。",
+    "recommendation": "自建与导入复用同一字段校验集，并为不合法枚举/大小写/MTU边界分别测试；错误明确返回，勿静默丢字段。",
+    "evidence": "mieru-import-probe"
+  },
+  {
+    "id": "F17",
+    "severity": "P2",
+    "title": "导航改名后教程仍按旧菜单指路",
+    "file": "doc/guide/nodes.md",
+    "line": 5,
+    "verification": "移植后桌面/H5 /node=服务器、/inbound=节点、/forward=转发；nodes.md仍把落地/规则解释为当前菜单，getting-started:19/23同样未同步。",
+    "recommendation": "更新与导航直接相关的路径说明和截图标注，同时保留页面功能文案与布局。",
+    "evidence": "navigation"
+  }
+]

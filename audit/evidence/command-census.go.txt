@@ -1,0 +1,12 @@
+//go:build ignore
+package main
+import("bytes";"encoding/json";"go/ast";"go/parser";"go/token";"go/format";"os";"os/exec";"path/filepath";"strconv";"strings")
+func ex(fs *token.FileSet,n ast.Node)string{var b bytes.Buffer;format.Node(&b,fs,n);return b.String()}
+func main(){root:=os.Args[1];out:=os.Args[2];cmd:=exec.Command("git","ls-files","-z");cmd.Dir=root;raw,_:=cmd.Output();var records []map[string]interface{}
+ for _,p:=range strings.Split(string(raw),"\x00"){if !strings.HasSuffix(p,".go")||strings.HasSuffix(p,"_test.go")||!strings.HasPrefix(p,"go-"){continue};fs:=token.NewFileSet();f,e:=parser.ParseFile(fs,filepath.Join(root,p),nil,0);if e!=nil{panic(e)}
+ rec:=func(kind,name string,n ast.Node,values []string){records=append(records,map[string]interface{}{"file":p,"kind":kind,"name":name,"line":fs.Position(n.Pos()).Line,"values":values})}
+ ast.Inspect(f,func(n ast.Node)bool{switch x:=n.(type){case *ast.ValueSpec:for i,name:=range x.Names{if i<len(x.Values){if v,ok:=x.Values[i].(*ast.BasicLit);ok&&v.Kind==token.STRING{q,_:=strconv.Unquote(v.Value);rec("constant",name.Name,n,[]string{q})}}};case *ast.AssignStmt:for i,v:=range x.Rhs{if i<len(x.Lhs){if lit,ok:=v.(*ast.BasicLit);ok&&lit.Kind==token.STRING{q,_:=strconv.Unquote(lit.Value);rec("assign",ex(fs,x.Lhs[i]),n,[]string{q})}}};case *ast.SwitchStmt:if p=="go-gost/x/socket/websocket_reporter.go"&&x.Tag!=nil&&ex(fs,x.Tag)=="cmd.Type"{for _,part:=range x.Body.List{c:=part.(*ast.CaseClause);var vals []string;for _,v:=range c.List{if lit,ok:=v.(*ast.BasicLit);ok{q,_:=strconv.Unquote(lit.Value);vals=append(vals,q)}};if len(vals)>0{rec("receive","routeCommand",c,vals)}}}}
+ return true})
+ }
+ b,_:=json.MarshalIndent(records,"","  ");os.WriteFile(out,b,0644)
+}
