@@ -349,7 +349,7 @@ function goFuncSpan(source, signature) {
 // 已删，本表对应行与 C7 的 group.tsx 副本校验一并摘除；删功能时同步
 // 删行——残行会令本门在当前树上恒红（登记行在下方对位循环点名）。
 const listToInterface = {
-  ListNodes: "NodeApiItem",
+  ListNodesPage: "NodeApiItem",
   ListUsers: "UserApiItem",
   ListSpeedLimits: "SpeedLimitApiItem",
   ListForwards: "ForwardApiItem",

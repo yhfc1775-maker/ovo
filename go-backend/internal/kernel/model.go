@@ -1017,6 +1017,10 @@ func normalizeMieru(s *Settings) error {
 			return errors.New("Mieru 密码不能包含控制字符")
 		}
 	}
+	return normalizeMieruOptions(s)
+}
+
+func normalizeMieruOptions(s *Settings) error {
 	if s.MTU == 0 {
 		s.MTU = DefaultMieruMTU
 	}

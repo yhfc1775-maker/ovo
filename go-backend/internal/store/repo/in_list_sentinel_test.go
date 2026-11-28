@@ -37,12 +37,14 @@ type inListSiteClass struct {
 // lanes/K8/r3/rescan.md）未随轮次归档保留在本工作区，无法同步；
 // 增删点位只须改此处，门禁以此处为准（W8 对账）。
 var inListSiteRegistry = map[string]inListSiteClass{
+	"repository_in_list.go:ListNodeNICPeers":     {"chunkInt64IDs", "F10 page ID chunks feed an address subquery; peers remain visible across pages"},
+	"repository_in_list.go:ListInboundNodes":     {"chunkInt64IDs", "F09 page node IDs, shared 500-ID chunks"},
+	"repository_in_list.go:ListInboundNames":     {"chunkInt64IDs", "F10 page outbound reference IDs, shared 500-ID chunks"},
 	"repository.go:ListTunnels":                  {`Select("node_id")`, "OPT-TUNNEL-NODES-2131：数据库子查询，无 ID 参数展开，仅取链路引用的节点地址"},
 	"repository_kernel_nodes.go:ListKernelNodes": {"chunkInt64IDs", "OPT-KERNEL-VIEWS-2130：可见内核的整表节点元数据，按共享上限分块"},
 	// —— 分块（chunkInt64IDs）——
 	"repository_subscription.go:LastSubscriptionCounterUpdates":         {"chunkInt64IDs", "F4/D-06：订阅列表页当前页订阅 id 集，按 inListChunkSize 分块求 MAX(updated_time)"},
-	"repository.go:LatestNodeMetricTimes":                               {"chunkInt64IDs", "F5/A-低-6：节点列表 stale 打标的节点集，按 inListChunkSize 分块求 MAX(timestamp)（集成补登：F5 引入时漏登记，repo 门红）"},
-	"repository.go:ListNodes":                                           {"chunkInt64IDs", "整表节点集，T2-NEW-01 已分块"},
+	"repository.go:ListNodesPage":                                       {"chunkInt64IDs", "整表节点集，T2-NEW-01 已分块"},
 	"repository_upgrade_verify.go:ListVisibleNodeUpgradeVerifications":  {"chunkInt64IDs", "整表节点集（升级核验可见行），A4-V-06 已分块"},
 	"repository.go:ListForwards":                                        {"chunkInt64IDs", "整表转发集，已分块"},
 	"repository.go:getTunnelEntryPortRanges":                            {"chunkInt64IDs", "整表隧道集，已分块"},
