@@ -36,8 +36,13 @@ type NodeInbound struct {
 	// from: auto (node default) / ipv4 / ipv6 / custom (ShareHost).
 	ShareAddressMode string `gorm:"column:share_address_mode;type:varchar(16);not null;default:'auto'"`
 	ShareHost        string `gorm:"column:share_host;type:varchar(255);not null;default:''"`
-	Remark           string `gorm:"type:text;not null;default:''"`
-	RelayOnly        int    `gorm:"column:relay_only;not null;default:0"`
+	// MuxPort is the internal loopback port (127.0.0.1:<MuxPort>) automatically
+	// assigned when this inbound is served behind the node's NodePortMux (0 = not muxed).
+	// While muxed the Xray render accepts the mux's PROXY protocol header
+	// (AcceptProxyProtocol is set to 1 alongside; see handler/kernel_mux.go).
+	MuxPort   int    `gorm:"column:mux_port;not null;default:0"`
+	Remark    string `gorm:"type:text;not null;default:''"`
+	RelayOnly int    `gorm:"column:relay_only;not null;default:0"`
 	// AcceptProxyProtocol: relays send PROXY protocol so the kernel sees
 	// the real client IP; direct access is then impossible (forces RelayOnly).
 	AcceptProxyProtocol int `gorm:"column:accept_proxy_protocol;not null;default:0"`
@@ -97,6 +102,30 @@ type NodeInbound struct {
 }
 
 func (NodeInbound) TableName() string { return "node_inbound" }
+
+// NodePortMux is one node's TCP SNI multiplexer (443 port reuse): a single
+// public port whose TLS ClientHello SNI decides which inbound (or external
+// target) a connection goes to. The agent runs the splitter (see
+// go-gost/x/kernel/sni_mux.go); the panel builds its route table from the
+// node's muxed inbounds plus the admin's external rules.
+type NodePortMux struct {
+	ID             int64  `gorm:"primaryKey;autoIncrement"`
+	NodeID         int64  `gorm:"column:node_id;not null;uniqueIndex"`
+	Enabled        int    `gorm:"not null;default:0"`
+	Listen         string `gorm:"type:varchar(100);not null;default:'::'"`
+	Port           int    `gorm:"not null;default:443"`
+	Rules          string `gorm:"type:text;not null;default:''"`
+	FallbackTarget string `gorm:"column:fallback_target;type:varchar(255);not null;default:''"`
+	FallbackProxy  int    `gorm:"column:fallback_proxy;not null;default:0"`
+	Status         string `gorm:"type:varchar(20);not null;default:'stopped'"`
+	LastError      string `gorm:"column:last_error;type:text;not null;default:''"`
+	ConfigHash     string `gorm:"column:config_hash;type:varchar(64);not null;default:''"`
+	AppliedHash    string `gorm:"column:applied_hash;type:varchar(64);not null;default:''"`
+	CreatedTime    int64  `gorm:"column:created_time;not null"`
+	UpdatedTime    int64  `gorm:"column:updated_time;not null"`
+}
+
+func (NodePortMux) TableName() string { return "node_port_mux" }
 
 // RemoteSource is a subscription URL (an airport, a friend's panel) whose
 // nodes are kept as imported nodes and refreshed periodically.

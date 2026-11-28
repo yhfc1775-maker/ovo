@@ -619,6 +619,7 @@ type InboundsBackup struct {
 	Kernels       []KernelBackup         `json:"kernels"`
 	Inbounds      []InboundBackup        `json:"inbounds"`
 	Relays        []InboundRelayBackup   `json:"relays"`
+	PortMuxes     []NodePortMuxBackup    `json:"portMuxes,omitempty"`
 	Counters      []InboundCounterBackup `json:"counters,omitempty"`
 	Subscriptions []SubscriptionBackup   `json:"subscriptions,omitempty"`
 	// FIX132-C（A3-04）：订阅计数基线随备份（与入站基线 Counters
@@ -726,6 +727,9 @@ type InboundBackup struct {
 	Extra               string `json:"extra"`
 	ShareAddressMode    string `json:"shareAddressMode,omitempty"`
 	ShareHost           string `json:"shareHost"`
+	// MuxPort is the loopback port the inbound listens on while served
+	// behind the node's port mux (0 = not muxed); restored verbatim.
+	MuxPort             int    `json:"muxPort,omitempty"`
 	Remark              string `json:"remark"`
 	RelayOnly           int    `json:"relayOnly"`
 	AcceptProxyProtocol int    `json:"acceptProxyProtocol"`
@@ -754,6 +758,20 @@ type InboundBackup struct {
 	// ConnIdleSeconds is the per-inbound idle timeout (seconds) for
 	// Xray (policy.levels[].connIdle); 0 = unset (Xray default 300s).
 	ConnIdleSeconds int `json:"connIdleSeconds,omitempty"`
+}
+
+// NodePortMuxBackup is one node's port-mux config (443 port reuse). Status
+// and hashes are runtime state, not config: restore starts from stopped /
+// pending and the panel re-applies the mux (see repository_inbound_backup).
+type NodePortMuxBackup struct {
+	NodeID         int64  `json:"nodeId"`
+	Enabled        int    `json:"enabled"`
+	Listen         string `json:"listen"`
+	Port           int    `json:"port"`
+	Rules          string `json:"rules"`
+	FallbackTarget string `json:"fallbackTarget,omitempty"`
+	FallbackProxy  int    `json:"fallbackProxy,omitempty"`
+	CreatedTime    int64  `json:"createdTime"`
 }
 
 type RemoteSourceBackup struct {

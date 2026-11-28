@@ -108,6 +108,7 @@ type Manager struct {
 	restoreOnce sync.Once
 	instances   map[string]*instance
 	nft         *nftCounters
+	mux         *sniMux
 }
 
 var (
@@ -220,10 +221,12 @@ func NewManager(baseDir string) *Manager {
 		baseDir:   baseDir,
 		instances: make(map[string]*instance),
 		nft:       newNftCounters(baseDir),
+		mux:       newSNIMux(),
 	}
 }
 
 func (m *Manager) statePath() string { return filepath.Join(m.baseDir, "state.json") }
+func (m *Manager) muxPath() string   { return filepath.Join(m.baseDir, "mux.json") }
 func (m *Manager) runDir(t string) string {
 	return filepath.Join(m.baseDir, t, "run")
 }
@@ -246,6 +249,11 @@ func (m *Manager) Restore() {
 }
 
 func (m *Manager) restore() {
+	// The mux state is independent of the kernel state: restore it even
+	// when state.json is missing or corrupt. Deferred so it runs after
+	// the kernel re-apply loop (the mux's loopback targets must be
+	// listening before it starts accepting).
+	defer m.restoreMux()
 	b, err := os.ReadFile(m.statePath())
 	if err != nil {
 		return
@@ -330,6 +338,49 @@ func (m *Manager) restore() {
 		}
 		m.persist()
 	}
+}
+
+func (m *Manager) restoreMux() {
+	b, err := os.ReadFile(m.muxPath())
+	if err != nil {
+		return
+	}
+	var cfg MuxConfig
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		fmt.Printf("⚠️ 端口复用状态文件损坏: %v\n", err)
+		return
+	}
+	if !cfg.Enabled {
+		return
+	}
+	if _, err := m.mux.apply(cfg); err != nil {
+		fmt.Printf("⚠️ 恢复端口复用失败: %v\n", err)
+	}
+}
+
+func (m *Manager) persistMux(cfg MuxConfig) {
+	if !cfg.Enabled {
+		_ = os.Remove(m.muxPath())
+		return
+	}
+	b, err := json.Marshal(cfg)
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(m.baseDir, 0o700); err != nil {
+		return
+	}
+	_ = writeFileAtomic(m.muxPath(), b, 0o600)
+}
+
+// ApplyMux starts, hot-reloads, or stops the node's TCP SNI multiplexer and
+// persists the configuration so it survives agent restarts.
+func (m *Manager) ApplyMux(cfg MuxConfig) (MuxState, error) {
+	st, err := m.mux.apply(cfg)
+	if err == nil {
+		m.persistMux(m.mux.config())
+	}
+	return st, err
 }
 
 func (m *Manager) persist() {
@@ -2442,7 +2493,12 @@ func (m *Manager) Status(logsFor string) Status {
 	m.mu.Unlock()
 	sort.Strings(types)
 
-	out := Status{Kernels: make([]State, 0, len(types)), Counters: make([]Counter, 0), Users: make([]UserCounter, 0)}
+	var muxSt *MuxState
+	if m.mux != nil {
+		st := m.mux.state()
+		muxSt = &st
+	}
+	out := Status{Kernels: make([]State, 0, len(types)), Counters: make([]Counter, 0), Users: make([]UserCounter, 0), Mux: muxSt}
 	for _, t := range types {
 		out.Kernels = append(out.Kernels, m.state(t, t == logsFor))
 	}
@@ -2538,6 +2594,11 @@ func (m *Manager) Shutdown() {
 }
 
 func (m *Manager) shutdownProcesses() {
+	// The mux listener is independent of the kernel instances: stop it
+	// here so both Shutdown and Uninstall release the shared port.
+	if m.mux != nil {
+		m.mux.stop()
+	}
 	m.mu.Lock()
 	insts := make([]*instance, 0, len(m.instances))
 	for _, inst := range m.instances {

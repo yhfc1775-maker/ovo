@@ -171,6 +171,9 @@ type Status struct {
 	Epoch        string        `json:"epoch"`
 	NftAvailable bool          `json:"nftAvailable"`
 	NftError     string        `json:"nftError,omitempty"`
+	// Mux is the node's TCP SNI multiplexer state (443 port reuse); nil
+	// only when the manager was built without NewManager.
+	Mux *MuxState `json:"mux,omitempty"`
 	// NftReadError 承载最近一次 nft 计数读取失败的原因（R3A-NEW-1：
 	// 表被删/不可读时 read() 出错）。与 NftError（自动安装失败）
 	// 分开：读错必须随每次上报带给面板置 failing＋告警，而安装

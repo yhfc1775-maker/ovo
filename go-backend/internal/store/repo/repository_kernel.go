@@ -68,6 +68,46 @@ func (r *Repository) GetNodeKernelByType(nodeID int64, kernelType string) (*mode
 	return &k, err
 }
 
+func (r *Repository) GetNodePortMux(nodeID int64) (*model.NodePortMux, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	var m model.NodePortMux
+	err := r.db.Where("node_id = ?", nodeID).First(&m).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	return &m, err
+}
+
+func (r *Repository) ListNodePortMuxes() ([]model.NodePortMux, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	var rows []model.NodePortMux
+	return rows, r.db.Order("node_id ASC").Find(&rows).Error
+}
+
+func (r *Repository) UpsertNodePortMux(m *model.NodePortMux) error {
+	if r == nil || r.db == nil {
+		return errors.New("repository not initialized")
+	}
+	return r.db.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "node_id"}},
+		DoUpdates: clause.AssignmentColumns([]string{
+			"enabled", "listen", "port", "rules", "fallback_target", "fallback_proxy",
+			"status", "last_error", "config_hash", "applied_hash", "updated_time",
+		}),
+	}).Create(m).Error
+}
+
+func (r *Repository) UpdateNodePortMuxFields(nodeID int64, fields map[string]interface{}) error {
+	if r == nil || r.db == nil {
+		return errors.New("repository not initialized")
+	}
+	return r.db.Model(&model.NodePortMux{}).Where("node_id = ?", nodeID).Updates(fields).Error
+}
+
 func (r *Repository) CreateNodeKernel(k *model.NodeKernel) error {
 	if r == nil || r.db == nil {
 		return errors.New("repository not initialized")
@@ -498,6 +538,56 @@ func (r *Repository) NodePortRangeOccupant(nodeID int64, lo, hi int, excludeInbo
 	return "", nil
 }
 
+// NodePortRangeOccupantExcluding is NodePortRangeOccupant with a list of
+// inbound IDs to exclude (NodePortRangeOccupant takes only one). The
+// port-mux conflict check uses it to ignore the other muxed inbounds
+// sharing the mux port while still reporting any other occupant.
+func (r *Repository) NodePortRangeOccupantExcluding(nodeID int64, lo, hi int, excludeInboundIDs []int64) (string, error) {
+	if r == nil || r.db == nil {
+		return "", errors.New("repository not initialized")
+	}
+	occ, err := r.NodePortRangeOccupancyTx(r.db, nodeID, lo, hi, PortExclusions{InboundIDs: excludeInboundIDs})
+	if err != nil {
+		return "", err
+	}
+	switch {
+	case occ.Sources[PortSourceInbound]:
+		if occ.InboundCompanion {
+			return "SS 计量伴生入站", nil
+		}
+		return "其他节点服务", nil
+	case occ.Sources[PortSourceForward]:
+		return "转发", nil
+	case occ.Sources[PortSourceChain]:
+		return "隧道", nil
+	case occ.Sources[PortSourceCompanion]:
+		return "伴生 Clash API", nil
+	}
+	return "", nil
+}
+
+// NodeForwardOrTunnelPortRangeOccupant reports whether a forward or chain
+// tunnel listens on any port in [lo, hi] of a node ("" when free). The
+// port-mux save path uses this narrow check (not NodePortRangeOccupant):
+// the inbounds on the mux port are the ones being multiplexed, so they
+// must not count as occupants — only forwards and tunnels conflict.
+func (r *Repository) NodeForwardOrTunnelPortRangeOccupant(nodeID int64, lo, hi int) (string, error) {
+	if r == nil || r.db == nil {
+		return "", errors.New("repository not initialized")
+	}
+	occ, err := r.NodePortRangeOccupancyTx(r.db, nodeID, lo, hi, PortExclusions{})
+	if err != nil {
+		return "", err
+	}
+	switch {
+	case occ.Sources[PortSourceForward]:
+		return "转发", nil
+	case occ.Sources[PortSourceChain]:
+		return "隧道", nil
+	}
+	return "", nil
+}
+
 // ApplyInboundCounterSamples converts cumulative counters into traffic deltas.
 // R2X-033：基线语义与订阅管线同形——无基线（首采）或 epoch 变化
 // 时只推进基线、delta=0，不把累计值计入（旧语义全量计，干净恢复
@@ -848,6 +938,22 @@ func (r *Repository) SetNodeInboundRelayOnly(id int64, relayOnly int) error {
 		return errors.New("repository not initialized")
 	}
 	return r.db.Model(&model.NodeInbound{}).Where("id = ?", id).Update("relay_only", relayOnly).Error
+}
+
+// SetNodeInboundMuxState moves one inbound into or out of the node's port
+// mux: muxPort is the loopback port (0 = not muxed) and acceptProxy is the
+// PROXY-protocol switch the Xray render needs while muxed (the mux is the
+// relay that sends the header, so the inbound must accept it). The two
+// fields are written together so a muxed row is never half-configured.
+func (r *Repository) SetNodeInboundMuxState(id int64, muxPort int, acceptProxy int, now int64) error {
+	if r == nil || r.db == nil {
+		return errors.New("repository not initialized")
+	}
+	return r.db.Model(&model.NodeInbound{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"mux_port":              muxPort,
+		"accept_proxy_protocol": acceptProxy,
+		"updated_time":          now,
+	}).Error
 }
 
 // ---- user inbound permissions ----
