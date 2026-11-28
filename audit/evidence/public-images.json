@@ -1,0 +1,32 @@
+[
+  {
+    "package": "ovo-panel-backend",
+    "apiStatus": 0,
+    "api": {
+      "name": "ovo-panel-backend",
+      "repository": "yhfc1775-maker/ovo",
+      "visibility": "public"
+    },
+    "anonymousDockerPullExit": 0
+  },
+  {
+    "package": "ovo-vite-frontend",
+    "apiStatus": 0,
+    "api": {
+      "name": "ovo-vite-frontend",
+      "repository": "yhfc1775-maker/ovo",
+      "visibility": "public"
+    },
+    "anonymousDockerPullExit": 0
+  },
+  {
+    "package": "ovo-agent",
+    "apiStatus": 0,
+    "api": {
+      "name": "ovo-agent",
+      "repository": "yhfc1775-maker/ovo",
+      "visibility": "public"
+    },
+    "anonymousDockerPullExit": 0
+  }
+]

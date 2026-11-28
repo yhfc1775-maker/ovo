@@ -1,0 +1,1041 @@
+{
+  "method": "AST literals/constants/assignments plus fixed-point forwarded parameter wrappers; production files only",
+  "wrappers": {
+    "SendCommand": 1,
+    "SendCommandContext": 2,
+    "sendNodeCommand": 1,
+    "sendNodeCommandWithTimeout": 1,
+    "nodeAgentSendCommand": 2,
+    "tunnelTLSCommandSender": 1,
+    "sendTunnelTLSCommand": 1,
+    "syncForwardServicesWithWarnings": 1,
+    "controlForwardServicesOnNode": 2,
+    "syncForwardServices": 1,
+    "controlForwardServices": 1
+  },
+  "sendSites": [
+    {
+      "file": "go-backend/internal/health/checker.go",
+      "line": 456,
+      "function": "checkOnNodeContext",
+      "callee": "SendCommandContext",
+      "expression": "\"ServiceMonitorCheck\"",
+      "commands": [
+        "ServiceMonitorCheck"
+      ]
+    },
+    {
+      "file": "go-backend/internal/health/checker.go",
+      "line": 458,
+      "function": "checkOnNodeContext",
+      "callee": "SendCommand",
+      "expression": "\"ServiceMonitorCheck\"",
+      "commands": [
+        "ServiceMonitorCheck"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/add_service_guard.go",
+      "line": 189,
+      "function": "addServiceSend",
+      "callee": "sendNodeCommand",
+      "expression": "\"AddService\"",
+      "commands": [
+        "AddService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/control_plane.go",
+      "line": 630,
+      "function": "syncForwardServicesWithWarnings",
+      "callee": "controlForwardServices",
+      "expression": "\"PauseService\"",
+      "commands": [
+        "PauseService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/control_plane.go",
+      "line": 770,
+      "function": "deleteForwardServiceBasesOnNode",
+      "callee": "sendNodeCommand",
+      "expression": "\"DeleteService\"",
+      "commands": [
+        "DeleteService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/control_plane.go",
+      "line": 894,
+      "function": "controlForwardServices",
+      "callee": "syncForwardServices",
+      "expression": "\"UpdateService\"",
+      "commands": [
+        "UpdateService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/control_plane.go",
+      "line": 911,
+      "function": "controlForwardServices",
+      "callee": "syncForwardServices",
+      "expression": "\"UpdateService\"",
+      "commands": [
+        "UpdateService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/control_plane.go",
+      "line": 1054,
+      "function": "applyNodeProtocolChange",
+      "callee": "sendNodeCommand",
+      "expression": "\"SetProtocol\"",
+      "commands": [
+        "SetProtocol"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/control_plane.go",
+      "line": 2771,
+      "function": "ensureConnLimiterOnNode",
+      "callee": "sendNodeCommand",
+      "expression": "\"AddCLimiters\"",
+      "commands": [
+        "AddCLimiters"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/control_plane.go",
+      "line": 2776,
+      "function": "ensureConnLimiterOnNode",
+      "callee": "sendNodeCommand",
+      "expression": "\"UpdateCLimiters\"",
+      "commands": [
+        "UpdateCLimiters"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/control_plane.go",
+      "line": 2845,
+      "function": "deleteForwardConnLimiterOnNode",
+      "callee": "sendNodeCommand",
+      "expression": "\"DeleteCLimiters\"",
+      "commands": [
+        "DeleteCLimiters"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/control_plane.go",
+      "line": 2899,
+      "function": "deleteForwardTrafficLimitersOnNode",
+      "callee": "sendNodeCommand",
+      "expression": "\"DeleteLimiters\"",
+      "commands": [
+        "DeleteLimiters"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/control_plane.go",
+      "line": 2929,
+      "function": "deleteStaleForwardTrafficLimitersOnNode",
+      "callee": "sendNodeCommand",
+      "expression": "\"DeleteLimiters\"",
+      "commands": [
+        "DeleteLimiters"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/control_plane.go",
+      "line": 3024,
+      "function": "deleteStaleUserTunnelLimiter",
+      "callee": "sendNodeCommand",
+      "expression": "\"DeleteLimiters\"",
+      "commands": [
+        "DeleteLimiters"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/control_plane.go",
+      "line": 3161,
+      "function": "upsertLimiterOnNode",
+      "callee": "sendNodeCommand",
+      "expression": "\"AddLimiters\"",
+      "commands": [
+        "AddLimiters"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/control_plane.go",
+      "line": 3169,
+      "function": "upsertLimiterOnNode",
+      "callee": "sendNodeCommand",
+      "expression": "\"UpdateLimiters\"",
+      "commands": [
+        "UpdateLimiters"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/control_plane.go",
+      "line": 3183,
+      "function": "ensureTrafficLimiterOnNode",
+      "callee": "sendNodeCommand",
+      "expression": "\"AddLimiters\"",
+      "commands": [
+        "AddLimiters"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/control_plane.go",
+      "line": 3187,
+      "function": "ensureTrafficLimiterOnNode",
+      "callee": "sendNodeCommand",
+      "expression": "\"UpdateLimiters\"",
+      "commands": [
+        "UpdateLimiters"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/flow_policy.go",
+      "line": 354,
+      "function": "pauseForwardRecords",
+      "callee": "controlForwardServices",
+      "expression": "\"PauseService\"",
+      "commands": [
+        "PauseService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/flow_policy.go",
+      "line": 495,
+      "function": "cleanOrphanedServices",
+      "callee": "sendNodeCommand",
+      "expression": "\"DeleteService\"",
+      "commands": [
+        "DeleteService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/flow_policy.go",
+      "line": 574,
+      "function": "cleanOrphanedChains",
+      "callee": "sendNodeCommand",
+      "expression": "\"DeleteChains\"",
+      "commands": [
+        "DeleteChains"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/flow_policy.go",
+      "line": 594,
+      "function": "cleanOrphanedLimiters",
+      "callee": "sendNodeCommand",
+      "expression": "\"DeleteLimiters\"",
+      "commands": [
+        "DeleteLimiters"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/flow_policy.go",
+      "line": 661,
+      "function": "deleteOrphanedForwardService",
+      "callee": "sendNodeCommand",
+      "expression": "\"DeleteService\"",
+      "commands": [
+        "DeleteService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/kernel.go",
+      "line": 887,
+      "function": "kernelControl",
+      "callee": "sendNodeCommandWithTimeout",
+      "expression": "\"KernelControl\"",
+      "commands": [
+        "KernelControl"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/kernel.go",
+      "line": 919,
+      "function": "kernelControl",
+      "callee": "sendNodeCommandWithTimeout",
+      "expression": "\"KernelControl\"",
+      "commands": [
+        "KernelControl"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/kernel.go",
+      "line": 1041,
+      "function": "kernelLogs",
+      "callee": "sendNodeCommandWithTimeout",
+      "expression": "\"KernelStatus\"",
+      "commands": [
+        "KernelStatus"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/kernel.go",
+      "line": 3687,
+      "function": "removeStaleCompanionKernel",
+      "callee": "sendNodeCommandWithTimeout",
+      "expression": "\"KernelControl\"",
+      "commands": [
+        "KernelControl"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/kernel.go",
+      "line": 3864,
+      "function": "applyKernelWithMode",
+      "callee": "sendNodeCommandWithTimeout",
+      "expression": "\"KernelApply\"",
+      "commands": [
+        "KernelApply"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/kernel.go",
+      "line": 4104,
+      "function": "pollNodeKernels",
+      "callee": "sendNodeCommandWithTimeout",
+      "expression": "\"KernelStatus\"",
+      "commands": [
+        "KernelStatus"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/kernel.go",
+      "line": 4178,
+      "function": "pollNodeKernels",
+      "callee": "sendNodeCommandWithTimeout",
+      "expression": "\"KernelControl\"",
+      "commands": [
+        "KernelControl"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/kernel.go",
+      "line": 4394,
+      "function": "settleKernelCountersAfterApply",
+      "callee": "sendNodeCommandWithTimeout",
+      "expression": "\"KernelStatus\"",
+      "commands": [
+        "KernelStatus"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/kernel.go",
+      "line": 4513,
+      "function": "removeNodeKernelsFromAgent",
+      "callee": "sendNodeCommandWithTimeout",
+      "expression": "\"KernelControl\"",
+      "commands": [
+        "KernelControl"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/kernel_external.go",
+      "line": 711,
+      "function": "retargetRelays",
+      "callee": "syncForwardServices",
+      "expression": "\"UpdateService\"",
+      "commands": [
+        "UpdateService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/kernel_protect.go",
+      "line": 271,
+      "function": "syncRelayProxyProtocol",
+      "callee": "syncForwardServices",
+      "expression": "\"UpdateService\"",
+      "commands": [
+        "UpdateService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/kernel_relay.go",
+      "line": 825,
+      "function": "applyRelayRemoteAddr",
+      "callee": "syncForwardServices",
+      "expression": "\"UpdateService\"",
+      "commands": [
+        "UpdateService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/kernel_relay.go",
+      "line": 1099,
+      "function": "inboundRelayCreate",
+      "callee": "syncForwardServices",
+      "expression": "\"UpdateService\"",
+      "commands": [
+        "UpdateService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/kernel_relay.go",
+      "line": 1263,
+      "function": "createRelayForward",
+      "callee": "syncForwardServices",
+      "expression": "\"UpdateService\"",
+      "commands": [
+        "UpdateService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/kernel_relay.go",
+      "line": 1299,
+      "function": "removeForwardWithServices",
+      "callee": "controlForwardServices",
+      "expression": "\"DeleteService\"",
+      "commands": [
+        "DeleteService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "line": 3600,
+      "function": "cleanupTunnelRuntime",
+      "callee": "sendNodeCommand",
+      "expression": "\"DeleteChains\"",
+      "commands": [
+        "DeleteChains"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "line": 3604,
+      "function": "cleanupTunnelRuntime",
+      "callee": "sendNodeCommand",
+      "expression": "\"DeleteChains\"",
+      "commands": [
+        "DeleteChains"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "line": 3607,
+      "function": "cleanupTunnelRuntime",
+      "callee": "sendNodeCommand",
+      "expression": "\"DeleteService\"",
+      "commands": [
+        "DeleteService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "line": 3611,
+      "function": "cleanupTunnelRuntime",
+      "callee": "sendNodeCommand",
+      "expression": "\"DeleteService\"",
+      "commands": [
+        "DeleteService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "line": 3677,
+      "function": "cleanupObsoleteTunnelRuntime",
+      "callee": "sendNodeCommand",
+      "expression": "\"DeleteChains\"",
+      "commands": [
+        "DeleteChains"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "line": 3683,
+      "function": "cleanupObsoleteTunnelRuntime",
+      "callee": "sendNodeCommand",
+      "expression": "\"DeleteService\"",
+      "commands": [
+        "DeleteService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "line": 4442,
+      "function": "tunnelUpdate",
+      "callee": "syncForwardServices",
+      "expression": "\"UpdateService\"",
+      "commands": [
+        "UpdateService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "line": 4565,
+      "function": "deleteForwardServicesOnNodeBatchWithTimeout",
+      "callee": "sendNodeCommandWithTimeout",
+      "expression": "\"DeleteService\"",
+      "commands": [
+        "DeleteService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "line": 5289,
+      "function": "redeployTunnelAndForwards",
+      "callee": "syncForwardServices",
+      "expression": "\"UpdateService\"",
+      "commands": [
+        "UpdateService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "line": 5862,
+      "function": "createForwardWithPortRetry",
+      "callee": "syncForwardServicesWithWarnings",
+      "expression": "\"UpdateService\"",
+      "commands": [
+        "UpdateService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "line": 6567,
+      "function": "forwardUpdate",
+      "callee": "syncForwardServicesWithWarnings",
+      "expression": "\"UpdateService\"",
+      "commands": [
+        "UpdateService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "line": 6653,
+      "function": "forwardDelete",
+      "callee": "controlForwardServices",
+      "expression": "\"DeleteService\"",
+      "commands": [
+        "DeleteService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "line": 6889,
+      "function": "forwardPause",
+      "callee": "controlForwardServices",
+      "expression": "\"PauseService\"",
+      "commands": [
+        "PauseService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "line": 7010,
+      "function": "forwardResume",
+      "callee": "controlForwardServices",
+      "expression": "\"ResumeService\"",
+      "commands": [
+        "ResumeService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "line": 7211,
+      "function": "forwardBatchDelete",
+      "callee": "controlForwardServices",
+      "expression": "\"DeleteService\"",
+      "commands": [
+        "DeleteService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "line": 7370,
+      "function": "batchForwardPauseResume",
+      "callee": "controlForwardServices",
+      "expression": "serviceCmd",
+      "commands": [
+        "PauseService",
+        "ResumeService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "line": 7475,
+      "function": "forwardBatchRedeploy",
+      "callee": "syncForwardServicesWithWarnings",
+      "expression": "\"UpdateService\"",
+      "commands": [
+        "UpdateService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "line": 7700,
+      "function": "forwardBatchChangeTunnel",
+      "callee": "syncForwardServicesWithWarnings",
+      "expression": "\"UpdateService\"",
+      "commands": [
+        "UpdateService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "line": 7976,
+      "function": "resyncForwardsForSpeedLimit",
+      "callee": "syncForwardServicesWithWarnings",
+      "expression": "\"UpdateService\"",
+      "commands": [
+        "UpdateService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "line": 8016,
+      "function": "deleteSpeedLimitLimitersOnNodes",
+      "callee": "sendNodeCommand",
+      "expression": "\"DeleteLimiters\"",
+      "commands": [
+        "DeleteLimiters"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "line": 9323,
+      "function": "applyTunnelChainOnNode",
+      "callee": "sendNodeCommand",
+      "expression": "\"AddChains\"",
+      "commands": [
+        "AddChains"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "line": 9431,
+      "function": "upsertTunnelChainOnNode",
+      "callee": "sendNodeCommand",
+      "expression": "\"UpdateChains\"",
+      "commands": [
+        "UpdateChains"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "line": 9475,
+      "function": "addTunnelServiceOnNodeWithMode",
+      "callee": "sendNodeCommand",
+      "expression": "command",
+      "commands": [
+        "AddService",
+        "UpdateService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "line": 9479,
+      "function": "addTunnelServiceOnNodeWithMode",
+      "callee": "sendNodeCommand",
+      "expression": "\"DeleteService\"",
+      "commands": [
+        "DeleteService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "line": 9502,
+      "function": "rollbackTunnelRuntime",
+      "callee": "sendNodeCommand",
+      "expression": "\"DeleteService\"",
+      "commands": [
+        "DeleteService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "line": 9515,
+      "function": "rollbackTunnelRuntime",
+      "callee": "sendNodeCommand",
+      "expression": "\"DeleteChains\"",
+      "commands": [
+        "DeleteChains"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "line": 11168,
+      "function": "rollbackForwardMutation",
+      "callee": "syncForwardServices",
+      "expression": "\"UpdateService\"",
+      "commands": [
+        "UpdateService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "line": 11515,
+      "function": "syncUserTunnelForwards",
+      "callee": "syncForwardServices",
+      "expression": "\"UpdateService\"",
+      "commands": [
+        "UpdateService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "line": 11553,
+      "function": "syncUserMaxConnForwards",
+      "callee": "syncForwardServicesWithWarnings",
+      "expression": "\"UpdateService\"",
+      "commands": [
+        "UpdateService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/mutations.go",
+      "line": 11638,
+      "function": "cleanupForwardsForUserTunnelWithWarnings",
+      "callee": "controlForwardServices",
+      "expression": "\"DeleteService\"",
+      "commands": [
+        "DeleteService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/node_delete_uninstall.go",
+      "line": 181,
+      "function": "beginNodeAgentUninstallWithKey",
+      "callee": "nodeAgentSendCommand",
+      "expression": "\"UninstallAgent\"",
+      "commands": [
+        "UninstallAgent"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/node_delete_uninstall.go",
+      "line": 232,
+      "function": "reissuePendingNodeUninstall",
+      "callee": "nodeAgentSendCommand",
+      "expression": "\"UninstallAgent\"",
+      "commands": [
+        "UninstallAgent"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/node_ping_slots.go",
+      "line": 88,
+      "function": "tcpPingSend",
+      "callee": "sendNodeCommandWithTimeout",
+      "expression": "\"TcpPing\"",
+      "commands": [
+        "TcpPing"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/node_ping_slots.go",
+      "line": 95,
+      "function": "udpPingSend",
+      "callee": "sendNodeCommandWithTimeout",
+      "expression": "\"UdpPing\"",
+      "commands": [
+        "UdpPing"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/node_restart.go",
+      "line": 164,
+      "function": "pushNodeRestartSchedule",
+      "callee": "sendNodeCommandWithTimeout",
+      "expression": "restartScheduleCommand",
+      "commands": [
+        "SetRestartSchedule"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/node_restart.go",
+      "line": 311,
+      "function": "restartOneNode",
+      "callee": "SendCommand",
+      "expression": "\"RestartAgent\"",
+      "commands": [
+        "RestartAgent"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/node_route.go",
+      "line": 284,
+      "function": "nodeTraceroute",
+      "callee": "sendNodeCommandWithTimeout",
+      "expression": "\"Traceroute\"",
+      "commands": [
+        "Traceroute"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/node_swap.go",
+      "line": 184,
+      "function": "reconcileSwapSetTimeout",
+      "callee": "sendNodeCommandWithTimeout",
+      "expression": "nodeSwapInfoCommand",
+      "commands": [
+        "SwapInfo"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/node_swap.go",
+      "line": 206,
+      "function": "executeNodeSwapSet",
+      "callee": "sendNodeCommandWithTimeout",
+      "expression": "nodeSwapSetCommand",
+      "commands": [
+        "SwapSet"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/node_swap.go",
+      "line": 236,
+      "function": "nodeSwapInfo",
+      "callee": "sendNodeCommandWithTimeout",
+      "expression": "nodeSwapInfoCommand",
+      "commands": [
+        "SwapInfo"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/node_tune.go",
+      "line": 253,
+      "function": "nodeTune",
+      "callee": "sendNodeCommandWithTimeout",
+      "expression": "command",
+      "commands": [
+        "Tune",
+        "TuneProbe",
+        "TuneStatus"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/port_live_probe.go",
+      "line": 55,
+      "function": "checkLivePortsOccupied",
+      "callee": "sendNodeCommandWithTimeout",
+      "expression": "\"CheckPortListening\"",
+      "commands": [
+        "CheckPortListening"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/port_live_probe.go",
+      "line": 101,
+      "function": "probeForwardPortsOnNode",
+      "callee": "sendNodeCommandWithTimeout",
+      "expression": "\"CheckPortListening\"",
+      "commands": [
+        "CheckPortListening"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/realm.go",
+      "line": 488,
+      "function": "switchTunnelEngine",
+      "callee": "syncForwardServices",
+      "expression": "\"UpdateService\"",
+      "commands": [
+        "UpdateService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/tunnel_delete_resolution.go",
+      "line": 874,
+      "function": "applyTunnelDeleteForwardMigration",
+      "callee": "syncForwardServicesWithWarnings",
+      "expression": "\"UpdateService\"",
+      "commands": [
+        "UpdateService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/tunnel_delete_resolution.go",
+      "line": 1128,
+      "function": "cleanupForwardsDataPlane",
+      "callee": "controlForwardServices",
+      "expression": "\"DeleteService\"",
+      "commands": [
+        "DeleteService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/tunnel_tls.go",
+      "line": 140,
+      "function": "distributeNodeTunnelTLS",
+      "callee": "sendTunnelTLSCommand",
+      "expression": "ws.TunnelTLSIssueCommand",
+      "commands": [
+        "TunnelTLSIssue"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/tunnel_tls.go",
+      "line": 173,
+      "function": "checkNodeTunnelTLSStatus",
+      "callee": "sendTunnelTLSCommand",
+      "expression": "ws.TunnelTLSStatusCommand",
+      "commands": [
+        "TunnelTLSStatus"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/upgrade.go",
+      "line": 841,
+      "function": "nodeUpgrade",
+      "callee": "SendCommand",
+      "expression": "\"UpgradeAgent\"",
+      "commands": [
+        "UpgradeAgent"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/upgrade.go",
+      "line": 1115,
+      "function": "nodeBatchUpgrade",
+      "callee": "SendCommandContext",
+      "expression": "\"UpgradeAgent\"",
+      "commands": [
+        "UpgradeAgent"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/upgrade.go",
+      "line": 1280,
+      "function": "nodeRollback",
+      "callee": "SendCommand",
+      "expression": "\"RollbackAgent\"",
+      "commands": [
+        "RollbackAgent"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/upgrade.go",
+      "line": 2178,
+      "function": "redeployLocalNodeRuntime",
+      "callee": "syncForwardServicesWithWarnings",
+      "expression": "\"UpdateService\"",
+      "commands": [
+        "UpdateService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/upgrade.go",
+      "line": 2341,
+      "function": "retryFailedRedeploys",
+      "callee": "syncForwardServices",
+      "expression": "\"UpdateService\"",
+      "commands": [
+        "UpdateService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/user_quota.go",
+      "line": 176,
+      "function": "enforceUserQuotaIfNeeded",
+      "callee": "controlForwardServices",
+      "expression": "\"PauseService\"",
+      "commands": [
+        "PauseService"
+      ]
+    },
+    {
+      "file": "go-backend/internal/http/handler/user_quota.go",
+      "line": 327,
+      "function": "applyUserQuotaRelease",
+      "callee": "controlForwardServices",
+      "expression": "\"ResumeService\"",
+      "commands": [
+        "ResumeService"
+      ]
+    }
+  ],
+  "sendCommands": [
+    "AddCLimiters",
+    "AddChains",
+    "AddLimiters",
+    "AddService",
+    "CheckPortListening",
+    "DeleteCLimiters",
+    "DeleteChains",
+    "DeleteLimiters",
+    "DeleteService",
+    "KernelApply",
+    "KernelControl",
+    "KernelStatus",
+    "PauseService",
+    "RestartAgent",
+    "ResumeService",
+    "RollbackAgent",
+    "ServiceMonitorCheck",
+    "SetProtocol",
+    "SetRestartSchedule",
+    "SwapInfo",
+    "SwapSet",
+    "TcpPing",
+    "Traceroute",
+    "Tune",
+    "TuneProbe",
+    "TuneStatus",
+    "TunnelTLSIssue",
+    "TunnelTLSStatus",
+    "UdpPing",
+    "UninstallAgent",
+    "UpdateCLimiters",
+    "UpdateChains",
+    "UpdateLimiters",
+    "UpdateService",
+    "UpgradeAgent"
+  ],
+  "receiveCommands": [
+    "AddCLimiters",
+    "AddChains",
+    "AddLimiters",
+    "AddService",
+    "CheckPortListening",
+    "DeleteCLimiters",
+    "DeleteChains",
+    "DeleteLimiters",
+    "DeleteService",
+    "KernelApply",
+    "KernelControl",
+    "KernelStatus",
+    "PauseService",
+    "RestartAgent",
+    "ResumeService",
+    "RollbackAgent",
+    "ServiceMonitorCheck",
+    "SetProtocol",
+    "SetRestartSchedule",
+    "SwapInfo",
+    "SwapSet",
+    "TcpPing",
+    "Traceroute",
+    "Tune",
+    "TuneApply",
+    "TuneCancel",
+    "TuneProbe",
+    "TuneStart",
+    "TuneStatus",
+    "TunnelTLSIssue",
+    "TunnelTLSStatus",
+    "UdpPing",
+    "UninstallAgent",
+    "UpdateCLimiters",
+    "UpdateChains",
+    "UpdateLimiters",
+    "UpdateService",
+    "UpgradeAgent"
+  ],
+  "sentNotReceived": [],
+  "receivedNotSent": [
+    "TuneApply",
+    "TuneCancel",
+    "TuneStart"
+  ],
+  "explicitlyRetired": [
+    "TuneApply",
+    "TuneStart",
+    "TuneCancel"
+  ],
+  "unresolved": []
+}

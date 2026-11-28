@@ -1,0 +1,623 @@
+[
+  {
+    "name": "handler probes",
+    "source": "local-work/audit-2134/handler-probes.log",
+    "lines": [
+      "    rr4_c1_internal_error_test.go:95: REPRODUCED storage text in admin receipt: {\"code\":-1,\"msg\":\"已更新启停状态，但下发失败: SQL logic error: no such table: node_inbound (1)\",\"ts\":1795851461382}",
+      "--- PASS: TestAuditKernelControlRepoTextLeak (0.15s)",
+      "    rr4_c1_internal_error_test.go:108: REPRODUCED full inbound list n=1 returned=1 node_queries=1 total_queries=map[node:1 node_inbound:1 node_kernel:1 remote_source:1] elapsed_us=982 response_bytes=869",
+      "    rr4_c1_internal_error_test.go:108: REPRODUCED full inbound list n=40 returned=40 node_queries=40 total_queries=map[node:40 node_inbound:1 node_kernel:1 remote_source:1] elapsed_us=9252 response_bytes=32543",
+      "--- PASS: TestAuditInboundListQueryGrowth (0.28s)",
+      "    rr4_c1_internal_error_test.go:117: REPRODUCED storage read failure converted to metricStale=true and lastMetricAt=0 instead of unknown/omitted markers",
+      "--- PASS: TestAuditMetricStalenessReadFailure (0.13s)",
+      "PASS",
+      "ok  \tgo-backend/internal/http/handler\t0.643s"
+    ]
+  },
+  {
+    "name": "repository probes",
+    "source": "local-work/audit-2134/repo-probes.log",
+    "lines": [
+      "    sqlite_reclaim_test.go:129: REPRODUCED >1h aggregation drops resource fields: short active=9 RSS=4096 conntrack=80; long active=0 RSS=0 conntrack=0",
+      "--- PASS: TestAuditLongRangeMetricFieldsLost (0.10s)",
+      "    sqlite_reclaim_test.go:142: COST nodes=8 history_rows_per_node=100 elapsed_us=[794 588 388 226 218 528 407] plan=[{SEARCH node_metric USING COVERING INDEX idx_node_metric_node_time (node_id=?)}]",
+      "    sqlite_reclaim_test.go:142: COST nodes=8 history_rows_per_node=10000 elapsed_us=[15759 14771 17663 15682 15639 15610 20139] plan=[{SEARCH node_metric USING COVERING INDEX idx_node_metric_node_time (node_id=?)}]",
+      "--- PASS: TestAuditMetricFreshnessHistoryCost (6.52s)",
+      "    sqlite_reclaim_test.go:155: COST full VACUUM 16MiB blocks sole DB connection: elapsed_ms=101 wait_count_delta=1 wait_duration_ms=100 (no request context/deadline in VacuumSQLite)",
+      "--- PASS: TestAuditSQLiteVacuumBlocksConnection (0.24s)",
+      "PASS",
+      "ok  \tgo-backend/internal/store/repo\t6.885s"
+    ]
+  },
+  {
+    "name": "statistics overflow",
+    "source": "local-work/audit-2134/statistics-overflow-probe.log",
+    "lines": [
+      "    rr4_c1_internal_error_test.go:127: REPRODUCED hourly total_flow overflow: positive MaxInt64 in_flow + 1 out_flow persisted total_flow=-9223372036854775808",
+      "--- PASS: TestAuditHourlyStatisticsTotalOverflow (0.13s)",
+      "PASS",
+      "ok  \tgo-backend/internal/http/handler\t0.145s"
+    ]
+  },
+  {
+    "name": "Mieru invalid import",
+    "source": "local-work/audit-2134/mieru-import-probe.log",
+    "lines": [
+      "    mieru_test.go:415: REPRODUCED malformed Mieru enums accepted and re-exported: mierus://audit:test@203.0.113.1?handshake-mode=INVALID&multiplexing=INVALID&port=23456&profile=203.0.113.1%3A23456&protocol=TCP",
+      "--- PASS: TestAuditMieruInvalidEnumsPassImport (0.00s)",
+      "PASS",
+      "ok  \tgo-backend/internal/kernel\t0.004s"
+    ]
+  },
+  {
+    "name": "dual agent coexistence",
+    "source": "local-work/audit-2134/dual-agent-probe.log",
+    "lines": [
+      "✅ 存量安装已迁移到新布局：/home/adminuser/ovo/.git/audit-2134/dual-agent.2JyGkT/ovo_agent（服务名 ovo_agent，配置与状态原样保留）",
+      "❌ 目标目录已有 agent，保留两套安装，请先确认迁移目标",
+      "REPRODUCED menu update rc=1: flmx migrated to ovo, flux binary/service remain; second migration rejects occupied ovo target"
+    ]
+  },
+  {
+    "name": "SNI peer isolated probe",
+    "source": "local-work/upstream/mux-probe.log",
+    "lines": [
+      "    peer_probe_test.go:11: client source 127.0.0.2 became kernel peer 127.0.0.1; native inbound route does not send PROXY",
+      "--- PASS: TestUpstreamMuxChangesKernelPeer (0.00s)",
+      "--- PASS: TestSNIMuxRoutingWildcardFallbackWhitelistHotReload (0.01s)",
+      "--- PASS: TestPeekFragmentedClientHello (0.01s)",
+      "PASS",
+      "ok  \tovo-mux-probe\t0.033s"
+    ]
+  },
+  {
+    "name": "official Mieru TCP UDP",
+    "source": "local-work/upstream/mieru-e2e.log",
+    "lines": [
+      "PASS official mita + mieru TCP SOCKS5 -> local HTTP round trip; ONLY_IPv4 / MTU 1400 / multiplex LOW",
+      "PASS official mita + mieru UDP SOCKS5 -> local HTTP round trip; ONLY_IPv4 / MTU 1400 / multiplex LOW"
+    ]
+  },
+  {
+    "name": "official Mieru Manager lifecycle",
+    "source": "local-work/upstream/official-lifecycle.log",
+    "lines": [
+      "ok  \tgo-backend/internal/kernel\t0.009s",
+      "    mieru_test.go:81: PASS backend Render -> JSON -> digest-checked archive install -> official mita supervised env/process -> stop/start/restart/remove; nft stubbed",
+      "--- PASS: TestPortOfficialMitaLifecycle (5.01s)",
+      "ok  \tgithub.com/go-gost/x/kernel\t5.019s"
+    ]
+  },
+  {
+    "name": "theme browser",
+    "source": "local-work/upstream/theme-check.log",
+    "lines": [
+      "PASS default unchanged; flyx selected via settings; light-only; reload persists; reset restores original computed colors/background"
+    ]
+  },
+  {
+    "name": "demo four endpoints",
+    "source": "local-work/upstream/demo-extra.log",
+    "lines": [
+      "PASS node/restart: clicked immediate restart and confirmation",
+      "PASS node/connlog, node/connlog-readiness, node/connlog-repush: opened log dialog, repushed and refreshed",
+      "PASS no [demo] not recorded or browser errors"
+    ]
+  },
+  {
+    "name": "demo 17 pages",
+    "source": "local-work/upstream/demo-check.log",
+    "lines": [
+      "demo ok: 12 admin + 5 user pages"
+    ]
+  },
+  {
+    "name": "routes and raw gates",
+    "source": "local-work/audit-2134/route-gates.log",
+    "lines": [
+      "    admin_raw_error_gate_test.go:608: admin raw-error gate: 148 admin routes derived, 1917 handler declarations indexed, 0 violations",
+      "--- PASS: TestAdminRawErrorGate (0.26s)",
+      "--- PASS: TestAdminRawErrorGateSynthetic (0.00s)",
+      "    route_classification_test.go:750: route census: 200 registered, 200 classified (管理员 148 / 普通用户 34 / 公开面 18)",
+      "--- PASS: TestRouteClassificationCensus (0.29s)",
+      "--- PASS: TestAuditFullDumpRoutes (0.00s)",
+      "    unauth_raw_error_gate_test.go:341: unauthenticated raw-error gate: 17 public routes derived, 1917 handler declarations indexed",
+      "--- PASS: TestUnauthenticatedRawErrorGate (0.18s)",
+      "--- PASS: TestUnauthenticatedRawErrorGateSynthetic (0.00s)",
+      "PASS",
+      "ok  \tgo-backend/internal/http/middleware\t0.748s"
+    ]
+  },
+  {
+    "name": "PostgreSQL contract",
+    "source": "local-work/audit-2134/postgres-contract.log",
+    "lines": [
+      "=== RUN   TestPostgresCompanionPartialUniqueIndex",
+      "--- PASS: TestPostgresCompanionPartialUniqueIndex (1.93s)",
+      "=== RUN   TestPostgresApplySubscriptionCounterSamplesConcurrentDoubleApplyContract",
+      "--- PASS: TestPostgresApplySubscriptionCounterSamplesConcurrentDoubleApplyContract (1.89s)",
+      "=== RUN   TestPostgresApplyInboundCounterSamplesConcurrentDoubleApplyContract",
+      "--- PASS: TestPostgresApplyInboundCounterSamplesConcurrentDoubleApplyContract (1.96s)",
+      "=== RUN   TestPostgresLegacySeqContract",
+      "--- PASS: TestPostgresLegacySeqContract (1.89s)",
+      "=== RUN   TestPostgresFederationRemovalMigrationEndState",
+      "--- PASS: TestPostgresFederationRemovalMigrationEndState (5.65s)",
+      "=== RUN   TestPostgresLegacyConstraintRenameEndState",
+      "--- PASS: TestPostgresLegacyConstraintRenameEndState (5.47s)",
+      "=== RUN   TestPostgresViteConfigValueMigrationEndState",
+      "--- PASS: TestPostgresViteConfigValueMigrationEndState (4.98s)",
+      "=== RUN   TestPostgresTrafficBigIntMigrationEndState",
+      "--- PASS: TestPostgresTrafficBigIntMigrationEndState (3.70s)",
+      "=== RUN   TestPostgresLegacyTableIDDefaultEndState",
+      "--- PASS: TestPostgresLegacyTableIDDefaultEndState (3.50s)",
+      "=== RUN   TestPostgresStorageSummaryEndState",
+      "--- PASS: TestPostgresStorageSummaryEndState (1.80s)",
+      "=== RUN   TestPostgresNodeCreateRepairsMissingIDDefaultContract",
+      "--- PASS: TestPostgresNodeCreateRepairsMissingIDDefaultContract (3.28s)",
+      "=== RUN   TestPostgresSeqConcurrentDoubleApplyContract",
+      "--- PASS: TestPostgresSeqConcurrentDoubleApplyContract (1.67s)",
+      "=== RUN   TestPostgresUsernameFoldChecksAndRename",
+      "--- PASS: TestPostgresUsernameFoldChecksAndRename (1.99s)",
+      "=== RUN   TestPostgresUsernameFoldConcurrentVariants",
+      "--- PASS: TestPostgresUsernameFoldConcurrentVariants (2.15s)",
+      "=== RUN   TestPostgresUsernameFoldLockFoldFromSQL",
+      "=== RUN   TestPostgresUsernameFoldDirtyDataReopenDegrades",
+      "--- PASS: TestPostgresUsernameFoldDirtyDataReopenDegrades (3.59s)",
+      "PASS",
+      "ok  \tgo-backend/tests/contract\t47.352s"
+    ]
+  },
+  {
+    "name": "nft semantic",
+    "source": "local-work/audit-2134/nft-check.log",
+    "lines": [
+      "--- PASS: TestRenderTablePassesNftCheck (0.22s)",
+      "--- PASS: TestRenderTableMixedFamilyRejectedByNftCheck (0.01s)",
+      "PASS"
+    ]
+  },
+  {
+    "name": "Alpine lifecycle",
+    "source": "local-work/audit-2134/alpine-suite.log",
+    "lines": [
+      "Alpine installer lifecycle tests passed"
+    ]
+  },
+  {
+    "name": "root shell",
+    "source": "local-work/upstream/shell-root-full.log",
+    "lines": [
+      "skip: test_main_requires_root needs a non-root environment",
+      "install script tests passed"
+    ]
+  },
+  {
+    "name": "non-root shell",
+    "source": "local-work/upstream/shell-full.log",
+    "lines": [
+      "skip: test_panel_main_delete_self_only_on_success needs a root environment",
+      "skip: test_configure_docker_ipv6_false_value_is_updated_not_claimed needs a writable /etc/docker",
+      "skip: test_configure_docker_ipv6_sed_path_replaces_false_value needs a writable /etc/docker",
+      "skip: test_configure_docker_ipv6_true_value_is_accepted_without_rewrite needs a writable /etc/docker",
+      "install script tests passed"
+    ]
+  },
+  {
+    "name": "three generations",
+    "source": "local-work/audit-2134/three-generation.log",
+    "lines": [
+      "PASS image owner and generation pairing (positive and negative)",
+      "PASS flux cwd update/uninstall/migrate resolution gates",
+      "PASS flux explicit update/uninstall/migrate resolution gates",
+      "PASS flux arbitrary update/uninstall/migrate resolution gates",
+      "PASS flux identity migration, UUID/volume preservation and configuration rollback",
+      "PASS flmx cwd update/uninstall/migrate resolution gates",
+      "PASS flmx explicit update/uninstall/migrate resolution gates",
+      "PASS flmx arbitrary update/uninstall/migrate resolution gates",
+      "PASS flmx identity migration, UUID/volume preservation and configuration rollback",
+      "PASS ovo cwd update/uninstall/migrate resolution gates",
+      "PASS ovo explicit update/uninstall/migrate resolution gates",
+      "PASS ovo arbitrary update/uninstall/migrate resolution gates",
+      "PASS ovo identity migration, UUID/volume preservation and configuration rollback",
+      "PASS flux direct agent migration success",
+      "PASS flux direct agent migration rollback",
+      "PASS flux direct agent migration snapshot-failure",
+      "PASS flmx direct agent migration success",
+      "PASS flmx direct agent migration rollback",
+      "PASS flmx direct agent migration snapshot-failure",
+      "PASS kernel directory current-key priority and previous-key fallback",
+      "PASS PostgreSQL URL identity preserved; unknown identity fails closed",
+      "PASS all three-generation rename regression cases"
+    ]
+  },
+  {
+    "name": "backend final",
+    "source": "local-work/upstream/backend-full-final.log",
+    "lines": [
+      "ok  \tgo-backend/cmd/paneld\t0.021s",
+      "ok  \tgo-backend/internal/app\t0.018s",
+      "ok  \tgo-backend/internal/auth\t(cached)",
+      "ok  \tgo-backend/internal/clientip\t(cached)",
+      "ok  \tgo-backend/internal/config\t(cached)",
+      "ok  \tgo-backend/internal/envcompat\t(cached)",
+      "ok  \tgo-backend/internal/health\t(cached)",
+      "ok  \tgo-backend/internal/http\t0.420s",
+      "ok  \tgo-backend/internal/http/handler\t847.213s",
+      "ok  \tgo-backend/internal/http/middleware\t6.390s",
+      "?   \tgo-backend/internal/http/response\t[no test files]",
+      "ok  \tgo-backend/internal/kernel\t(cached)",
+      "ok  \tgo-backend/internal/logredact\t(cached)",
+      "ok  \tgo-backend/internal/metrics\t(cached)",
+      "ok  \tgo-backend/internal/monitoring\t(cached)",
+      "ok  \tgo-backend/internal/netguard\t(cached)",
+      "ok  \tgo-backend/internal/runtime/nftables\t(cached)",
+      "ok  \tgo-backend/internal/security\t(cached)",
+      "?   \tgo-backend/internal/store/model\t[no test files]",
+      "ok  \tgo-backend/internal/store/repo\t226.806s",
+      "ok  \tgo-backend/internal/ws\t(cached)",
+      "ok  \tgo-backend/tests/contract\t50.934s"
+    ]
+  },
+  {
+    "name": "agent full",
+    "source": "local-work/upstream/agent-full.log",
+    "lines": [
+      "ok  \tgithub.com/go-gost/gost\t0.048s",
+      "ok  \tgithub.com/go-gost/gost/tests/lifecycle\t(cached)"
+    ]
+  },
+  {
+    "name": "x full short",
+    "source": "local-work/upstream/x-full.log",
+    "lines": [
+      "?   \tgithub.com/go-gost/x/admission\t[no test files]",
+      "?   \tgithub.com/go-gost/x/admission/plugin\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/admission/wrapper\t(cached)",
+      "ok  \tgithub.com/go-gost/x/api\t0.121s",
+      "ok  \tgithub.com/go-gost/x/api/service\t0.026s",
+      "?   \tgithub.com/go-gost/x/auth\t[no test files]",
+      "?   \tgithub.com/go-gost/x/auth/plugin\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/bypass\t(cached)",
+      "?   \tgithub.com/go-gost/x/bypass/plugin\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/chain\t(cached)",
+      "ok  \tgithub.com/go-gost/x/config\t(cached)",
+      "?   \tgithub.com/go-gost/x/config/cmd\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/config/loader\t(cached)",
+      "?   \tgithub.com/go-gost/x/config/parsing\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/config/parsing/admission\t(cached)",
+      "ok  \tgithub.com/go-gost/x/config/parsing/auth\t(cached)",
+      "ok  \tgithub.com/go-gost/x/config/parsing/bypass\t(cached)",
+      "ok  \tgithub.com/go-gost/x/config/parsing/chain\t(cached)",
+      "?   \tgithub.com/go-gost/x/config/parsing/hop\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/config/parsing/hosts\t(cached)",
+      "ok  \tgithub.com/go-gost/x/config/parsing/ingress\t(cached)",
+      "ok  \tgithub.com/go-gost/x/config/parsing/limiter\t(cached)",
+      "ok  \tgithub.com/go-gost/x/config/parsing/logger\t(cached)",
+      "ok  \tgithub.com/go-gost/x/config/parsing/node\t(cached)",
+      "?   \tgithub.com/go-gost/x/config/parsing/observer\t[no test files]",
+      "?   \tgithub.com/go-gost/x/config/parsing/parser\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/config/parsing/recorder\t(cached)",
+      "ok  \tgithub.com/go-gost/x/config/parsing/resolver\t(cached)",
+      "ok  \tgithub.com/go-gost/x/config/parsing/router\t(cached)",
+      "?   \tgithub.com/go-gost/x/config/parsing/sd\t[no test files]",
+      "?   \tgithub.com/go-gost/x/config/parsing/selector\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/config/parsing/service\t(cached)",
+      "?   \tgithub.com/go-gost/x/connector/direct\t[no test files]",
+      "?   \tgithub.com/go-gost/x/connector/forward\t[no test files]",
+      "?   \tgithub.com/go-gost/x/connector/http\t[no test files]",
+      "?   \tgithub.com/go-gost/x/connector/http2\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/connector/relay\t(cached)",
+      "ok  \tgithub.com/go-gost/x/connector/router\t(cached)",
+      "?   \tgithub.com/go-gost/x/connector/serial\t[no test files]",
+      "?   \tgithub.com/go-gost/x/connector/sni\t[no test files]",
+      "?   \tgithub.com/go-gost/x/connector/socks/v4\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/connector/socks/v5\t(cached)",
+      "ok  \tgithub.com/go-gost/x/connector/ss\t(cached)",
+      "ok  \tgithub.com/go-gost/x/connector/ss/udp\t(cached)",
+      "?   \tgithub.com/go-gost/x/connector/sshd\t[no test files]",
+      "?   \tgithub.com/go-gost/x/connector/tcp\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/connector/tunnel\t(cached)",
+      "?   \tgithub.com/go-gost/x/connector/unix\t[no test files]",
+      "?   \tgithub.com/go-gost/x/ctx\t[no test files]",
+      "?   \tgithub.com/go-gost/x/dialer/direct\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/dialer/dtls\t(cached)",
+      "?   \tgithub.com/go-gost/x/dialer/ftcp\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/dialer/grpc\t(cached)",
+      "?   \tgithub.com/go-gost/x/dialer/http2\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/dialer/http2/h2\t(cached)",
+      "ok  \tgithub.com/go-gost/x/dialer/http3\t(cached)",
+      "ok  \tgithub.com/go-gost/x/dialer/http3/wt\t(cached)",
+      "?   \tgithub.com/go-gost/x/dialer/icmp\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/dialer/kcp\t(cached)",
+      "ok  \tgithub.com/go-gost/x/dialer/mtcp\t(cached)",
+      "ok  \tgithub.com/go-gost/x/dialer/mtls\t(cached)",
+      "ok  \tgithub.com/go-gost/x/dialer/mws\t(cached)",
+      "?   \tgithub.com/go-gost/x/dialer/obfs/http\t[no test files]",
+      "?   \tgithub.com/go-gost/x/dialer/obfs/tls\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/dialer/pht\t(cached)",
+      "?   \tgithub.com/go-gost/x/dialer/quic\t[no test files]",
+      "?   \tgithub.com/go-gost/x/dialer/serial\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/dialer/ssh\t(cached)",
+      "ok  \tgithub.com/go-gost/x/dialer/sshd\t(cached)",
+      "?   \tgithub.com/go-gost/x/dialer/tcp\t[no test files]",
+      "?   \tgithub.com/go-gost/x/dialer/tls\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/dialer/udp\t(cached)",
+      "?   \tgithub.com/go-gost/x/dialer/unix\t[no test files]",
+      "?   \tgithub.com/go-gost/x/dialer/wg\t[no test files]",
+      "?   \tgithub.com/go-gost/x/dialer/ws\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/envcompat\t(cached)",
+      "ok  \tgithub.com/go-gost/x/handler/api\t6.050s",
+      "?   \tgithub.com/go-gost/x/handler/auto\t[no test files]",
+      "?   \tgithub.com/go-gost/x/handler/dns\t[no test files]",
+      "?   \tgithub.com/go-gost/x/handler/file\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/handler/forward/local\t(cached)",
+      "ok  \tgithub.com/go-gost/x/handler/forward/remote\t(cached)",
+      "ok  \tgithub.com/go-gost/x/handler/http\t(cached)",
+      "ok  \tgithub.com/go-gost/x/handler/http2\t(cached)",
+      "?   \tgithub.com/go-gost/x/handler/http3\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/handler/metrics\t(cached)",
+      "?   \tgithub.com/go-gost/x/handler/redirect/tcp\t[no test files]",
+      "?   \tgithub.com/go-gost/x/handler/redirect/udp\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/handler/relay\t(cached)",
+      "ok  \tgithub.com/go-gost/x/handler/router\t(cached)",
+      "?   \tgithub.com/go-gost/x/handler/serial\t[no test files]",
+      "?   \tgithub.com/go-gost/x/handler/sni\t[no test files]",
+      "?   \tgithub.com/go-gost/x/handler/socks/v4\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/handler/socks/v5\t(cached)",
+      "ok  \tgithub.com/go-gost/x/handler/ss\t(cached)",
+      "ok  \tgithub.com/go-gost/x/handler/ss/udp\t(cached)",
+      "?   \tgithub.com/go-gost/x/handler/sshd\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/handler/tap\t(cached)",
+      "ok  \tgithub.com/go-gost/x/handler/tun\t(cached)",
+      "ok  \tgithub.com/go-gost/x/handler/tunnel\t(cached)",
+      "?   \tgithub.com/go-gost/x/handler/unix\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/hop\t(cached)",
+      "?   \tgithub.com/go-gost/x/hop/plugin\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/hosts\t(cached)",
+      "?   \tgithub.com/go-gost/x/hosts/plugin\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/ingress\t(cached)",
+      "?   \tgithub.com/go-gost/x/ingress/plugin\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/internal/connlog\t(cached)",
+      "?   \tgithub.com/go-gost/x/internal/ctx\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/internal/idle\t(cached)",
+      "?   \tgithub.com/go-gost/x/internal/io\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/internal/keepalive\t(cached)",
+      "?   \tgithub.com/go-gost/x/internal/loader\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/internal/matcher\t(cached)",
+      "ok  \tgithub.com/go-gost/x/internal/net\t(cached)",
+      "ok  \tgithub.com/go-gost/x/internal/net/dialer\t(cached)",
+      "ok  \tgithub.com/go-gost/x/internal/net/http\t(cached)",
+      "?   \tgithub.com/go-gost/x/internal/net/ip\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/internal/net/proxyproto\t(cached)",
+      "ok  \tgithub.com/go-gost/x/internal/net/udp\t(cached)",
+      "?   \tgithub.com/go-gost/x/internal/plugin\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/internal/reap\t(cached)",
+      "ok  \tgithub.com/go-gost/x/internal/sessionbudget\t(cached)",
+      "ok  \tgithub.com/go-gost/x/internal/util/cache\t(cached)",
+      "?   \tgithub.com/go-gost/x/internal/util/crypto\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/internal/util/download\t(cached)",
+      "?   \tgithub.com/go-gost/x/internal/util/dtls\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/internal/util/eventlog\t(cached)",
+      "ok  \tgithub.com/go-gost/x/internal/util/forwarder\t(cached)",
+      "?   \tgithub.com/go-gost/x/internal/util/grpc/proto\t[no test files]",
+      "?   \tgithub.com/go-gost/x/internal/util/icmp\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/internal/util/kcp\t(cached)",
+      "?   \tgithub.com/go-gost/x/internal/util/mux\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/internal/util/pht\t(cached)",
+      "ok  \tgithub.com/go-gost/x/internal/util/port\t(cached)",
+      "?   \tgithub.com/go-gost/x/internal/util/quic\t[no test files]",
+      "?   \tgithub.com/go-gost/x/internal/util/relay\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/internal/util/resolver\t(cached)",
+      "?   \tgithub.com/go-gost/x/internal/util/serial\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/internal/util/sessionretire\t(cached)",
+      "ok  \tgithub.com/go-gost/x/internal/util/sniffing\t(cached)",
+      "?   \tgithub.com/go-gost/x/internal/util/socks\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/internal/util/ss\t(cached)",
+      "?   \tgithub.com/go-gost/x/internal/util/ssh\t[no test files]",
+      "?   \tgithub.com/go-gost/x/internal/util/sshd\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/internal/util/stats\t(cached)",
+      "?   \tgithub.com/go-gost/x/internal/util/tap\t[no test files]",
+      "?   \tgithub.com/go-gost/x/internal/util/tls\t[no test files]",
+      "?   \tgithub.com/go-gost/x/internal/util/tun\t[no test files]",
+      "?   \tgithub.com/go-gost/x/internal/util/ws\t[no test files]",
+      "?   \tgithub.com/go-gost/x/internal/util/wt\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/kernel\t296.347s",
+      "ok  \tgithub.com/go-gost/x/limiter/conn\t(cached)",
+      "ok  \tgithub.com/go-gost/x/limiter/conn/wrapper\t(cached)",
+      "ok  \tgithub.com/go-gost/x/limiter/rate\t(cached)",
+      "ok  \tgithub.com/go-gost/x/limiter/traffic\t(cached)",
+      "?   \tgithub.com/go-gost/x/limiter/traffic/cache\t[no test files]",
+      "?   \tgithub.com/go-gost/x/limiter/traffic/plugin\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/limiter/traffic/wrapper\t(cached)",
+      "ok  \tgithub.com/go-gost/x/listener/dns\t(cached)",
+      "?   \tgithub.com/go-gost/x/listener/dtls\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/listener/ftcp\t(cached)",
+      "ok  \tgithub.com/go-gost/x/listener/grpc\t(cached)",
+      "ok  \tgithub.com/go-gost/x/listener/http2\t(cached)",
+      "ok  \tgithub.com/go-gost/x/listener/http2/h2\t(cached)",
+      "ok  \tgithub.com/go-gost/x/listener/http3\t(cached)",
+      "?   \tgithub.com/go-gost/x/listener/http3/h3\t[no test files]",
+      "?   \tgithub.com/go-gost/x/listener/http3/wt\t[no test files]",
+      "?   \tgithub.com/go-gost/x/listener/icmp\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/listener/kcp\t(cached)",
+      "?   \tgithub.com/go-gost/x/listener/mtcp\t[no test files]",
+      "?   \tgithub.com/go-gost/x/listener/mtls\t[no test files]",
+      "?   \tgithub.com/go-gost/x/listener/mws\t[no test files]",
+      "?   \tgithub.com/go-gost/x/listener/obfs/http\t[no test files]",
+      "?   \tgithub.com/go-gost/x/listener/obfs/tls\t[no test files]",
+      "?   \tgithub.com/go-gost/x/listener/pht\t[no test files]",
+      "?   \tgithub.com/go-gost/x/listener/quic\t[no test files]",
+      "?   \tgithub.com/go-gost/x/listener/redirect/tcp\t[no test files]",
+      "?   \tgithub.com/go-gost/x/listener/redirect/udp\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/listener/rtcp\t(cached)",
+      "ok  \tgithub.com/go-gost/x/listener/rudp\t(cached)",
+      "ok  \tgithub.com/go-gost/x/listener/serial\t(cached)",
+      "?   \tgithub.com/go-gost/x/listener/ssh\t[no test files]",
+      "?   \tgithub.com/go-gost/x/listener/sshd\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/listener/tap\t(cached)",
+      "ok  \tgithub.com/go-gost/x/listener/tcp\t(cached)",
+      "?   \tgithub.com/go-gost/x/listener/tls\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/listener/tun\t(cached)",
+      "ok  \tgithub.com/go-gost/x/listener/udp\t(cached)",
+      "?   \tgithub.com/go-gost/x/listener/unix\t[no test files]",
+      "?   \tgithub.com/go-gost/x/listener/ws\t[no test files]",
+      "?   \tgithub.com/go-gost/x/logger\t[no test files]",
+      "?   \tgithub.com/go-gost/x/metadata\t[no test files]",
+      "?   \tgithub.com/go-gost/x/metadata/util\t[no test files]",
+      "?   \tgithub.com/go-gost/x/metrics\t[no test files]",
+      "?   \tgithub.com/go-gost/x/metrics/service\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/metrics/wrapper\t(cached)",
+      "?   \tgithub.com/go-gost/x/observer/plugin\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/observer/stats\t(cached)",
+      "ok  \tgithub.com/go-gost/x/observer/stats/wrapper\t(cached)",
+      "?   \tgithub.com/go-gost/x/recorder\t[no test files]",
+      "?   \tgithub.com/go-gost/x/recorder/plugin\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/registry\t(cached)",
+      "?   \tgithub.com/go-gost/x/resolver\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/resolver/exchanger\t(cached)",
+      "?   \tgithub.com/go-gost/x/resolver/plugin\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/router\t(cached)",
+      "?   \tgithub.com/go-gost/x/router/plugin\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/routing\t(cached)",
+      "ok  \tgithub.com/go-gost/x/routing/rules\t(cached)",
+      "?   \tgithub.com/go-gost/x/sd/plugin\t[no test files]",
+      "ok  \tgithub.com/go-gost/x/selector\t(cached)",
+      "ok  \tgithub.com/go-gost/x/service\t(cached)",
+      "ok  \tgithub.com/go-gost/x/socket\t43.422s"
+    ]
+  },
+  {
+    "name": "race auth and WebSocket",
+    "source": "local-work/audit-2134/race-auth-ws.log",
+    "lines": [
+      "ok  \tgo-backend/internal/auth\t1.031s",
+      "ok  \tgo-backend/internal/ws\t184.282s"
+    ]
+  },
+  {
+    "name": "E2E default local FS",
+    "source": "local-work/audit-2134/e2e-full.log",
+    "lines": [
+      "======== 7 failed, 20 passed, 1 warning, 14 errors in 263.91s (0:04:23) ========"
+    ]
+  },
+  {
+    "name": "E2E local FS override",
+    "source": "local-work/audit-2134/e2e-local-fs-override.log",
+    "lines": [
+      "FAILED tests/e2e/test_auth.py::TestAuthentication::test_logout_clears_session[chromium]",
+      "=================== 1 failed, 40 passed, 1 warning in 58.06s ==================="
+    ]
+  },
+  {
+    "name": "E2E logout fresh retest",
+    "source": "local-work/audit-2134/e2e-logout-retest.log",
+    "lines": [
+      "tests/e2e/test_auth.py::TestAuthentication::test_logout_clears_session[chromium] PASSED [100%]",
+      "======================= 1 passed, 6 deselected in 4.15s ========================"
+    ]
+  },
+  {
+    "name": "secret scan",
+    "source": "local-work/upstream/port-secret-scan.log",
+    "lines": [
+      "PASS  check-secret-material：2961 个入库文本文件无秘密材料形态（合成自检 8 格全过）"
+    ]
+  },
+  {
+    "name": "timeout-selftest",
+    "source": "local-work/audit-2134/timeout-selftest.log",
+    "lines": [
+      "== variant: C080 re-misclassified as class must FAIL, naming C080 ==",
+      "== variant: C113 re-misclassified as class must FAIL, naming C113 ==",
+      "== variant R9-23: second Network call in one export must FAIL, naming probeNodeLatency ==",
+      "== variant R9-24: parameter-shadowed config identifier must FAIL, naming rollbackNode ==",
+      "== variant R9-25: helper growth term replaced by a static value must FAIL, naming latencyProbeTimeout ==",
+      "== variant R2-C6-02: kernel_external literal anchor drift 20s->500s must FAIL, naming T061 ==",
+      "== variant RR4-C6-01a: raw-string shadow line + true drift 180->999 must FAIL, naming C059 ==",
+      "== variant RR4-C6-01b: nodeTuneTimeout drift 30->99 must FAIL, naming T019 ==",
+      "== variant D-R7-02: duplicated cell ID must FAIL, naming the cell ==",
+      "SELFTEST: PASS"
+    ]
+  },
+  {
+    "name": "private-ranges-selftest",
+    "source": "local-work/audit-2134/private-ranges-selftest.log",
+    "lines": [
+      "== variant 1: canonical CGNAT 100.64.0.0/10 -> /11 must FAIL and name the segment ==",
+      "== variant 2: canonical 2001:db8::/32 -> /33 must FAIL and name the segment ==",
+      "== variant 3: comment out one canonical CIDR line must FAIL and name the segment (R6-C4-05) ==",
+      "== variant 4: delete the ::ffff: derivation code (comments keep the word) must FAIL (R6-C4-06) ==",
+      "== variant 5: rewrite one canonical CIDR as a quoted-content raw string must FAIL and name the segment (R7 census) ==",
+      "== variant 6: netguard lineage gains one segment one-sidedly (203.0.113.0/24) must FAIL and name it (R3-C6-01) ==",
+      "== variant 7: canonical set drops one documentation segment (192.0.2.0/24) must FAIL via the gold pin and the adjudicated diff (R3-C2-01) ==",
+      "== variant 8: socket reserved-table drift (240.0.0.0/4 -> /5) must FAIL and name it (R3-C6-01) ==",
+      "== variant 9: bypass translation prefix drift (2002::/16 -> /17) must FAIL and name it (R3-C6-01) ==",
+      "SELFTEST PASS"
+    ]
+  },
+  {
+    "name": "hist-selftest",
+    "source": "local-work/audit-2134/hist-selftest.log",
+    "lines": [
+      "== variant 1: emptyForm ssSubscriptionUsers false -> true must FAIL ==",
+      "== variant 2: toPayload ungated ssSubscriptionUsers must FAIL ==",
+      "== variant 3: toPayload re-sending meteringEnabled must FAIL =="
+    ]
+  },
+  {
+    "name": "pins-selftest",
+    "source": "local-work/audit-2134/pins-selftest.log",
+    "lines": [
+      "== variant 1: plain-form unpinned ref (evil/action@v1) must FAIL and name it ==",
+      "== variant 2: SHA pin without the # vX comment must FAIL ==",
+      "== variant 3: flow-form unpinned ref - {uses: evil/action@v1} must FAIL (A4-01) ==",
+      "== variant 4: block-scalar unpinned ref (uses: >-) must FAIL (A4-01) ==",
+      "== variant 5: docker:// without digest must FAIL ==",
+      "== variant 7: Dockerfile FROM without digest must FAIL and name it (A4-03) ==",
+      "== variant 8: floating workflow services image must FAIL and name it (R2-01-03) ==",
+      "SELFTEST PASS"
+    ]
+  },
+  {
+    "name": "script-version-selftest",
+    "source": "local-work/audit-2134/script-version-selftest.log",
+    "lines": [
+      "== variant 1: body changed after tag, stamp NOT bumped, must FAIL and name it ==",
+      "== variant 4: PINNED_VERSION filled in panel_install.sh, must FAIL and name it ==",
+      "== variant 5: PINNED_VERSION filled in install.sh, must FAIL and name it ==",
+      "== variant 6: cross-commit: unbumped body change masked by an intermediate bump, then another unbumped body change, must FAIL ==",
+      "SELFTEST PASS"
+    ]
+  },
+  {
+    "name": "contract-selftest",
+    "source": "local-work/audit-2134/contract-selftest.log",
+    "lines": [
+      "== variant 1: drop | null from NodeApiItem.remark in types.ts must FAIL and name it (C1) ==",
+      "== variant 3: drop | null from TunnelApiItem.inIp (emitted via nullableInIPString) must FAIL and name it (R2-01-04) ==",
+      "== variant 2: new unregistered List* exit emitting a nullable field must FAIL and name it (A4-04) ==",
+      "== variant 4: drop panelRttLossRate from NodeTuneProbeResult must FAIL and name it (C8b) ==",
+      "== variant 5: drop agent Warnings field (json tag warnings, threshold-only catch) must FAIL and report 16 tags (C8 threshold) ==",
+      "SELFTEST PASS"
+    ]
+  },
+  {
+    "name": "anchors-selftest",
+    "source": "local-work/audit-2134/anchors-selftest.log",
+    "lines": [
+      "== variant 1: rename the target heading (anchor dies) must FAIL and name it ==",
+      "== variant 2: link to a missing file must FAIL and name it ==",
+      "== variant 3: unclosed link (R6-A-01 shape: full-width parens, no ASCII close) must FAIL and name it ==",
+      "== variant 4: unanchored link to a missing file (R18-A4-03) must FAIL and name it ==",
+      "SELFTEST PASS"
+    ]
+  },
+  {
+    "name": "audit artifact secret scan",
+    "source": "local-work/audit-2134/audit-secret-scan.log",
+    "lines": [
+      "PASS  check-secret-material：2995 个入库文本文件无秘密材料形态（合成自检 8 格全过）"
+    ]
+  }
+]

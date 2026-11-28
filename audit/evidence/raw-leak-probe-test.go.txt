@@ -1,0 +1,128 @@
+package handler
+
+import (
+	"encoding/json"
+	"net/http/httptest"
+	"strings"
+	"testing"
+ "fmt"
+ "go-backend/internal/kernel"
+ "go-backend/internal/store/model"
+ "gorm.io/gorm"
+ "time"
+ "math"
+)
+
+// RR4-C1-01 钉死用例：普通用户可达面在仓储错误时只回通用文案
+// （code -2 + "Internal error"），批量回执的逐条失败原因同样净化
+// （"内部错误，请稍后重试"）；业务文案（转发不存在等）逐字不变。
+// 故障注入沿用 DROP TABLE 口径（原文含 "no such table"）。
+
+func TestRR4C1GetConfigsRepoErrorIsGeneric(t *testing.T) {
+	h, r := newPanelsecHandler(t)
+	dropTableForTest(t, r, "vite_config")
+	req := newAuthenticatedJSONRequestAs(t, 2, "user2", 1, map[string]any{})
+	rec := httptest.NewRecorder()
+	h.getConfigs(rec, req)
+	assertGenericInternalError(t, rec)
+}
+
+func TestRR4C1ForwardListRepoErrorIsGeneric(t *testing.T) {
+	h, r := newPanelsecHandler(t)
+	dropTableForTest(t, r, "forward")
+	req := newAuthenticatedJSONRequestAs(t, 2, "user2", 1, map[string]any{})
+	rec := httptest.NewRecorder()
+	h.forwardList(rec, req)
+	assertGenericInternalError(t, rec)
+}
+
+func TestRR4C1ForwardPauseRepoErrorIsGeneric(t *testing.T) {
+	h, r := newPanelsecHandler(t)
+	dropTableForTest(t, r, "forward")
+	req := newAuthenticatedJSONRequestAs(t, 2, "user2", 1, map[string]any{"id": 1})
+	rec := httptest.NewRecorder()
+	h.forwardPause(rec, req)
+	assertGenericInternalError(t, rec)
+}
+
+// 业务文案保持钉：转发不存在仍回原文案，不被内部错误收口误伤。
+func TestRR4C1ForwardPauseMissingKeepsBusinessCopy(t *testing.T) {
+	h, _ := newPanelsecHandler(t)
+	req := newAuthenticatedJSONRequestAs(t, 2, "user2", 1, map[string]any{"id": 424242})
+	rec := httptest.NewRecorder()
+	h.forwardPause(rec, req)
+	code, msg := decodePendingEnvelopeCode(t, rec)
+	if code != -1 || msg != "转发不存在" {
+		t.Fatalf("expected business copy (-1, 转发不存在), got (%d, %q) body=%s", code, msg, rec.Body.String())
+	}
+}
+
+// 批量回执通道钉：逐条失败原因中的仓储原文必须被净化为通用文案。
+func TestRR4C1ForwardBatchPauseReceiptSanitizesRepoError(t *testing.T) {
+	h, r := newPanelsecHandler(t)
+	dropTableForTest(t, r, "forward")
+	req := newAuthenticatedJSONRequestAs(t, 2, "user2", 1, map[string]any{"ids": []int64{1}})
+	rec := httptest.NewRecorder()
+	h.forwardBatchPause(rec, req)
+	body := rec.Body.String()
+	if strings.Contains(body, "no such table") || strings.Contains(body, "sql:") {
+		t.Fatalf("batch receipt leaks raw storage error: %s", body)
+	}
+	var out struct {
+		Code int `json:"code"`
+		Data struct {
+			FailCount int `json:"failCount"`
+			Failures  []struct {
+				Reason string `json:"reason"`
+			} `json:"failures"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode response: %v body=%s", err, body)
+	}
+	if out.Code != 0 || out.Data.FailCount != 1 || len(out.Data.Failures) != 1 {
+		t.Fatalf("expected one sanitized failure, got body=%s", body)
+	}
+	if out.Data.Failures[0].Reason != "内部错误，请稍后重试" {
+		t.Fatalf("expected generic batch reason, got %q", out.Data.Failures[0].Reason)
+	}
+}
+
+func TestAuditKernelControlRepoTextLeak(t *testing.T){
+ h,r:=newPanelsecHandler(t);nodeID:=seedRelayTargetNode(t,r,"audit-raw","203.0.113.1");k:=seedB8Kernel(t,r,nodeID,kernel.TypeXray,"25.9.5")
+ dropTableForTest(t,r,"node_inbound")
+ rec:=postJSON(t,h,h.kernelControl,"/api/v1/kernel/control",fmt.Sprintf(`{"id":%d,"action":"start"}`,k.ID))
+ if !strings.Contains(rec.Body.String(),"no such table: node_inbound"){t.Fatalf("not reproduced: %s",rec.Body.String())}
+ t.Logf("REPRODUCED storage text in admin receipt: %s",rec.Body.String())
+}
+
+func TestAuditInboundListQueryGrowth(t *testing.T){
+ for _,n:=range []int{1,40}{t.Run(fmt.Sprint(n),func(t *testing.T){
+ h,r:=newPanelsecHandler(t)
+ for i:=0;i<n;i++{nid:=seedRelayTargetNode(t,r,fmt.Sprintf("audit-perf-%d",i),"203.0.113.1");k:=seedB8Kernel(t,r,nid,kernel.TypeXray,"25.9.5");seedChainInbound(t,r,k,"audit-in",kernel.Inbound{Protocol:kernel.ProtocolVLESS,Port:23456,Settings:kernel.Settings{UUID:"11111111-2222-3333-4444-555555555555"},Security:kernel.Security{Type:kernel.SecurityNone},Transport:kernel.Transport{Type:kernel.TransportTCP}},0)}
+ queries:=map[string]int{};rows:=map[string]int64{}
+ if err:=r.DB().Callback().Query().After("gorm:query").Register("audit_full_query_count",func(tx *gorm.DB){queries[tx.Statement.Table]++;rows[tx.Statement.Table]+=tx.RowsAffected});err!=nil{t.Fatal(err)}
+ defer r.DB().Callback().Query().Remove("audit_full_query_count")
+ start:=time.Now();rec:=postJSON(t,h,h.inboundList,"/api/v1/inbound/list",`{}`);elapsed:=time.Since(start)
+ var out struct{Code int `json:"code"`;Data []interface{} `json:"data"`};if err:=json.Unmarshal(rec.Body.Bytes(),&out);err!=nil{t.Fatal(err)}
+ if out.Code!=0||len(out.Data)!=n||queries["node"]!=n{t.Fatalf("unexpected: code=%d items=%d queries=%v",out.Code,len(out.Data),queries)}
+ t.Logf("REPRODUCED full inbound list n=%d returned=%d node_queries=%d total_queries=%v elapsed_us=%d response_bytes=%d",n,len(out.Data),queries["node"],queries,elapsed.Microseconds(),rec.Body.Len())
+ })}
+}
+func TestAuditMetricStalenessReadFailure(t *testing.T){
+ h,r:=newPanelsecHandler(t);id:=seedRelayTargetNode(t,r,"audit-stale","203.0.113.1")
+ if err:=r.DB().Create(&model.NodeMetric{NodeID:id,Timestamp:time.Now().UnixMilli()}).Error;err!=nil{t.Fatal(err)}
+ items:=[]map[string]interface{}{{"id":id}};h.attachNodeMetricStaleness(items);if items[0]["metricStale"]!=false{t.Fatal("fresh control failed")}
+ dropTableForTest(t,r,"node_metric");items=[]map[string]interface{}{{"id":id}};h.attachNodeMetricStaleness(items)
+ if items[0]["metricStale"]!=true||items[0]["lastMetricAt"]!=int64(0){t.Fatalf("not reproduced: %v",items)}
+ t.Log("REPRODUCED storage read failure converted to metricStale=true and lastMetricAt=0 instead of unknown/omitted markers")
+}
+
+func TestAuditHourlyStatisticsTotalOverflow(t *testing.T){
+ h,r:=newPanelsecHandler(t);now:=time.Now()
+ if err:=r.DB().Exec(`UPDATE "user" SET in_flow=?,out_flow=? WHERE id=1`,int64(math.MaxInt64),int64(1)).Error;err!=nil{t.Fatal(err)}
+ h.runStatisticsFlowJob(now)
+ total,err:=r.GetLastStatisticsFlowTotal(1);if err!=nil||!total.Valid{t.Fatalf("missing stats: %v %v",total,err)}
+ if total.Int64>=0{t.Fatalf("not reproduced: %d",total.Int64)}
+ t.Logf("REPRODUCED hourly total_flow overflow: positive MaxInt64 in_flow + 1 out_flow persisted total_flow=%d",total.Int64)
+}

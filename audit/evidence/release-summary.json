@@ -1,0 +1,94 @@
+{
+  "id": 461315994,
+  "tag_name": "2.1.34",
+  "target_commitish": "745cde4dd765eee414ec9c651376cd928830c3d5",
+  "published_at": "2026-11-28T05:06:44Z",
+  "html_url": "https://github.com/yhfc1775-maker/ovo/releases/tag/2.1.34",
+  "body": "## What's Changed\n\nRename the complete d73af7b2 content snapshot to OVO 2.1.34. Preserve three-generation deployment recognition, existing credentials, resource identities and rollback. Fix demo API gaps and expired-session remounts; publish anonymous, checksummed installation assets.\n\n## Release assets (14)\n\n- gost-amd64\n- gost-arm64\n- gost-amd64.sha256\n- gost-arm64.sha256\n- install.sh\n- panel_install.sh\n- install.sh.sha256\n- panel_install.sh.sha256\n- docker-compose-v4.yml\n- docker-compose-v6.yml\n- docker-compose-v4.yml.sha256\n- docker-compose-v6.yml.sha256\n- ovo-skill-api-2.1.34.tgz\n- ovo-skill-api-2.1.34.tgz.sha256\n\n## \ud83d\udcdd Release Information\n\n- **Version**: 2.1.34\n- **Commit**: [`745cde4`](https://github.com/yhfc1775-maker/ovo/commit/745cde4dd765eee414ec9c651376cd928830c3d5)\n- **Author**: yhfc1775-maker\n- **Date**: 2026-11-28 10:48:21 +0800\n- **Message**: Rename flmx-max to ovo for public release 2.1.34 (#1)\n\n## \ud83d\udce6 Docker Images\n\n```bash\n# Backend\ndocker pull ghcr.io/yhfc1775-maker/ovo-panel-backend:2.1.34\n\n# Frontend\ndocker pull ghcr.io/yhfc1775-maker/ovo-vite-frontend:2.1.34\n\n# Agent (node container install form)\ndocker pull ghcr.io/yhfc1775-maker/ovo-agent:2.1.34\n```\n\n## \ud83d\ude80 Quick Install\n\n**Panel (\u5b89\u88c5\u6b64\u7248\u672c 2.1.34):**\n```bash\ncurl -L https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/panel_install.sh -o panel_install.sh && curl -L https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/panel_install.sh.sha256 -o panel_install.sh.sha256 && sha256sum -c panel_install.sh.sha256 && chmod +x panel_install.sh && ./panel_install.sh\n```\n\n**Node (\u5b89\u88c5\u6b64\u7248\u672c 2.1.34):**\n```bash\ncurl -L https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/install.sh -o install.sh && curl -L https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/install.sh.sha256 -o install.sh.sha256 && sha256sum -c install.sh.sha256 && chmod +x install.sh && ./install.sh\n```\n\n**\u5b89\u88c5\u6700\u65b0\u7248:**\n```bash\n# \u9762\u677f\u7aef\ncurl -L https://github.com/yhfc1775-maker/ovo/releases/latest/download/panel_install.sh -o panel_install.sh && curl -L https://github.com/yhfc1775-maker/ovo/releases/latest/download/panel_install.sh.sha256 -o panel_install.sh.sha256 && sha256sum -c panel_install.sh.sha256 && chmod +x panel_install.sh && ./panel_install.sh\n# \u8282\u70b9\u7aef\ncurl -L https://github.com/yhfc1775-maker/ovo/releases/latest/download/install.sh -o install.sh && curl -L https://github.com/yhfc1775-maker/ovo/releases/latest/download/install.sh.sha256 -o install.sh.sha256 && sha256sum -c install.sh.sha256 && chmod +x install.sh && ./install.sh\n```",
+  "assets": [
+    {
+      "name": "docker-compose-v4.yml",
+      "size": 5089,
+      "digest": "sha256:6f202ea3ff061d80e11a6cd24ec42e493c34e7ab3e98be7c838eea76abc19755",
+      "browser_download_url": "https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/docker-compose-v4.yml"
+    },
+    {
+      "name": "docker-compose-v4.yml.sha256",
+      "size": 88,
+      "digest": "sha256:efaf02e636c640e962bc9cf998fa31fce3525d7a0d3ca882c8df7497e9c56630",
+      "browser_download_url": "https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/docker-compose-v4.yml.sha256"
+    },
+    {
+      "name": "docker-compose-v6.yml",
+      "size": 5149,
+      "digest": "sha256:592f60d1c59320eb65ad42df740772e9da0b3fe1d8f3851725598f58213f94e6",
+      "browser_download_url": "https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/docker-compose-v6.yml"
+    },
+    {
+      "name": "docker-compose-v6.yml.sha256",
+      "size": 88,
+      "digest": "sha256:c30585e3879a2584c9030bf439bcf716f4efda38b9ccbcfed5a382ae0f817234",
+      "browser_download_url": "https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/docker-compose-v6.yml.sha256"
+    },
+    {
+      "name": "gost-amd64",
+      "size": 9567188,
+      "digest": "sha256:7bc3070ca05c7dc2fb0f8c62059ce0d3338a5a50ecb103ced75c46cd076636aa",
+      "browser_download_url": "https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/gost-amd64"
+    },
+    {
+      "name": "gost-amd64.sha256",
+      "size": 77,
+      "digest": "sha256:1786e3dabba4a480937e168f894f3dd35053441875d9ba0826800918595d381e",
+      "browser_download_url": "https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/gost-amd64.sha256"
+    },
+    {
+      "name": "gost-arm64",
+      "size": 7690096,
+      "digest": "sha256:7564a04ffeade7f91cdf91509a670965f0d7b1af861e12796a44794cc7f861a6",
+      "browser_download_url": "https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/gost-arm64"
+    },
+    {
+      "name": "gost-arm64.sha256",
+      "size": 77,
+      "digest": "sha256:4d1bc3fee3c458b7e152dd061732a1c722d25bf5439a66c7fc8be71c7c158663",
+      "browser_download_url": "https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/gost-arm64.sha256"
+    },
+    {
+      "name": "install.sh",
+      "size": 205036,
+      "digest": "sha256:04adcd024f2caf37354e319cacc15ca9427e4108675a25b68c3017c2d09d0afb",
+      "browser_download_url": "https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/install.sh"
+    },
+    {
+      "name": "install.sh.sha256",
+      "size": 77,
+      "digest": "sha256:f461a3ed2413aaba74cbddcb0912a7f3611e4886af93a68f4e484c345d83145d",
+      "browser_download_url": "https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/install.sh.sha256"
+    },
+    {
+      "name": "ovo-skill-api-2.1.34.tgz",
+      "size": 41279,
+      "digest": "sha256:b830077302bd7db07fe528a73e6caec7e0517c3973fc2b1c90b94570bb6e51e0",
+      "browser_download_url": "https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/ovo-skill-api-2.1.34.tgz"
+    },
+    {
+      "name": "ovo-skill-api-2.1.34.tgz.sha256",
+      "size": 91,
+      "digest": "sha256:5e4fee5e651b027e4578544561bdc95287c99e490bef5428f19379c9b55bc8a2",
+      "browser_download_url": "https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/ovo-skill-api-2.1.34.tgz.sha256"
+    },
+    {
+      "name": "panel_install.sh",
+      "size": 362156,
+      "digest": "sha256:799bad0d95f42ef86e35a387d5ac8f592d53b66d4eaac1831cfd9cf5d03090f1",
+      "browser_download_url": "https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/panel_install.sh"
+    },
+    {
+      "name": "panel_install.sh.sha256",
+      "size": 83,
+      "digest": "sha256:2263388c7cd26d5fae0764594954535ab61e67c3d183ab94a9a8b99af32b014f",
+      "browser_download_url": "https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/panel_install.sh.sha256"
+    }
+  ]
+}

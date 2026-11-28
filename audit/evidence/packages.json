@@ -1,0 +1,4413 @@
+{
+  "go-backend": [
+    {
+      "importPath": "go-backend/cmd/paneld",
+      "dir": "go-backend/cmd/paneld",
+      "goFiles": [
+        "main.go",
+        "memlimit.go"
+      ],
+      "testGoFiles": [
+        "memlimit_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "go-backend/internal/app",
+      "dir": "go-backend/internal/app",
+      "goFiles": [
+        "app.go"
+      ],
+      "testGoFiles": [
+        "app_postgres_password_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "go-backend/internal/auth",
+      "dir": "go-backend/internal/auth",
+      "goFiles": [
+        "jwt.go",
+        "user_state.go"
+      ],
+      "testGoFiles": [
+        "jwt_alg_f067_test.go",
+        "jwt_b01_r3_test.go",
+        "user_state_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "go-backend/internal/clientip",
+      "dir": "go-backend/internal/clientip",
+      "goFiles": [
+        "clientip.go"
+      ],
+      "testGoFiles": [
+        "clientip_c401_test.go",
+        "clientip_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "go-backend/internal/config",
+      "dir": "go-backend/internal/config",
+      "goFiles": [
+        "config.go",
+        "env.go",
+        "jwt_secret.go",
+        "tunnel_tls_ca.go"
+      ],
+      "testGoFiles": [
+        "concurrent_log_capture_test.go",
+        "config_dbtype_test.go",
+        "config_r18_b11_01_test.go",
+        "config_test.go",
+        "jwt_secret_b104_test.go",
+        "jwt_secret_test.go",
+        "tunnel_tls_ca_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "go-backend/internal/envcompat",
+      "dir": "go-backend/internal/envcompat",
+      "goFiles": [
+        "env.go"
+      ],
+      "testGoFiles": [
+        "env_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "go-backend/internal/health",
+      "dir": "go-backend/internal/health",
+      "goFiles": [
+        "checker.go",
+        "monitor_ssrf.go"
+      ],
+      "testGoFiles": [
+        "b8_checker_evict_test.go",
+        "b8_ssrf_zero8_test.go",
+        "checker_c304_test.go",
+        "checker_r18_b11_02_test.go",
+        "checker_r18_b11_03_test.go",
+        "checker_test.go",
+        "final_l1_f05_test.go",
+        "fxe_r1_checker_test.go",
+        "monitor_ssrf_test.go",
+        "monitor_timeout_audit_test.go",
+        "netguard_r2_b1_test.go",
+        "port_closure_d_test.go",
+        "r4_b7_monitor_harddeny_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "go-backend/internal/http",
+      "dir": "go-backend/internal/http",
+      "goFiles": [
+        "router.go"
+      ],
+      "testGoFiles": [
+        "router_logout_e102_test.go",
+        "router_r18_b10_01_test.go",
+        "router_ticket_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "go-backend/internal/http/handler",
+      "dir": "go-backend/internal/http/handler",
+      "goFiles": [
+        "add_service_guard.go",
+        "agent_image_digest.go",
+        "backup_import_repush.go",
+        "config_access.go",
+        "connlog.go",
+        "connlog_mark.go",
+        "connlog_marks.go",
+        "connlog_readiness.go",
+        "control_plane.go",
+        "diagnosis_stream.go",
+        "dns_budget.go",
+        "flow_auth_fail_limit.go",
+        "flow_ownership.go",
+        "flow_policy.go",
+        "flow_upload_batch.go",
+        "flow_upload_v2.go",
+        "forward_target_policy.go",
+        "gh_mirror.go",
+        "github_routes.go",
+        "github_token.go",
+        "handler.go",
+        "idempotency.go",
+        "import_auto_backup.go",
+        "jobs.go",
+        "kcp_tuning.go",
+        "kernel.go",
+        "kernel_chain.go",
+        "kernel_egress.go",
+        "kernel_external.go",
+        "kernel_probe.go",
+        "kernel_protect.go",
+        "kernel_relay.go",
+        "kernel_share_address.go",
+        "login_rate_limit.go",
+        "monitoring.go",
+        "mutations.go",
+        "nft_blocked_sweep.go",
+        "nftables_reconcile_guard.go",
+        "nftables_runtime.go",
+        "nftables_serialized_manager.go",
+        "nftables_traffic.go",
+        "node_collect_health.go",
+        "node_delete_uninstall.go",
+        "node_display_group.go",
+        "node_latency.go",
+        "node_latency_history.go",
+        "node_ping_slots.go",
+        "node_reconnect_probe.go",
+        "node_restart.go",
+        "node_route.go",
+        "node_secret_header.go",
+        "node_status_reconcile.go",
+        "node_swap.go",
+        "node_traffic.go",
+        "node_tune.go",
+        "notify.go",
+        "notify_bot.go",
+        "notify_reports.go",
+        "panel_disk.go",
+        "passkey.go",
+        "port_live_probe.go",
+        "realm.go",
+        "relay_latency.go",
+        "remote_source.go",
+        "resource_alert.go",
+        "secure_fetch.go",
+        "security_utils.go",
+        "state_sweep.go",
+        "storage.go",
+        "subscription.go",
+        "subscription_capability.go",
+        "subscription_front.go",
+        "subscription_metering.go",
+        "subscription_template.go",
+        "subscription_traffic.go",
+        "system_upgrade.go",
+        "traffic_limit.go",
+        "tunnel_best_exit.go",
+        "tunnel_best_exit_display.go",
+        "tunnel_delete_resolution.go",
+        "tunnel_metrics_ingestion.go",
+        "tunnel_probe_target.go",
+        "tunnel_quality_prober.go",
+        "tunnel_tls.go",
+        "upgrade.go",
+        "upgrade_verify.go",
+        "user_inbound.go",
+        "user_quota.go",
+        "user_subscription.go",
+        "write_deadline.go"
+      ],
+      "testGoFiles": [
+        "a1_02_limiter_cleanup_test.go",
+        "add_service_guard_test.go",
+        "agent_stop_audit_test.go",
+        "applying_gen_d18_test.go",
+        "audit_b2_01_subonly_user_test.go",
+        "audit_b2_02_user_tunnel_remove_retry_test.go",
+        "audit_b4_02_create_compensate_test.go",
+        "audit_b4_03_relay_force_delete_test.go",
+        "audit_b4_05_relay_dedup_address_test.go",
+        "audit_b4_tunnel_apply_defer_test.go",
+        "audit_b4_tunnel_apply_timeout_test.go",
+        "audit_b5_01_preview_format_skipped_test.go",
+        "audit_b5_03_preview_total_test.go",
+        "audit_b6_02_refresh_delete_race_test.go",
+        "audit_b6_03_refresh_error_surface_test.go",
+        "audit_b6_04_same_url_save_test.go",
+        "audit_b7_01_tunnel_entry_gate_test.go",
+        "audit_c5_proxy_protocol_allowlist_test.go",
+        "audit_c5_proxy_protocol_receive_test.go",
+        "audit_r18_f1_01_d3_test.go",
+        "audit_r18_r2_f1_01_direct_test.go",
+        "audit_r18_r2_f1_01_test.go",
+        "audit_r18_r2_f1_03_receipt_test.go",
+        "audit_r18_r2_f1_03_test.go",
+        "audit_r18_r3_b7_01_test.go",
+        "audit_r18_r3_f1_01_test.go",
+        "audit_r18_r3_f1_02_test.go",
+        "audit_r18_r3_f1_03_test.go",
+        "audit_r1_fix_test.go",
+        "audit_r2_b6_01_save_delete_race_test.go",
+        "audit_r2_fix_test.go",
+        "audit_r3_fix_test.go",
+        "audit_r3_k4_test.go",
+        "audit_r4_kr1_batch_test.go",
+        "audit_r4_kr1_nodeupdate_test.go",
+        "audit_r4_kr1_test.go",
+        "audit_r4_kr6_node_traffic_test.go",
+        "audit_regression_20261019_test.go",
+        "audit_regression_test.go",
+        "audit_udp_entry_shadowtls_test.go",
+        "audit_udp_fix5_pp_send_guard_test.go",
+        "audit_udp_relay_ku10_test.go",
+        "audit_udp_relay_ku1_test.go",
+        "audit_udp_relay_ku9_test.go",
+        "auth_p3_b3_test.go",
+        "auth_snapshot_audit_test.go",
+        "b2_fixture_test.go",
+        "b5_billing_test.go",
+        "b8_kernel_version_gate_test.go",
+        "b8_quality_cache_test.go",
+        "b8_route_ctx_test.go",
+        "b8_ssrf_zero8_test.go",
+        "backup_final_p2_1_test.go",
+        "backup_import_ctx_cb14_test.go",
+        "backup_import_errcode_r9_test.go",
+        "backup_import_hash_budget_r10_test.go",
+        "backup_import_r18_b9_03_test.go",
+        "backup_import_r18_b9_05_test.go",
+        "backup_import_removed_segment_test.go",
+        "backup_r13_br_test.go",
+        "backup_r4_b5_test.go",
+        "backup_r6_b3_test.go",
+        "backup_r7_b2_pending_recheck_test.go",
+        "batch_caps_r10_test.go",
+        "batch_delete_inip_a205_test.go",
+        "batch_ids_dedup_r2_test.go",
+        "batch_upgrade_wave_test.go",
+        "c01_redirect_tag_test.go",
+        "c02_github_fetch_ssrf_test.go",
+        "c02_login_account_security_test.go",
+        "c08_b10_test.go",
+        "c09_timeout_cluster_test.go",
+        "c10_kernel_control_test.go",
+        "combo_ss2022_tunnel_test.go",
+        "command_stdout_audit_test.go",
+        "compare_versions_test.go",
+        "concurrent_log_capture_test.go",
+        "config_access_test.go",
+        "config_ip_corpus_f3d_test.go",
+        "connidle_save_test.go",
+        "connidle_test.go",
+        "connidle_unlimited_test.go",
+        "connlog_c502_test.go",
+        "connlog_c503_test.go",
+        "connlog_forward_ownership_audit_test.go",
+        "connlog_mark_test.go",
+        "connlog_marks_test.go",
+        "connlog_readiness_test.go",
+        "connlog_reconnect_repush_test.go",
+        "connlog_test.go",
+        "connlog_u5_test.go",
+        "control_plane_activate_pending_test.go",
+        "control_plane_s04_test.go",
+        "control_plane_test.go",
+        "db_test_helper_test.go",
+        "decode_json_trailing_test.go",
+        "dual_stack_test.go",
+        "e01_replace_chains_remote_test.go",
+        "f01_f11_docker_ghcr_test.go",
+        "f02_nodeinstall_panel_gate_test.go",
+        "f03_nodeinstall_rotate_test.go",
+        "f04_github_token_error_test.go",
+        "f08_node_secret_header_test.go",
+        "f09_install_command_no_secret_history_test.go",
+        "f1_tunnel_rename_tx_test.go",
+        "f2_01_sub_counter_ownership_test.go",
+        "f2_03_legacy_replay_http_test.go",
+        "f2_04_import_tail_test.go",
+        "f2_04_sub_used_saturate_test.go",
+        "federation_removal_test.go",
+        "final_l1_forward_config_test.go",
+        "final_resweep_test.go",
+        "fix132_a_test.go",
+        "fix2_tunnellock_r2005_test.go",
+        "fix2a_v2_regression_test.go",
+        "fix2b_test.go",
+        "fix2c_compose_test.go",
+        "fix2c_fetch_log_test.go",
+        "fix2c_nodeinstall_test.go",
+        "fix3_forwardports_c601_test.go",
+        "fix3_forwardports_cf301_test.go",
+        "fix4_forwardports2_r401_test.go",
+        "fix7_forwardval_r704_r705_test.go",
+        "fix8_forwardfix_r806_r818_test.go",
+        "fix9_forwardquota_r909_test.go",
+        "fix_b_version_ux_test.go",
+        "fix_c3_02_install_test.go",
+        "fix_c3_03_family_test.go",
+        "fix_c3_04_intake_test.go",
+        "fix_cascade_r2_test.go",
+        "fix_lookback_lb01_ut_limiter_test.go",
+        "fix_lookback_lb03_supersede_test.go",
+        "fix_r1_c3_01_upgrade_test.go",
+        "fix_r3_b_read_swallow_test.go",
+        "fix_residual_2_stale_traffic_test.go",
+        "fixa_ports_test.go",
+        "fixa_scheme_test.go",
+        "fixa_strategy_test.go",
+        "fixk_kcp_key_test.go",
+        "fixkcpmem_kcp_caps_test.go",
+        "fixr2a_handler_test.go",
+        "flow_auth_fail_limit_c403_test.go",
+        "flow_auth_fail_limit_r8_test.go",
+        "flow_body_limit_test.go",
+        "flow_cleanup_regression_test.go",
+        "flow_config_cleanup_test.go",
+        "flow_limit_zero_unlimited_r9_test.go",
+        "flow_ownership_test.go",
+        "flow_policy_limiter_test.go",
+        "flow_upload_batch_test.go",
+        "flow_upload_failclosed_test.go",
+        "flow_upload_ownership_failclosed_test.go",
+        "flow_upload_sweep_l3_test.go",
+        "flow_upload_v2_behind_test.go",
+        "flow_upload_v2_clone_conflict_test.go",
+        "flow_upload_v2_dropped_test.go",
+        "flow_upload_v2_reject_log_test.go",
+        "flow_upload_v2_test.go",
+        "flow_v1_tighten_c101_test.go",
+        "fork_plumbing_test.go",
+        "forward_change_tunnel_nft_a4006_test.go",
+        "forward_create_warnings_a4002_test.go",
+        "forward_delete_pending_d1_test.go",
+        "forward_pause_resume_d12_test.go",
+        "forward_proxy_protocol_test.go",
+        "forward_reset_flow_test.go",
+        "forward_target_policy_retarget_test.go",
+        "forward_update_order_a002_test.go",
+        "fxe_r1_monitor_test.go",
+        "fxe_r1_release_channel_test.go",
+        "fxe_r1_sub_test.go",
+        "g3_131_semantics_test.go",
+        "g_update01_propagate_test.go",
+        "gh_mirror_api_assets_test.go",
+        "gh_mirror_r18_b10_02_test.go",
+        "gh_mirror_r18_b8_01_test.go",
+        "gist_removal_regression_test.go",
+        "github_routes_test.go",
+        "github_token_gh_mirror_test.go",
+        "github_token_test.go",
+        "github_token_upgrade_test.go",
+        "hist_c_r031_r032_test.go",
+        "hist_c_r068_test.go",
+        "hist_c_r078_test.go",
+        "import_auto_backup_r18_b9_02_test.go",
+        "inbound_import_preview_test.go",
+        "inbound_port_r1_test.go",
+        "initial_admin_login_test.go",
+        "install_addr_charset_b04_r3_test.go",
+        "irl7_relay_count_test.go",
+        "j03_redirect_channel_test.go",
+        "jobs_lifecycle_audit_test.go",
+        "jobs_maintenance_loop_test.go",
+        "jobs_renewal_test.go",
+        "jobs_test.go",
+        "jobs_wg_structure_test.go",
+        "k6_tunnel_forward_semantics_test.go",
+        "k9_tunnel_ports_test.go",
+        "kernel_apply_f1_pending_test.go",
+        "kernel_apply_f2apply01_test.go",
+        "kernel_baseline_settle_test.go",
+        "kernel_bnew_regress_test.go",
+        "kernel_chain_test.go",
+        "kernel_egress_test.go",
+        "kernel_encryption_gate_test.go",
+        "kernel_external_h15_test.go",
+        "kernel_install_kver_test.go",
+        "kernel_logs_missing_test.go",
+        "kernel_markbase_test.go",
+        "kernel_notify_transition_test.go",
+        "kernel_parallel_fixd_test.go",
+        "kernel_pq_reality_test.go",
+        "kernel_relay_target_test.go",
+        "kernel_share_address_test.go",
+        "kernel_versions_test.go",
+        "kernel_views_batch_audit_test.go",
+        "latency_targets_config_fixd_test.go",
+        "lifecycle_ghcr_shell_audit_test.go",
+        "limiter_offline_failclosed_test.go",
+        "log_capture_concurrent_audit_test.go",
+        "login_rate_limit_a001_test.go",
+        "login_rate_limit_r001_test.go",
+        "login_revocation_race_reaudit_test.go",
+        "login_username_d11_test.go",
+        "longtail_p1_test.go",
+        "manual_node_row_shape_test.go",
+        "metering_default_s05_test.go",
+        "monitor_scope_test.go",
+        "monitor_write_admin_r1_test.go",
+        "monitoring_internal_error_xc4_test.go",
+        "monitoring_range_c11_test.go",
+        "mutations_forward_ports_test.go",
+        "mutations_s05_test.go",
+        "mutations_s06_test.go",
+        "netguard_r2_b1_test.go",
+        "nft_collect_health_test.go",
+        "nft_isolation_gate_test.go",
+        "nft_mixed_streak_test.go",
+        "nft_not_installed_test.go",
+        "nft_ws_health_test.go",
+        "nftables_baseline_settle_test.go",
+        "nftables_capability_outside_tx_test.go",
+        "nftables_hostkey_test.go",
+        "nftables_pause_filter_test.go",
+        "nftables_runtime_test.go",
+        "nftables_traffic_collect_parallel_test.go",
+        "nftables_traffic_test.go",
+        "node_c04_test.go",
+        "node_command_cleanup_reliability_test.go",
+        "node_connlog_whitelist_test.go",
+        "node_delete_cleanup_budget_test.go",
+        "node_delete_guard_order_test.go",
+        "node_delete_stall_test.go",
+        "node_delete_uninstall_issuedat_gate_test.go",
+        "node_delete_uninstall_online_test.go",
+        "node_delete_uninstall_retry_test.go",
+        "node_delete_uninstall_test.go",
+        "node_delete_whitelist_retry_test.go",
+        "node_display_group_test.go",
+        "node_identity_race_audit3_test.go",
+        "node_idle_timeout_repush_test.go",
+        "node_idle_timeout_test.go",
+        "node_install_anchor_fixr29_test.go",
+        "node_install_modes_test.go",
+        "node_latency_history_test.go",
+        "node_latency_list_test.go",
+        "node_latency_r171_b5_test.go",
+        "node_latency_targets_test.go",
+        "node_latency_test.go",
+        "node_legacy_force_clear_test.go",
+        "node_legacy_retry_reliability_test.go",
+        "node_ping_slots_test.go",
+        "node_protocol_persist_failure_audit3_test.go",
+        "node_protocol_validation_audit3_test.go",
+        "node_reap_settings_test.go",
+        "node_reconnect_probe_test.go",
+        "node_reliability_test.go",
+        "node_restart_test.go",
+        "node_restart_version_reliability_test.go",
+        "node_rotate_secret_contract_test.go",
+        "node_route_dualstack_contract_test.go",
+        "node_route_test.go",
+        "node_runtime_inputs_repush_test.go",
+        "node_secret_b301_test.go",
+        "node_swap_test.go",
+        "node_tune_faces_test.go",
+        "node_tune_probe_ssrf_r7_test.go",
+        "node_uninstall_classification_reliability_test.go",
+        "node_upgrade_pending_uninstall_guard_test.go",
+        "notify_bot_test.go",
+        "notify_daily_hour_fix2_test.go",
+        "notify_daily_report_omitted_test.go",
+        "notify_dispatcher_leak_test.go",
+        "notify_fixd_test.go",
+        "notify_netguard_r2_test.go",
+        "notify_pending_generation_r6_test.go",
+        "notify_r2_b10_test.go",
+        "notify_r3_b11_test.go",
+        "notify_r4_b8_test.go",
+        "notify_r5_b9_test.go",
+        "notify_r9_b6_test.go",
+        "notify_resend_r1_test.go",
+        "notify_template_test.go",
+        "notify_test.go",
+        "open_sub_ratelimit_c102_test.go",
+        "open_sub_user_invalid_r215_test.go",
+        "ovo_generation_test.go",
+        "panel_disk_test.go",
+        "panel_frontend_health_audit_test.go",
+        "panel_install_pg_restore_reaudit3_test.go",
+        "panel_source_test.go",
+        "partial_update_a204_test.go",
+        "passkey_login_revocation_race_reaudit_test.go",
+        "passkey_revoke_atomic_reaudit_test.go",
+        "passkey_test.go",
+        "password_verify_census_b01_r3_test.go",
+        "pending_guard_d15_test.go",
+        "pg_snapshot_capture_fullr2_test.go",
+        "pick_free_port_b302_test.go",
+        "poison_scope_d10_test.go",
+        "port_clamp_e01_test.go",
+        "port_live_probe_test.go",
+        "portalloc_fix5_test.go",
+        "portclosure_c_fix_test.go",
+        "portclosure_fix_a_test.go",
+        "portclosure_int_tunnel_inip_test.go",
+        "portprobe_coexist_p02_test.go",
+        "probe_fixture_helper_test.go",
+        "proxy_fallback_test.go",
+        "quota_enforce_nft_a4001_test.go",
+        "quota_flow_stop_c1_test.go",
+        "quota_nft_d2_test.go",
+        "quota_pause_c04_test.go",
+        "quota_recovery_r171_b5_test.go",
+        "quota_release_c05_test.go",
+        "quota_release_offline_f4_test.go",
+        "quota_release_r18_f202_test.go",
+        "r10_b6_batch_test.go",
+        "r10_batchdel_test.go",
+        "r10_fedidem_test.go",
+        "r11_b4_tunnel_write_validation_test.go",
+        "r11_b6_monthly_reset_test.go",
+        "r13_t2a_tunnel_create_guard_test.go",
+        "r14_f06f04_test.go",
+        "r14_f08_test.go",
+        "r18_f01_summary_format_test.go",
+        "r19_f01_tunnel_delete_disclosure_residual_test.go",
+        "r19_fix_f03_test.go",
+        "r1_b3_kernel_remove_guard_test.go",
+        "r1_b3_relay_retarget_test.go",
+        "r1_b3_tunnel_delete_offline_test.go",
+        "r1_b3_whitelist_refresh_test.go",
+        "r1_b8_xp215_test.go",
+        "r1_b8_xp217_test.go",
+        "r1_b8_xp314_test.go",
+        "r1_b8_xp315_316_test.go",
+        "r1_b8_xp317_test.go",
+        "r1_b8_xp318_test.go",
+        "r1_b8_xp319_test.go",
+        "r1_b8_xp320_test.go",
+        "r1_b8_xp324_test.go",
+        "r1_b8_xp326_test.go",
+        "r1_b8_xp327_test.go",
+        "r1_b8_xp328_329_test.go",
+        "r1_b8_xp331_test.go",
+        "r1_b8_xp334_test.go",
+        "r1_fxb_gates_test.go",
+        "r202_silence_guard_test.go",
+        "r20_fix_f01_test.go",
+        "r215_red1_mark_timing_test.go",
+        "r21_fix_f01_test.go",
+        "r21_fix_f02_test.go",
+        "r21_fix_f03_test.go",
+        "r24_a_xff_test.go",
+        "r25_share_host_port_test.go",
+        "r28_fix_f01_test.go",
+        "r29_fix_f01_test.go",
+        "r2_03_speed_limit_disable_test.go",
+        "r2_ap8_created_time_test.go",
+        "r2_b13_fetch_error_redact_test.go",
+        "r2_b13_submission_recheck_handler_test.go",
+        "r2_b2_idempotency_state_test.go",
+        "r2_b2_idempotency_surfaces_test.go",
+        "r2_b3_realm_speed_warning_test.go",
+        "r2_b6_presence_test.go",
+        "r2_b6_test.go",
+        "r2_b7_batch_test.go",
+        "r2_b8_pending_config_test.go",
+        "r2_b9_guard_node_test.go",
+        "r2_b9_wiring_test.go",
+        "r2_f203_orphan_service_test.go",
+        "r2_f2_01_kernel_reinstall_test.go",
+        "r2_f2_22_instance_warning_test.go",
+        "r2_f4_01_admin_raw_error_test.go",
+        "r2_k1_b02_username_normalize_test.go",
+        "r2_k1_b04_node_address_test.go",
+        "r2_k1_b09_flow_guard_test.go",
+        "r2_k1_b12_b14_test.go",
+        "r2_k1_enum_residual_test.go",
+        "r2_k1_name_length_test.go",
+        "r2_netlabel_go_test.go",
+        "r2_r140_delete_forgets_offline_test.go",
+        "r2_raw291_gate_blindspots_test.go",
+        "r2_w3_fix_test.go",
+        "r30_fix_f01_test.go",
+        "r30_fix_f02_test.go",
+        "r30_fix_f03_test.go",
+        "r30_fix_f04_test.go",
+        "r31_fix_f01_test.go",
+        "r31_h01_probe_test.go",
+        "r32_fix_f01_test.go",
+        "r3_b1_probe_target_test.go",
+        "r3_b1_probe_test.go",
+        "r3_b2_external_ss2022_test.go",
+        "r3_b3_billing_nft_warning_test.go",
+        "r3_b4_whitelist_funnel_test.go",
+        "r3_b5_batch_test.go",
+        "r3_b7_presence_test.go",
+        "r3_b8_node_batch_referrers_test.go",
+        "r3_b9_guard_failclosed_test.go",
+        "r3_gate_f2_presence_test.go",
+        "r3_gate_f3_failed_switch_whitelist_test.go",
+        "r3_gen_fix_test.go",
+        "r3_h01_deploy_test.go",
+        "r3_k5_config_collision_test.go",
+        "r3_k9_upgrade_system_test.go",
+        "r4_b3_presence_test.go",
+        "r4_b6_rollback_wrapup_test.go",
+        "r4_b7_guard_test.go",
+        "r4_f1_source_refs_test.go",
+        "r4_f2_nodeop_release_test.go",
+        "r4_f4_strategy_test.go",
+        "r4_fxb_dispatch_recheck_test.go",
+        "r4_s1_kernel_register_race_test.go",
+        "r4b01_kr4_test.go",
+        "r5_b2_delete_wrapup_test.go",
+        "r5_b6_ssrf_test.go",
+        "r5_b7_share_presence_test.go",
+        "r5_fc_fixes_test.go",
+        "r5_fe_fixes_test.go",
+        "r5_frv3_fixes_test.go",
+        "r5a01_mode_switch_ssh_test.go",
+        "r6_b5_ghmirror_test.go",
+        "r6_b5_turnstile_test.go",
+        "r6_b6_status_test.go",
+        "r6_g2_unverified_test.go",
+        "r6_g6_subheader_direction_test.go",
+        "r6_l8f01_compose_test.go",
+        "r6_l8f04_rate_limit_key_test.go",
+        "r6_nodeupdate_atomic_test.go",
+        "r6_rollback_receipt_test.go",
+        "r7_g01_quota_saturation_test.go",
+        "r7_g02_user_tunnel_legalset_test.go",
+        "r7_j01_nodeinstall_warning_test.go",
+        "r8_b1_enc_gate_test.go",
+        "r8_latency_semantics_test.go",
+        "r8_privnet_xray_warning_test.go",
+        "r9_b4_naive_gate_test.go",
+        "r9_nodesrace_test.go",
+        "read_error_swallow_gate_test.go",
+        "realm_metering_baseline_test.go",
+        "realm_strategy_a4004_test.go",
+        "realm_strategy_switch_r2f4_test.go",
+        "realm_switch_accounting_r301_test.go",
+        "realm_switch_error_a4003_test.go",
+        "realm_test.go",
+        "realm_warnings_ut_limiter_r1_test.go",
+        "reconcile_drain_d4_test.go",
+        "reconcile_guard_d3_test.go",
+        "reconstruct_tunnel_state_test.go",
+        "reference_node_read_audit_test.go",
+        "relay_latency_test.go",
+        "releases_channel_b705_test.go",
+        "remediation_audit_test.go",
+        "remote_addr_caps_r10_test.go",
+        "remote_source_fixd_test.go",
+        "remote_source_integrity_gate_test.go",
+        "remote_source_prededup_identity_test.go",
+        "remote_source_r2_test.go",
+        "remote_source_refresh_failure_test.go",
+        "remote_source_shield_backup_test.go",
+        "remote_source_shield_r10_test.go",
+        "remote_source_truncation_status_test.go",
+        "rename_compat_test.go",
+        "resource_alert_f3new01_test.go",
+        "resource_alert_test.go",
+        "rmd5_sunset_test.go",
+        "rotation_idem_c106_test.go",
+        "route_coverage_c102_test.go",
+        "rr4_c1_internal_error_test.go",
+        "rr4_f3_realm_delete_migration_gate_test.go",
+        "rr4_f5_latest_results_test.go",
+        "sec01_autobackup_leak_test.go",
+        "sec01_bc01_autobackup_test.go",
+        "secure_fetch_d17_test.go",
+        "secure_fetch_r1b5_limit_test.go",
+        "secure_fetch_r1b5_test.go",
+        "security_utils_test.go",
+        "serialized_manager_d14_test.go",
+        "service_monitor_limits_rr_test.go",
+        "speed_limit_receipt_r7x004_test.go",
+        "speed_limit_resync_r6x017_test.go",
+        "ss_inplace_cleanup_test.go",
+        "ss_inplace_metering_status_test.go",
+        "ss_inplace_metering_test.go",
+        "ss_inplace_rotation_test.go",
+        "ss_inplace_save_gate_test.go",
+        "ss_inplace_version_gate_test.go",
+        "ss_metering_r1fix_test.go",
+        "ss_metering_r2fix_test.go",
+        "state_sweep_test.go",
+        "sub_info_assignment_f001_test.go",
+        "sub_info_scope_r5_test.go",
+        "sub_store_a004_test.go",
+        "sub_store_aggregate_r7_test.go",
+        "sub_store_default_password_r5_test.go",
+        "sub_store_flowmib_r10_test.go",
+        "sub_store_username_bucket_c103_test.go",
+        "subscription_companion_push_c03_test.go",
+        "subscription_delete_race_audit_test.go",
+        "subscription_front_test.go",
+        "subscription_legacy_reset_r1_test.go",
+        "subscription_metering_test.go",
+        "subscription_metering_unsupported_c07_test.go",
+        "subscription_nodecount_fix132_test.go",
+        "subscription_open_fixture_test.go",
+        "subscription_quota_rotation_c02_test.go",
+        "subscription_rotation_race_reaudit_test.go",
+        "subscription_save_r215_test.go",
+        "subscription_snapshot_audit_test.go",
+        "subscription_stash_count_r1_test.go",
+        "subscription_template_test.go",
+        "subscription_test.go",
+        "subscription_tombstone_r10_test.go",
+        "subscription_traffic_fix132_test.go",
+        "subscription_traffic_r18_f2_01_test.go",
+        "subscription_traffic_saturation_audit_test.go",
+        "subscription_traffic_test.go",
+        "system_upgrade_a_an1_test.go",
+        "system_upgrade_anchor_fixr29_test.go",
+        "system_upgrade_anchor_test.go",
+        "system_upgrade_api_route_test.go",
+        "system_upgrade_b703_test.go",
+        "system_upgrade_b704_test.go",
+        "system_upgrade_env_dollar_probe_test.go",
+        "system_upgrade_env_dollar_test.go",
+        "system_upgrade_fallback_test.go",
+        "system_upgrade_fix199d_test.go",
+        "system_upgrade_fix199r1_test.go",
+        "system_upgrade_fix_d5_test.go",
+        "system_upgrade_fix_r1_b8_01_test.go",
+        "system_upgrade_garbage_test.go",
+        "system_upgrade_image_ownership_test.go",
+        "system_upgrade_netlabel_flow_test.go",
+        "system_upgrade_pg_snapshot_integrity_reaudit_test.go",
+        "system_upgrade_pg_stop_reaudit3_test.go",
+        "system_upgrade_rename_snapshot_test.go",
+        "system_upgrade_resource_pin_r18_a2_10_test.go",
+        "system_upgrade_resource_pin_test.go",
+        "system_upgrade_snapshot_env_reaudit_test.go",
+        "system_upgrade_test.go",
+        "system_upgrade_version_dualwrite_test.go",
+        "template_usage_audit_test.go",
+        "timeout_budgets_r8_test.go",
+        "traffic_display_test.go",
+        "traffic_limit_test.go",
+        "tunnel_best_exit_display_test.go",
+        "tunnel_best_exit_test.go",
+        "tunnel_cleanup_b403_test.go",
+        "tunnel_create_c001_latent_guard_test.go",
+        "tunnel_entry_sqlite_test.go",
+        "tunnel_flow_default_c01_test.go",
+        "tunnel_port_change_reason_f2t102_test.go",
+        "tunnel_probe_target_api_test.go",
+        "tunnel_probe_target_test.go",
+        "tunnel_quality_prober_b07_test.go",
+        "tunnel_quality_prober_fixd_test.go",
+        "tunnel_quality_prober_obs1_test.go",
+        "tunnel_quality_prober_r2_b07_test.go",
+        "tunnel_quality_prober_r3_k7_test.go",
+        "tunnel_quality_prober_r5x025_test.go",
+        "tunnel_quality_prober_r6x016_test.go",
+        "tunnel_quality_prober_test.go",
+        "tunnel_strategy_gate_b401_test.go",
+        "tunnel_tls_batch_read_audit_test.go",
+        "unauth_internal_error_fix2_test.go",
+        "uninstall_attempt_audit_test.go",
+        "uninstall_read_guard_audit_test.go",
+        "update_password_b102_test.go",
+        "upgrade_dispatch_receipt_test.go",
+        "upgrade_il_nu02_test.go",
+        "upgrade_il_nu03_test.go",
+        "upgrade_il_nu04_test.go",
+        "upgrade_il_nu06_test.go",
+        "upgrade_il_nu10_test.go",
+        "upgrade_r18_b804_test.go",
+        "upgrade_r18_b8_02_test.go",
+        "upgrade_r18_f302_test.go",
+        "upgrade_r2_d1_02_panel_compat_test.go",
+        "upgrade_ratelimit_test.go",
+        "upgrade_release_channel_test.go",
+        "upgrade_s02_test.go",
+        "upgrade_test.go",
+        "upgrade_verify_nu07_test.go",
+        "upgrade_verify_read_failure_test.go",
+        "upgrade_verify_resend_test.go",
+        "upgrade_verify_test.go",
+        "user_disable_atomic_reaudit_test.go",
+        "user_expire_disable_reaudit_test.go",
+        "user_quota_boundary_test.go",
+        "user_quota_decimal_c6_test.go",
+        "user_quota_r171_b5_test.go",
+        "user_reset_flow_b202_test.go",
+        "user_reset_flow_r2_g01_test.go",
+        "user_subscription_assignment_audit3_test.go",
+        "user_subscription_test.go",
+        "user_update_atomic_reaudit_test.go",
+        "userlist_pagination_test.go",
+        "validate_local_port_b4_test.go",
+        "validate_local_port_g4_test.go",
+        "version_gates_strict_r2_test.go",
+        "version_reported_fix3_test.go",
+        "version_strict_units_r2_test.go",
+        "w3_fix_test.go",
+        "write_deadline_r8_backup_test.go",
+        "write_deadline_r8_create_test.go",
+        "write_deadline_r8_test.go",
+        "x04_001_chain_guard_index_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "go-backend/internal/http/middleware",
+      "dir": "go-backend/internal/http/middleware",
+      "goFiles": [
+        "auth.go",
+        "cors.go",
+        "recover.go",
+        "request_log.go"
+      ],
+      "testGoFiles": [
+        "admin_raw_error_gate_test.go",
+        "auth_regression_20261019_test.go",
+        "auth_revocation_e102_test.go",
+        "auth_test.go",
+        "concurrent_log_capture_test.go",
+        "flow_test_location_test.go",
+        "frontend_cache_hotfix133_test.go",
+        "log_redaction_fix132_test.go",
+        "request_log_deadline_test.go",
+        "route_classification_test.go",
+        "route_test_coverage_test.go",
+        "subscription_traffic_auth_test.go",
+        "unauth_raw_error_gate_test.go",
+        "user_subscription_auth_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "go-backend/internal/http/response",
+      "dir": "go-backend/internal/http/response",
+      "goFiles": [
+        "r.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "go-backend/internal/kernel",
+      "dir": "go-backend/internal/kernel",
+      "goFiles": [
+        "capabilities.go",
+        "chain.go",
+        "chain_strategy.go",
+        "credentials.go",
+        "egress.go",
+        "egress_xray.go",
+        "forward_strategy.go",
+        "import.go",
+        "model.go",
+        "private_ranges.go",
+        "proxy.go",
+        "proxy_parse.go",
+        "proxy_produce.go",
+        "realm.go",
+        "render.go",
+        "render_mieru.go",
+        "render_singbox.go",
+        "render_xray.go",
+        "share.go",
+        "share_clients.go",
+        "split.go",
+        "sub_chain.go",
+        "sub_count.go",
+        "sub_notice.go",
+        "sub_options.go",
+        "sub_rules.go",
+        "sub_template.go",
+        "sub_template_builder.go",
+        "sub_template_service_groups.go",
+        "users.go",
+        "vless_encryption.go",
+        "yaml.go"
+      ],
+      "testGoFiles": [
+        "audit_b5_02_cr_name_test.go",
+        "audit_b6_01_singbox_bad_filter_test.go",
+        "b8_extra_protected_test.go",
+        "b8_line_escape_test.go",
+        "b8_self_cert_pair_test.go",
+        "batch2_b01_test.go",
+        "batch2_b03_test.go",
+        "batch2_b04_test.go",
+        "batch2_k01_test.go",
+        "batch2_naive_test.go",
+        "capabilities_alias_test.go",
+        "chain_strategy_test.go",
+        "chain_test.go",
+        "clash_api_port_test.go",
+        "combo_ss2022_socks_test.go",
+        "companion_c03_test.go",
+        "concurrent_log_capture_test.go",
+        "connidle_test.go",
+        "connidle_unlimited_test.go",
+        "connlog_render_test.go",
+        "egress_test.go",
+        "extra_container_guard_test.go",
+        "fa171_b3_render_test.go",
+        "final_l1_kernel_test.go",
+        "final_resweep_test.go",
+        "fix_b6_c201_version_validation_test.go",
+        "fix_b6_c202_xray_digest_test.go",
+        "fork_version_test.go",
+        "forward_strategy_test.go",
+        "g4_regression_test.go",
+        "import_fix132_test.go",
+        "import_r1b5_test.go",
+        "import_r3_b1_test.go",
+        "import_test.go",
+        "kernel_test.go",
+        "manual_node_fix_test.go",
+        "manual_node_import_test.go",
+        "markbase_test.go",
+        "mieru_test.go",
+        "netguard_r2_b1_test.go",
+        "pinned_hash_format_test.go",
+        "port_surgevless_test.go",
+        "portclosure_int_qxline_test.go",
+        "proxy_r6l01_test.go",
+        "proxy_rstore01_test.go",
+        "r10_b1_enum_test.go",
+        "r10_b2_enc_align_test.go",
+        "r10_b3_render_heal_test.go",
+        "r10_b4_surge_vmess_test.go",
+        "r11_b1_xhttp_mode_test.go",
+        "r11_b2_render_gate_test.go",
+        "r11_b3_enc_test.go",
+        "r12_bx_xhttp_mode_test.go",
+        "r14_f03_test.go",
+        "r14_f06f04_test.go",
+        "r18_c2_01_selfsigned_warn_test.go",
+        "r18_r2_c2_01_all_render_paths_warn_test.go",
+        "r20_f03_test.go",
+        "r25_share_host_port_test.go",
+        "r2_l01_transport_host_test.go",
+        "r2_l3_f02_clash_fingerprint_test.go",
+        "r31_l4_e01_test.go",
+        "r3_b2_ss2022_test.go",
+        "r3_b8_extra_protected_test.go",
+        "r3_d01_stored_bad_host_test.go",
+        "r3_gate_f1_ss2022_render_test.go",
+        "r3_l01_plugin_host_test.go",
+        "r4_b01_nested_headers_test.go",
+        "r4_b1_credentials_test.go",
+        "r4_b2_sip023_test.go",
+        "r4_c01_ss_plugin_case_test.go",
+        "r4_fxb_regression_test.go",
+        "r5_b01_direct_host_test.go",
+        "r5_b1_credentials_test.go",
+        "r5_b2_d01_test.go",
+        "r5_d02_relay_host_test.go",
+        "r5_fe_usermark_test.go",
+        "r6_b01_regression_test.go",
+        "r6_b1_ss_cipher_test.go",
+        "r7_b1_xray_ss_subset_test.go",
+        "r7_g1_matrix_test.go",
+        "r7_g1_private_block_test.go",
+        "r7_s1b_domain_guard_test.go",
+        "r8_b1_enc_grammar_test.go",
+        "r8_b2_sip023_chain_test.go",
+        "r8_b2_ss_singleface_test.go",
+        "r8_privnet_ranges_test.go",
+        "r9_b2_enc_test.go",
+        "r9_b3_render_heal_test.go",
+        "r9_b4_naive_gate_test.go",
+        "reality_dest_import_test.go",
+        "realm_test.go",
+        "render_matrix_regression_test.go",
+        "rr4_c2_fix_test.go",
+        "rr4_connidle_range_test.go",
+        "share_clients_test.go",
+        "share_pq_reality_test.go",
+        "share_roundtrip_test.go",
+        "share_rules_regression_test.go",
+        "share_stash_test.go",
+        "share_test.go",
+        "snell_fingerprint_r1_test.go",
+        "split_test.go",
+        "ss_inplace_test.go",
+        "ss_metering_test.go",
+        "sub_count_test.go",
+        "sub_notice_test.go",
+        "sub_options_test.go",
+        "sub_plain_format_test.go",
+        "sub_template_builder_test.go",
+        "sub_template_notice_test.go",
+        "sub_template_test.go",
+        "users_test.go",
+        "vless_encryption_test.go",
+        "vmess_reality_import_test.go",
+        "w3_import_fix_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "go-backend/internal/logredact",
+      "dir": "go-backend/internal/logredact",
+      "goFiles": [
+        "logredact.go"
+      ],
+      "testGoFiles": [
+        "logredact_c403_test.go",
+        "logredact_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "go-backend/internal/metrics",
+      "dir": "go-backend/internal/metrics",
+      "goFiles": [
+        "ingestion.go"
+      ],
+      "testGoFiles": [
+        "connlog_ingestion_test.go",
+        "ingestion_c305_test.go",
+        "ingestion_c306_test.go",
+        "ingestion_c402_test.go",
+        "ingestion_forget_test.go",
+        "ingestion_test.go",
+        "sqlite_reclaim_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "go-backend/internal/monitoring",
+      "dir": "go-backend/internal/monitoring",
+      "goFiles": [
+        "connlog_retention.go",
+        "limits.go",
+        "retention.go",
+        "tunnel_quality.go"
+      ],
+      "testGoFiles": [
+        "connlog_retention_test.go",
+        "limits_test.go",
+        "retention_test.go",
+        "tunnel_quality_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "go-backend/internal/netguard",
+      "dir": "go-backend/internal/netguard",
+      "goFiles": [
+        "netguard.go"
+      ],
+      "testGoFiles": [
+        "netguard_n01_test.go",
+        "netguard_r3_b1_test.go",
+        "netguard_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "go-backend/internal/runtime/nftables",
+      "dir": "go-backend/internal/runtime/nftables",
+      "goFiles": [
+        "collector.go",
+        "manager.go",
+        "parser.go",
+        "pause_filter.go",
+        "renderer.go",
+        "runner.go",
+        "types.go"
+      ],
+      "testGoFiles": [
+        "collector_test.go",
+        "fix_c3_01_test.go",
+        "fix_c3_02_test.go",
+        "fix_c3_03_test.go",
+        "fix_c3_04_test.go",
+        "fix_c3_05_test.go",
+        "fix_c3_07_test.go",
+        "fix_c3_09_test.go",
+        "fix_r1_c3_01_test.go",
+        "fix_r1_c3_03_test.go",
+        "manager_test.go",
+        "parser_test.go",
+        "pause_filter_test.go",
+        "renderer_bindip_a4005_test.go",
+        "renderer_nftcheck_test.go",
+        "renderer_test.go",
+        "renderer_validate_test.go",
+        "runner_hostkey_test.go",
+        "runner_test.go",
+        "table_name_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "go-backend/internal/security",
+      "dir": "go-backend/internal/security",
+      "goFiles": [
+        "aes.go",
+        "node_secret.go",
+        "password.go"
+      ],
+      "testGoFiles": [
+        "node_secret_test.go",
+        "password_b01_r3_test.go",
+        "password_b102_test.go",
+        "password_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "go-backend/internal/store/model",
+      "dir": "go-backend/internal/store/model",
+      "goFiles": [
+        "model.go",
+        "node_kernel.go",
+        "node_pending_uninstall.go",
+        "node_uninstall.go",
+        "passkey.go",
+        "sub_user.go",
+        "subscription.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "go-backend/internal/store/repo",
+      "dir": "go-backend/internal/store/repo",
+      "goFiles": [
+        "config_notify.go",
+        "config_policy.go",
+        "connlog.go",
+        "credential_guard.go",
+        "flow_legacy_dedupe.go",
+        "index_catalog.go",
+        "initial_admin.go",
+        "kcp_node_mem.go",
+        "migration_c12_v4.go",
+        "migration_k10_v5.go",
+        "migration_node_secret_hash.go",
+        "migration_partial_predicate.go",
+        "migration_quota_decimal_v1.go",
+        "migration_r5b4_v1.go",
+        "migration_r5b4_v2.go",
+        "migration_r5b4_v3.go",
+        "migration_rmann_v1.go",
+        "migration_rmshare_v6.go",
+        "migration_rmsnell_v1.go",
+        "migration_status.go",
+        "migration_tunnel_flow_bidi_v1.go",
+        "node_seq.go",
+        "node_tunnel_tls.go",
+        "pg_name_lock.go",
+        "port_alloc_lock.go",
+        "reference_username.go",
+        "repository.go",
+        "repository_auth.go",
+        "repository_backup_precheck.go",
+        "repository_cascade_cleanup.go",
+        "repository_control.go",
+        "repository_flow.go",
+        "repository_forward_target_policy.go",
+        "repository_in_list.go",
+        "repository_inbound_backup.go",
+        "repository_kernel.go",
+        "repository_kernel_nodes.go",
+        "repository_kernel_orphan.go",
+        "repository_latency.go",
+        "repository_monitor_nodes.go",
+        "repository_monitor_permission.go",
+        "repository_monitor_tunnels.go",
+        "repository_mutations.go",
+        "repository_nft_counter.go",
+        "repository_nft_pending_delete.go",
+        "repository_nftables.go",
+        "repository_node_pending_uninstall.go",
+        "repository_node_uninstall.go",
+        "repository_passkey.go",
+        "repository_port_occupancy.go",
+        "repository_remote_source.go",
+        "repository_storage.go",
+        "repository_subscription.go",
+        "repository_subscription_template.go",
+        "repository_tunnel_quality.go",
+        "repository_upgrade_verify.go",
+        "repository_user_quota.go",
+        "repository_user_subscription.go",
+        "storage_error.go",
+        "subscription_front.go",
+        "traffic_dropped.go",
+        "traffic_stream.go",
+        "unique_violation.go",
+        "username_check.go",
+        "username_fold.go"
+      ],
+      "testGoFiles": [
+        "audit_r3_k4_import_test.go",
+        "audit_r4_kr6_user_tunnel_test.go",
+        "auth_watermark_audit_test.go",
+        "b4_concurrent_test.go",
+        "b5_counter_test.go",
+        "backup_b8_fixb5_test.go",
+        "backup_connidle_test.go",
+        "backup_f004_test.go",
+        "backup_fix132_test.go",
+        "backup_fix2b_test.go",
+        "backup_fix8_r807_test.go",
+        "backup_fix9_r909_test.go",
+        "backup_g2_test.go",
+        "backup_import_hash_budget_r10_test.go",
+        "backup_integrity_r2e3_test.go",
+        "backup_ip_restore_f3d_test.go",
+        "backup_metering_sanitize_test.go",
+        "backup_precheck_b4_test.go",
+        "backup_r11_b1_test.go",
+        "backup_r13_br_test.go",
+        "backup_r13_t2c_test.go",
+        "backup_r171_b5_latency_targets_test.go",
+        "backup_r1_fxb_gates_test.go",
+        "backup_r1b5_test.go",
+        "backup_r2_b8_test.go",
+        "backup_r2_batch1_test.go",
+        "backup_r2_e1_fidelity_test.go",
+        "backup_r31_h02_test.go",
+        "backup_r3_b6_test.go",
+        "backup_r3_h01_test.go",
+        "backup_r3_sanitize_test.go",
+        "backup_r4_b4_test.go",
+        "backup_r4_f01_test.go",
+        "backup_r4_kr3_subscription_front_test.go",
+        "backup_r4_strategy_test.go",
+        "backup_r5_b5_test.go",
+        "backup_r6_b2_test.go",
+        "backup_r6_b3_test.go",
+        "backup_r6_h01_test.go",
+        "backup_r6_h01r1_test.go",
+        "backup_r7_b2_test.go",
+        "backup_r7_h01_test.go",
+        "backup_r8_b3_test.go",
+        "backup_r9_b5_test.go",
+        "backup_removed_features_210_test.go",
+        "backup_removed_segments_rr_test.go",
+        "backup_rr4_rfxb_test.go",
+        "backup_share_host_sanitize_test.go",
+        "backup_subedit_scrub_test.go",
+        "backup_templates_test.go",
+        "c03_guard_test.go",
+        "cascade_b4_test.go",
+        "cascade_relay_materialized_test.go",
+        "companion_inbound_test.go",
+        "concurrent_log_capture_test.go",
+        "config_key_census_test.go",
+        "config_policy_r10b6_test.go",
+        "config_policy_test.go",
+        "connlog_c502_test.go",
+        "connlog_c503_test.go",
+        "connlog_forward_ownership_audit_test.go",
+        "connlog_sweep_l3_test.go",
+        "connlog_test.go",
+        "counter_concurrent_s3_test.go",
+        "create_forward_b404_test.go",
+        "credential_guard_audit_test.go",
+        "d23_precheck_test.go",
+        "dropped_counters_saturation_reaudit_test.go",
+        "exp_in_list_chunk_test.go",
+        "export_snapshot_c105_test.go",
+        "f03_node_secret_hash_test.go",
+        "f1_tunnel_name_exists_tx_test.go",
+        "f2_02_inbound_counter_node_scope_test.go",
+        "f2_03_legacy_batch_dedupe_test.go",
+        "f2_04_import_counter_gate_test.go",
+        "f2_05_forward_num_tx_test.go",
+        "final_l1_f04_f05_test.go",
+        "final_resweep_test.go",
+        "fix9_r910_quota_monotonic_test.go",
+        "fix_cascade_r2_test.go",
+        "fix_lookback_lb03_supersede_test.go",
+        "fixr2_cb01_backup_test.go",
+        "flow_saturate_b08_test.go",
+        "flow_saturate_pg_expr_test.go",
+        "forward_batch_c12_test.go",
+        "forward_target_policy_audit_test.go",
+        "gist_removal_regression_test.go",
+        "import_admin_disclosure_r20301_test.go",
+        "import_admin_guard_r1_test.go",
+        "in_list_sentinel_test.go",
+        "inbound_counter_chunk_d603_test.go",
+        "index_catalog_health_test.go",
+        "index_catalog_scope_test.go",
+        "initial_admin_memory_test.go",
+        "initial_admin_test.go",
+        "k8_in_list_cascade_test.go",
+        "kcp_node_mem_test.go",
+        "migration_fix132_test.go",
+        "migration_partial_predicate_test.go",
+        "migration_quota_decimal_v1_test.go",
+        "migration_r5b4_v2_test.go",
+        "migration_r5b4_v3_test.go",
+        "migration_rmann_v1_test.go",
+        "migration_rmshare_v6_test.go",
+        "migration_rmsnell_v1_test.go",
+        "migration_status_b4_test.go",
+        "migration_status_c101_test.go",
+        "migration_tunnel_flow_bidi_v1_test.go",
+        "mul_div_saturating_test.go",
+        "node_display_group_test.go",
+        "node_force_clear_test.go",
+        "node_inx_c04_test.go",
+        "node_operation_attempt_test.go",
+        "node_renewal_test.go",
+        "node_traffic_since_saturation_r2_test.go",
+        "node_traffic_since_test.go",
+        "node_tunnel_tls_test.go",
+        "notify_daily_hour_fix2_test.go",
+        "passkey_import_test.go",
+        "pc_fix_b_probe_test.go",
+        "port_occupancy_k9_test.go",
+        "port_occupancy_sentinel_mutation_test.go",
+        "port_occupancy_sentinel_test.go",
+        "port_pick_excluding_test.go",
+        "port_precheck_b4_test.go",
+        "prune_batched_sweep_l3_test.go",
+        "r18_b9_01_import_limit_gate_test.go",
+        "r1_b8_xp314_test.go",
+        "r1_b8_xp317_test.go",
+        "r1_b8_xp320_test.go",
+        "r1_b8_xp321_test.go",
+        "r1_b8_xp331_test.go",
+        "r28_fix_f01_test.go",
+        "r2_b13_submission_recheck_test.go",
+        "r2_b3_inbound_baseline_test.go",
+        "r2_b3_seq_replay_test.go",
+        "r2_k10_username_fold_test.go",
+        "r2_k1_config_shadow_test.go",
+        "r2_k1_latency_chunk_test.go",
+        "r30_fix_f05_test.go",
+        "r32_l4_probe_test.go",
+        "r3_b3_flow_ratio_test.go",
+        "r3_d01_sweep_auth_test.go",
+        "r3_k5_config_import_test.go",
+        "r3_k5_rename_guard_test.go",
+        "r4_node_status_test.go",
+        "r4b01_kr4_test.go",
+        "r7_g01_quota_saturation_test.go",
+        "r7_g02_user_tunnel_import_test.go",
+        "realm_unaccounted_warn_test.go",
+        "reference_username_audit_test.go",
+        "replace_forward_ports_r20501_test.go",
+        "repository_auth_revocation_test.go",
+        "repository_auth_test.go",
+        "repository_backup_test.go",
+        "repository_flow_batch_test.go",
+        "repository_forward_flow_reset_test.go",
+        "repository_forward_proxy_protocol_test.go",
+        "repository_kernel_nodes_test.go",
+        "repository_migrate_test.go",
+        "repository_monitoring_test.go",
+        "repository_nft_counter_test.go",
+        "repository_nft_hostkey_test.go",
+        "repository_nftables_test.go",
+        "repository_node_online_report_test.go",
+        "repository_node_uninstall_test.go",
+        "repository_pool_test.go",
+        "repository_storage_test.go",
+        "repository_subscription_test.go",
+        "repository_traffic_limit_test.go",
+        "repository_upgrade_verify_test.go",
+        "repository_user_subscription_test.go",
+        "resolve_user_tunnel_limiter_r1_test.go",
+        "seed_observability_test.go",
+        "service_monitor_limits_rr_test.go",
+        "sqlite_reclaim_test.go",
+        "subscription_counter_baseline_test.go",
+        "subscription_delete_race_audit_test.go",
+        "subscription_front_test.go",
+        "subscription_traffic_test.go",
+        "traffic_saturate_coverage_sat_test.go",
+        "traffic_saturate_sat2_test.go",
+        "tunnel_list_budget_audit_test.go",
+        "uninstall_attempt_audit_test.go",
+        "uninstall_cascade_atomic_audit_test.go",
+        "user_update_atomic_reaudit_test.go",
+        "x01_name_lock_test.go",
+        "x01_schema_version_test.go"
+      ],
+      "xTestGoFiles": [
+        "audit_r1_cascade_test.go",
+        "b7_cascade_test.go",
+        "cascade_connlog_telemetry_c104_test.go",
+        "r4_s1_node_kernel_create_test.go",
+        "traffic_stream_cascade_test.go",
+        "traffic_stream_sweep_test.go",
+        "tunnel_quality_history_limit_r2_test.go",
+        "zero_value_flags_fixd_test.go"
+      ]
+    },
+    {
+      "importPath": "go-backend/internal/ws",
+      "dir": "go-backend/internal/ws",
+      "goFiles": [
+        "node_lifecycle.go",
+        "node_secret.go",
+        "server.go",
+        "ticket.go",
+        "tunnel_tls_commands.go",
+        "uninstall.go"
+      ],
+      "testGoFiles": [
+        "clientip_key_test.go",
+        "command_family_reliability_test.go",
+        "command_response_binding_reliability_test.go",
+        "concurrent_log_capture_test.go",
+        "f08_node_secret_header_test.go",
+        "fix132_a_test.go",
+        "monitor_scope_test.go",
+        "node_online_binsha_test.go",
+        "node_online_write_audit2_test.go",
+        "node_reconnect_audit2_test.go",
+        "r1_b8_xp326_test.go",
+        "r1_b8_xp330_test.go",
+        "r2_b4_ws_session_reservation_test.go",
+        "r2_d1_02_missing_inner_timestamp_test.go",
+        "r2_x2_preparse_log_test.go",
+        "realtime_queue_test.go",
+        "server_a005_test.go",
+        "server_auth_fail_limit_c403_test.go",
+        "server_test.go",
+        "ticket_handshake_test.go",
+        "ticket_test.go",
+        "uninstall_attempt_audit_test.go",
+        "uninstall_final_contract_test.go",
+        "uninstall_issuedat_gate_test.go",
+        "uninstall_issuedat_r2_test.go",
+        "uninstall_log_sanitize_c404_test.go",
+        "uninstall_read_failure_audit_test.go",
+        "uninstall_test.go",
+        "upgrade_reliability_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "go-backend/tests/contract",
+      "dir": "go-backend/tests/contract",
+      "goFiles": [],
+      "testGoFiles": [],
+      "xTestGoFiles": [
+        "auth_contract_test.go",
+        "b8_empty_subscription_test.go",
+        "b8_pick_tunnel_port_test.go",
+        "b8_remote_source_dedup_test.go",
+        "batch_action_failure_details_contract_test.go",
+        "batch_redeploy_error_details_contract_test.go",
+        "c03_validation_family_contract_test.go",
+        "c08_subscription_mine_save_contract_test.go",
+        "c15_password_alias_contract_test.go",
+        "db_test_helper_test.go",
+        "diagnosis_contract_test.go",
+        "f002_tunnel_delete_dataplane_contract_test.go",
+        "f003_external_same_port_contract_test.go",
+        "f014_tunnel_update_lock_contract_test.go",
+        "f015_tunnel_explicit_port_contract_test.go",
+        "f056_f057_delete_dataplane_contract_test.go",
+        "f058_subscription_delete_retry_contract_test.go",
+        "flow_contract_test.go",
+        "flow_limit_forward_enable_contract_test.go",
+        "flow_upload_batch_contract_test.go",
+        "forward_count_limit_contract_test.go",
+        "forward_local_remote_addr_contract_test.go",
+        "inbound_port_race_contract_test.go",
+        "inbound_save_fields_contract_test.go",
+        "issue313_entry_port_conflict_contract_test.go",
+        "issue349_ipv6_entry_format_contract_test.go",
+        "k5_inbound_reset_traffic_contract_test.go",
+        "k6_paused_maxconn_contract_test.go",
+        "kernel_backup_contract_test.go",
+        "kernel_external_contract_test.go",
+        "kernel_external_credential_identity_test.go",
+        "kernel_inbound_contract_test.go",
+        "kernel_share_contract_test.go",
+        "limiter_sync_failure_contract_test.go",
+        "max_conn_limit_contract_test.go",
+        "migration_contract_test.go",
+        "monitor_ssrf_contract_test.go",
+        "monitoring_contract_test.go",
+        "node_traffic_contract_test.go",
+        "notify_contract_test.go",
+        "passkey_contract_test.go",
+        "per_ip_speed_limit_contract_test.go",
+        "postgres_companion_partial_unique_contract_test.go",
+        "postgres_counter_concurrent_contract_test.go",
+        "postgres_legacy_seq_contract_test.go",
+        "postgres_migration_endstate_contract_test.go",
+        "postgres_node_id_repair_contract_test.go",
+        "postgres_seq_concurrent_contract_test.go",
+        "postgres_username_fold_contract_test.go",
+        "probe_fixture_helper_test.go",
+        "r3_gen_contract_test.go",
+        "remote_source_contract_test.go",
+        "shared_helpers_test.go",
+        "speed_limit_contract_test.go",
+        "storage_contract_test.go",
+        "subscription_contract_test.go",
+        "tunnel_create_contract_test.go",
+        "tunnel_delete_resolution_contract_test.go",
+        "tunnel_ip_preference_contract_test.go",
+        "tunnel_metrics_ingestion_contract_test.go",
+        "tunnel_visibility_contract_test.go",
+        "user_list_max_conn_contract_test.go",
+        "user_quota_contract_test.go",
+        "user_tunnel_status_contract_test.go",
+        "w2_b04_node_order_contract_test.go",
+        "w2_c05_receipts_contract_test.go"
+      ]
+    }
+  ],
+  "go-gost": [
+    {
+      "importPath": "github.com/go-gost/gost",
+      "dir": "go-gost",
+      "goFiles": [
+        "config.go",
+        "coredump.go",
+        "coredump_unix.go",
+        "hostguard.go",
+        "main.go",
+        "memlimit.go",
+        "program.go",
+        "register.go",
+        "uninstalled.go",
+        "version.go"
+      ],
+      "testGoFiles": [
+        "api_auth_audit_test.go",
+        "main_test.go",
+        "memlimit_test.go",
+        "program_profiling_test.go",
+        "startup_log_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/gost/tests/lifecycle",
+      "dir": "go-gost/tests/lifecycle",
+      "goFiles": [],
+      "testGoFiles": [],
+      "xTestGoFiles": [
+        "lifecycle_test.go"
+      ]
+    }
+  ],
+  "go-gost/x": [
+    {
+      "importPath": "github.com/go-gost/x/admission",
+      "dir": "go-gost/x/admission",
+      "goFiles": [
+        "admission.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/admission/plugin",
+      "dir": "go-gost/x/admission/plugin",
+      "goFiles": [
+        "grpc.go",
+        "http.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/admission/wrapper",
+      "dir": "go-gost/x/admission/wrapper",
+      "goFiles": [
+        "conn.go",
+        "listener.go"
+      ],
+      "testGoFiles": [
+        "conn_raw_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/api",
+      "dir": "go-gost/x/api",
+      "goFiles": [
+        "api.go",
+        "config.go",
+        "config_admission.go",
+        "config_auther.go",
+        "config_bypass.go",
+        "config_chain.go",
+        "config_commit.go",
+        "config_conn_limiter.go",
+        "config_hop.go",
+        "config_hosts.go",
+        "config_ingress.go",
+        "config_limiter.go",
+        "config_observer.go",
+        "config_rate_limiter.go",
+        "config_recorder.go",
+        "config_reload.go",
+        "config_resolver.go",
+        "config_router.go",
+        "config_sd.go",
+        "config_service.go",
+        "config_transaction.go",
+        "config_upsert.go",
+        "doc.go",
+        "error.go",
+        "middleware.go"
+      ],
+      "testGoFiles": [
+        "config_transaction_test.go",
+        "middleware_test.go",
+        "r18_fix_f02f04_test.go",
+        "r19_fix_f02_test.go",
+        "r19_fix_t01_batch_dup_test.go",
+        "r2_a01_003_resume_rebuild_test.go",
+        "remediation_audit_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/api/service",
+      "dir": "go-gost/x/api/service",
+      "goFiles": [
+        "service.go"
+      ],
+      "testGoFiles": [
+        "listen_keepalive_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/auth",
+      "dir": "go-gost/x/auth",
+      "goFiles": [
+        "auth.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/auth/plugin",
+      "dir": "go-gost/x/auth/plugin",
+      "goFiles": [
+        "grpc.go",
+        "http.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/bypass",
+      "dir": "go-gost/x/bypass",
+      "goFiles": [
+        "bypass.go",
+        "ovo_no_private.go"
+      ],
+      "testGoFiles": [
+        "bypass_group_pin_test.go",
+        "domain_root_dot_test.go",
+        "netguard_r2_b1_test.go",
+        "ovo_no_private_pin_test.go",
+        "ovo_no_private_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/bypass/plugin",
+      "dir": "go-gost/x/bypass/plugin",
+      "goFiles": [
+        "grpc.go",
+        "http.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/chain",
+      "dir": "go-gost/x/chain",
+      "goFiles": [
+        "chain.go",
+        "route.go",
+        "router.go",
+        "transport.go"
+      ],
+      "testGoFiles": [
+        "attempt_context_race_test.go",
+        "chain_test.go",
+        "failclosed_test.go",
+        "fix2c_chain_test.go",
+        "route_dialstage_r2f307_test.go",
+        "route_handshake_balance_test.go",
+        "router_cancel_test.go",
+        "router_dial_guard_test.go",
+        "router_exclude_test.go",
+        "router_logger_test.go",
+        "router_r217_evidence_test.go",
+        "router_r217_more_test.go",
+        "router_retry_test.go",
+        "transport_retire_test.go",
+        "transport_test.go"
+      ],
+      "xTestGoFiles": [
+        "router_r217_a01_test.go",
+        "router_r217_stack_test.go"
+      ]
+    },
+    {
+      "importPath": "github.com/go-gost/x/config",
+      "dir": "go-gost/x/config",
+      "goFiles": [
+        "config.go",
+        "dedupe.go",
+        "persist.go"
+      ],
+      "testGoFiles": [
+        "config_concurrency_test.go",
+        "dedupe_test.go",
+        "idle_window_publish_test.go",
+        "persist_test.go",
+        "r18_fix_f03_test.go",
+        "r19_fix_f02_test.go",
+        "r20_fix_f04_test.go",
+        "r2_a01_001_dedupe_all_test.go",
+        "r3_k2_heal_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/config/cmd",
+      "dir": "go-gost/x/config/cmd",
+      "goFiles": [
+        "cmd.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/config/loader",
+      "dir": "go-gost/x/config/loader",
+      "goFiles": [
+        "loader.go"
+      ],
+      "testGoFiles": [
+        "idle_window_test.go",
+        "r3_k2_heal_test.go",
+        "reap_window_test.go"
+      ],
+      "xTestGoFiles": [
+        "duplicate_service_test.go",
+        "idle_window_file_test.go",
+        "loader_traffic_flush_test.go",
+        "r17_fix_a_test.go",
+        "r18_fix_f03_test.go",
+        "r19_fix_f02_test.go",
+        "reload_test.go"
+      ]
+    },
+    {
+      "importPath": "github.com/go-gost/x/config/parsing",
+      "dir": "go-gost/x/config/parsing",
+      "goFiles": [
+        "parse.go",
+        "tls.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/config/parsing/admission",
+      "dir": "go-gost/x/config/parsing/admission",
+      "goFiles": [
+        "parse.go"
+      ],
+      "testGoFiles": [
+        "admission_logger_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/config/parsing/auth",
+      "dir": "go-gost/x/config/parsing/auth",
+      "goFiles": [
+        "parse.go"
+      ],
+      "testGoFiles": [
+        "auth_logger_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/config/parsing/bypass",
+      "dir": "go-gost/x/config/parsing/bypass",
+      "goFiles": [
+        "parse.go"
+      ],
+      "testGoFiles": [
+        "bypass_logger_test.go",
+        "fix2c_builtin_test.go",
+        "fix2c_register_test.go",
+        "group_pin_production_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/config/parsing/chain",
+      "dir": "go-gost/x/config/parsing/chain",
+      "goFiles": [
+        "parse.go"
+      ],
+      "testGoFiles": [
+        "ownership_audit_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/config/parsing/hop",
+      "dir": "go-gost/x/config/parsing/hop",
+      "goFiles": [
+        "parse.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/config/parsing/hosts",
+      "dir": "go-gost/x/config/parsing/hosts",
+      "goFiles": [
+        "parse.go"
+      ],
+      "testGoFiles": [
+        "hosts_logger_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/config/parsing/ingress",
+      "dir": "go-gost/x/config/parsing/ingress",
+      "goFiles": [
+        "parse.go"
+      ],
+      "testGoFiles": [
+        "ingress_logger_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/config/parsing/limiter",
+      "dir": "go-gost/x/config/parsing/limiter",
+      "goFiles": [
+        "parse.go"
+      ],
+      "testGoFiles": [
+        "limiter_logger_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/config/parsing/logger",
+      "dir": "go-gost/x/config/parsing/logger",
+      "goFiles": [
+        "parse.go"
+      ],
+      "testGoFiles": [
+        "parse_logger_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/config/parsing/node",
+      "dir": "go-gost/x/config/parsing/node",
+      "goFiles": [
+        "parse.go"
+      ],
+      "testGoFiles": [
+        "audit_r18_f1_01_test.go",
+        "parse_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/config/parsing/observer",
+      "dir": "go-gost/x/config/parsing/observer",
+      "goFiles": [
+        "parse.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/config/parsing/parser",
+      "dir": "go-gost/x/config/parsing/parser",
+      "goFiles": [
+        "parser.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/config/parsing/recorder",
+      "dir": "go-gost/x/config/parsing/recorder",
+      "goFiles": [
+        "parse.go"
+      ],
+      "testGoFiles": [
+        "recorder_logger_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/config/parsing/resolver",
+      "dir": "go-gost/x/config/parsing/resolver",
+      "goFiles": [
+        "parse.go"
+      ],
+      "testGoFiles": [
+        "resolver_logger_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/config/parsing/router",
+      "dir": "go-gost/x/config/parsing/router",
+      "goFiles": [
+        "parse.go"
+      ],
+      "testGoFiles": [
+        "router_logger_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/config/parsing/sd",
+      "dir": "go-gost/x/config/parsing/sd",
+      "goFiles": [
+        "parse.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/config/parsing/selector",
+      "dir": "go-gost/x/config/parsing/selector",
+      "goFiles": [
+        "parse.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/config/parsing/service",
+      "dir": "go-gost/x/config/parsing/service",
+      "goFiles": [
+        "composite_limiter.go",
+        "parse.go"
+      ],
+      "testGoFiles": [
+        "a02_001_guard_test.go",
+        "composite_limiter_test.go",
+        "parse_retries_floor_test.go",
+        "parse_security_test.go",
+        "service_logger_test.go"
+      ],
+      "xTestGoFiles": [
+        "udp_forward_return_test.go"
+      ]
+    },
+    {
+      "importPath": "github.com/go-gost/x/connector/direct",
+      "dir": "go-gost/x/connector/direct",
+      "goFiles": [
+        "conn.go",
+        "connector.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/connector/forward",
+      "dir": "go-gost/x/connector/forward",
+      "goFiles": [
+        "connector.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/connector/http",
+      "dir": "go-gost/x/connector/http",
+      "goFiles": [
+        "connector.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/connector/http2",
+      "dir": "go-gost/x/connector/http2",
+      "goFiles": [
+        "conn.go",
+        "connector.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/connector/relay",
+      "dir": "go-gost/x/connector/relay",
+      "goFiles": [
+        "bind.go",
+        "conn.go",
+        "connector.go",
+        "listener.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "conn_write_test.go",
+        "halfclose_test.go"
+      ],
+      "xTestGoFiles": [
+        "server_first_test.go",
+        "tcp_over_udp_test.go",
+        "udp_relay_test.go"
+      ]
+    },
+    {
+      "importPath": "github.com/go-gost/x/connector/router",
+      "dir": "go-gost/x/connector/router",
+      "goFiles": [
+        "conn.go",
+        "connector.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": [
+        "stream_conn_test.go"
+      ]
+    },
+    {
+      "importPath": "github.com/go-gost/x/connector/serial",
+      "dir": "go-gost/x/connector/serial",
+      "goFiles": [
+        "connector.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/connector/sni",
+      "dir": "go-gost/x/connector/sni",
+      "goFiles": [
+        "conn.go",
+        "connector.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/connector/socks/v4",
+      "dir": "go-gost/x/connector/socks/v4",
+      "goFiles": [
+        "connector.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/connector/socks/v5",
+      "dir": "go-gost/x/connector/socks/v5",
+      "goFiles": [
+        "bind.go",
+        "conn.go",
+        "connector.go",
+        "listener.go",
+        "metadata.go",
+        "selector.go"
+      ],
+      "testGoFiles": [
+        "connector_tls_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/connector/ss",
+      "dir": "go-gost/x/connector/ss",
+      "goFiles": [
+        "connector.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "connector_test.go"
+      ],
+      "xTestGoFiles": [
+        "server_first_test.go"
+      ]
+    },
+    {
+      "importPath": "github.com/go-gost/x/connector/ss/udp",
+      "dir": "go-gost/x/connector/ss/udp",
+      "goFiles": [
+        "connector.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "connector_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/connector/sshd",
+      "dir": "go-gost/x/connector/sshd",
+      "goFiles": [
+        "connector.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/connector/tcp",
+      "dir": "go-gost/x/connector/tcp",
+      "goFiles": [
+        "connector.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/connector/tunnel",
+      "dir": "go-gost/x/connector/tunnel",
+      "goFiles": [
+        "bind.go",
+        "conn.go",
+        "connector.go",
+        "listener.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": [
+        "stream_conn_test.go"
+      ]
+    },
+    {
+      "importPath": "github.com/go-gost/x/connector/unix",
+      "dir": "go-gost/x/connector/unix",
+      "goFiles": [
+        "connector.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/ctx",
+      "dir": "go-gost/x/ctx",
+      "goFiles": [
+        "value.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/dialer/direct",
+      "dir": "go-gost/x/dialer/direct",
+      "goFiles": [
+        "conn.go",
+        "dialer.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/dialer/dtls",
+      "dir": "go-gost/x/dialer/dtls",
+      "goFiles": [
+        "dialer.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "dialer_tls_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/dialer/ftcp",
+      "dir": "go-gost/x/dialer/ftcp",
+      "goFiles": [
+        "conn.go",
+        "dialer.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/dialer/grpc",
+      "dir": "go-gost/x/dialer/grpc",
+      "goFiles": [
+        "conn.go",
+        "dialer.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "dialer_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/dialer/http2",
+      "dir": "go-gost/x/dialer/http2",
+      "goFiles": [
+        "conn.go",
+        "dialer.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/dialer/http2/h2",
+      "dir": "go-gost/x/dialer/http2/h2",
+      "goFiles": [
+        "conn.go",
+        "dialer.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "dialer_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/dialer/http3",
+      "dir": "go-gost/x/dialer/http3",
+      "goFiles": [
+        "dialer.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "dialer_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/dialer/http3/wt",
+      "dir": "go-gost/x/dialer/http3/wt",
+      "goFiles": [
+        "client.go",
+        "dialer.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "dialer_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/dialer/icmp",
+      "dir": "go-gost/x/dialer/icmp",
+      "goFiles": [
+        "conn.go",
+        "dialer.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/dialer/kcp",
+      "dir": "go-gost/x/dialer/kcp",
+      "goFiles": [
+        "conn.go",
+        "dialer.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "dialer_test.go",
+        "fec_off_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/dialer/mtcp",
+      "dir": "go-gost/x/dialer/mtcp",
+      "goFiles": [
+        "conn.go",
+        "dialer.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "dialer_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/dialer/mtls",
+      "dir": "go-gost/x/dialer/mtls",
+      "goFiles": [
+        "conn.go",
+        "dialer.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "dialer_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/dialer/mws",
+      "dir": "go-gost/x/dialer/mws",
+      "goFiles": [
+        "conn.go",
+        "dialer.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "dialer_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/dialer/obfs/http",
+      "dir": "go-gost/x/dialer/obfs/http",
+      "goFiles": [
+        "conn.go",
+        "dialer.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/dialer/obfs/tls",
+      "dir": "go-gost/x/dialer/obfs/tls",
+      "goFiles": [
+        "conn.go",
+        "dialer.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/dialer/pht",
+      "dir": "go-gost/x/dialer/pht",
+      "goFiles": [
+        "dialer.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "dialer_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/dialer/quic",
+      "dir": "go-gost/x/dialer/quic",
+      "goFiles": [
+        "conn.go",
+        "dialer.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/dialer/serial",
+      "dir": "go-gost/x/dialer/serial",
+      "goFiles": [
+        "dialer.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/dialer/ssh",
+      "dir": "go-gost/x/dialer/ssh",
+      "goFiles": [
+        "dialer.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "dialer_retire_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/dialer/sshd",
+      "dir": "go-gost/x/dialer/sshd",
+      "goFiles": [
+        "dialer.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "dialer_retire_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/dialer/tcp",
+      "dir": "go-gost/x/dialer/tcp",
+      "goFiles": [
+        "dialer.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/dialer/tls",
+      "dir": "go-gost/x/dialer/tls",
+      "goFiles": [
+        "dialer.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/dialer/udp",
+      "dir": "go-gost/x/dialer/udp",
+      "goFiles": [
+        "conn.go",
+        "dialer.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "dialer_nonudp_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/dialer/unix",
+      "dir": "go-gost/x/dialer/unix",
+      "goFiles": [
+        "dialer.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/dialer/wg",
+      "dir": "go-gost/x/dialer/wg",
+      "goFiles": [
+        "dialer.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/dialer/ws",
+      "dir": "go-gost/x/dialer/ws",
+      "goFiles": [
+        "dialer.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/envcompat",
+      "dir": "go-gost/x/envcompat",
+      "goFiles": [
+        "env.go"
+      ],
+      "testGoFiles": [
+        "env_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/handler/api",
+      "dir": "go-gost/x/handler/api",
+      "goFiles": [
+        "handler.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "handler_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/handler/auto",
+      "dir": "go-gost/x/handler/auto",
+      "goFiles": [
+        "handler.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/handler/dns",
+      "dir": "go-gost/x/handler/dns",
+      "goFiles": [
+        "handler.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/handler/file",
+      "dir": "go-gost/x/handler/file",
+      "goFiles": [
+        "handler.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/handler/forward/local",
+      "dir": "go-gost/x/handler/forward/local",
+      "goFiles": [
+        "handler.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "proxy_protocol_test.go",
+        "reap_role_test.go",
+        "recorder_test.go",
+        "retry_transport_audit_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/handler/forward/remote",
+      "dir": "go-gost/x/handler/forward/remote",
+      "goFiles": [
+        "handler.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "retry_transport_audit_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/handler/http",
+      "dir": "go-gost/x/handler/http",
+      "goFiles": [
+        "handler.go",
+        "metadata.go",
+        "udp.go"
+      ],
+      "testGoFiles": [
+        "probe_decoy_test.go",
+        "websocket_relay_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/handler/http2",
+      "dir": "go-gost/x/handler/http2",
+      "goFiles": [
+        "conn.go",
+        "handler.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "conn_test.go",
+        "probe_decoy_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/handler/http3",
+      "dir": "go-gost/x/handler/http3",
+      "goFiles": [
+        "handler.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/handler/metrics",
+      "dir": "go-gost/x/handler/metrics",
+      "goFiles": [
+        "handler.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "handler_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/handler/redirect/tcp",
+      "dir": "go-gost/x/handler/redirect/tcp",
+      "goFiles": [
+        "handler.go",
+        "handler_linux.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/handler/redirect/udp",
+      "dir": "go-gost/x/handler/redirect/udp",
+      "goFiles": [
+        "handler.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/handler/relay",
+      "dir": "go-gost/x/handler/relay",
+      "goFiles": [
+        "bind.go",
+        "conn.go",
+        "connect.go",
+        "entrypoint.go",
+        "forward.go",
+        "handler.go",
+        "metadata.go",
+        "pacing.go"
+      ],
+      "testGoFiles": [
+        "bind_udp_stats_test.go",
+        "conn_syscall_test.go",
+        "conn_write_test.go",
+        "halfclose_test.go",
+        "pacing_test.go",
+        "reap_role_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/handler/router",
+      "dir": "go-gost/x/handler/router",
+      "goFiles": [
+        "associate.go",
+        "entrypoint.go",
+        "handler.go",
+        "metadata.go",
+        "router.go"
+      ],
+      "testGoFiles": [
+        "associate_foreign_timeout_test.go",
+        "associate_idle_test.go",
+        "router_cache_test.go",
+        "router_pool_reclaim_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/handler/serial",
+      "dir": "go-gost/x/handler/serial",
+      "goFiles": [
+        "conn.go",
+        "handler.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/handler/sni",
+      "dir": "go-gost/x/handler/sni",
+      "goFiles": [
+        "handler.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/handler/socks/v4",
+      "dir": "go-gost/x/handler/socks/v4",
+      "goFiles": [
+        "handler.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/handler/socks/v5",
+      "dir": "go-gost/x/handler/socks/v5",
+      "goFiles": [
+        "bind.go",
+        "connect.go",
+        "handler.go",
+        "mbind.go",
+        "metadata.go",
+        "selector.go",
+        "udp.go",
+        "udp_tun.go"
+      ],
+      "testGoFiles": [
+        "udp_idle_test.go",
+        "udp_localaddr_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/handler/ss",
+      "dir": "go-gost/x/handler/ss",
+      "goFiles": [
+        "handler.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "handler_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/handler/ss/udp",
+      "dir": "go-gost/x/handler/ss/udp",
+      "goFiles": [
+        "handler.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "handler_test.go",
+        "r2_a02_001_pin_memo_test.go",
+        "r3_k1_production_pin_test.go",
+        "relay_attribution_test.go",
+        "relay_foreign_timeout_test.go",
+        "relay_idle_test.go",
+        "relay_logagg_test.go",
+        "ss_udp_over_tcp_stats_test.go",
+        "ss_udp_stats_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/handler/sshd",
+      "dir": "go-gost/x/handler/sshd",
+      "goFiles": [
+        "handler.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/handler/tap",
+      "dir": "go-gost/x/handler/tap",
+      "goFiles": [
+        "handler.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "handler_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/handler/tun",
+      "dir": "go-gost/x/handler/tun",
+      "goFiles": [
+        "client.go",
+        "handler.go",
+        "logagg.go",
+        "metadata.go",
+        "server.go"
+      ],
+      "testGoFiles": [
+        "logagg_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/handler/tunnel",
+      "dir": "go-gost/x/handler/tunnel",
+      "goFiles": [
+        "bind.go",
+        "connect.go",
+        "dialer.go",
+        "entrypoint.go",
+        "handler.go",
+        "metadata.go",
+        "tunnel.go"
+      ],
+      "testGoFiles": [
+        "websocket_relay_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/handler/unix",
+      "dir": "go-gost/x/handler/unix",
+      "goFiles": [
+        "handler.go",
+        "metadata.go",
+        "sniffing.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/hop",
+      "dir": "go-gost/x/hop",
+      "goFiles": [
+        "hop.go"
+      ],
+      "testGoFiles": [
+        "hop_test.go",
+        "root_dot_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/hop/plugin",
+      "dir": "go-gost/x/hop/plugin",
+      "goFiles": [
+        "grpc.go",
+        "http.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/hosts",
+      "dir": "go-gost/x/hosts",
+      "goFiles": [
+        "hosts.go"
+      ],
+      "testGoFiles": [
+        "root_dot_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/hosts/plugin",
+      "dir": "go-gost/x/hosts/plugin",
+      "goFiles": [
+        "grpc.go",
+        "http.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/ingress",
+      "dir": "go-gost/x/ingress",
+      "goFiles": [
+        "ingress.go"
+      ],
+      "testGoFiles": [
+        "root_dot_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/ingress/plugin",
+      "dir": "go-gost/x/ingress/plugin",
+      "goFiles": [
+        "grpc.go",
+        "http.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/connlog",
+      "dir": "go-gost/x/internal/connlog",
+      "goFiles": [
+        "connlog.go"
+      ],
+      "testGoFiles": [
+        "connlog_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/ctx",
+      "dir": "go-gost/x/internal/ctx",
+      "goFiles": [
+        "value.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/idle",
+      "dir": "go-gost/x/internal/idle",
+      "goFiles": [
+        "idle.go"
+      ],
+      "testGoFiles": [
+        "idle_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/io",
+      "dir": "go-gost/x/internal/io",
+      "goFiles": [
+        "io.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/keepalive",
+      "dir": "go-gost/x/internal/keepalive",
+      "goFiles": [
+        "keepalive.go"
+      ],
+      "testGoFiles": [
+        "keepalive_readback_test.go",
+        "keepalive_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/loader",
+      "dir": "go-gost/x/internal/loader",
+      "goFiles": [
+        "file.go",
+        "http.go",
+        "loader.go",
+        "redis.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/matcher",
+      "dir": "go-gost/x/internal/matcher",
+      "goFiles": [
+        "matcher.go"
+      ],
+      "testGoFiles": [
+        "domain_root_dot_address_guard_test.go",
+        "domain_root_dot_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/net",
+      "dir": "go-gost/x/internal/net",
+      "goFiles": [
+        "addr.go",
+        "net.go",
+        "pacing.go",
+        "reap.go",
+        "resovle.go",
+        "tcpinfo.go",
+        "tcpinfo_linux.go",
+        "transport.go"
+      ],
+      "testGoFiles": [
+        "domain_root_dot_test.go",
+        "keepalive_listen_test.go",
+        "net_test.go",
+        "pacing_test.go",
+        "reap_test.go",
+        "tcpinfo_test.go",
+        "transport_adapter_test.go",
+        "transport_bench_test.go",
+        "transport_deadleg_spin_test.go",
+        "transport_fallback_test.go",
+        "transport_foreign_timeout_test.go",
+        "transport_idle_window_test.go",
+        "transport_test.go",
+        "transport_write_wake_audit_r2_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/net/dialer",
+      "dir": "go-gost/x/internal/net/dialer",
+      "goFiles": [
+        "dialer.go",
+        "dialer_linux.go"
+      ],
+      "testGoFiles": [
+        "keepalive_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/net/http",
+      "dir": "go-gost/x/internal/net/http",
+      "goFiles": [
+        "http.go",
+        "single_conn_listener.go"
+      ],
+      "testGoFiles": [
+        "single_conn_listener_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/net/ip",
+      "dir": "go-gost/x/internal/net/ip",
+      "goFiles": [
+        "ip.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/net/proxyproto",
+      "dir": "go-gost/x/internal/net/proxyproto",
+      "goFiles": [
+        "conn.go",
+        "listener.go"
+      ],
+      "testGoFiles": [
+        "listener_allowlist_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/net/udp",
+      "dir": "go-gost/x/internal/net/udp",
+      "goFiles": [
+        "conn.go",
+        "listener.go",
+        "pool.go",
+        "relay.go",
+        "stream.go"
+      ],
+      "testGoFiles": [
+        "close_concurrency_audit_test.go",
+        "listener_bench_test.go",
+        "listener_bytes_test.go",
+        "listener_drop_test.go",
+        "listener_queue_test.go",
+        "listener_readbuffer_test.go",
+        "listener_retention_test.go",
+        "listener_session_test.go",
+        "loopback_env_test.go",
+        "pool_idle_test.go",
+        "pool_ttl_test.go",
+        "r2_a02_001_pin_memo_test.go",
+        "r3_k1_production_pin_test.go",
+        "relay_attribution_test.go",
+        "relay_foreign_timeout_test.go",
+        "relay_idle_test.go",
+        "relay_idle_window_test.go",
+        "relay_pin_test.go",
+        "stream_wrap_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/plugin",
+      "dir": "go-gost/x/internal/plugin",
+      "goFiles": [
+        "plugin.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/reap",
+      "dir": "go-gost/x/internal/reap",
+      "goFiles": [
+        "reap.go"
+      ],
+      "testGoFiles": [
+        "reap_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/sessionbudget",
+      "dir": "go-gost/x/internal/sessionbudget",
+      "goFiles": [
+        "sessionbudget.go"
+      ],
+      "testGoFiles": [
+        "sessionbudget_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/util/cache",
+      "dir": "go-gost/x/internal/util/cache",
+      "goFiles": [
+        "cache.go"
+      ],
+      "testGoFiles": [
+        "cache_bench_test.go",
+        "cache_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/util/crypto",
+      "dir": "go-gost/x/internal/util/crypto",
+      "goFiles": [
+        "aes.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/util/download",
+      "dir": "go-gost/x/internal/util/download",
+      "goFiles": [
+        "resume.go",
+        "routes.go",
+        "stall.go"
+      ],
+      "testGoFiles": [
+        "budget_values_r6_test.go",
+        "panel_route_test.go",
+        "priority_route_test.go",
+        "resume_test.go",
+        "routes_test.go",
+        "slow_direct_test.go",
+        "stall_test.go",
+        "trickle_budget_test.go",
+        "trickle_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/util/dtls",
+      "dir": "go-gost/x/internal/util/dtls",
+      "goFiles": [
+        "conn.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/util/eventlog",
+      "dir": "go-gost/x/internal/util/eventlog",
+      "goFiles": [
+        "eventlog.go"
+      ],
+      "testGoFiles": [
+        "eventlog_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/util/forwarder",
+      "dir": "go-gost/x/internal/util/forwarder",
+      "goFiles": [
+        "sniffer.go"
+      ],
+      "testGoFiles": [
+        "sniffer_tls_test.go",
+        "websocket_relay_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/util/grpc/proto",
+      "dir": "go-gost/x/internal/util/grpc/proto",
+      "goFiles": [
+        "gost.pb.go",
+        "gost_grpc.pb.go",
+        "gost_grpcx.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/util/icmp",
+      "dir": "go-gost/x/internal/util/icmp",
+      "goFiles": [
+        "conn.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/util/kcp",
+      "dir": "go-gost/x/internal/util/kcp",
+      "goFiles": [
+        "config.go",
+        "kcp.go"
+      ],
+      "testGoFiles": [
+        "config_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/util/mux",
+      "dir": "go-gost/x/internal/util/mux",
+      "goFiles": [
+        "mux.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/util/pht",
+      "dir": "go-gost/x/internal/util/pht",
+      "goFiles": [
+        "client.go",
+        "conn.go",
+        "server.go"
+      ],
+      "testGoFiles": [
+        "close_concurrency_audit_test.go",
+        "server_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/util/port",
+      "dir": "go-gost/x/internal/util/port",
+      "goFiles": [
+        "port.go"
+      ],
+      "testGoFiles": [
+        "port_test.go",
+        "stdout_audit_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/util/quic",
+      "dir": "go-gost/x/internal/util/quic",
+      "goFiles": [
+        "conn.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/util/relay",
+      "dir": "go-gost/x/internal/util/relay",
+      "goFiles": [
+        "conn.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/util/resolver",
+      "dir": "go-gost/x/internal/util/resolver",
+      "goFiles": [
+        "cache.go",
+        "resolver.go"
+      ],
+      "testGoFiles": [
+        "cache_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/util/serial",
+      "dir": "go-gost/x/internal/util/serial",
+      "goFiles": [
+        "conn.go",
+        "serial.go",
+        "serial_linux.go",
+        "util.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/util/sessionretire",
+      "dir": "go-gost/x/internal/util/sessionretire",
+      "goFiles": [
+        "sessionretire.go"
+      ],
+      "testGoFiles": [
+        "sessionretire_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/util/sniffing",
+      "dir": "go-gost/x/internal/util/sniffing",
+      "goFiles": [
+        "sniff.go",
+        "sniffer.go"
+      ],
+      "testGoFiles": [
+        "sniffer_tls_test.go",
+        "websocket_relay_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/util/socks",
+      "dir": "go-gost/x/internal/util/socks",
+      "goFiles": [
+        "conn.go",
+        "socks.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/util/ss",
+      "dir": "go-gost/x/internal/util/ss",
+      "goFiles": [
+        "conn.go",
+        "ss.go"
+      ],
+      "testGoFiles": [
+        "ss_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/util/ssh",
+      "dir": "go-gost/x/internal/util/ssh",
+      "goFiles": [
+        "conn.go",
+        "session.go",
+        "ssh.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/util/sshd",
+      "dir": "go-gost/x/internal/util/sshd",
+      "goFiles": [
+        "conn.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/util/stats",
+      "dir": "go-gost/x/internal/util/stats",
+      "goFiles": [
+        "stats.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": [
+        "stats_test.go"
+      ]
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/util/tap",
+      "dir": "go-gost/x/internal/util/tap",
+      "goFiles": [
+        "config.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/util/tls",
+      "dir": "go-gost/x/internal/util/tls",
+      "goFiles": [
+        "tls.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/util/tun",
+      "dir": "go-gost/x/internal/util/tun",
+      "goFiles": [
+        "config.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/util/ws",
+      "dir": "go-gost/x/internal/util/ws",
+      "goFiles": [
+        "frame.go",
+        "ws.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/internal/util/wt",
+      "dir": "go-gost/x/internal/util/wt",
+      "goFiles": [
+        "conn.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/kernel",
+      "dir": "go-gost/x/kernel",
+      "goFiles": [
+        "clashapi.go",
+        "connlog.go",
+        "coredump.go",
+        "geodata.go",
+        "install.go",
+        "manager.go",
+        "manager_workers.go",
+        "nft.go",
+        "nft_install.go",
+        "panel_route.go",
+        "process.go",
+        "rulesets.go",
+        "sockkill.go",
+        "sys_linux.go",
+        "types.go",
+        "xrayusers.go"
+      ],
+      "testGoFiles": [
+        "blocked_marks_persist_test.go",
+        "clashapi_test.go",
+        "companion_c03_test.go",
+        "concurrent_log_capture_test.go",
+        "connlog_test.go",
+        "container_probe_test.go",
+        "coredump_test.go",
+        "detectversion_test.go",
+        "ensure_binary_hash_test.go",
+        "f032_rollback_test.go",
+        "f061_github_proxy_test.go",
+        "fix2_guard_test.go",
+        "fix9_uninstall_applymu_test.go",
+        "fix_c3_06_test.go",
+        "fix_hist_metering_test.go",
+        "fixr2_e02_a2_test.go",
+        "geodata_test.go",
+        "guard_align_test.go",
+        "guard_restart_test.go",
+        "inplace_switchoff_cleanup_test.go",
+        "install_anchor_fixr210_test.go",
+        "install_cnew2_test.go",
+        "install_fetch_r7_test.go",
+        "install_r5_test.go",
+        "install_test.go",
+        "kernel_test.go",
+        "ku4_testmain_test.go",
+        "leg4a_missing_nft_test.go",
+        "manager_fixture_audit_test.go",
+        "manager_resolve_test.go",
+        "manager_shutdown_audit_test.go",
+        "manager_test_cleanup_test.go",
+        "manager_workers_test.go",
+        "markbase_test.go",
+        "mieru_test.go",
+        "nft_hop_check_test.go",
+        "nft_install_test.go",
+        "nft_isolation_test.go",
+        "nft_table_loss_test.go",
+        "no_nft_status_test.go",
+        "panel_route_test.go",
+        "panel_source_fetch_test.go",
+        "process_stop_test.go",
+        "r3_wdg_test.go",
+        "r6_binprune_test.go",
+        "r7_g1_guard_localize_test.go",
+        "realm_port_counting_test.go",
+        "restore_nft_rebuild_test.go",
+        "rollback_sync_order_test.go",
+        "rulesets_test.go",
+        "rv2_test.go",
+        "sockkill_test.go",
+        "status_empty_test.go",
+        "timeout_budgets_r8_test.go",
+        "uninstall_test.go",
+        "vd_tombstone_nft_test.go",
+        "waitstable_test.go",
+        "whitelist_guard_test.go",
+        "xray_useronly_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/limiter/conn",
+      "dir": "go-gost/x/limiter/conn",
+      "goFiles": [
+        "conn.go",
+        "generator.go",
+        "limiter.go"
+      ],
+      "testGoFiles": [
+        "conn_bound_test.go",
+        "conn_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/limiter/conn/wrapper",
+      "dir": "go-gost/x/limiter/conn/wrapper",
+      "goFiles": [
+        "conn.go",
+        "listener.go"
+      ],
+      "testGoFiles": [
+        "conn_raw_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/limiter/rate",
+      "dir": "go-gost/x/limiter/rate",
+      "goFiles": [
+        "generator.go",
+        "limiter.go",
+        "rate.go"
+      ],
+      "testGoFiles": [
+        "rate_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/limiter/traffic",
+      "dir": "go-gost/x/limiter/traffic",
+      "goFiles": [
+        "generator.go",
+        "limiter.go",
+        "traffic.go"
+      ],
+      "testGoFiles": [
+        "traffic_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/limiter/traffic/cache",
+      "dir": "go-gost/x/limiter/traffic/cache",
+      "goFiles": [
+        "limiter.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/limiter/traffic/plugin",
+      "dir": "go-gost/x/limiter/traffic/plugin",
+      "goFiles": [
+        "grpc.go",
+        "http.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/limiter/traffic/wrapper",
+      "dir": "go-gost/x/limiter/traffic/wrapper",
+      "goFiles": [
+        "conn.go",
+        "io.go",
+        "listener.go"
+      ],
+      "testGoFiles": [
+        "conn_raw_test.go",
+        "halfclose_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/listener/dns",
+      "dir": "go-gost/x/listener/dns",
+      "goFiles": [
+        "listener.go",
+        "metadata.go",
+        "server.go"
+      ],
+      "testGoFiles": [
+        "close_concurrency_audit_test.go",
+        "doh_body_limit_audit_test.go",
+        "listener_eventlog_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/listener/dtls",
+      "dir": "go-gost/x/listener/dtls",
+      "goFiles": [
+        "listener.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/listener/ftcp",
+      "dir": "go-gost/x/listener/ftcp",
+      "goFiles": [
+        "conn.go",
+        "listener.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "conn_deadline_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/listener/grpc",
+      "dir": "go-gost/x/listener/grpc",
+      "goFiles": [
+        "listener.go",
+        "metadata.go",
+        "server.go"
+      ],
+      "testGoFiles": [
+        "close_concurrency_audit_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/listener/http2",
+      "dir": "go-gost/x/listener/http2",
+      "goFiles": [
+        "conn.go",
+        "listener.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "close_concurrency_audit_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/listener/http2/h2",
+      "dir": "go-gost/x/listener/http2/h2",
+      "goFiles": [
+        "conn.go",
+        "listener.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "close_concurrency_audit_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/listener/http3",
+      "dir": "go-gost/x/listener/http3",
+      "goFiles": [
+        "conn.go",
+        "listener.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "close_concurrency_audit_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/listener/http3/h3",
+      "dir": "go-gost/x/listener/http3/h3",
+      "goFiles": [
+        "listener.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/listener/http3/wt",
+      "dir": "go-gost/x/listener/http3/wt",
+      "goFiles": [
+        "listener.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/listener/icmp",
+      "dir": "go-gost/x/listener/icmp",
+      "goFiles": [
+        "conn.go",
+        "listener.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/listener/kcp",
+      "dir": "go-gost/x/listener/kcp",
+      "goFiles": [
+        "listener.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "fec_off_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/listener/mtcp",
+      "dir": "go-gost/x/listener/mtcp",
+      "goFiles": [
+        "listener.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/listener/mtls",
+      "dir": "go-gost/x/listener/mtls",
+      "goFiles": [
+        "listener.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/listener/mws",
+      "dir": "go-gost/x/listener/mws",
+      "goFiles": [
+        "listener.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/listener/obfs/http",
+      "dir": "go-gost/x/listener/obfs/http",
+      "goFiles": [
+        "conn.go",
+        "listener.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/listener/obfs/tls",
+      "dir": "go-gost/x/listener/obfs/tls",
+      "goFiles": [
+        "conn.go",
+        "listener.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/listener/pht",
+      "dir": "go-gost/x/listener/pht",
+      "goFiles": [
+        "listener.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/listener/quic",
+      "dir": "go-gost/x/listener/quic",
+      "goFiles": [
+        "conn.go",
+        "listener.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/listener/redirect/tcp",
+      "dir": "go-gost/x/listener/redirect/tcp",
+      "goFiles": [
+        "listener.go",
+        "listener_linux.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/listener/redirect/udp",
+      "dir": "go-gost/x/listener/redirect/udp",
+      "goFiles": [
+        "conn.go",
+        "listener.go",
+        "listener_linux.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/listener/rtcp",
+      "dir": "go-gost/x/listener/rtcp",
+      "goFiles": [
+        "listener.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "close_concurrency_audit_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/listener/rudp",
+      "dir": "go-gost/x/listener/rudp",
+      "goFiles": [
+        "listener.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "close_concurrency_audit_test.go",
+        "ttl_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/listener/serial",
+      "dir": "go-gost/x/listener/serial",
+      "goFiles": [
+        "listener.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "close_concurrency_audit_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/listener/ssh",
+      "dir": "go-gost/x/listener/ssh",
+      "goFiles": [
+        "listener.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/listener/sshd",
+      "dir": "go-gost/x/listener/sshd",
+      "goFiles": [
+        "listener.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/listener/tap",
+      "dir": "go-gost/x/listener/tap",
+      "goFiles": [
+        "conn.go",
+        "listener.go",
+        "metadata.go",
+        "tap_linux.go"
+      ],
+      "testGoFiles": [
+        "close_concurrency_audit_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/listener/tcp",
+      "dir": "go-gost/x/listener/tcp",
+      "goFiles": [
+        "listener.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "listener_allowlist_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/listener/tls",
+      "dir": "go-gost/x/listener/tls",
+      "goFiles": [
+        "listener.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/listener/tun",
+      "dir": "go-gost/x/listener/tun",
+      "goFiles": [
+        "conn.go",
+        "listener.go",
+        "metadata.go",
+        "tun.go",
+        "tun_linux.go"
+      ],
+      "testGoFiles": [
+        "close_concurrency_audit_test.go",
+        "metadata_logger_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/listener/udp",
+      "dir": "go-gost/x/listener/udp",
+      "goFiles": [
+        "listener.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [
+        "listener_test.go",
+        "ttl_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/listener/unix",
+      "dir": "go-gost/x/listener/unix",
+      "goFiles": [
+        "listener.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/listener/ws",
+      "dir": "go-gost/x/listener/ws",
+      "goFiles": [
+        "listener.go",
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/logger",
+      "dir": "go-gost/x/logger",
+      "goFiles": [
+        "logger.go",
+        "nop_logger.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/metadata",
+      "dir": "go-gost/x/metadata",
+      "goFiles": [
+        "metadata.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/metadata/util",
+      "dir": "go-gost/x/metadata/util",
+      "goFiles": [
+        "util.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/metrics",
+      "dir": "go-gost/x/metrics",
+      "goFiles": [
+        "metrics.go",
+        "noop.go",
+        "prom.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/metrics/service",
+      "dir": "go-gost/x/metrics/service",
+      "goFiles": [
+        "service.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/metrics/wrapper",
+      "dir": "go-gost/x/metrics/wrapper",
+      "goFiles": [
+        "conn.go",
+        "listener.go"
+      ],
+      "testGoFiles": [
+        "conn_raw_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/observer/plugin",
+      "dir": "go-gost/x/observer/plugin",
+      "goFiles": [
+        "grpc.go",
+        "http.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/observer/stats",
+      "dir": "go-gost/x/observer/stats",
+      "goFiles": [
+        "stats.go"
+      ],
+      "testGoFiles": [
+        "stats_reset_traffic_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/observer/stats/wrapper",
+      "dir": "go-gost/x/observer/stats/wrapper",
+      "goFiles": [
+        "conn.go",
+        "io.go",
+        "listener.go"
+      ],
+      "testGoFiles": [
+        "conn_raw_test.go",
+        "halfclose_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/recorder",
+      "dir": "go-gost/x/recorder",
+      "goFiles": [
+        "file.go",
+        "http.go",
+        "recorder.go",
+        "redis.go",
+        "tcp.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/recorder/plugin",
+      "dir": "go-gost/x/recorder/plugin",
+      "goFiles": [
+        "grpc.go",
+        "http.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/registry",
+      "dir": "go-gost/x/registry",
+      "goFiles": [
+        "admission.go",
+        "auther.go",
+        "bypass.go",
+        "chain.go",
+        "commit.go",
+        "connector.go",
+        "dialer.go",
+        "handler.go",
+        "hop.go",
+        "hosts.go",
+        "ingress.go",
+        "limiter.go",
+        "listener.go",
+        "logger.go",
+        "observer.go",
+        "recorder.go",
+        "registry.go",
+        "resolver.go",
+        "router.go",
+        "sd.go",
+        "service.go"
+      ],
+      "testGoFiles": [
+        "bypass_pin_test.go",
+        "chain_test.go",
+        "unregister_concurrency_audit_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/resolver",
+      "dir": "go-gost/x/resolver",
+      "goFiles": [
+        "resolver.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/resolver/exchanger",
+      "dir": "go-gost/x/resolver/exchanger",
+      "goFiles": [
+        "exchanger.go"
+      ],
+      "testGoFiles": [
+        "doh_body_limit_audit_test.go",
+        "exchanger_tls_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/resolver/plugin",
+      "dir": "go-gost/x/resolver/plugin",
+      "goFiles": [
+        "grpc.go",
+        "http.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/router",
+      "dir": "go-gost/x/router",
+      "goFiles": [
+        "router.go",
+        "router_linux.go"
+      ],
+      "testGoFiles": [
+        "router_logger_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/router/plugin",
+      "dir": "go-gost/x/router/plugin",
+      "goFiles": [
+        "grpc.go",
+        "http.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/routing",
+      "dir": "go-gost/x/routing",
+      "goFiles": [
+        "matcher.go"
+      ],
+      "testGoFiles": [
+        "matcher_host_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/routing/rules",
+      "dir": "go-gost/x/routing/rules",
+      "goFiles": [
+        "parser.go"
+      ],
+      "testGoFiles": [
+        "parser_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/sd/plugin",
+      "dir": "go-gost/x/sd/plugin",
+      "goFiles": [
+        "grpc.go",
+        "http.go"
+      ],
+      "testGoFiles": [],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/selector",
+      "dir": "go-gost/x/selector",
+      "goFiles": [
+        "filter.go",
+        "selector.go",
+        "strategy.go",
+        "weighted.go"
+      ],
+      "testGoFiles": [
+        "filter_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/service",
+      "dir": "go-gost/x/service",
+      "goFiles": [
+        "connlog.go",
+        "connlog_client_watch.go",
+        "connlog_client_watch_linux.go",
+        "connlog_reporter.go",
+        "connlog_spool.go",
+        "global_traffic_manager.go",
+        "service.go",
+        "status.go",
+        "traffic_reliable_report.go",
+        "traffic_reporter.go",
+        "traffic_seq.go",
+        "traffic_spool.go"
+      ],
+      "testGoFiles": [
+        "a01_001_redirect_test.go",
+        "a02_002_seq_retry_test.go",
+        "connlog_client_watch_linux_test.go",
+        "connlog_client_watch_test.go",
+        "connlog_peerip_test.go",
+        "connlog_reporter_test.go",
+        "connlog_spool_test.go",
+        "connlog_test.go",
+        "detectconn_syscall_test.go",
+        "f087_stale_retry_test.go",
+        "fix132_a_test.go",
+        "fix2c_report_test.go",
+        "fixh_redact_test.go",
+        "global_traffic_manager_test.go",
+        "owned_closers_audit_test.go",
+        "r2_a02_002_seq_atomic_test.go",
+        "service_accept_proxy_test.go",
+        "service_close_flush_test.go",
+        "service_flush_twice_test.go",
+        "service_hooks_refused_test.go",
+        "service_needwrap_race_test.go",
+        "service_panic_recover_test.go",
+        "traffic_behind_cursor_test.go",
+        "traffic_reliable_report_test.go",
+        "traffic_reporter_bodycap_test.go",
+        "traffic_reporter_test.go",
+        "traffic_seq_test.go",
+        "traffic_spool_backoff_test.go",
+        "traffic_spool_dropped_wire_test.go",
+        "traffic_spool_identity_test.go",
+        "traffic_spool_orphan_sweep_test.go",
+        "traffic_spool_rejected_test.go",
+        "traffic_spool_test.go"
+      ],
+      "xTestGoFiles": []
+    },
+    {
+      "importPath": "github.com/go-gost/x/socket",
+      "dir": "go-gost/x/socket",
+      "goFiles": [
+        "chain.go",
+        "container.go",
+        "distro.go",
+        "hostguard.go",
+        "kernel_commands.go",
+        "limiter.go",
+        "outbound_guard.go",
+        "port_listening.go",
+        "restart_schedule.go",
+        "service.go",
+        "swap.go",
+        "tcp_ping_queue.go",
+        "traceroute.go",
+        "tuning.go",
+        "tuning_limits_unix.go",
+        "tuning_probe.go",
+        "tuning_probe_linux.go",
+        "tuning_process_unix.go",
+        "tunnel_tls.go",
+        "uninstall.go",
+        "websocket_reporter.go"
+      ],
+      "testGoFiles": [
+        "a01_002_set_protocol_test.go",
+        "agent_self_restart_test.go",
+        "agent_upgrade_log_cap_test.go",
+        "chain_test.go",
+        "command_contract_test.go",
+        "command_dispatch_test.go",
+        "concurrent_log_capture_test.go",
+        "container_test.go",
+        "d1_deadline_fix_test.go",
+        "d1_plaintext_fix_test.go",
+        "d1_r18_replay_test.go",
+        "d1_r18_upgrade_direction_test.go",
+        "d1_r18_version_normalize_test.go",
+        "d1_readlimit_fix_test.go",
+        "d1_replay_fix_test.go",
+        "d1_upgrade_checksum_fix_test.go",
+        "f088_f089_test.go",
+        "fix132_a_test.go",
+        "fix212_w4_test.go",
+        "fix2c_redact_test.go",
+        "fix3_health_test.go",
+        "fix9_uninstall_serialization_test.go",
+        "fix_r2_w4_issuedat_test.go",
+        "fixh2_legacy_gost_guard_test.go",
+        "fixh_command_test.go",
+        "fixh_service_test.go",
+        "fixh_test.go",
+        "fixr29_anchor_test.go",
+        "gate_resetfailed_test.go",
+        "hostguard_test.go",
+        "immediate_restart_test.go",
+        "issuedat_gate_test.go",
+        "ku4_upgrade_routes_test.go",
+        "launch_script_reap_test.go",
+        "limiter_test.go",
+        "machine_boot_id_test.go",
+        "managed_stop_audit_test.go",
+        "panel_source_test.go",
+        "pause_c04_test.go",
+        "port_listening_anew_test.go",
+        "port_listening_c04_test.go",
+        "port_listening_test.go",
+        "r14_f06f04_test.go",
+        "r17_fix_a_test.go",
+        "r18_fix_f03_test.go",
+        "r19_fix_f02_test.go",
+        "r19_fix_f03_test.go",
+        "r2_a01_002_config_writeback_test.go",
+        "r2_a01_003_resume_rebuild_test.go",
+        "r2_x2_error_receipt_test.go",
+        "r3_b1_tcpping_test.go",
+        "r3_f103_shell_quote_test.go",
+        "r3_k2_test.go",
+        "r3_k2fix_checksum_test.go",
+        "r4_b7_guard_test.go",
+        "r5_fb_test.go",
+        "r5_frm1_test.go",
+        "r5_frm2_packet_loss_test.go",
+        "r5_frm3_test.go",
+        "r5_frm4_test.go",
+        "r6_b6_udpping_test.go",
+        "r6_g1_budget_pins_test.go",
+        "r6_g1_upgrade_rollback_test.go",
+        "r6_g2_udpping_test.go",
+        "r6_rollback_pairing_test.go",
+        "r8_t09_upgrade_download_test.go",
+        "remediation_audit_test.go",
+        "rename_layout_test.go",
+        "restart_guard_exec_test.go",
+        "restart_schedule_disable_test.go",
+        "restart_schedule_reload_test.go",
+        "restart_schedule_test.go",
+        "resume_upgrade_test.go",
+        "service_test.go",
+        "swap_test.go",
+        "swap_uninstall_test.go",
+        "tcp_ping_queue_test.go",
+        "timeout_budgets_r8_test.go",
+        "traceroute_test.go",
+        "tuning_probe_linux_test.go",
+        "tuning_probe_r7_test.go",
+        "tuning_probe_test.go",
+        "tuning_r18_d2_11_test.go",
+        "tuning_ring_test.go",
+        "tuning_rollback_r2_test.go",
+        "tuning_status_shape_test.go",
+        "tuning_vpsing_test.go",
+        "tunnel_tls_test.go",
+        "uninstall_final_contract_test.go",
+        "uninstall_host_cleanup_test.go",
+        "uninstall_report_flush_bound_test.go",
+        "uninstall_report_wait_test.go",
+        "uninstall_resend_waiter_test.go",
+        "uninstall_restart_replay_test.go",
+        "uninstall_script_audit_test.go",
+        "uninstall_state_credentials_test.go",
+        "uninstall_test.go",
+        "uninstall_waiter_test.go",
+        "upgrade_container_test.go",
+        "upgrade_il_nu01_test.go",
+        "upgrade_proxy_test.go",
+        "upgrade_verify_reconnect_test.go",
+        "version_stdout_audit_test.go",
+        "websocket_reporter_f08_test.go",
+        "websocket_reporter_test.go"
+      ],
+      "xTestGoFiles": []
+    }
+  ]
+}

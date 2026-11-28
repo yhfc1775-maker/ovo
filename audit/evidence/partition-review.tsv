@@ -1,0 +1,31 @@
+分区	范围	源码入口	功能正确性	安全	并发一致性	数据安全	兼容性	健壮性	测试真实性	结果/边界
+A1	安装与下载	install.sh	包管理与下载路线	镜像/目录归属与无令牌下载	下载临时文件与原子替换	安装失败保留现装	三代目录与 Alpine	缺依赖/校验失败关闭	333 定义双身份 shell + Alpine 容器	无新增发现；不是所有发行版实装
+A2	面板安装/PG	panel_install.sh	更新/卸载/迁移入口与确认	目录锚定及外国镜像拒绝	身份改名的 Compose/env 同批变化	SQLite/PG 备份、回滚及保留数	旧库名/UUID/卷值保留	非交互迁移确认失败关闭	shell 外目录 fixture + 三代桩	未执行真实面板升级
+A3	agent 生命周期	install.sh	安装与菜单更新两个迁移槽	agent 归属守卫	三代共存快照后的目标冲突	快照失败关闭及旧服务回滚	flux/flmx 分别直迁 ovo	部分迁移失败不应遗留双 agent	单代桩通过；双代新 probe 复现	F03
+A4	CI/镜像/发版	.github/workflows/docker-build.yml	tag→构建→资产/版本印记	GITHUB_TOKEN 权限与全 SHA pins	重跑幂等和 Pages 发布触发	下载摘要及重建正文一致性	官方 runner 与双架构	已有 Release/在线等待失败	11 job CI、pins 突变、自检/匿名拉取	F07、F08
+A5	技能/文档/夹具	doc/guide/getting-started.md	安装命令及 IX 教程路线	校验优先于执行、无 PAT	录制演示与合成答案的优先级	备份说明与一次性密码说明	旧截图版本与当前品牌区分	缺录制应显式告警	文档构建、62锚点、demo 17页+4端点	F05、F06、F17
+B1	登录与身份	go-backend/internal/auth/jwt.go	密码/Passkey/撤销与状态门	算法白名单、raw Authorization	改密/撤销水位交错与缓存刷新	不持久化明文密码/原始会话	JWT base64url 与旧 token 拒绝	缺会话/过期/禁用用户	auth+WS race、Passkey/撤销包测试	真实 Passkey 设备未验
+B2	用户与权限	go-backend/internal/http/handler/user_inbound.go	CRUD/自己的订阅及隧道权限	管理员和用户资源归属	删除/授权变更后的读取与下发	删除引用和凭据不误共享	签名代际与旧个人链接	不存在/无权限固定错误	handler、repo 授权/水位测试	不等同多真人权限验收
+B3	节点	go-backend/internal/http/handler/mutations.go	CRUD/部分更新/重连/SSH	secret hash、SSH 归属、敏感字段	旧断开与新会话注册竞争	删除级联与配置快照	旧 agent 能力提示与三代身份	不在线/下发失败回执	node_reconnect/字段回归；列表 query probe	F09、F10、F14
+B4	转发与隧道	go-backend/internal/http/handler/control_plane.go	直连/中转/多跳与 TCP/UDP	节点/隧道访问及端口所有权	下发、补偿与并行 ACK	端口分配/事务/失败回滚	保留出口 pacing/UDP 修复	离线、部分成功、超时预算	handler 转发/隧道与 x 协议测试	F01；真实 IX 多机未验
+B5	订阅与计量	go-backend/internal/http/handler/subscription.go	分享/模板流水线/限额/轮换	HMAC、签名过期、用户隔离	回执与有效配置 ACK 的一致性	轮换/撤销不重生成既有域	ovo→flmx→历史签名校验	空集合/超限/拒绝返回	quota、SS in-place 与签名回归	F01；不放宽自有 enforcement
+B6	模板与客户端	go-backend/internal/http/handler/subscription_template.go	模板 CRUD/刷新/过滤/导出	拉取 SSRF 及输入/错误分类	刷新失败保留可用模板	模板删除引用与备份	Surge VLESS/Mieru 输出差异	无效 YAML/JSON/空输出	kernel 格式矩阵、golden、模板测试	F16；真实客户端矩阵未验
+B7	联邦退场	go-backend/internal/http/handler/federation_removal_test.go	退场路由与旧字段清理	不得恢复远端管理入口	迁移重跑不再插入旧引用	备份导入剔除退役字段	历史数据迁移可重入	带旧联邦段输入的拒绝/丢弃	federation_removal/backup_removed 测试	无新增确认发现
+B8	升级链	go-backend/internal/http/handler/system_upgrade.go	版本方向/快照/helper/回执	镜像归属与下载校验	helper 接管与面板重启	升级失败的 DB/文件回滚	旧 owner+旧名字配对	公开下载失败、不可比版本	升级 shell 桩、release 7对 SHA256	F02；未执行在线升级回退
+B9	备份恢复	go-backend/internal/store/repo/repository_backup_test.go	分段导入/导出和自动备份	敏感字段清理与 hash 预算	事务/写入上下文/引用先校验	负值、缺引用、重复行拒绝	SQLite/PG 及旧格式	失败不半导入、备份最近3份	repo/handler 备份全包+PG contract	恢复真实用户库未验
+B10	路由和信封	go-backend/internal/http/handler/handler.go	实际注册与分类展开	JWT 豁免接口的独立鉴权	统一守卫的控制流支配关系	原始 SQL/上游原文不得误透传	旧 API 保留与 retired 拒绝	响应 Msg/错误分支差集	200路由及348错误 sink逐项定性	F01、F02
+B11	配置/健康/通知	go-backend/internal/http/handler/notify.go	配置校验、通知模板和机器人	公开配置去秘密/SSRF	派送队列/重试/去重/关闭	配置快照与通知持久化	公开品牌及 FLMX 回退	供应商失败/ctx取消/队列满	notify/config/health 与 API 测试	真实供应商发送未验
+C1	Repository	go-backend/internal/store/repo/repository.go	SQLite/PG、迁移与查询	参数绑定、唯一约束、行锁	唯一连接/事务/并发父行锁	迁移可重入、备份一致性	PG16 contract 与旧库标识	历史量/缺表/VACUUM 预算	repo全包、PG16、3个新查询probe	F11、F12、F13
+C2	内核渲染	go-backend/internal/kernel/render_mieru.go	各内核输入/出站/分享格式	参数校验、进程 Env 白名单	配置 hash 和替换时序	配置错误不替换运行配置	Surge/Mieru 与既有 SS mark	非法协议组合/枚举/MTU	kernel 全包；官方 mita 渲染→Manager	F04、F16
+C3	面板 nft	go-backend/internal/runtime/nftables/renderer.go	规则、限额、计数与清理	installID 表隔离与旧表归属	渲染/应用的一致性和锁	只删已证明属于本安装的表	ovo_<hash> 与旧 flmx 识别	IPv4/IPv6 混配拒绝	nft -c + runtime/nftables 包	真实宿主包计数未验
+C4	WS 会话	go-backend/internal/ws/server.go	鉴权/注册/重连/命令收发	认证信封与秘密比较	旧断开不删除新连接、ACK映射	失败上线不污染在线状态	35现用+3退役命令	取消/超时/断开失败回执	ws全包、race、命令AST差集	无新增确认发现
+C5	连接日志	go-backend/internal/http/handler/connlog.go	摄入、权限、剪枝与补发	入口归属/转发ID/真实 peer	乱序、重复、dropped 与 repush	磁盘 spool 和截断边界	旧文件前缀保留	离线/大批/过期数据	handler/repo/agent connlog 全包	F04关联；多机实网未验
+D1	agent 控制面	go-gost/x/socket/websocket_reporter.go	命令信封/升级/回报	时间戳、重放、签名/节点身份	重连、命令超时和序号	升级备份、校验后替换	X-Ovo+X-Flmx 双发	未知命令/旧版内核提示	go-gost/x -short全包、命令普查	未向真实节点派发命令
+D2	宿主管理	go-gost/x/socket/restart_schedule.go	重启/Swap/调优/卸载	归属与退役 Tune 明确拒绝	执行互斥/取消与计划重排	回滚服务与清理边界	systemd/OpenRC/旧布局	能力缺失不误报成功	shell/Alpine 与 service 包测试	F03；非所有发行版真装
+D3	agent 内核	go-gost/x/kernel/manager.go	安装、监管、nft、用户限制	源IP/mark/enforcement/Env白名单	进程替换与状态持久化	缓存摘要、重启恢复和失败保旧	三代目录/历史 nft/spool	重启失败、真实 peer、表丢失	Manager官方mita生命周期及 kernel测试	F04；未验真实限速
+D4	GOST 数据面	go-gost/x/router/router.go	handler/dialer/listener/chain	TLS/认证/地址校验边界	UDP会话/并发关闭/连接预算	缓冲/超时/资源释放	既有 UDP/出口 pacing 保留	短报文、断开、连接回收	x 214包 -short；三模块build/vet	103包只有编译；未做全协议实网
+E1	会话前端	vite-frontend/src/utils/token-expired.ts	登录/改密/退出与角色路由	无token不清会话、隐藏管理员页	401多点处理和 remount	敏感会话清理及切换用户	JWT 中文名 base64url	过期、登录页后台401	API+浏览器E2E；共享handler源追踪	本地一次不稳定项及重跑如实列出
+E2	功能前端	vite-frontend/src/pages/config.tsx	82页源文件/表单/回执/主题	危险确认、权限隐藏不代替后端鉴权	刷新、保存恢复与组件卸载	危险动作确认、单位与导入回执	默认主题不变；flyx需主动选	空列表/无录制/复制失败	demo17页+4端点、主题浏览器检查	F17；不是所有弹窗实机验收
+F1	隧道 TLS/版本	go-backend/internal/http/handler/tunnel_tls.go	CA/证书/ACK/就绪和出口选择	节点证书身份与下载摘要	签发/ACK/旧会话失败交错	未就绪不发布可用状态	不同内核能力/版本方向	证书缺失/校验失败/回执丢失	tunnel_tls/upgrade handler与agent测试	真实证书/出口实网未验
+F2	指标统计	go-backend/internal/http/handler/monitoring.go	节点/订阅统计与图表	资源访问与查询参数预算	reset/采样/时区/DST	饱和计数与聚合不伪造零	长短区间与SQLite/PG	缺表/无指标/极大计数	新聚合/stale/overflow probe+原测试	F11、F13、F14、F15
+F3	定时作业	go-backend/internal/http/handler/jobs.go	刷新/重置/配额/续费/剪枝	作业查询与用户边界	去重/重试/停机追赶/ctx退出	统计基线和回收不丢账	月份/时区与恢复后基线	溢出、失败与跳过日志	jobs/renewal/maintenance及overflow probe	F12、F15

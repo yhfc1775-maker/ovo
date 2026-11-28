@@ -1,0 +1,1002 @@
+[
+  {
+    "class": "公开面",
+    "gate": 4,
+    "path": "/flow/config"
+  },
+  {
+    "class": "公开面",
+    "gate": 4,
+    "path": "/flow/test"
+  },
+  {
+    "class": "公开面",
+    "gate": 4,
+    "path": "/flow/upload"
+  },
+  {
+    "class": "公开面",
+    "gate": 4,
+    "path": "/flow/upload/v2"
+  },
+  {
+    "class": "公开面",
+    "gate": 4,
+    "path": "/flow/connlog/v2"
+  },
+  {
+    "class": "公开面",
+    "gate": 4,
+    "path": "/api/v1/open_api/gh/"
+  },
+  {
+    "class": "公开面",
+    "gate": 4,
+    "path": "/api/v1/open_api/sub/"
+  },
+  {
+    "class": "公开面",
+    "gate": 4,
+    "path": "/api/v1/open_api/sub_store"
+  },
+  {
+    "class": "公开面",
+    "gate": 4,
+    "path": "/api/v1/captcha/check"
+  },
+  {
+    "class": "公开面",
+    "gate": 4,
+    "path": "/api/v1/captcha/verify"
+  },
+  {
+    "class": "公开面",
+    "gate": 4,
+    "path": "/api/v1/user/login"
+  },
+  {
+    "class": "公开面",
+    "gate": 4,
+    "path": "/api/v1/user/passkey/status"
+  },
+  {
+    "class": "公开面",
+    "gate": 4,
+    "path": "/api/v1/user/passkey/login/begin"
+  },
+  {
+    "class": "公开面",
+    "gate": 4,
+    "path": "/api/v1/user/passkey/login/finish"
+  },
+  {
+    "class": "公开面",
+    "gate": 4,
+    "path": "/api/v1/public/config/get"
+  },
+  {
+    "class": "公开面",
+    "gate": 5,
+    "path": "/api/v1/config/get"
+  },
+  {
+    "class": "公开面",
+    "gate": 6,
+    "path": "/error"
+  },
+  {
+    "class": "公开面",
+    "gate": 6,
+    "path": "/system-info"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/api/v1/backup/export"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/api/v1/backup/import"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/api/v1/backup/import-auto-backup"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/api/v1/backup/import-auto-backup/status"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/api/v1/backup/restore"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/backup/export"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/backup/import"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/backup/import-auto-backup"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/backup/import-auto-backup/status"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/backup/restore"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/config/update"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/config/update-single"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/inbound/batch-delete"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/inbound/batch-toggle"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/inbound/create"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/inbound/delete"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/inbound/external/update"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/inbound/import"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/inbound/import/preview"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/inbound/list"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/inbound/probe"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/inbound/regenerate"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/inbound/relay/create"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/inbound/relay/delete"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/inbound/relay/list"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/inbound/relay/probe"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/inbound/reset-traffic"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/inbound/share"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/inbound/split"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/inbound/toggle"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/inbound/update"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/kernel/capabilities"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/kernel/control"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/kernel/install"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/kernel/list"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/kernel/logs"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/kernel/versions"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/monitor/permission/assign"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/monitor/permission/list"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/monitor/permission/remove"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/batch-delete"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/batch-set-group"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/batch-upgrade"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/check-status"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/connlog"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/connlog-readiness"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/connlog-repush"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/create"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/delete"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/dismiss-expiry-reminder"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/group/create"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/group/delete"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/group/rename"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/install"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/latency/history"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/latency/probe"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/latency/targets"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/list"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/nftables/clear"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/nftables/pending-deletes"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/nftables/reconcile"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/nftables/test"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/releases"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/restart-schedule"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/restart"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/batch-restart"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/rotate-secret"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/rollback"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/route"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/route/probe"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/swap-info"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/swap-set"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/traffic/month"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/traffic/dropped"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/tune"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/update"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/update-order"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/upgrade"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/node/upgrade-verification/clear"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/notify/test"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/notify/health"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/speed-limit/create"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/speed-limit/delete"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/speed-limit/list"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/speed-limit/update"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/subscription/delete"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/subscription/list"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/subscription/preview"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/subscription/reset"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/subscription/reset-traffic"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/subscription/save"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/subscription/source/delete"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/subscription/source/list"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/subscription/source/refresh"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/subscription/source/save"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/subscription/template/catalog"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/subscription/template/check"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/subscription/template/delete"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/subscription/template/list"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/subscription/template/refresh"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/subscription/template/save"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/subscription/traffic"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/system/check-updates"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/system/gh-cache/purge"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/system/storage"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/system/upgrade"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/system/upgrade/status"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/system/version"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/tunnel/batch-delete"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/tunnel/batch-delete-preview"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/tunnel/batch-delete-with-forwards"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/tunnel/batch-redeploy"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/tunnel/create"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/tunnel/delete"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/tunnel/delete-preview"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/tunnel/delete-with-forwards"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/tunnel/diagnose"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/tunnel/diagnose/stream"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/tunnel/get"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/tunnel/list"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/tunnel/update"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/tunnel/update-order"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/tunnel/user/assign"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/tunnel/user/batch-assign"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/tunnel/user/list"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/tunnel/user/remove"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/tunnel/user/update"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/user/create"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/user/delete"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/user/list"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/user/quota/reset"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/user/reset"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/user/update"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/user-inbound/list"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/user-inbound/set"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/user-subscription/list"
+  },
+  {
+    "class": "管理员",
+    "gate": 1,
+    "path": "/api/v1/user-subscription/set"
+  },
+  {
+    "class": "管理员",
+    "gate": 2,
+    "path": "/api/v1/monitor/nodes"
+  },
+  {
+    "class": "管理员",
+    "gate": 2,
+    "path": "/api/v1/monitor/nodes/"
+  },
+  {
+    "class": "管理员",
+    "gate": 2,
+    "path": "/api/v1/monitor/services"
+  },
+  {
+    "class": "管理员",
+    "gate": 2,
+    "path": "/api/v1/monitor/services/"
+  },
+  {
+    "class": "管理员",
+    "gate": 2,
+    "path": "/api/v1/monitor/services/create"
+  },
+  {
+    "class": "管理员",
+    "gate": 2,
+    "path": "/api/v1/monitor/services/delete"
+  },
+  {
+    "class": "管理员",
+    "gate": 2,
+    "path": "/api/v1/monitor/services/latest-results"
+  },
+  {
+    "class": "管理员",
+    "gate": 2,
+    "path": "/api/v1/monitor/services/limits"
+  },
+  {
+    "class": "管理员",
+    "gate": 2,
+    "path": "/api/v1/monitor/services/run"
+  },
+  {
+    "class": "管理员",
+    "gate": 2,
+    "path": "/api/v1/monitor/services/update"
+  },
+  {
+    "class": "管理员",
+    "gate": 2,
+    "path": "/api/v1/forward/force-delete"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/config/list"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/forward/batch-change-tunnel"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/forward/batch-delete"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/forward/batch-pause"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/forward/batch-redeploy"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/forward/batch-resume"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/forward/create"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/forward/delete"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/forward/diagnose"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/forward/diagnose/stream"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/forward/list"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/forward/pause"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/forward/reset-flow"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/forward/resume"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/forward/update"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/forward/update-order"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/inbound/sub/info"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/monitor/access"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/monitor/tunnels"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/monitor/tunnels/"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/monitor/tunnels/quality"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/tunnel/user/tunnel"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/user/package"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/user/subscription/traffic"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/user/updatePassword"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/user/logout"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/system-info/ticket"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/user/passkey/list"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/user/passkey/delete"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/user/passkey/register/begin"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/user/passkey/register/finish"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/user-inbound/mine"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/user-subscription/mine"
+  },
+  {
+    "class": "普通用户",
+    "gate": 3,
+    "path": "/api/v1/user/quota/mine"
+  }
+]

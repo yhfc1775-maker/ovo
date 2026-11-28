@@ -1,0 +1,44 @@
+[
+  {
+    "asset": "docker-compose-v4.yml",
+    "bytes": 5089,
+    "sha256": "6f202ea3ff061d80e11a6cd24ec42e493c34e7ab3e98be7c838eea76abc19755",
+    "pass": true
+  },
+  {
+    "asset": "docker-compose-v6.yml",
+    "bytes": 5149,
+    "sha256": "592f60d1c59320eb65ad42df740772e9da0b3fe1d8f3851725598f58213f94e6",
+    "pass": true
+  },
+  {
+    "asset": "gost-amd64",
+    "bytes": 9567188,
+    "sha256": "7bc3070ca05c7dc2fb0f8c62059ce0d3338a5a50ecb103ced75c46cd076636aa",
+    "pass": true
+  },
+  {
+    "asset": "gost-arm64",
+    "bytes": 7690096,
+    "sha256": "7564a04ffeade7f91cdf91509a670965f0d7b1af861e12796a44794cc7f861a6",
+    "pass": true
+  },
+  {
+    "asset": "install.sh",
+    "bytes": 205036,
+    "sha256": "04adcd024f2caf37354e319cacc15ca9427e4108675a25b68c3017c2d09d0afb",
+    "pass": true
+  },
+  {
+    "asset": "ovo-skill-api-2.1.34.tgz",
+    "bytes": 41279,
+    "sha256": "b830077302bd7db07fe528a73e6caec7e0517c3973fc2b1c90b94570bb6e51e0",
+    "pass": true
+  },
+  {
+    "asset": "panel_install.sh",
+    "bytes": 362156,
+    "sha256": "799bad0d95f42ef86e35a387d5ac8f592d53b66d4eaac1831cfd9cf5d03090f1",
+    "pass": true
+  }
+]

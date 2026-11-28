@@ -1,0 +1,1673 @@
+[
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 416,
+    "args": [
+      "\"/api/v1/user/login\"",
+      "h.login"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 417,
+    "args": [
+      "\"/api/v1/user/passkey/status\"",
+      "h.passkeyStatus"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 418,
+    "args": [
+      "\"/api/v1/user/passkey/login/begin\"",
+      "h.passkeyLoginBegin"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 419,
+    "args": [
+      "\"/api/v1/user/passkey/login/finish\"",
+      "h.passkeyLoginFinish"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 420,
+    "args": [
+      "\"/api/v1/user/passkey/register/begin\"",
+      "h.passkeyRegisterBegin"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 421,
+    "args": [
+      "\"/api/v1/user/passkey/register/finish\"",
+      "h.passkeyRegisterFinish"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 422,
+    "args": [
+      "\"/api/v1/user/passkey/list\"",
+      "h.passkeyList"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 423,
+    "args": [
+      "\"/api/v1/user/passkey/delete\"",
+      "h.passkeyDelete"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 424,
+    "args": [
+      "\"/api/v1/user/list\"",
+      "h.userList"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 425,
+    "args": [
+      "\"/api/v1/user/create\"",
+      "h.userCreate"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 426,
+    "args": [
+      "\"/api/v1/user/update\"",
+      "h.userUpdate"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 427,
+    "args": [
+      "\"/api/v1/user/delete\"",
+      "h.userDelete"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 428,
+    "args": [
+      "\"/api/v1/user/reset\"",
+      "h.userResetFlow"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 429,
+    "args": [
+      "\"/api/v1/user/quota/reset\"",
+      "h.userQuotaReset"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 430,
+    "args": [
+      "\"/api/v1/user/quota/mine\"",
+      "h.userQuotaMine"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 431,
+    "args": [
+      "\"/api/v1/public/config/get\"",
+      "h.getPublicConfigByName"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 432,
+    "args": [
+      "\"/api/v1/config/get\"",
+      "h.getConfigByName"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 433,
+    "args": [
+      "\"/api/v1/config/list\"",
+      "h.getConfigs"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 434,
+    "args": [
+      "\"/api/v1/config/update\"",
+      "h.updateConfigs"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 435,
+    "args": [
+      "\"/api/v1/config/update-single\"",
+      "h.updateSingleConfig"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 436,
+    "args": [
+      "\"/api/v1/system/storage\"",
+      "h.storageSummary"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 437,
+    "args": [
+      "\"/api/v1/system/version\"",
+      "h.systemVersion"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 438,
+    "args": [
+      "\"/api/v1/system/check-updates\"",
+      "h.systemCheckUpdates"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 439,
+    "args": [
+      "\"/api/v1/system/upgrade\"",
+      "h.systemUpgrade"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 440,
+    "args": [
+      "\"/api/v1/system/upgrade/status\"",
+      "h.systemUpgradeStatus"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 442,
+    "args": [
+      "\"/api/v1/system/gh-cache/purge\"",
+      "h.ghMirrorPurgeCache"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 458,
+    "args": [
+      "route.path",
+      "route.fn"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 459,
+    "args": [
+      "\"/api/v1\" + route.path",
+      "route.fn"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 461,
+    "args": [
+      "\"/api/v1/captcha/check\"",
+      "h.checkCaptcha"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 462,
+    "args": [
+      "\"/api/v1/captcha/verify\"",
+      "h.captchaVerify"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 463,
+    "args": [
+      "\"/api/v1/user/package\"",
+      "h.userPackage"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 464,
+    "args": [
+      "\"/api/v1/user/subscription/traffic\"",
+      "h.userSubscriptionTraffic"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 465,
+    "args": [
+      "\"/api/v1/user/updatePassword\"",
+      "h.updatePassword"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 466,
+    "args": [
+      "\"/api/v1/user/logout\"",
+      "h.userLogout"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 467,
+    "args": [
+      "\"/api/v1/system-info/ticket\"",
+      "h.issueWSTicket"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 468,
+    "args": [
+      "\"/api/v1/node/list\"",
+      "h.nodeList"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 469,
+    "args": [
+      "\"/api/v1/node/connlog\"",
+      "h.nodeConnlog"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 470,
+    "args": [
+      "\"/api/v1/node/connlog-readiness\"",
+      "h.nodeConnlogReadiness"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 471,
+    "args": [
+      "\"/api/v1/node/connlog-repush\"",
+      "h.nodeConnlogRepush"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 472,
+    "args": [
+      "\"/api/v1/node/create\"",
+      "h.nodeCreate"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 473,
+    "args": [
+      "\"/api/v1/node/update\"",
+      "h.nodeUpdate"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 474,
+    "args": [
+      "\"/api/v1/node/delete\"",
+      "h.nodeDelete"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 475,
+    "args": [
+      "\"/api/v1/node/install\"",
+      "h.nodeInstall"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 477,
+    "args": [
+      "\"/api/v1/node/rotate-secret\"",
+      "h.nodeRotateSecret"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 478,
+    "args": [
+      "\"/api/v1/node/update-order\"",
+      "h.nodeUpdateOrder"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 479,
+    "args": [
+      "\"/api/v1/node/dismiss-expiry-reminder\"",
+      "h.nodeDismissExpiryReminder"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 480,
+    "args": [
+      "\"/api/v1/node/batch-delete\"",
+      "h.nodeBatchDelete"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 482,
+    "args": [
+      "\"/api/v1/node/batch-set-group\"",
+      "h.nodeBatchSetGroup"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 483,
+    "args": [
+      "\"/api/v1/node/group/create\"",
+      "h.nodeGroupCreate"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 484,
+    "args": [
+      "\"/api/v1/node/group/rename\"",
+      "h.nodeGroupRename"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 485,
+    "args": [
+      "\"/api/v1/node/group/delete\"",
+      "h.nodeGroupDelete"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 486,
+    "args": [
+      "\"/api/v1/node/check-status\"",
+      "h.nodeCheckStatus"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 487,
+    "args": [
+      "\"/api/v1/node/upgrade\"",
+      "h.nodeUpgrade"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 488,
+    "args": [
+      "\"/api/v1/node/upgrade-verification/clear\"",
+      "h.clearNodeUpgradeVerification"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 489,
+    "args": [
+      "\"/api/v1/node/batch-upgrade\"",
+      "h.nodeBatchUpgrade"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 490,
+    "args": [
+      "\"/api/v1/node/rollback\"",
+      "h.nodeRollback"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 492,
+    "args": [
+      "\"/api/v1/node/latency/probe\"",
+      "h.nodeLatencyProbe"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 493,
+    "args": [
+      "\"/api/v1/node/latency/targets\"",
+      "h.nodeLatencyTargetsSet"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 494,
+    "args": [
+      "\"/api/v1/node/latency/history\"",
+      "h.nodeLatencyHistory"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 496,
+    "args": [
+      "\"/api/v1/node/tune\"",
+      "h.nodeTune"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 498,
+    "args": [
+      "\"/api/v1/node/restart-schedule\"",
+      "h.nodeRestartScheduleSet"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 499,
+    "args": [
+      "\"/api/v1/node/restart\"",
+      "h.nodeRestart"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 500,
+    "args": [
+      "\"/api/v1/node/batch-restart\"",
+      "h.nodeBatchRestart"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 502,
+    "args": [
+      "\"/api/v1/node/swap-info\"",
+      "h.nodeSwapInfo"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 503,
+    "args": [
+      "\"/api/v1/node/swap-set\"",
+      "h.nodeSwapSet"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 505,
+    "args": [
+      "\"/api/v1/node/route\"",
+      "h.nodeRouteGet"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 506,
+    "args": [
+      "\"/api/v1/node/route/probe\"",
+      "h.nodeRouteProbe"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 508,
+    "args": [
+      "ghMirrorPath",
+      "h.githubMirror"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 509,
+    "args": [
+      "\"/api/v1/node/releases\"",
+      "h.listReleases"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 510,
+    "args": [
+      "\"/api/v1/node/nftables/test\"",
+      "h.nodeNftablesTest"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 511,
+    "args": [
+      "\"/api/v1/node/nftables/reconcile\"",
+      "h.nodeNftablesReconcile"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 512,
+    "args": [
+      "\"/api/v1/node/nftables/clear\"",
+      "h.nodeNftablesClear"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 513,
+    "args": [
+      "\"/api/v1/node/nftables/pending-deletes\"",
+      "h.nftPendingDeleteList"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 514,
+    "args": [
+      "\"/api/v1/kernel/capabilities\"",
+      "h.kernelCapabilities"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 515,
+    "args": [
+      "\"/api/v1/kernel/list\"",
+      "h.kernelList"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 516,
+    "args": [
+      "\"/api/v1/kernel/install\"",
+      "h.kernelInstall"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 517,
+    "args": [
+      "\"/api/v1/kernel/versions\"",
+      "h.kernelVersions"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 518,
+    "args": [
+      "\"/api/v1/kernel/control\"",
+      "h.kernelControl"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 519,
+    "args": [
+      "\"/api/v1/kernel/logs\"",
+      "h.kernelLogs"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 520,
+    "args": [
+      "\"/api/v1/inbound/list\"",
+      "h.inboundList"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 521,
+    "args": [
+      "\"/api/v1/inbound/create\"",
+      "h.inboundCreate"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 522,
+    "args": [
+      "\"/api/v1/inbound/update\"",
+      "h.inboundUpdate"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 523,
+    "args": [
+      "\"/api/v1/inbound/delete\"",
+      "h.inboundDelete"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 524,
+    "args": [
+      "\"/api/v1/inbound/batch-delete\"",
+      "h.inboundBatchDelete"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 525,
+    "args": [
+      "\"/api/v1/inbound/probe\"",
+      "h.inboundProbe"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 526,
+    "args": [
+      "\"/api/v1/inbound/batch-toggle\"",
+      "h.inboundBatchToggle"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 527,
+    "args": [
+      "\"/api/v1/notify/test\"",
+      "h.notifyTest"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 528,
+    "args": [
+      "\"/api/v1/notify/health\"",
+      "h.notifyHealth"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 529,
+    "args": [
+      "\"/api/v1/subscription/list\"",
+      "h.subscriptionList"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 530,
+    "args": [
+      "\"/api/v1/subscription/save\"",
+      "h.subscriptionSave"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 531,
+    "args": [
+      "\"/api/v1/subscription/delete\"",
+      "h.subscriptionDelete"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 532,
+    "args": [
+      "\"/api/v1/subscription/reset\"",
+      "h.subscriptionReset"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 533,
+    "args": [
+      "\"/api/v1/subscription/reset-traffic\"",
+      "h.subscriptionResetTraffic"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 534,
+    "args": [
+      "\"/api/v1/subscription/traffic\"",
+      "h.subscriptionTraffic"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 535,
+    "args": [
+      "\"/api/v1/subscription/source/list\"",
+      "h.remoteSourceList"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 536,
+    "args": [
+      "\"/api/v1/subscription/source/save\"",
+      "h.remoteSourceSave"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 537,
+    "args": [
+      "\"/api/v1/subscription/source/refresh\"",
+      "h.remoteSourceRefresh"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 538,
+    "args": [
+      "\"/api/v1/subscription/source/delete\"",
+      "h.remoteSourceDelete"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 539,
+    "args": [
+      "\"/api/v1/subscription/preview\"",
+      "h.subscriptionPreview"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 540,
+    "args": [
+      "\"/api/v1/subscription/template/catalog\"",
+      "h.subscriptionTemplateCatalog"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 541,
+    "args": [
+      "\"/api/v1/subscription/template/list\"",
+      "h.subscriptionTemplateList"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 542,
+    "args": [
+      "\"/api/v1/subscription/template/check\"",
+      "h.subscriptionTemplateCheck"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 543,
+    "args": [
+      "\"/api/v1/subscription/template/save\"",
+      "h.subscriptionTemplateSave"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 544,
+    "args": [
+      "\"/api/v1/subscription/template/refresh\"",
+      "h.subscriptionTemplateRefresh"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 545,
+    "args": [
+      "\"/api/v1/subscription/template/delete\"",
+      "h.subscriptionTemplateDelete"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 546,
+    "args": [
+      "\"/api/v1/inbound/toggle\"",
+      "h.inboundToggle"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 547,
+    "args": [
+      "\"/api/v1/inbound/split\"",
+      "h.inboundSplitSave"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 548,
+    "args": [
+      "\"/api/v1/inbound/reset-traffic\"",
+      "h.inboundResetTraffic"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 549,
+    "args": [
+      "\"/api/v1/inbound/regenerate\"",
+      "h.inboundRegenerate"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 550,
+    "args": [
+      "\"/api/v1/inbound/share\"",
+      "h.inboundShare"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 551,
+    "args": [
+      "\"/api/v1/inbound/import\"",
+      "h.inboundImport"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 552,
+    "args": [
+      "\"/api/v1/inbound/import/preview\"",
+      "h.inboundImportPreview"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 553,
+    "args": [
+      "\"/api/v1/inbound/external/update\"",
+      "h.inboundExternalUpdate"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 554,
+    "args": [
+      "\"/api/v1/inbound/sub/info\"",
+      "h.inboundSubInfo"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 555,
+    "args": [
+      "\"/api/v1/inbound/relay/list\"",
+      "h.inboundRelayList"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 556,
+    "args": [
+      "\"/api/v1/inbound/relay/create\"",
+      "h.inboundRelayCreate"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 557,
+    "args": [
+      "\"/api/v1/inbound/relay/delete\"",
+      "h.inboundRelayDelete"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 558,
+    "args": [
+      "\"/api/v1/inbound/relay/probe\"",
+      "h.inboundRelayProbe"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 559,
+    "args": [
+      "\"/api/v1/user-inbound/list\"",
+      "h.getUserInbounds"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 560,
+    "args": [
+      "\"/api/v1/user-inbound/set\"",
+      "h.setUserInbounds"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 561,
+    "args": [
+      "\"/api/v1/user-inbound/mine\"",
+      "h.getMyInbounds"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 562,
+    "args": [
+      "\"/api/v1/user-subscription/list\"",
+      "h.userSubscriptionList"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 563,
+    "args": [
+      "\"/api/v1/user-subscription/set\"",
+      "h.userSubscriptionSet"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 564,
+    "args": [
+      "\"/api/v1/user-subscription/mine\"",
+      "h.userSubscriptionMine"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 565,
+    "args": [
+      "\"/api/v1/open_api/sub/\"",
+      "h.openSubscription"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 566,
+    "args": [
+      "\"/api/v1/tunnel/list\"",
+      "h.tunnelList"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 567,
+    "args": [
+      "\"/api/v1/tunnel/create\"",
+      "h.tunnelCreate"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 568,
+    "args": [
+      "\"/api/v1/tunnel/get\"",
+      "h.tunnelGet"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 569,
+    "args": [
+      "\"/api/v1/tunnel/update\"",
+      "h.tunnelUpdate"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 570,
+    "args": [
+      "\"/api/v1/tunnel/delete\"",
+      "h.tunnelDelete"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 571,
+    "args": [
+      "\"/api/v1/tunnel/delete-preview\"",
+      "h.tunnelDeletePreview"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 572,
+    "args": [
+      "\"/api/v1/tunnel/delete-with-forwards\"",
+      "h.tunnelDeleteWithForwards"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 573,
+    "args": [
+      "\"/api/v1/tunnel/batch-delete-preview\"",
+      "h.tunnelBatchDeletePreview"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 574,
+    "args": [
+      "\"/api/v1/tunnel/batch-delete-with-forwards\"",
+      "h.tunnelBatchDeleteWithForwards"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 575,
+    "args": [
+      "\"/api/v1/tunnel/diagnose\"",
+      "h.tunnelDiagnose"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 576,
+    "args": [
+      "\"/api/v1/tunnel/diagnose/stream\"",
+      "h.tunnelDiagnoseStream"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 577,
+    "args": [
+      "\"/api/v1/tunnel/update-order\"",
+      "h.tunnelUpdateOrder"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 578,
+    "args": [
+      "\"/api/v1/tunnel/batch-delete\"",
+      "h.tunnelBatchDelete"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 579,
+    "args": [
+      "\"/api/v1/tunnel/batch-redeploy\"",
+      "h.tunnelBatchRedeploy"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 580,
+    "args": [
+      "\"/api/v1/tunnel/user/assign\"",
+      "h.userTunnelAssign"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 581,
+    "args": [
+      "\"/api/v1/tunnel/user/batch-assign\"",
+      "h.userTunnelBatchAssign"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 582,
+    "args": [
+      "\"/api/v1/tunnel/user/remove\"",
+      "h.userTunnelRemove"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 583,
+    "args": [
+      "\"/api/v1/tunnel/user/update\"",
+      "h.userTunnelUpdate"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 584,
+    "args": [
+      "\"/api/v1/forward/list\"",
+      "h.forwardList"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 585,
+    "args": [
+      "\"/api/v1/forward/create\"",
+      "h.forwardCreate"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 586,
+    "args": [
+      "\"/api/v1/forward/update\"",
+      "h.forwardUpdate"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 587,
+    "args": [
+      "\"/api/v1/forward/delete\"",
+      "h.forwardDelete"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 588,
+    "args": [
+      "\"/api/v1/forward/force-delete\"",
+      "h.forwardForceDelete"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 589,
+    "args": [
+      "\"/api/v1/forward/pause\"",
+      "h.forwardPause"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 590,
+    "args": [
+      "\"/api/v1/forward/resume\"",
+      "h.forwardResume"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 591,
+    "args": [
+      "\"/api/v1/forward/reset-flow\"",
+      "h.forwardResetFlow"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 592,
+    "args": [
+      "\"/api/v1/forward/diagnose\"",
+      "h.forwardDiagnose"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 593,
+    "args": [
+      "\"/api/v1/forward/diagnose/stream\"",
+      "h.forwardDiagnoseStream"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 594,
+    "args": [
+      "\"/api/v1/forward/update-order\"",
+      "h.forwardUpdateOrder"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 595,
+    "args": [
+      "\"/api/v1/forward/batch-delete\"",
+      "h.forwardBatchDelete"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 596,
+    "args": [
+      "\"/api/v1/forward/batch-pause\"",
+      "h.forwardBatchPause"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 597,
+    "args": [
+      "\"/api/v1/forward/batch-resume\"",
+      "h.forwardBatchResume"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 598,
+    "args": [
+      "\"/api/v1/forward/batch-redeploy\"",
+      "h.forwardBatchRedeploy"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 599,
+    "args": [
+      "\"/api/v1/forward/batch-change-tunnel\"",
+      "h.forwardBatchChangeTunnel"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 600,
+    "args": [
+      "\"/api/v1/speed-limit/list\"",
+      "h.speedLimitList"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 601,
+    "args": [
+      "\"/api/v1/speed-limit/create\"",
+      "h.speedLimitCreate"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 602,
+    "args": [
+      "\"/api/v1/speed-limit/update\"",
+      "h.speedLimitUpdate"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 603,
+    "args": [
+      "\"/api/v1/speed-limit/delete\"",
+      "h.speedLimitDelete"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 604,
+    "args": [
+      "\"/api/v1/tunnel/user/tunnel\"",
+      "h.userTunnelVisibleList"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 605,
+    "args": [
+      "\"/api/v1/tunnel/user/list\"",
+      "h.userTunnelList"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 606,
+    "args": [
+      "\"/api/v1/open_api/sub_store\"",
+      "h.openAPISubStore"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 608,
+    "args": [
+      "\"/api/v1/node/traffic/month\"",
+      "h.nodeTrafficMonth"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 609,
+    "args": [
+      "\"/api/v1/node/traffic/dropped\"",
+      "h.nodeTrafficDropped"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 610,
+    "args": [
+      "\"/api/v1/monitor/access\"",
+      "h.monitorAccessHandler"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 611,
+    "args": [
+      "\"/api/v1/monitor/nodes/\"",
+      "h.monitorNodeMetricsHandler"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 612,
+    "args": [
+      "\"/api/v1/monitor/nodes\"",
+      "h.monitorNodeListHandler"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 613,
+    "args": [
+      "\"/api/v1/monitor/tunnels\"",
+      "h.monitorTunnelListHandler"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 614,
+    "args": [
+      "\"/api/v1/monitor/tunnels/quality\"",
+      "h.monitorTunnelQualityHandler"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 615,
+    "args": [
+      "\"/api/v1/monitor/tunnels/\"",
+      "h.monitorTunnelMetrics"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 616,
+    "args": [
+      "\"/api/v1/monitor/services\"",
+      "h.monitorServiceListHandler"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 617,
+    "args": [
+      "\"/api/v1/monitor/services/create\"",
+      "h.monitorServiceCreate"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 618,
+    "args": [
+      "\"/api/v1/monitor/services/update\"",
+      "h.monitorServiceUpdate"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 619,
+    "args": [
+      "\"/api/v1/monitor/services/delete\"",
+      "h.monitorServiceDelete"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 620,
+    "args": [
+      "\"/api/v1/monitor/services/run\"",
+      "h.monitorServiceRun"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 621,
+    "args": [
+      "\"/api/v1/monitor/services/latest-results\"",
+      "h.monitorServiceLatestResultsHandler"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 622,
+    "args": [
+      "\"/api/v1/monitor/services/limits\"",
+      "h.monitorServiceLimitsHandler"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 623,
+    "args": [
+      "\"/api/v1/monitor/services/\"",
+      "h.monitorServiceResultsHandler"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 624,
+    "args": [
+      "\"/api/v1/monitor/permission/list\"",
+      "h.monitorPermissionList"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 625,
+    "args": [
+      "\"/api/v1/monitor/permission/assign\"",
+      "h.monitorPermissionAssign"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 626,
+    "args": [
+      "\"/api/v1/monitor/permission/remove\"",
+      "h.monitorPermissionRemove"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 628,
+    "args": [
+      "\"/flow/test\"",
+      "h.flowTest"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 629,
+    "args": [
+      "\"/flow/config\"",
+      "h.flowConfig"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 630,
+    "args": [
+      "\"/flow/upload\"",
+      "h.flowUpload"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 631,
+    "args": [
+      "\"/flow/upload/v2\"",
+      "h.flowUploadV2"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 632,
+    "args": [
+      "\"/flow/connlog/v2\"",
+      "h.flowConnlogV2"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/handler/handler.go:HandleFunc",
+    "line": 633,
+    "args": [
+      "\"/error\"",
+      "h.errorPage"
+    ]
+  },
+  {
+    "name": "go-backend/internal/http/router.go:Handle",
+    "line": 15,
+    "args": [
+      "\"/system-info\"",
+      "h.WebSocketHandler()"
+    ]
+  },
+  {
+    "name": "go-gost/x/handler/auto/handler.go:Handle",
+    "line": 108,
+    "args": [
+      "ctx",
+      "conn"
+    ]
+  },
+  {
+    "name": "go-gost/x/handler/auto/handler.go:Handle",
+    "line": 112,
+    "args": [
+      "ctx",
+      "conn"
+    ]
+  },
+  {
+    "name": "go-gost/x/handler/auto/handler.go:Handle",
+    "line": 116,
+    "args": [
+      "ctx",
+      "conn"
+    ]
+  },
+  {
+    "name": "go-gost/x/handler/metrics/handler.go:Handle",
+    "line": 49,
+    "args": [
+      "h.md.path",
+      "http.HandlerFunc(h.handleFunc)"
+    ]
+  },
+  {
+    "name": "go-gost/x/handler/tunnel/entrypoint.go:Handle",
+    "line": 774,
+    "args": [
+      "ctx",
+      "conn"
+    ]
+  },
+  {
+    "name": "go-gost/x/internal/util/pht/server.go:HandleFunc",
+    "line": 189,
+    "args": [
+      "options.authorizePath",
+      "s.handleAuthorize"
+    ]
+  },
+  {
+    "name": "go-gost/x/internal/util/pht/server.go:HandleFunc",
+    "line": 190,
+    "args": [
+      "options.pushPath",
+      "s.handlePush"
+    ]
+  },
+  {
+    "name": "go-gost/x/internal/util/pht/server.go:HandleFunc",
+    "line": 191,
+    "args": [
+      "options.pullPath",
+      "s.handlePull"
+    ]
+  },
+  {
+    "name": "go-gost/x/internal/util/pht/server.go:HandleFunc",
+    "line": 232,
+    "args": [
+      "options.authorizePath",
+      "s.handleAuthorize"
+    ]
+  },
+  {
+    "name": "go-gost/x/internal/util/pht/server.go:HandleFunc",
+    "line": 233,
+    "args": [
+      "options.pushPath",
+      "s.handlePush"
+    ]
+  },
+  {
+    "name": "go-gost/x/internal/util/pht/server.go:HandleFunc",
+    "line": 234,
+    "args": [
+      "options.pullPath",
+      "s.handlePull"
+    ]
+  },
+  {
+    "name": "go-gost/x/internal/util/serial/serial_windows.go:Handle",
+    "line": 313,
+    "args": [
+      "r"
+    ]
+  },
+  {
+    "name": "go-gost/x/listener/http3/wt/listener.go:Handle",
+    "line": 102,
+    "args": [
+      "l.md.path",
+      "http.HandlerFunc(l.upgrade)"
+    ]
+  },
+  {
+    "name": "go-gost/x/listener/mws/listener.go:Handle",
+    "line": 119,
+    "args": [
+      "path",
+      "http.HandlerFunc(l.upgrade)"
+    ]
+  },
+  {
+    "name": "go-gost/x/listener/ws/listener.go:Handle",
+    "line": 109,
+    "args": [
+      "l.md.path",
+      "http.HandlerFunc(l.upgrade)"
+    ]
+  },
+  {
+    "name": "go-gost/x/metrics/service/service.go:Handle",
+    "line": 63,
+    "args": [
+      "options.path",
+      "http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\tif options.auther != nil {\n\t\tu, p, _ := r.BasicAuth()\n\t\tif _, ok := options.auther.Authenticate(r.Context(), u, p); !ok {\n\t\t\tw.WriteHeader(http.StatusUnauthorized)\n\t\t\treturn\n\t\t}\n\t}\n\tpromhttp.Handler().ServeHTTP(w, r)\n})"
+    ]
+  },
+  {
+    "name": "go-gost/x/service/service.go:Handle",
+    "line": 514,
+    "args": [
+      "ctx",
+      "conn"
+    ]
+  }
+]
