@@ -350,6 +350,10 @@ func (h *Handler) nodePortMuxList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) nodePortMuxSave(w http.ResponseWriter, r *http.Request) {
+	// R2-K2 family closure (B11-001): the tail applies each affected
+	// kernel once (deduped), each with the conditional
+	// kernelApplyTimeout bound; arm the batch write relief.
+	extendWriteDeadline(w, inboundBatchWriteDeadline)
 	if r.Method != http.MethodPost {
 		response.WriteJSON(w, response.ErrDefault("请求失败"))
 		return

@@ -185,15 +185,19 @@ export function NodePortMuxModal({
 
     setSaving(true);
     try {
-      const res = await saveNodePortMux({
-        nodeId: node.id,
-        enabled,
-        listen: listen.trim() || "::",
-        port: portNum,
-        rules: cleanRules,
-        fallbackTarget: fallbackTarget.trim(),
-        fallbackProxy,
-      });
+      const kernelCount = new Set((data?.inbounds ?? []).map((ib) => ib.kernelType)).size || 1;
+      const res = await saveNodePortMux(
+        {
+          nodeId: node.id,
+          enabled,
+          listen: listen.trim() || "::",
+          port: portNum,
+          rules: cleanRules,
+          fallbackTarget: fallbackTarget.trim(),
+          fallbackProxy,
+        },
+        kernelCount,
+      );
 
       if (res.code !== 0) {
         toast.error(res.msg || "保存失败");
@@ -245,7 +249,7 @@ export function NodePortMuxModal({
                 )}
               </div>
               {node && (
-                <p className="text-xs font-normal text-default-500">
+                <p className="text-xs font-semibold text-default-500">
                   {node.name} · 由节点 Agent 按 TLS ClientHello SNI
                   无解密分流，无需安装第三方组件
                 </p>
@@ -263,7 +267,7 @@ export function NodePortMuxModal({
                       <p className="text-sm font-medium">
                         启用 TCP SNI 端口复用
                       </p>
-                      <p className="text-xs text-default-500 mt-0.5">
+                      <p className="text-xs font-semibold text-default-500 mt-0.5">
                         开启后，同机多个监听 {displayPort} 端口的 Xray TLS /
                         Reality / ShadowTLS 入站可与面板 HTTPS / 网站共用{" "}
                         {displayPort} 端口；UDP 入站（如 Hysteria2 /
@@ -279,7 +283,7 @@ export function NodePortMuxModal({
                   </div>
 
                   {data?.lastError && (
-                    <div className="rounded-lg bg-danger-50 px-3 py-2 text-xs text-danger dark:bg-danger-100/10">
+                    <div className="rounded-lg bg-danger-50 px-3 py-2 text-xs font-semibold text-danger dark:bg-danger-100/10">
                       上次下发异常：{data.lastError}
                     </div>
                   )}
@@ -318,7 +322,7 @@ export function NodePortMuxModal({
                         {data.inbounds.map((ib) => (
                           <div
                             key={ib.id}
-                            className="flex flex-wrap items-center justify-between gap-2 rounded-md bg-default-100/70 px-2.5 py-1.5 text-xs"
+                            className="flex flex-wrap items-center justify-between gap-2 rounded-md bg-default-100/70 px-2.5 py-1.5 text-xs font-semibold"
                           >
                             <div className="flex flex-wrap items-center gap-1.5">
                               <span className="font-medium text-foreground">
@@ -343,7 +347,7 @@ export function NodePortMuxModal({
                         ))}
                       </div>
                     ) : (
-                      <p className="text-xs text-default-500">
+                      <p className="text-xs font-semibold text-default-500">
                         暂无监听 {displayPort} 端口的 Xray TCP
                         入站。启用后，在「节点」页面新建监听 {displayPort}{" "}
                         端口的 VLESS + Reality / Trojan + TLS / ShadowTLS 等
@@ -359,7 +363,7 @@ export function NodePortMuxModal({
                         <p className="text-sm font-medium">
                           外部服务 / 面板 HTTPS 分流规则
                         </p>
-                        <p className="text-xs text-default-500">
+                        <p className="text-xs font-semibold text-default-500">
                           按 SNI 将面板域名或建站域名转发至本机 Caddy / Nginx
                           的内部 HTTPS 端口（如 127.0.0.1:8443）
                         </p>
@@ -375,7 +379,7 @@ export function NodePortMuxModal({
                     </div>
 
                     {rules.length === 0 ? (
-                      <p className="text-xs text-default-400">
+                      <p className="text-xs font-semibold text-default-400">
                         暂无外部规则；若仅需把所有未匹配的域名统一回落到面板
                         HTTPS，也可直接填写下方「默认回落目标」。
                       </p>
@@ -430,7 +434,7 @@ export function NodePortMuxModal({
                                     updateRule(idx, "proxyProtocol", v)
                                   }
                                 >
-                                  <span className="text-xs">
+                                  <span className="text-xs font-semibold">
                                     PROXY protocol v1
                                   </span>
                                 </Switch>
@@ -469,7 +473,7 @@ export function NodePortMuxModal({
                         size="sm"
                         onValueChange={setFallbackProxy}
                       >
-                        <span className="text-xs whitespace-nowrap">
+                        <span className="text-xs font-semibold whitespace-nowrap">
                           PROXY protocol v1
                         </span>
                       </Switch>
@@ -479,7 +483,7 @@ export function NodePortMuxModal({
                   {/* 面板 HTTPS 配置参考 */}
                   <div className="rounded-lg border border-divider">
                     <button
-                      className="flex w-full items-center justify-between px-3 py-2 text-left text-xs font-medium text-default-600 hover:text-foreground"
+                      className="flex w-full items-center justify-between px-3 py-2 text-left text-xs font-semibold text-default-600 hover:text-foreground"
                       type="button"
                       onClick={() => setShowGuide((v) => !v)}
                     >
@@ -494,7 +498,7 @@ export function NodePortMuxModal({
                       )}
                     </button>
                     {showGuide && (
-                      <div className="space-y-3 border-t border-divider p-3 text-xs">
+                      <div className="space-y-3 border-t border-divider p-3 text-xs font-semibold">
                         <p className="text-default-500">
                           当面板与代理节点部署在同一台服务器时：先将 Caddy /
                           Nginx 的 HTTPS 监听改为{" "}
@@ -518,7 +522,7 @@ export function NodePortMuxModal({
                               复制
                             </Button>
                           </div>
-                          <pre className="overflow-x-auto rounded-md bg-default-100 p-2 font-mono text-[11px] leading-relaxed">
+                          <pre className="overflow-x-auto rounded-md bg-default-100 p-2 font-mono text-[11px] font-semibold leading-relaxed">
                             {CADDY_SNIPPET}
                           </pre>
                         </div>
@@ -536,7 +540,7 @@ export function NodePortMuxModal({
                               复制
                             </Button>
                           </div>
-                          <pre className="overflow-x-auto rounded-md bg-default-100 p-2 font-mono text-[11px] leading-relaxed">
+                          <pre className="overflow-x-auto rounded-md bg-default-100 p-2 font-mono text-[11px] font-semibold leading-relaxed">
                             {NGINX_SNIPPET}
                           </pre>
                         </div>

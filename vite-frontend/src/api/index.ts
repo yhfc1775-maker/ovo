@@ -1067,8 +1067,14 @@ export const getNodePortMux = (nodeId: number) =>
   Network.post<NodePortMuxApiData>("/node/port-mux/get", { nodeId });
 export const getNodePortMuxList = () =>
   Network.post<NodePortMuxApiData[]>("/node/port-mux/list");
-export const saveNodePortMux = (data: NodePortMuxSavePayload) =>
-  Network.post<NodePortMuxApiData>("/node/port-mux/save", data);
+export const saveNodePortMux = (data: NodePortMuxSavePayload, kernelCount = 1) =>
+  Network.post<NodePortMuxApiData>(
+    "/node/port-mux/save",
+    data,
+    // B11-001 家族（R2-K2）：保存尾部对受影响内核逐个下发（去重），
+    // 每次带 300s 条件界，按内核数放宽（登记表 T072）。
+    { timeout: batchCallTimeoutKernelApply(kernelCount) },
+  );
 export const getInboundList = () =>
   Network.post<InboundApiItem[]>("/inbound/list");
 export const createInbound = (data: InboundMutationPayload, idemKey?: string) =>
