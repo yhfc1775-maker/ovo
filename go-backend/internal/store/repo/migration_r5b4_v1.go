@@ -40,6 +40,16 @@ type precheckResult struct {
 // runV1Precheck 运行只读预检（与 scripts/phase_a_dryrun.sql 逻辑一致）。
 func runV1Precheck(db *gorm.DB) (*precheckResult, error) {
 	r := &precheckResult{}
+	inboundDuplicates := `SELECT COUNT(*) FROM (SELECT 1 FROM node_inbound WHERE kernel_id > 0 GROUP BY node_id, port HAVING COUNT(*) > 1)`
+	def, exists, err := nodeInboundIndexDefinition(db)
+	if err != nil {
+		return nil, err
+	}
+	if exists && nodeInboundIndexIsProtocolAware(def) {
+		// Leg 6: after an index repair, legal TCP/UDP pairs must not
+		// prevent re-recording v1 when one of its indexes was missing.
+		inboundDuplicates = nodeInboundProtocolDuplicateGroupsSQL
+	}
 	queries := []struct {
 		dest *int64
 		sql  string
@@ -49,7 +59,7 @@ func runV1Precheck(db *gorm.DB) (*precheckResult, error) {
 		// B4/F-003: node_inbound 的唯一索引是部分索引（WHERE kernel_id > 0，
 		// 见 migrateV2NodeInboundPartialUnique），预检口径必须一致——导入行
 		// （kernel_id=0）同端口重复是合法数据，不能让它挡住全部四个索引。
-		{&r.NodeInboundDups, `SELECT COUNT(*) FROM (SELECT 1 FROM node_inbound WHERE kernel_id > 0 GROUP BY node_id, port HAVING COUNT(*) > 1)`},
+		{&r.NodeInboundDups, inboundDuplicates},
 		{&r.UsernameDups, `SELECT COUNT(*) FROM (SELECT 1 FROM "user" GROUP BY "user" HAVING COUNT(*) > 1)`},
 	}
 	for _, q := range queries {

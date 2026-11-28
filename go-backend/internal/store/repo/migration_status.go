@@ -90,6 +90,12 @@ func (r *Repository) GetPendingMigrationStatus() *PendingMigrationStatus {
 			pendingIndex(migrationV2Version, "node_inbound", "索引 "+nodeInboundIndexName+" 仍为全量唯一定义或不匹配的部分定义，v2 部分索引迁移待处理（通常是 kernel 入站存在同节点同端口重复，需先清理）")
 		}
 	}
+	// Leg 6: the old partial index is still too strict for cross-network
+	// listeners. Check the structure even when the v4 ledger row exists.
+	def, exists, err := nodeInboundIndexDefinition(r.db)
+	if err != nil || !exists || !nodeInboundIndexIsProtocolAware(def) {
+		pendingIndex(migrationV4InboundVersion, "node_inbound", "入站协议索引缺失或定义不匹配；清理同节点同端口同协议及传输的重复入站后重启面板")
+	}
 	if !applied(migrationV3Version) {
 		def, exists, err := chainTunnelIndexDefinition(r.db)
 		if err != nil {

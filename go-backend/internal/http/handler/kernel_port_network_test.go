@@ -1,11 +1,14 @@
 package handler
 
 import (
+	"encoding/json"
 	"fmt"
+	"strings"
+	"testing"
+
 	"go-backend/internal/kernel"
 	"go-backend/internal/store/model"
 	"go-backend/internal/store/repo"
-	"testing"
 )
 
 // Local reproduction: real save handler + SQLite + WebSocket fake agent.
@@ -34,6 +37,26 @@ func TestLeg6MuxUDPInboundSave(t *testing.T) {
 	out := callInboundSave(t, h, false, `{"nodeId":1,"kernelType":"sing-box","name":"mux-hy2","protocol":"hysteria2","port":8443,"security":{"type":"tls","sni":"udp.example.com"}}`)
 	if out.Code != 0 {
 		t.Fatalf("UDP-only inbound on TCP mux port must save: %+v", out)
+	}
+	rows, err := h.repo.ListNodeInboundsByNode(1)
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("TCP and UDP rows not persisted: %+v %v", rows, err)
+	}
+	var udpRow model.NodeInbound
+	for _, stored := range rows {
+		if stored.Protocol == kernel.ProtocolHysteria2 {
+			udpRow = stored
+		}
+	}
+	if udpRow.ID == 0 || udpRow.Port != 8443 || udpRow.MuxPort != 0 {
+		t.Fatalf("wrong UDP row: %+v", udpRow)
+	}
+	updateBody := fmt.Sprintf(`{"id":%d,"name":"mux-hy2-updated","protocol":%q,"port":8443,"security":{"type":"tls","sni":"udp.example.com"}}`, udpRow.ID, kernel.ProtocolHysteria2)
+	if out := callInboundSave(t, h, true, updateBody); out.Code != 0 {
+		t.Fatalf("UDP update on TCP mux port: %+v", out)
+	}
+	if out := callInboundSave(t, h, false, `{"nodeId":1,"kernelType":"sing-box","name":"duplicate-hy2","protocol":"hysteria2","port":8443,"security":{"type":"tls","sni":"udp.example.com"}}`); out.Code == 0 || out.Msg != "端口 8443 已被其他节点服务占用" {
+		t.Fatalf("same-network duplicate must be rejected by occupancy: %+v", out)
 	}
 }
 
@@ -114,5 +137,57 @@ func TestLeg6MuxNetworkConflictGuards(t *testing.T) {
 				t.Fatalf("conflict=%q err=%v want blocked=%v", msg, err, tc.blocked)
 			}
 		})
+	}
+}
+
+// Exercise Normalize -> applyInboundToModel -> actual INSERT for both Mieru
+// variants, verifying the JSON discriminator used by the fallback index.
+func TestLeg6MieruStoredTransportsSharePortAcrossNetworks(t *testing.T) {
+	r, err := repo.Open(t.TempDir() + "/mieru-network.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	nodeID := seedRelayTargetNode(t, r, "mieru-node", "203.0.113.10")
+	k := seedChainKernel(t, r, nodeID, kernel.TypeMieru)
+	h := New(r, "test-jwt-secret")
+	for _, network := range []string{"tcp", "udp"} {
+		row := seedChainInbound(t, r, k, network, kernel.Inbound{Protocol: kernel.ProtocolMieru, Port: 9443, Transport: kernel.Transport{Type: network}}, 0)
+		stored, err := r.GetNodeInbound(row.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var transport kernel.Transport
+		if err := json.Unmarshal([]byte(stored.Transport), &transport); err != nil || transport.Type != network {
+			t.Fatalf("stored %s transport=%q err=%v", network, stored.Transport, err)
+		}
+	}
+	for _, network := range []string{"tcp", "udp"} {
+		msg, err := h.inboundPortConflict(nodeID, kernel.TypeMieru, kernel.Inbound{Protocol: kernel.ProtocolMieru, Port: 9443, Transport: kernel.Transport{Type: network}}, 0)
+		if err != nil || !strings.Contains(msg, "已被") {
+			t.Fatalf("duplicate Mieru %s conflict=%q err=%v", network, msg, err)
+		}
+	}
+}
+
+func TestLeg6LooseIndexStillUsesExactOccupancy(t *testing.T) {
+	r, err := repo.Open(t.TempDir() + "/fallback-index.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	nodeID := seedRelayTargetNode(t, r, "fallback-node", "203.0.113.10")
+	k := seedChainKernel(t, r, nodeID, kernel.TypeXray)
+	seedChainInbound(t, r, k, "vless-tcp", kernel.Inbound{Protocol: kernel.ProtocolVLESS, Port: 8443}, 0)
+	h := New(r, "test-jwt-secret")
+	for _, in := range []kernel.Inbound{
+		{Protocol: kernel.ProtocolTrojan, Port: 8443},
+		{Protocol: kernel.ProtocolVLESS, Port: 8443, Transport: kernel.Transport{Type: kernel.TransportWS, Path: "/other"}},
+		{Protocol: kernel.ProtocolShadowsocks, Port: 8443},
+	} {
+		msg, err := h.inboundPortConflict(nodeID, kernel.TypeXray, in, 0)
+		if err != nil || msg != "端口 8443 已被其他节点服务占用" {
+			t.Fatalf("same network must be blocked despite different index key: %+v msg=%q err=%v", in, msg, err)
+		}
 	}
 }
