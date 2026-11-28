@@ -1,5 +1,6 @@
 @import "tailwindcss";
 @import "./tailwind-theme.pcss";
+@import "./flyx.css";
 @plugin "tailwindcss-animate";
 
 /* Dark mode was removed app-wide (2026-11-02, user directive: one

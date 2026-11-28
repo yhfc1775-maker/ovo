@@ -1,3 +1,4 @@
+import { AppearanceSettings } from "@/components/appearance-settings";
 import type {
   SystemUpgradeCheckApiData,
   SystemUpgradeReleaseApiItem,
@@ -1847,6 +1848,7 @@ export default function ConfigPage() {
         </CardHeader>
         <Divider />
         <CardBody className="pt-8">
+          <div className="mb-6"><AppearanceSettings /></div>
           <div className="space-y-6">
             {CONFIG_ITEMS.filter((item) =>
               [

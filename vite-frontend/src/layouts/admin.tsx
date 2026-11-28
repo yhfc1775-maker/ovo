@@ -90,7 +90,7 @@ export default function AdminLayout({
     },
     {
       path: "/forward",
-      label: "规则",
+      label: "转发",
       icon: (
         <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
           <path
@@ -105,7 +105,7 @@ export default function AdminLayout({
     {
       path: "/node",
       section: "线路",
-      label: "节点",
+      label: "服务器",
       icon: (
         <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
           <path
@@ -119,7 +119,7 @@ export default function AdminLayout({
     },
     {
       path: "/inbound",
-      label: "落地",
+      label: "节点",
       icon: (
         <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
           <path

@@ -860,6 +860,9 @@ export interface KernelStateApiData {
 }
 
 export interface InboundSettings {
+ mtu?:number;
+ mieruMultiplexing?:string;
+ mieruHandshakeMode?:string;
   uuid?: string;
   flow?: string;
   encryptionAuth?: string;

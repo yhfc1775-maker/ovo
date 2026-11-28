@@ -39,6 +39,7 @@ func IsForkVersion(version string) bool {
 const SingboxForkVersion = "1.14.4-flmx1"
 
 const (
+	TypeMieru   = "mieru"
 	TypeXray    = "xray"
 	TypeSingbox = "singbox"
 	// TypeSingboxCompanion is the managed second sing-box instance
@@ -49,6 +50,7 @@ const (
 )
 
 const (
+	ProtocolMieru       = "mieru"
 	ProtocolVLESS       = "vless"
 	ProtocolVMess       = "vmess"
 	ProtocolTrojan      = "trojan"
@@ -61,6 +63,7 @@ const (
 )
 
 const (
+	TransportUDP   = "udp"
 	TransportTCP   = "tcp"
 	TransportWS    = "ws"
 	TransportGRPC  = "grpc"
@@ -175,6 +178,16 @@ var singboxDownload = &Download{
 	Mirrorable:  true,
 }
 
+var mieruDownload = &Download{
+	URL:         "https://github.com/enfein/mieru/releases/download/v{VERSION}/mita_{VERSION}_linux_{ARCH}.tar.gz",
+	Archive:     "tar.gz",
+	BinName:     "mita",
+	ArchMap:     map[string]string{"amd64": "amd64", "arm64": "arm64"},
+	GitHubRepo:  "enfein/mieru",
+	GitHubAsset: "mita_{VERSION}_linux_{ARCH}.tar.gz",
+	Mirrorable:  true,
+}
+
 var catalog = []Info{
 	{
 		Type:        TypeXray,
@@ -235,6 +248,20 @@ var catalog = []Info{
 			}},
 			{Protocol: ProtocolShadowsocks, Transports: []TransportCap{
 				{Type: TransportTCP, Securities: []string{SecurityNone, SecurityShadowTLS}},
+			}},
+		},
+	},
+	{
+		Type:        TypeMieru,
+		Name:        "Mieru",
+		Implemented: true,
+		ReleaseRepo: "enfein/mieru",
+		CertModes:   []string{},
+		Download:    mieruDownload,
+		Protocols: []ProtocolCap{
+			{Protocol: ProtocolMieru, Transports: []TransportCap{
+				{Type: TransportTCP, Securities: []string{SecurityNone}},
+				{Type: TransportUDP, Securities: []string{SecurityNone}},
 			}},
 		},
 	},

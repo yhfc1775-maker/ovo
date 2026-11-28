@@ -138,6 +138,7 @@ func ghMirrorAllow(ip string) bool {
 func ghMirrorRepos() map[string]bool {
 	return map[string]bool{
 		strings.ToLower(githubRepo):    true,
+		"enfein/mieru":                 true,
 		"xtls/xray-core":               true,
 		"sagernet/sing-box":            true, // 上游仓保留，只作回退，不作默认
 		"iiiiiiiii7125-art/sing-box":   true, // FLMX fork 仓（默认源，见 kernel.SingboxForkRepo）

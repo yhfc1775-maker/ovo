@@ -94,8 +94,8 @@ func TestSubscriptionFormats(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertGolden(t, "surge.golden.conf", surge)
-	if strings.Contains(surge, "Reality") {
-		t.Fatal("surge has no reality support")
+	if !strings.Contains(surge, "reality-public-key=") || !strings.Contains(surge, "xhttp=true") {
+		t.Fatal("Surge VLESS Reality/XHTTP nodes are missing")
 	}
 
 	if _, _, err := Subscription("nope", eps, SubOptions{}); err == nil {

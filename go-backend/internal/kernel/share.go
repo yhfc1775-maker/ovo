@@ -94,6 +94,10 @@ func hostPort(host string, port int) string {
 // ShareURI renders the de-facto standard share link (v2rayN / Shadowrocket /
 // NekoBox style) for an endpoint.
 func ShareURI(e Endpoint) (string, bool) {
+	if e.Proxy == nil && e.Inbound.Protocol == ProtocolMieru {
+		e.Proxy = mieruClientProxy(e)
+		return proxyURI(e)
+	}
 	if e.Proxy != nil {
 		return proxyURI(e)
 	}
@@ -272,6 +276,10 @@ func clashProxyMihomo(e Endpoint) (yamlNode, bool) {
 }
 
 func clashProxy(e Endpoint, mihomo bool) (yamlNode, bool) {
+	if e.Proxy == nil && e.Inbound.Protocol == ProtocolMieru {
+		e.Proxy = mieruClientProxy(e)
+		return proxyClashFor(e, mihomo)
+	}
 	if e.Proxy != nil {
 		// Imported nodes split by format too (R10-01): the clash
 		// format applies the Mihomo acceptance gate inside
@@ -572,14 +580,14 @@ func singboxOutbound(e Endpoint) (map[string]interface{}, bool) {
 	return o, true
 }
 
-// SurgeLine renders a Surge [Proxy] line. Surge has no VLESS, Reality,
-// gRPC or XHTTP support, so those endpoints are skipped.
+// SurgeLine renders a Surge [Proxy] line. VLESS (Reality, XHTTP, gRPC, WS,
+// TLS, Encryption) requires Surge iOS 6.0.0+ / Mac 6.12.0+.
 func SurgeLine(e Endpoint) (string, bool) {
 	if e.Proxy != nil {
 		return proxySurge(e)
 	}
 	in := e.Inbound
-	if in.Security.Type == SecurityReality || in.Transport.Type == TransportGRPC || in.Transport.Type == TransportXHTTP {
+	if in.Protocol != ProtocolVLESS && (in.Security.Type == SecurityReality || in.Transport.Type == TransportGRPC || in.Transport.Type == TransportXHTTP) {
 		return "", false
 	}
 	// F-081: 行式格式（逗号分字段、首个等号分键值）里全部用户可控值与
@@ -632,6 +640,64 @@ func SurgeLine(e Endpoint) (string, bool) {
 	case ProtocolAnyTLS:
 		parts = append(parts, "anytls", host, strconv.Itoa(e.Port), "password="+surgeEscape(in.Settings.Password))
 		return name + " = " + strings.Join(append(parts, tlsTail()...), ", "), true
+	case ProtocolVLESS:
+		parts = append(parts, "vless", host, strconv.Itoa(e.Port), "username="+surgeEscape(in.Settings.UUID))
+		if in.Settings.Flow != "" {
+			parts = append(parts, "flow="+surgeEscape(in.Settings.Flow))
+		}
+		if enc, err := in.Settings.EncryptionString(); err != nil {
+			return "", false
+		} else if enc != "none" {
+			parts = append(parts, "encryption="+surgeEscape(enc))
+		}
+		switch in.Security.Type {
+		case SecurityReality:
+			if in.Security.SNI != "" {
+				parts = append(parts, "sni="+surgeEscape(in.Security.SNI))
+			}
+			parts = append(parts, "reality-public-key="+surgeEscape(in.Security.RealityPublicKey))
+			if len(in.Security.RealityShortIDs) > 0 && in.Security.RealityShortIDs[0] != "" {
+				parts = append(parts, "reality-short-id="+surgeEscape(in.Security.RealityShortIDs[0]))
+			}
+		case SecurityTLS:
+			parts = append(parts, "tls=true")
+			if in.Security.SNI != "" {
+				parts = append(parts, "sni="+surgeEscape(in.Security.SNI))
+			}
+			if e.selfSigned() {
+				parts = append(parts, "skip-cert-verify=true")
+			}
+			if len(in.Security.ALPN) > 0 {
+				parts = append(parts, "alpn="+strings.Join(in.Security.ALPN, ","))
+			}
+		}
+		switch in.Transport.Type {
+		case TransportTCP:
+		case TransportWS:
+			parts = append(parts, "ws=true", "ws-path="+surgeEscape(firstNonEmptyString(in.Transport.Path, "/")))
+			if in.Transport.Host != "" {
+				parts = append(parts, "ws-headers=Host:"+surgeEscape(in.Transport.Host))
+			}
+		case TransportGRPC:
+			if in.Security.Type == SecurityNone {
+				return "", false
+			}
+			parts = append(parts, "grpc=true")
+			if in.Transport.ServiceName != "" {
+				parts = append(parts, "grpc-service-name="+surgeEscape(in.Transport.ServiceName))
+			}
+		case TransportXHTTP:
+			parts = append(parts, "xhttp=true", "xhttp-path="+surgeEscape(firstNonEmptyString(in.Transport.Path, "/")))
+			if in.Transport.Host != "" {
+				parts = append(parts, "xhttp-host="+surgeEscape(in.Transport.Host))
+			}
+			if in.Transport.Mode != "" && in.Transport.Mode != defaultXHTTPMode {
+				parts = append(parts, "xhttp-mode="+surgeEscape(in.Transport.Mode))
+			}
+		default:
+			return "", false
+		}
+		return name + " = " + strings.Join(parts, ", "), true
 	case ProtocolVMess:
 		parts = append(parts, "vmess", host, strconv.Itoa(e.Port), "username="+surgeEscape(in.Settings.UUID), "vmess-aead=true")
 	case ProtocolTrojan:
@@ -987,5 +1053,20 @@ func clashQUICFamily(e Endpoint) yamlNode {
 		warnSkipCertVerifyRender("Clash 配置", "skip-cert-verify: true", e.Name, hostPort(e.Host, e.Port), "自签")
 		p = append(p, yamlField{"skip-cert-verify", true})
 	}
+	return p
+}
+
+func mieruClientProxy(e Endpoint) Proxy {
+	s := e.Inbound.Settings
+	tr := "TCP"
+	if e.Inbound.Transport.Type == TransportUDP {
+		tr = "UDP"
+	}
+	p := Proxy{"type": "mieru", "server": e.Host, "port": e.Port, "transport": tr, "username": s.Username, "password": s.Password, "udp": true}
+	p.set("multiplexing", s.MieruMultiplexing)
+	if s.MieruHandshakeMode != "" && s.MieruHandshakeMode != MieruHandshakeStandard {
+		p["handshake-mode"] = s.MieruHandshakeMode
+	}
+	p.set("mtu", s.MTU)
 	return p
 }

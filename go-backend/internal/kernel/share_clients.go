@@ -86,7 +86,7 @@ func shadowrocketProxiesTaken(endpoints []Endpoint, opts SubOptions, taken []str
 
 // shadowrocketSkips reports nodes Shadowrocket cannot express.
 func shadowrocketSkips(p Proxy) bool {
-	return hasVLESSEncryption(p) || p.Type() == "wireguard"
+	return hasVLESSEncryption(p) || p.Type() == "wireguard" || p.Type() == "mieru"
 }
 
 // hasVLESSEncryption reports whether a VLESS proxy sets a non-none

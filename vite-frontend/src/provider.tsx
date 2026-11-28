@@ -1,3 +1,4 @@
+import { applyAppearance } from "@/utils/appearance";
 import * as React from "react";
 import { getToken, SESSION_CLEARED_EVENT, SESSION_UPDATED_EVENT, SESSION_STORAGE_KEYS } from "@/utils/session";
 import { ENTITY_CHANGED_EVENT, ENTITY_REVISION_KEY } from "@/api/entity-sync";
@@ -40,6 +41,7 @@ const toastSurfaceStyle = {
 } as const;
 
 export function Provider({ children }: ProvidersProps) {
+  React.useEffect(() => { applyAppearance(); }, []);
   const navigate = useNavigate();
   const currentToken = React.useRef(getToken());
   const [sessionRevision, setSessionRevision] = React.useState(0);

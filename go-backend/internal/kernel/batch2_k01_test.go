@@ -108,15 +108,15 @@ func TestBatch2K01StoredPoisonedSkippedAtRender(t *testing.T) {
 		}
 	}
 	// Legal stored rows still render on every face that supports
-	// VLESS (Surge has no VLESS client by design, N-10).
+	// VLESS (Surge 6 supports VLESS after the 3.11.0 port).
 	legal := Proxy{"type": "vless", "server": "1.2.3.4", "port": 443, "uuid": manualUUID,
 		"tls": true, "servername": "www.microsoft.com", "client-fingerprint": "chrome",
 		"reality-opts": map[string]interface{}{"public-key": manualFixPBK, "short-id": "ab12"},
 		"flow":         "xtls-rprx-vision"}
 	e := Endpoint{Name: "k01-legal", Host: "1.2.3.4", Port: 443, Direct: true, Proxy: legal}
 	sb, sg, ln, qx, uri := b2FaceResults(e)
-	if !(sb && !sg && ln && qx && uri) {
-		t.Errorf("legal reality+tcp+vision faces singbox/surge/loon/qx/uri = %v/%v/%v/%v/%v, want true/false/true/true/true", sb, sg, ln, qx, uri)
+	if !(sb && sg && ln && qx && uri) {
+		t.Errorf("legal reality+tcp+vision faces singbox/surge/loon/qx/uri = %v/%v/%v/%v/%v, want true/true/true/true/true", sb, sg, ln, qx, uri)
 	}
 	if _, ok := proxyClash(e); !ok {
 		t.Error("legal reality+tcp+vision must render on the Clash face")
@@ -129,7 +129,7 @@ func TestBatch2K01StoredPoisonedSkippedAtRender(t *testing.T) {
 	// transport — the batch-2 predicate wrongly isolated them.
 	// Reality+gRPC: sing-box renders (grpc transport + reality TLS),
 	// Clash passes through, URI round-trips type=grpc + security=
-	// reality; Surge has no VLESS client, Loon/QX support tcp/ws
+	// reality; Surge supports VLESS, while Loon/QX support tcp/ws
 	// transports only. Xray chain accepts grpc + reality.
 	grpcLegal := Proxy{"type": "vless", "server": "1.2.3.4", "port": 443, "uuid": manualUUID,
 		"tls": true, "servername": "www.microsoft.com", "client-fingerprint": "chrome",
@@ -137,8 +137,8 @@ func TestBatch2K01StoredPoisonedSkippedAtRender(t *testing.T) {
 		"network":      "grpc", "grpc-opts": map[string]interface{}{"grpc-service-name": "svc"}}
 	ge := Endpoint{Name: "k01-legal-grpc", Host: "1.2.3.4", Port: 443, Direct: true, Proxy: grpcLegal}
 	sb, sg, ln, qx, uri = b2FaceResults(ge)
-	if !(sb && !sg && !ln && !qx && uri) {
-		t.Errorf("legal reality+grpc faces singbox/surge/loon/qx/uri = %v/%v/%v/%v/%v, want true/false/false/false/true", sb, sg, ln, qx, uri)
+	if !(sb && sg && !ln && !qx && uri) {
+		t.Errorf("legal reality+grpc faces singbox/surge/loon/qx/uri = %v/%v/%v/%v/%v, want true/true/false/false/true", sb, sg, ln, qx, uri)
 	}
 	if _, ok := proxyClash(ge); !ok {
 		t.Error("legal reality+grpc must render on the Clash face")
@@ -147,7 +147,7 @@ func TestBatch2K01StoredPoisonedSkippedAtRender(t *testing.T) {
 		t.Errorf("legal reality+grpc chainTargetFromProxy: %v", err)
 	}
 	// Reality+XHTTP: sing-box has no xhttp transport (always skipped,
-	// OBS-D-01), Loon/QX/Surge exclude XHTTP by client capability;
+	// OBS-D-01), Loon/QX exclude XHTTP by client capability;
 	// Clash renders xhttp-opts (Mihomo ≥1.19), URI round-trips
 	// type=xhttp + security=reality, Xray chain emits xhttpSettings
 	// with realitySettings.
@@ -157,8 +157,8 @@ func TestBatch2K01StoredPoisonedSkippedAtRender(t *testing.T) {
 		"network":      "xhttp", "xhttp-opts": map[string]interface{}{"path": "/xhttp", "mode": "auto"}}
 	xe := Endpoint{Name: "k01-legal-xhttp", Host: "1.2.3.4", Port: 443, Direct: true, Proxy: xhttpLegal}
 	sb, sg, ln, qx, uri = b2FaceResults(xe)
-	if !(!sb && !sg && !ln && !qx && uri) {
-		t.Errorf("legal reality+xhttp faces singbox/surge/loon/qx/uri = %v/%v/%v/%v/%v, want false/false/false/false/true", sb, sg, ln, qx, uri)
+	if !(!sb && sg && !ln && !qx && uri) {
+		t.Errorf("legal reality+xhttp faces singbox/surge/loon/qx/uri = %v/%v/%v/%v/%v, want false/true/false/false/true", sb, sg, ln, qx, uri)
 	}
 	if _, ok := proxyClash(xe); !ok {
 		t.Error("legal reality+xhttp must render on the Clash face")

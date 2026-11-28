@@ -2122,6 +2122,24 @@ func expandArgs(args []string, runDir, binDir string) []string {
 	return out
 }
 
+func expandEnv(env map[string]string, runDir, binDir string) []string {
+	if len(env) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		v := strings.ReplaceAll(env[k], "{RUN_DIR}", runDir)
+		v = strings.ReplaceAll(v, "{BIN_DIR}", binDir)
+		out = append(out, k+"="+v)
+	}
+	return out
+}
+
 func lastLines(r *logRing, n int) string {
 	lines := r.tail(n)
 	if len(lines) == 0 {
@@ -2210,6 +2228,7 @@ func (m *Manager) startProcesses(inst *instance) {
 			prefix = "[" + spec.Name + "] "
 		}
 		p := newProcess(bin, expandArgs(spec.Args, runDir, filepath.Dir(bin)), runDir, inst.logs)
+		p.env = expandEnv(spec.Env, runDir, filepath.Dir(bin))
 		p.prefix = prefix
 		// B-02 (A-03): the supervisor's crash relaunch is a start
 		// like any other — a guarded kernel must not come back while

@@ -724,6 +724,10 @@ func (h *Handler) kernelInstall(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.applyKernel(k.ID, true); err != nil {
+		if info.Type == kernel.TypeMieru && strings.Contains(err.Error(), "未知内核") {
+			err = errors.New("节点 Agent 暂不支持 Mieru，请先升级到包含本次 Mieru 移植的 Agent")
+		}
+
 		// F2-APPLY-01：确认待定不是失败——版本登记保留（pending 态
 		// 不回滚，见 rollbackKernelInstallAfterFailure），回执只说
 		// 「已发出、正在确认」。

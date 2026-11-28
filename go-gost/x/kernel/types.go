@@ -44,9 +44,10 @@ type ExtraBinary struct {
 // ProcessSpec is one supervised process of a kernel. Bin is "" for the main
 // binary or the Name of an extra binary.
 type ProcessSpec struct {
-	Name string   `json:"name"`
-	Bin  string   `json:"bin"`
-	Args []string `json:"args"`
+	Name string            `json:"name"`
+	Bin  string            `json:"bin"`
+	Args []string          `json:"args"`
+	Env  map[string]string `json:"env,omitempty"`
 }
 
 type File struct {
@@ -206,6 +207,7 @@ type adapter struct {
 }
 
 var adapters = map[string]adapter{
+	"mieru":   {versionArgs: []string{"version"}},
 	"xray":    {versionArgs: []string{"version"}, fixFile: xrayFixFile},
 	"singbox": {versionArgs: []string{"version"}},
 	// singbox-companion runs the metering companions (C-03) as a
@@ -274,6 +276,14 @@ func (r *ApplyRequest) validate() error {
 		seen[p.Name] = true
 		if p.Bin != "" && !extras[p.Bin] {
 			return fmt.Errorf("进程 %s 引用了未声明的程序 %s", p.Name, p.Bin)
+		}
+		for k, v := range p.Env {
+			if !allowedProcessEnvKeys[k] {
+				return fmt.Errorf("进程 %s 包含不允许的环境变量 %s", p.Name, k)
+			}
+			if strings.ContainsRune(v, 0) || strings.Contains(v, "..") {
+				return fmt.Errorf("进程 %s 的环境变量 %s 值非法", p.Name, k)
+			}
 		}
 	}
 	for _, f := range r.Files {
@@ -363,4 +373,13 @@ func (r ApplyRequest) processSpecs() []ProcessSpec {
 		return r.Processes
 	}
 	return []ProcessSpec{{Name: r.Type, Args: r.Args}}
+}
+
+// allowedProcessEnvKeys restricts ProcessSpec.Env to the variables a kernel
+// legitimately uses, blocking loader/runtime injection (LD_PRELOAD, etc.).
+var allowedProcessEnvKeys = map[string]bool{
+	"MITA_CONFIG_JSON_FILE": true,
+	"MITA_UDS_PATH":         true,
+	"MITA_INSECURE_UDS":     true,
+	"MITA_LOG_NO_TIMESTAMP": true,
 }
