@@ -3190,6 +3190,93 @@ LOGROTATE_EOF
 }
 
 
+# F03：双代共存时只读各自目录里的二进制版本，不能读迁移目标。
+legacy_agent_installed_version() {
+  local dir="$1" binary raw
+  case "$dir" in
+    "$LEGACY_INSTALL_DIR") binary="$dir/flux_agent" ;;
+    "$LEGACY2_INSTALL_DIR") binary="$dir/flmx_agent" ;;
+    *) return 1 ;;
+  esac
+  [[ -x "$binary" ]] || return 1
+  raw=$("$binary" -V 2>/dev/null) || return 1
+  extract_leading_semver "$raw"
+}
+
+# 调用方已对两代目录通过归属守卫。先定唯一 live，再调用原迁移
+# （保留其目标占用守卫、unit 快照及回滚）；只有成功才摘除 stale。
+migrate_coexisting_legacy_agents() {
+  local has_current="$1" flux_active="" flmx_active="" live="" stale stale_dir
+  ensure_service_manager || return 1
+  legacy_flux_agent_service_is_active && flux_active=1
+  legacy_flmx_agent_service_is_active && flmx_active=1
+
+  if [[ -n "$has_current" ]]; then
+    if [[ -n "$flux_active" || -n "$flmx_active" ]]; then
+      echo "❌ 三代布局共存且旧服务仍在运行：$INSTALL_DIR、$LEGACY_INSTALL_DIR、$LEGACY2_INSTALL_DIR；已拒绝迁移，目录与服务原样保留。"
+      echo "   请先核对三处配置与节点归属，备份旧目录，人工停止并禁用确认不再使用的 flux_agent / flmx_agent 服务后重试。"
+      return 1
+    fi
+    echo "ℹ️ $INSTALL_DIR 已有现版安装，两个旧服务均未运行；跳过 legacy 迁移，遗留目录 $LEGACY_INSTALL_DIR 与 $LEGACY2_INSTALL_DIR 原样保留，继续现版流程。"
+    return 0
+  fi
+
+  if [[ -n "$flux_active" && -z "$flmx_active" ]]; then
+    live=flux
+  elif [[ -n "$flmx_active" && -z "$flux_active" ]]; then
+    live=flmx
+  else
+    local flux_version flmx_version cmp=""
+    flux_version=$(legacy_agent_installed_version "$LEGACY_INSTALL_DIR" || true)
+    flmx_version=$(legacy_agent_installed_version "$LEGACY2_INSTALL_DIR" || true)
+    if [[ -n "$flux_version" && -z "$flmx_version" ]]; then
+      live=flux
+    elif [[ -n "$flmx_version" && -z "$flux_version" ]]; then
+      live=flmx
+    elif [[ -n "$flux_version" && -n "$flmx_version" ]]; then
+      cmp=$(panel_version_gate_cmp "$flux_version" "$flmx_version" || true)
+      case "$cmp" in
+        1) live=flux ;;
+        -1) live=flmx ;;
+      esac
+    fi
+    if [[ -z "$live" ]]; then
+      echo "❌ 无法确定双代安装的 live：$LEGACY_INSTALL_DIR（flux_agent，版本 ${flux_version:-无法读取}）与 $LEGACY2_INSTALL_DIR（flmx_agent，版本 ${flmx_version:-无法读取}）；两边均未迁移或删除，服务原样保留。"
+      echo "   请核对两处配置与节点归属，备份两个目录，人工仅保留选定的一代服务运行（停止并禁用另一代），再重试；或确认归属后人工整理遗留目录。"
+      return 1
+    fi
+  fi
+
+  echo "🔀 双代共存预检：选定 ${live}_agent 为 live（flux 运行=${flux_active:-0}，flmx 运行=${flmx_active:-0}），先迁移，成功后清理另一代。"
+  if [[ "$live" == flux ]]; then
+    migrate_legacy_agent_install || return $?
+    stale=flmx
+    stale_dir="$LEGACY2_INSTALL_DIR"
+  else
+    migrate_legacy_flmx_agent_install || return $?
+    stale=flux
+    stale_dir="$LEGACY_INSTALL_DIR"
+  fi
+
+  # 仅复用卸载路径对 stale 的停、禁、摘服务和删目录步骤；不做
+  # 宿主调优/内核等全局卸载清理，避免破坏已迁移的 live。
+  if "legacy_${stale}_agent_service_exists"; then
+    "stop_legacy_${stale}_agent_service" || {
+      echo "❌ stale 服务 ${stale}_agent 停止失败，保留 $stale_dir 与服务文件，请人工处理。"
+      return 1
+    }
+    "disable_legacy_${stale}_agent_service" || return $?
+  fi
+  "remove_legacy_${stale}_agent_service" || return $?
+  local stale_unit
+  stale_unit=$("legacy_${stale}_agent_service_file_path") || return $?
+  if [[ -e "$stale_unit" || -e "${stale_unit}.d" ]] || ! rm -rf "$stale_dir"; then
+    echo "❌ stale 清理未完成：$stale_dir / ${stale}_agent，请人工检查目录与服务文件。"
+    return 1
+  fi
+  echo "🧹 已停止并禁用 stale 服务 ${stale}_agent，删除其服务文件与安装目录 $stale_dir。"
+}
+
 install_ovo_agent() {
   echo "🚀 开始安装 ovo_agent..."
 
@@ -3223,13 +3310,19 @@ install_ovo_agent() {
   agent_dir_has_agent "$INSTALL_DIR" && has_current=1
   agent_dir_has_agent "$LEGACY2_INSTALL_DIR" && has_legacy2=1
   agent_dir_has_agent "$LEGACY_INSTALL_DIR" && has_legacy=1
-  if [[ -n "$has_legacy2" ]]; then
+  if [[ -n "$has_legacy" && -n "$has_legacy2" ]]; then
     guard_agent_dir_ownership "$LEGACY2_INSTALL_DIR" || return 1
-    migrate_legacy_flmx_agent_install || return 1
-  fi
-  if [[ -n "$has_legacy" ]]; then
     guard_agent_dir_ownership "$LEGACY_INSTALL_DIR" || return 1
-    migrate_legacy_agent_install || return 1
+    migrate_coexisting_legacy_agents "$has_current" || return $?
+  else
+    if [[ -n "$has_legacy2" ]]; then
+      guard_agent_dir_ownership "$LEGACY2_INSTALL_DIR" || return 1
+      migrate_legacy_flmx_agent_install || return 1
+    fi
+    if [[ -n "$has_legacy" ]]; then
+      guard_agent_dir_ownership "$LEGACY_INSTALL_DIR" || return 1
+      migrate_legacy_agent_install || return 1
+    fi
   fi
 
   # 检查并安装 tcpkill
@@ -3559,13 +3652,19 @@ update_ovo_agent() {
   if [[ -n "$has_current" ]]; then
     guard_agent_dir_ownership_menu "更新" "继续更新当前节点（连接地址不变）。" || return 1
   fi
-  if [[ -n "$has_legacy2" ]]; then
-    guard_agent_dir_ownership_menu "更新" "将迁移旧安装至 ovo。" "$LEGACY2_INSTALL_DIR" || return 1
-    migrate_legacy_flmx_agent_install || return 1
-  fi
-  if [[ -n "$has_legacy" ]]; then
-    guard_agent_dir_ownership_menu "更新" "将迁移旧安装至 ovo。" "$LEGACY_INSTALL_DIR" || return 1
-    migrate_legacy_agent_install || return 1
+  if [[ -n "$has_legacy" && -n "$has_legacy2" ]]; then
+    guard_agent_dir_ownership_menu "更新" "将迁移选定的旧安装至 ovo，成功后停止并删除另一代。" "$LEGACY2_INSTALL_DIR" || return 1
+    guard_agent_dir_ownership_menu "更新" "将迁移选定的旧安装至 ovo，成功后停止并删除另一代。" "$LEGACY_INSTALL_DIR" || return 1
+    migrate_coexisting_legacy_agents "$has_current" || return $?
+  else
+    if [[ -n "$has_legacy2" ]]; then
+      guard_agent_dir_ownership_menu "更新" "将迁移旧安装至 ovo。" "$LEGACY2_INSTALL_DIR" || return 1
+      migrate_legacy_flmx_agent_install || return 1
+    fi
+    if [[ -n "$has_legacy" ]]; then
+      guard_agent_dir_ownership_menu "更新" "将迁移旧安装至 ovo。" "$LEGACY_INSTALL_DIR" || return 1
+      migrate_legacy_agent_install || return 1
+    fi
   fi
   if [[ -z "$has_current" && -z "$has_legacy2" && -z "$has_legacy" ]]; then
     guard_agent_dir_ownership_menu "更新" "继续更新当前节点。" || return 1
