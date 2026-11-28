@@ -405,8 +405,15 @@ func TestPhase3KernelsContract(t *testing.T) {
 	if msg := hop("1100-1200"); strings.Contains(msg, "端口") {
 		t.Fatalf("free hop range: %s", msg)
 	}
-	if _, msg := create(`{"nodeId":` + n + `,"kernelType":"singbox","name":"in-hop","protocol":"anytls","port":1150,"security":{"type":"tls"}}`); !strings.Contains(msg, "端口跳跃范围") {
-		t.Fatalf("port inside another inbound's hop range must be rejected: %s", msg)
+	// Same network: a UDP inbound whose port falls inside another inbound's
+	// UDP hop range must still be rejected.
+	if _, msg := create(`{"nodeId":` + n + `,"kernelType":"singbox","name":"in-hop-udp","protocol":"hysteria2","port":1150,"transport":{"type":"quic"},"security":{"type":"tls"}}`); !strings.Contains(msg, "端口跳跃范围") {
+		t.Fatalf("UDP port inside another inbound's hop range must be rejected: %s", msg)
+	}
+	// Cross network: a TCP inbound whose port falls inside a UDP hop range
+	// does not conflict (TCP and UDP ports are independent).
+	if inHopID, msg := create(`{"nodeId":` + n + `,"kernelType":"singbox","name":"in-hop","protocol":"anytls","port":1150,"security":{"type":"tls"}}`); inHopID == 0 {
+		t.Fatalf("TCP port inside a UDP hop range must be allowed: %s", msg)
 	}
 	hyShare := kernelContractPost(t, router, admin, "/api/v1/inbound/share", `{"id":`+jsonInt64(hyID)+`}`)
 	if uri := hyShare.Data.([]interface{})[0].(map[string]interface{})["uri"].(string); !strings.HasPrefix(uri, "hysteria2://") || !strings.Contains(uri, "mport=1100-1200") {
