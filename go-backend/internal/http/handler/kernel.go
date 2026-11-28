@@ -265,35 +265,7 @@ type inboundRequest struct {
 // ---- conversion ----
 
 func inboundFromModel(row model.NodeInbound) (kernel.Inbound, error) {
-	in := kernel.Inbound{ID: row.ID, Protocol: row.Protocol, Listen: row.Listen, Port: row.Port,
-		AcceptProxyProtocol: row.AcceptProxyProtocol == 1, OutboundIPStrategy: row.OutboundIPStrategy,
-		ConnIdleSeconds: row.ConnIdleSeconds,
-		// The in-place switch is stored/API-named SSSubscriptionUsers
-		// (node_inbound.ss_subscription_users) and rendered as
-		// kernel InplaceUsers: this is the single mapping point
-		// between the two names (integration ruling).
-		InplaceUsers: row.SSSubscriptionUsers == 1,
-		Companion:    row.CompanionOf > 0}
-	if err := unmarshalOptional(row.Settings, &in.Settings); err != nil {
-		return in, fmt.Errorf("入站 %d settings 损坏: %v", row.ID, err)
-	}
-	if err := unmarshalOptional(row.Transport, &in.Transport); err != nil {
-		return in, fmt.Errorf("入站 %d transport 损坏: %v", row.ID, err)
-	}
-	if err := unmarshalOptional(row.Security, &in.Security); err != nil {
-		return in, fmt.Errorf("入站 %d security 损坏: %v", row.ID, err)
-	}
-	if strings.TrimSpace(row.Extra) != "" {
-		in.Extra = json.RawMessage(row.Extra)
-	}
-	return in, nil
-}
-
-func unmarshalOptional(raw string, out interface{}) error {
-	if strings.TrimSpace(raw) == "" {
-		return nil
-	}
-	return json.Unmarshal([]byte(raw), out)
+	return repo.InboundFromModel(row)
 }
 
 func applyInboundToModel(in kernel.Inbound, row *model.NodeInbound) error {
@@ -1522,11 +1494,7 @@ func (h *Handler) inboundSave(w http.ResponseWriter, r *http.Request, update boo
 	// 自身的段，避免把自己的监听器误判为占用。探针失败 fail-open
 	// （只记日志），DB 结论不变。
 	if in.Port != 0 {
-		spans := inboundSpans(in)
-		if oldIn != nil {
-			spans = subtractPortSpans(spans, inboundSpans(*oldIn))
-		}
-		if msg := h.checkLivePortsOccupied([]livePortProbeTarget{{NodeID: row.NodeID, Spans: spans}}); msg != "" {
+		if msg := h.checkLivePortsOccupied(inboundLivePortTargets(row.NodeID, in, oldIn)); msg != "" {
 			response.WriteJSON(w, response.ErrDefault(msg))
 			return
 		}
@@ -2053,13 +2021,14 @@ func (h *Handler) inboundPortConflict(nodeID int64, kernelType string, in kernel
 	}
 
 	spans := inboundSpans(in)
+	network := repo.InboundPortNetwork(in)
 	for _, sp := range spans {
 		if willMux && sp.lo == mux.Port && sp.hi == mux.Port {
 			// The mux port itself: only non-muxed occupants conflict.
 			// Every other muxed inbound on this port is behind the same
 			// mux and shares it by SNI.
 			excl := append(append([]int64{}, muxedInboundIDs...), excludeInboundID)
-			occ, err := h.repo.NodePortRangeOccupantExcluding(nodeID, sp.lo, sp.hi, excl)
+			occ, err := h.repo.NodePortRangeOccupantExcluding(nodeID, sp.lo, sp.hi, excl, network)
 			if err != nil {
 				return "", err
 			}
@@ -2068,7 +2037,7 @@ func (h *Handler) inboundPortConflict(nodeID int64, kernelType string, in kernel
 			}
 			continue
 		}
-		occ, err := h.repo.NodePortRangeOccupant(nodeID, sp.lo, sp.hi, excludeInboundID)
+		occ, err := h.repo.NodePortRangeOccupant(nodeID, sp.lo, sp.hi, excludeInboundID, network)
 		if err != nil {
 			return "", err
 		}
@@ -2153,8 +2122,11 @@ func (h *Handler) inboundPortConflict(nodeID int64, kernelType string, in kernel
 		// A muxed inbound's loopback port is an occupied span too, but only
 		// for TCP inbounds: the MuxPort is a TCP loopback listener, so a
 		// UDP hop range landing on the same number does not conflict.
-		otherSpans := inboundSpans(other)[1:]
-		if row.MuxPort > 0 && networkHasTCP(in.Network()) {
+		var otherSpans []portSpan
+		if repo.PortNetworksOverlap(network, repo.InboundPortNetwork(other)) {
+			otherSpans = inboundSpans(other)[1:]
+		}
+		if row.MuxPort > 0 && repo.PortNetworksOverlap(network, "tcp") {
 			otherSpans = append(otherSpans, portSpan{row.MuxPort, row.MuxPort, "复用内部端口"})
 		}
 		for _, os := range otherSpans {

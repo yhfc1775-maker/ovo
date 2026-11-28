@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"go-backend/internal/kernel"
 	"strings"
 	"testing"
 )
@@ -124,5 +125,66 @@ func TestCheckLivePortsOccupied(t *testing.T) {
 	// 离线节点：探针失败 fail-open，DB 结论不变（回 ""）。
 	if msg := a.h.checkLivePortsOccupied([]livePortProbeTarget{{NodeID: 2, Spans: []portSpan{{8080, 8080, "端口"}}}}); msg != "" {
 		t.Fatalf("offline node probe must fail open, got %q", msg)
+	}
+}
+
+func TestLeg6LiveProbeNetworks(t *testing.T) {
+	a := newNodeSwapFakeAgent(t)
+	cases := []struct {
+		name, network string
+		data          map[string]interface{}
+		blocked       bool
+	}{
+		{"TCP on UDP", "tcp", map[string]interface{}{"listening": []int{8443}, "tcp": []int{}, "udp": []int{8443}}, false},
+		{"UDP on TCP mux", "udp", map[string]interface{}{"listening": []int{8443}, "tcp": []int{8443}, "udp": []int{}}, false},
+		{"TCP on TCP", "tcp", map[string]interface{}{"listening": []int{8443}, "tcp": []int{8443}, "udp": []int{}}, true},
+		{"UDP on UDP", "udp", map[string]interface{}{"listening": []int{8443}, "tcp": []int{}, "udp": []int{8443}}, true},
+		{"dual on TCP", "tcp,udp", map[string]interface{}{"listening": []int{8443}, "tcp": []int{8443}, "udp": []int{}}, true},
+		{"allocator on UDP", "", map[string]interface{}{"listening": []int{8443}, "tcp": []int{}, "udp": []int{8443}}, true},
+		{"old agent TCP", "tcp", map[string]interface{}{"listening": []int{8443}}, true},
+		{"old agent UDP", "udp", map[string]interface{}{"listening": []int{8443}}, true},
+		{"partial report", "udp", map[string]interface{}{"listening": []int{8443}, "udp": []int{}}, true},
+		{"null report", "udp", map[string]interface{}{"listening": []int{8443}, "tcp": []int{8443}, "udp": nil}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a.mu.Lock()
+			a.reply = func(command cleanupAgentCommand) (bool, string, map[string]interface{}) { return true, "", tc.data }
+			a.mu.Unlock()
+			for _, sp := range []portSpan{{8443, 8443, "端口"}, {8400, 8500, "端口跳跃范围"}} {
+				msg := a.h.checkLivePortsOccupied([]livePortProbeTarget{{NodeID: 1, Spans: []portSpan{sp}, Network: tc.network}})
+				if (msg != "") != tc.blocked {
+					t.Fatalf("probe=%q want blocked=%v", msg, tc.blocked)
+				}
+			}
+		})
+	}
+}
+
+func TestLeg6InboundLiveProbeUpdateNetworks(t *testing.T) {
+	tcp := kernel.Inbound{Protocol: kernel.ProtocolVLESS, Port: 8443}
+	udp := kernel.Inbound{Protocol: kernel.ProtocolHysteria2, Port: 8443}
+	dual := kernel.Inbound{Protocol: kernel.ProtocolShadowsocks, Port: 8443}
+	for _, tc := range []struct {
+		name    string
+		in, old kernel.Inbound
+		want    string
+	}{
+		{"same TCP", tcp, tcp, ""}, {"same UDP", udp, udp, ""},
+		{"TCP to UDP", udp, tcp, "udp"}, {"UDP to TCP", tcp, udp, "tcp"},
+		{"add UDP", dual, tcp, "udp"}, {"add TCP", dual, udp, "tcp"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			targets := inboundLivePortTargets(1, tc.in, &tc.old)
+			if tc.want == "" {
+				if len(targets) != 0 {
+					t.Fatalf("own listener not removed: %+v", targets)
+				}
+				return
+			}
+			if len(targets) != 1 || targets[0].Network != tc.want || len(targets[0].Spans) != 1 || targets[0].Spans[0].lo != 8443 {
+				t.Fatalf("wrong new network targets: %+v", targets)
+			}
+		})
 	}
 }

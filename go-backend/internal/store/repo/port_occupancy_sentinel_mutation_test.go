@@ -59,3 +59,24 @@ func TestK9DecisionShapedPredicateVariants(t *testing.T) {
 		t.Fatal("query without an occupancy-table model must not be decision-shaped")
 	}
 }
+
+func TestK9OccupancyCallerClosureMutations(t *testing.T) {
+	fn := k9ParseFunc(t, `func probe() { r.NodePortRangeOccupancyTx(tx, 1, 80, 80, excl, "udp") }`)
+	actual := k9OccupancyCallerEdges([]k9Func{{file: "synthetic.go", name: "probe", decl: fn}}, "internal/store/repo")
+	edge := "internal/store/repo/synthetic.go::probe->NodePortRangeOccupancyTx"
+	want := map[string]bool{edge: true}
+	if diff := k9CallerDifference(want, actual); len(diff) != 0 {
+		t.Fatalf("real call not recognized: %v", diff)
+	}
+	if diff := k9CallerDifference(map[string]bool{}, actual); len(diff) != 1 {
+		t.Fatal("unregistered caller escaped closure")
+	}
+	if diff := k9CallerDifference(want, map[string]bool{}); len(diff) != 1 {
+		t.Fatal("removed caller escaped closure")
+	}
+	comment := k9ParseFunc(t, `func probe() { /* r.NodePortRangeOccupancyTx(tx, 1, 80, 80, excl) */ }`)
+	actual = k9OccupancyCallerEdges([]k9Func{{file: "synthetic.go", name: "probe", decl: comment}}, "internal/store/repo")
+	if diff := k9CallerDifference(want, actual); len(diff) != 1 {
+		t.Fatal("comment satisfied caller inventory")
+	}
+}

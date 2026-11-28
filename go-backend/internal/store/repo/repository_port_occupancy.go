@@ -1,7 +1,10 @@
 package repo
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 
 	"go-backend/internal/kernel"
 	"go-backend/internal/store/model"
@@ -138,7 +141,7 @@ func pluckPortsNotExcludedTx(base func() *gorm.DB, idColumn string, exclIDs []in
 // 检查顺序 forward → inbound → chain → companion，与
 // FindOtherForwardOnNodePortTx 的报告优先级一致；多源同占（降级态）
 // 时按此序报第一源。
-func (r *Repository) NodePortOccupantTx(tx *gorm.DB, nodeID int64, port int, excl PortExclusions) (string, error) {
+func (r *Repository) NodePortOccupantTx(tx *gorm.DB, nodeID int64, port int, excl PortExclusions, network ...string) (string, error) {
 	if tx == nil {
 		return "", errors.New("database unavailable")
 	}
@@ -146,43 +149,14 @@ func (r *Repository) NodePortOccupantTx(tx *gorm.DB, nodeID int64, port int, exc
 		return "", nil
 	}
 
-	occupied, err := existsOccupantNotExcludedTx(func() *gorm.DB {
-		return tx.Model(&model.ForwardPort{}).Where("node_id = ? AND port = ?", nodeID, port)
-	}, "forward_id", excl.ForwardIDs)
+	occ, err := r.NodePortRangeOccupancyTx(tx, nodeID, port, port, excl, network...)
 	if err != nil {
 		return "", err
 	}
-	if occupied {
-		return PortSourceForward, nil
-	}
-
-	occupied, err = existsOccupantNotExcludedTx(func() *gorm.DB {
-		return tx.Model(&model.NodeInbound{}).Where("node_id = ? AND port = ?", nodeID, port)
-	}, "id", excl.InboundIDs)
-	if err != nil {
-		return "", err
-	}
-	if occupied {
-		return PortSourceInbound, nil
-	}
-
-	occupied, err = existsOccupantNotExcludedTx(func() *gorm.DB {
-		return tx.Model(&model.ChainTunnel{}).Where("node_id = ? AND port = ? AND port > 0", nodeID, port)
-	}, "tunnel_id", excl.TunnelIDs)
-	if err != nil {
-		return "", err
-	}
-	if occupied {
-		return PortSourceChain, nil
-	}
-
-	// P1-01（PortAlloc Fix A）：伴生 Clash API 口（第四源，DB 无行）
-	// ——按节点 secret 派生的 41000–41999 段内一口，agent 侧常驻监听。
-	// 此前统一谓词看不到它，自动选口会抽中它、下发 bind 失败。
-	// 派生口是面板的唯一认知：agent 重启漂移后的实际口由 live 探针
-	// （转发/中转创建）兜底。
-	if companionClashAPIPortTx(tx, nodeID) == port {
-		return PortSourceCompanion, nil
+	for _, source := range []string{PortSourceForward, PortSourceInbound, PortSourceChain, PortSourceCompanion} {
+		if occ.Sources[source] {
+			return source, nil
+		}
 	}
 
 	return "", nil
@@ -205,8 +179,8 @@ func companionClashAPIPortTx(tx *gorm.DB, nodeID int64) int {
 }
 
 // NodePortOccupiedTx 是 NodePortOccupantTx 的布尔形。
-func (r *Repository) NodePortOccupiedTx(tx *gorm.DB, nodeID int64, port int, excl PortExclusions) (bool, error) {
-	source, err := r.NodePortOccupantTx(tx, nodeID, port, excl)
+func (r *Repository) NodePortOccupiedTx(tx *gorm.DB, nodeID int64, port int, excl PortExclusions, network ...string) (bool, error) {
+	source, err := r.NodePortOccupantTx(tx, nodeID, port, excl, network...)
 	if err != nil {
 		return false, err
 	}
@@ -298,15 +272,26 @@ type PortRangeOccupancy struct {
 }
 
 // NodePortRangeOccupancyTx 返回区间内各来源的占用情况（四源）。
-func (r *Repository) NodePortRangeOccupancyTx(tx *gorm.DB, nodeID int64, lo, hi int, excl PortExclusions) (*PortRangeOccupancy, error) {
+func (r *Repository) NodePortRangeOccupancyTx(tx *gorm.DB, nodeID int64, lo, hi int, excl PortExclusions, network ...string) (*PortRangeOccupancy, error) {
 	if tx == nil {
 		return nil, errors.New("database unavailable")
 	}
 	occ := &PortRangeOccupancy{Sources: map[string]bool{}}
+	netSpec := ""
+	if len(network) > 0 {
+		netSpec = network[0]
+	}
+	inboundIdentity := func(row model.NodeInbound) (int64, string) {
+		in, err := InboundFromModel(row)
+		if err != nil {
+			return row.ID, ""
+		} // Damaged occupancy stays fail-closed.
+		return row.ID, InboundPortNetwork(in)
+	}
 
-	inboundOccupied, err := existsOccupantNotExcludedTx(func() *gorm.DB {
+	inboundOccupied, err := existsNetworkOccupantNotExcludedTx(func() *gorm.DB {
 		return tx.Model(&model.NodeInbound{}).Where("node_id = ? AND port BETWEEN ? AND ?", nodeID, lo, hi)
-	}, "id", excl.InboundIDs)
+	}, "id", excl.InboundIDs, netSpec, inboundIdentity)
 	if err != nil {
 		return nil, err
 	}
@@ -314,9 +299,9 @@ func (r *Repository) NodePortRangeOccupancyTx(tx *gorm.DB, nodeID int64, lo, hi 
 		occ.Sources[PortSourceInbound] = true
 		// F7 (B-05)：伴生入站命名需要单独确认；原实现对该查询的
 		// 错误是吞掉的（err == nil 才采信），保持同口径。
-		companionOccupied, compErr := existsOccupantNotExcludedTx(func() *gorm.DB {
+		companionOccupied, compErr := existsNetworkOccupantNotExcludedTx(func() *gorm.DB {
 			return tx.Model(&model.NodeInbound{}).Where("node_id = ? AND port BETWEEN ? AND ? AND companion_of > 0", nodeID, lo, hi)
-		}, "id", excl.InboundIDs)
+		}, "id", excl.InboundIDs, netSpec, inboundIdentity)
 		if compErr == nil && companionOccupied {
 			occ.InboundCompanion = true
 		}
@@ -332,9 +317,14 @@ func (r *Repository) NodePortRangeOccupancyTx(tx *gorm.DB, nodeID int64, lo, hi 
 		occ.Sources[PortSourceForward] = true
 	}
 
-	chainOccupied, err := existsOccupantNotExcludedTx(func() *gorm.DB {
+	chainOccupied, err := existsNetworkOccupantNotExcludedTx(func() *gorm.DB {
 		return tx.Model(&model.ChainTunnel{}).Where("node_id = ? AND port BETWEEN ? AND ?", nodeID, lo, hi)
-	}, "tunnel_id", excl.TunnelIDs)
+	}, "tunnel_id", excl.TunnelIDs, netSpec, func(row model.ChainTunnel) (int64, string) {
+		if !row.Protocol.Valid {
+			return row.TunnelID, ""
+		}
+		return row.TunnelID, ChainTunnelPortNetwork(row.Protocol.String)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -343,7 +333,7 @@ func (r *Repository) NodePortRangeOccupancyTx(tx *gorm.DB, nodeID int64, lo, hi 
 	}
 
 	// P1-01：伴生 Clash API 派生口落入区间即第四源占用。
-	if cp := companionClashAPIPortTx(tx, nodeID); cp > 0 && cp >= lo && cp <= hi {
+	if cp := companionClashAPIPortTx(tx, nodeID); cp > 0 && cp >= lo && cp <= hi && PortNetworksOverlap(netSpec, "tcp") {
 		occ.Sources[PortSourceCompanion] = true
 	}
 
@@ -388,4 +378,102 @@ func (r *Repository) TunnelChainPortReusableTx(tx *gorm.DB, nodeID int64, port i
 		return false, err
 	}
 	return !occupied, nil
+}
+
+// InboundFromModel is shared with the handler so occupancy derives the
+// listening network from the same decoded inbound used for rendering.
+func InboundFromModel(row model.NodeInbound) (kernel.Inbound, error) {
+	in := kernel.Inbound{ID: row.ID, Protocol: row.Protocol, Listen: row.Listen, Port: row.Port,
+		AcceptProxyProtocol: row.AcceptProxyProtocol == 1, OutboundIPStrategy: row.OutboundIPStrategy,
+		ConnIdleSeconds: row.ConnIdleSeconds,
+		// The in-place switch is stored/API-named SSSubscriptionUsers
+		// (node_inbound.ss_subscription_users) and rendered as
+		// kernel InplaceUsers: this is the single mapping point
+		// between the two names (integration ruling).
+		InplaceUsers: row.SSSubscriptionUsers == 1,
+		Companion:    row.CompanionOf > 0}
+	if err := unmarshalInboundField(row.Settings, &in.Settings); err != nil {
+		return in, fmt.Errorf("入站 %d settings 损坏: %v", row.ID, err)
+	}
+	if err := unmarshalInboundField(row.Transport, &in.Transport); err != nil {
+		return in, fmt.Errorf("入站 %d transport 损坏: %v", row.ID, err)
+	}
+	if err := unmarshalInboundField(row.Security, &in.Security); err != nil {
+		return in, fmt.Errorf("入站 %d security 损坏: %v", row.ID, err)
+	}
+	if strings.TrimSpace(row.Extra) != "" {
+		in.Extra = json.RawMessage(row.Extra)
+	}
+	return in, nil
+}
+
+func unmarshalInboundField(raw string, out interface{}) error {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	return json.Unmarshal([]byte(raw), out)
+}
+
+// InboundPortNetwork preserves the allocator's bare-Inbound, fail-closed
+// contract. Network() defaults an unspecified protocol to TCP.
+func InboundPortNetwork(in kernel.Inbound) string {
+	if strings.TrimSpace(in.Protocol) == "" {
+		return ""
+	}
+	return in.Network()
+}
+
+// PortNetworksOverlap treats missing or unknown networks as both protocols.
+func PortNetworksOverlap(a, b string) bool {
+	mask := func(network string) int {
+		switch network {
+		case "tcp":
+			return 1
+		case "udp":
+			return 2
+		default:
+			return 3
+		}
+	}
+	return mask(a)&mask(b) != 0
+}
+
+// ChainTunnelPortNetwork follows buildTunnelListenerConfig's listener type:
+// TLS and raw TCP listen on TCP, UDP on UDP. Unmapped types stay fail-closed.
+func ChainTunnelPortNetwork(protocol string) string {
+	switch strings.ToLower(strings.TrimSpace(protocol)) {
+	case "tls", "tcp":
+		return "tcp"
+	case "udp":
+		return "udp"
+	default:
+		return ""
+	}
+}
+
+// Filter by network in Go after decoding stored fields. Exclusions use a set,
+// keeping SQL parameters bounded even for whole-backup exclusion lists.
+func existsNetworkOccupantNotExcludedTx[T any](base func() *gorm.DB, idColumn string, excludedIDs []int64, network string, identity func(T) (int64, string)) (bool, error) {
+	if PortNetworksOverlap(network, "tcp") && PortNetworksOverlap(network, "udp") {
+		return existsOccupantNotExcludedTx(base, idColumn, excludedIDs)
+	}
+	excluded := make(map[int64]bool, len(excludedIDs))
+	for _, id := range excludedIDs {
+		excluded[id] = true
+	}
+	for offset := 0; ; offset += inListChunkSize {
+		var rows []T
+		if err := base().Order("id ASC").Limit(inListChunkSize).Offset(offset).Find(&rows).Error; err != nil {
+			return false, err
+		}
+		for _, row := range rows {
+			id, occupiedNetwork := identity(row)
+			if !excluded[id] && PortNetworksOverlap(network, occupiedNetwork) {
+				return true, nil
+			}
+		}
+		if len(rows) < inListChunkSize {
+			return false, nil
+		}
+	}
 }
