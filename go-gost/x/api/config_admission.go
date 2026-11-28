@@ -1,0 +1,190 @@
+package api
+
+import (
+	"fmt"
+	"net/http"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+	"github.com/go-gost/core/logger"
+	"github.com/go-gost/x/config"
+	parser "github.com/go-gost/x/config/parsing/admission"
+	"github.com/go-gost/x/registry"
+)
+
+// swagger:parameters createAdmissionRequest
+type createAdmissionRequest struct {
+	// in: body
+	Data config.AdmissionConfig `json:"data"`
+}
+
+// successful operation.
+// swagger:response createAdmissionResponse
+type createAdmissionResponse struct {
+	Data Response
+}
+
+func createAdmission(ctx *gin.Context) {
+	// swagger:route POST /config/admissions Admission createAdmissionRequest
+	//
+	// Create a new admission, the name of admission must be unique in admission list.
+	//
+	//     Security:
+	//       basicAuth: []
+	//
+	//     Responses:
+	//       200: createAdmissionResponse
+
+	var req createAdmissionRequest
+	ctx.ShouldBindJSON(&req.Data)
+
+	name := strings.TrimSpace(req.Data.Name)
+	if name == "" {
+		writeError(ctx, NewError(http.StatusBadRequest, ErrCodeInvalid, "admission name is required"))
+		return
+	}
+	req.Data.Name = name
+
+	if registry.AdmissionRegistry().IsRegistered(name) {
+		writeError(ctx, NewError(http.StatusBadRequest, ErrCodeDup, fmt.Sprintf("admission %s already exists", name)))
+		return
+	}
+
+	v := parser.ParseAdmission(&req.Data)
+
+	if !commitNamedConfig(ctx, registry.AdmissionRegistry(), name, v, false, func(c *config.Config) error {
+		// R18-F02/F-04: 按名 upsert（R17-A 同款）。成员已在配置中、但不在注册表里时
+		// （例如暂停后 loader 跳过注册），无去重 append 会把第二份同名项写进配置并落盘。
+		c.Admissions = upsertNamed(c.Admissions, &req.Data, func(v *config.AdmissionConfig) string { return v.Name })
+		return nil
+	}) {
+		return
+	}
+
+	ctx.JSON(http.StatusOK, Response{
+		Msg: "OK",
+	})
+}
+
+// swagger:parameters updateAdmissionRequest
+type updateAdmissionRequest struct {
+	// in: path
+	// required: true
+	Admission string `uri:"admission" json:"admission"`
+	// in: body
+	Data config.AdmissionConfig `json:"data"`
+}
+
+// successful operation.
+// swagger:response updateAdmissionResponse
+type updateAdmissionResponse struct {
+	Data Response
+}
+
+func updateAdmission(ctx *gin.Context) {
+	// swagger:route PUT /config/admissions/{admission} Admission updateAdmissionRequest
+	//
+	// Update admission by name, the admission must already exist.
+	//
+	//     Security:
+	//       basicAuth: []
+	//
+	//     Responses:
+	//       200: updateAdmissionResponse
+
+	var req updateAdmissionRequest
+	ctx.ShouldBindUri(&req)
+	ctx.ShouldBindJSON(&req.Data)
+
+	name := strings.TrimSpace(req.Admission)
+
+	if !registry.AdmissionRegistry().IsRegistered(name) {
+		writeError(ctx, NewError(http.StatusBadRequest, ErrCodeNotFound, fmt.Sprintf("admission %s not found", name)))
+		return
+	}
+
+	req.Data.Name = name
+
+	v := parser.ParseAdmission(&req.Data)
+
+	if !commitNamedConfig(ctx, registry.AdmissionRegistry(), name, v, false, func(c *config.Config) error {
+		for i := range c.Admissions {
+			// R19-F02: nil 项跳过并记日志（原样保留，清理只走启动自愈），不得 panic。
+			if c.Admissions[i] == nil {
+				logger.Default().Warnf("update admission: skipped nil admission entry at index %d", i)
+				continue
+			}
+			if c.Admissions[i].Name == name {
+				c.Admissions[i] = &req.Data
+				break
+			}
+		}
+		return nil
+	}) {
+		return
+	}
+
+	ctx.JSON(http.StatusOK, Response{
+		Msg: "OK",
+	})
+}
+
+// swagger:parameters deleteAdmissionRequest
+type deleteAdmissionRequest struct {
+	// in: path
+	// required: true
+	Admission string `uri:"admission" json:"admission"`
+}
+
+// successful operation.
+// swagger:response deleteAdmissionResponse
+type deleteAdmissionResponse struct {
+	Data Response
+}
+
+func deleteAdmission(ctx *gin.Context) {
+	// swagger:route DELETE /config/admissions/{admission} Admission deleteAdmissionRequest
+	//
+	// Delete admission by name.
+	//
+	//     Security:
+	//       basicAuth: []
+	//
+	//     Responses:
+	//       200: deleteAdmissionResponse
+
+	var req deleteAdmissionRequest
+	ctx.ShouldBindUri(&req)
+
+	name := strings.TrimSpace(req.Admission)
+
+	if !registry.AdmissionRegistry().IsRegistered(name) {
+		writeError(ctx, NewError(http.StatusBadRequest, ErrCodeNotFound, fmt.Sprintf("admission %s not found", name)))
+		return
+	}
+
+	var zero = registry.AdmissionRegistry().Get(name)
+	if !commitNamedConfig(ctx, registry.AdmissionRegistry(), name, zero, true, func(c *config.Config) error {
+		admissiones := c.Admissions
+		c.Admissions = nil
+		for _, s := range admissiones {
+			// R19-F02: nil 项原样保留并记日志，不得 panic（清理只走启动自愈）。
+			if s == nil {
+				logger.Default().Warnf("delete admission: kept nil admission entry as-is")
+				c.Admissions = append(c.Admissions, s)
+				continue
+			}
+			if s.Name == name {
+				continue
+			}
+			c.Admissions = append(c.Admissions, s)
+		}
+		return nil
+	}) {
+		return
+	}
+
+	ctx.JSON(http.StatusOK, Response{
+		Msg: "OK",
+	})
+}

@@ -1,0 +1,473 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/go-gost/core/auth"
+	"github.com/go-gost/core/logger"
+	"github.com/go-gost/core/service"
+	api_service "github.com/go-gost/x/api/service"
+	xauth "github.com/go-gost/x/auth"
+	"github.com/go-gost/x/config"
+	"github.com/go-gost/x/config/loader"
+	auth_parser "github.com/go-gost/x/config/parsing/auth"
+	"github.com/go-gost/x/config/parsing/parser"
+	"github.com/go-gost/x/kernel"
+	xmetrics "github.com/go-gost/x/metrics"
+	metrics "github.com/go-gost/x/metrics/service"
+	"github.com/go-gost/x/registry"
+	xservice "github.com/go-gost/x/service"
+	"github.com/go-gost/x/socket"
+	"github.com/judwhite/go-svc"
+)
+
+type reporter interface {
+	Stop()
+}
+
+type program struct {
+	startReporter     func() reporter
+	reporter          reporter
+	srvApi            service.Service
+	srvMetrics        service.Service
+	srvProfiling      *http.Server
+	profilingListener net.Listener
+
+	cancel  context.CancelFunc
+	stopped bool
+}
+
+func (p *program) Init(env svc.Environment) error {
+	parser.Init(parser.Args{
+		CfgFile:     cfgFile,
+		Services:    services,
+		Nodes:       nodes,
+		Debug:       debug,
+		Trace:       trace,
+		ApiAddr:     apiAddr,
+		MetricsAddr: metricsAddr,
+	})
+
+	return nil
+}
+
+func (p *program) Start() (err error) {
+	unlock := config.LockMutation()
+	defer unlock()
+	p.stopped = false
+	defer func() {
+		if err != nil {
+			p.stopRuntime()
+		}
+	}()
+	cfg, err := parser.Parse()
+	if err != nil {
+		return err
+	}
+
+	// R17-A: 存量毒化 gost.json 自愈（见 healPersistedConfig；R2-A01-001 补齐全部 17 类，R18-F03 扩展
+	// 到 chains / limiters / climiters）。
+	healPersistedConfig(cfg)
+
+	if outputFormat != "" {
+		if err := cfg.Write(os.Stdout, outputFormat); err != nil {
+			return err
+		}
+		os.Exit(0)
+	}
+
+	if err := loader.Load(cfg); err != nil {
+		return err
+	}
+
+	if err := p.run(cfg); err != nil {
+		return err
+	}
+
+	config.Set(cfg)
+	socket.EnableConfigPersist()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	p.cancel = cancel
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, syscall.SIGHUP)
+	go p.reload(ctx, c)
+
+	// F-033: Restore 必须在 reporter 启动前同步完成。旧实现异步 Restore
+	// 与面板上线重下发（plans/070 B5）无序竞争：面板的 KernelApply 先
+	// 落地后，Restore 再按 state.json 的旧配置逐个 Apply，谁后执行谁
+	// 生效，面板新配置会被旧配置覆盖（60s 周期重下发才自愈）。
+	kernel.Default().Restore()
+
+	// A connected panel may immediately send commands. Only expose the agent
+	// after initial config loading, runtime startup and persistence are ready.
+	if p.startReporter != nil {
+		p.reporter = p.startReporter()
+	}
+
+	go func() {
+		select {
+		case <-time.After(10 * time.Second):
+			xservice.StartConfigReporter(ctx)
+		case <-ctx.Done():
+			return
+		}
+	}()
+
+	return nil
+}
+
+// loopbackOnlyAddr rewrites a listen address to 127.0.0.1,
+// keeping its port (C2-F07). An address whose port cannot be
+// parsed falls back to the default profiling port on loopback
+// rather than risking an exposed bind.
+func loopbackOnlyAddr(addr string) string {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil || port == "" {
+		return "127.0.0.1:6060"
+	}
+	return net.JoinHostPort("127.0.0.1", port)
+}
+
+func (p *program) run(cfg *config.Config) (err error) {
+	defer func() {
+		if err != nil {
+			// Auxiliary listeners may occupy ports required by the rollback config.
+			// Release all resources opened by this attempt before rebuilding it.
+			p.stopRuntime()
+		}
+	}()
+	for _, svc := range registry.ServiceRegistry().GetAll() {
+		svc := svc
+		go func() {
+			svc.Serve()
+		}()
+	}
+
+	if p.srvApi != nil {
+		p.srvApi.Close()
+		p.srvApi = nil
+	}
+	if cfg.API != nil {
+		s, err := buildApiService(cfg.API)
+		if err != nil {
+			return err
+		}
+
+		p.srvApi = s
+
+		go func() {
+			defer s.Close()
+
+			log := logger.Default().WithFields(map[string]any{"kind": "service", "service": "@api"})
+
+			log.Info("listening on ", s.Addr())
+			if err := s.Serve(); !errors.Is(err, http.ErrServerClosed) {
+				log.Error(err)
+			}
+		}()
+	}
+
+	xmetrics.Enable(false)
+	if p.srvMetrics != nil {
+		p.srvMetrics.Close()
+		p.srvMetrics = nil
+	}
+	if cfg.Metrics != nil && cfg.Metrics.Addr != "" {
+		s, err := buildMetricsService(cfg.Metrics)
+		if err != nil {
+			return err
+		}
+
+		p.srvMetrics = s
+
+		xmetrics.Enable(true)
+
+		go func() {
+			defer s.Close()
+
+			log := logger.Default().WithFields(map[string]any{"kind": "service", "service": "@metrics"})
+
+			log.Info("listening on ", s.Addr())
+			if err := s.Serve(); !errors.Is(err, http.ErrServerClosed) {
+				log.Error(err)
+			}
+		}()
+	}
+
+	if p.srvProfiling != nil {
+		p.srvProfiling.Close()
+		if p.profilingListener != nil {
+			p.profilingListener.Close()
+			p.profilingListener = nil
+		}
+		p.srvProfiling = nil
+	}
+	if cfg.Profiling != nil {
+		addr := cfg.Profiling.Addr
+		if addr == "" {
+			addr = ":6060"
+		}
+		// C2-F07: the profiling server is net/http/pprof with no
+		// authentication — it must never be reachable off-host.
+		// Force loopback regardless of the configured host part
+		// (the default ":6060" binds every interface).
+		if forced := loopbackOnlyAddr(addr); forced != addr {
+			logger.Default().Warnf("profiling address %s forced to %s (pprof is unauthenticated, loopback only)", addr, forced)
+			addr = forced
+		}
+		s := &http.Server{
+			Addr: addr,
+		}
+		ln, err := api_service.Listen("tcp", addr)
+		if err != nil {
+			return err
+		}
+		p.srvProfiling = s
+		p.profilingListener = ln
+
+		go func() {
+			defer s.Close()
+
+			log := logger.Default().WithFields(map[string]any{"kind": "service", "service": "@profiling"})
+
+			log.Info("listening on ", addr)
+			if err := s.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
+				log.Error(err)
+			}
+		}()
+	}
+
+	return nil
+}
+
+func (p *program) Stop() error {
+	if p.cancel != nil {
+		p.cancel()
+	}
+
+	if p.reporter != nil {
+		p.reporter.Stop()
+	}
+	kernel.Default().Shutdown()
+	unlock := config.LockMutation()
+	defer unlock()
+	p.stopped = true
+	p.stopRuntime()
+	// 停机收尾：stopRuntime 已关采样来源并两遍 FlushTraffic 把尾
+	// 量交进管理器，这里停管理器并把全部未报流量落盘进 spool，
+	// 下次启动续报——正常升级/重启只余「第二遍换出后仍未排空的
+	// 连接在退出前计入的亚秒级尾量」这一残余窗口（审计 A-T-02）。
+	xservice.GetGlobalTrafficManager().Stop()
+	return nil
+}
+
+// stopRuntimeSettle 是停机两遍 FlushTraffic 之间的收敛等待：监听
+// 关闭后，排空中的连接与采样协程仍可能把最后字节计入 stats 或投
+// 递进管理器，给它们一个短暂窗口再做第二遍换出。
+var stopRuntimeSettle = 200 * time.Millisecond
+
+func (p *program) stopRuntime() {
+	services := registry.ServiceRegistry().GetAll()
+	// 先全集注销：Unregister 连带 Close 监听与 handler（采样来源
+	// 随 Serve 返回而停、新连接不再进入），再两遍 FlushTraffic
+	// 承接尾量——第一遍换出关闭前已计入 stats 的量，第二遍承接
+	// 关闭排空期间新计入的量。旧顺序逐服务「注销＋换出」交错进
+	// 行：先换出的服务在后续服务处理期间新计入的尾量无人再换、
+	// 随进程退出丢失（审计 A-T-02）。残余例外只有第二遍换出后
+	// 仍未排空的连接在进程退出前计入的字节，量级为亚秒级尾量。
+	for name := range services {
+		registry.ServiceRegistry().Unregister(name)
+		logger.Default().Debugf("service %s shutdown", name)
+	}
+	xservice.FlushServicesTrafficTwice(services, stopRuntimeSettle)
+
+	if p.srvApi != nil {
+		p.srvApi.Close()
+		p.srvApi = nil
+		logger.Default().Debug("service @api shutdown")
+	}
+	if p.srvMetrics != nil {
+		p.srvMetrics.Close()
+		p.srvMetrics = nil
+		logger.Default().Debug("service @metrics shutdown")
+	}
+	if p.srvProfiling != nil {
+		p.srvProfiling.Close()
+		if p.profilingListener != nil {
+			p.profilingListener.Close()
+			p.profilingListener = nil
+		}
+		p.srvProfiling = nil
+		logger.Default().Debug("service @profiling shutdown")
+	}
+}
+
+func (p *program) reload(ctx context.Context, c chan os.Signal) {
+	defer signal.Stop(c)
+
+	for {
+		select {
+		case <-c:
+			if err := p.reloadConfig(); err != nil {
+				logger.Default().Error(err)
+			} else {
+				logger.Default().Info("config reloaded")
+			}
+
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (p *program) reloadConfig() error {
+	unlock := config.LockMutation()
+	defer unlock()
+	if p.stopped {
+		return errors.New("agent is shutting down")
+	}
+	cfg, err := parser.Parse()
+	if err != nil {
+		return err
+	}
+	// R17-A: SIGHUP 重载走同一加载路径，毒化文件同样先自愈（R2-A01-001：全部 17 类，R18-F03：含
+	// chains / limiters / climiters）。
+	healPersistedConfig(cfg)
+	if err := loader.Reload(cfg, p.run); err != nil {
+		return err
+	}
+	activeServices := make(map[string]struct{}, len(cfg.Services))
+	for _, svc := range cfg.Services {
+		if svc != nil {
+			activeServices[svc.Name] = struct{}{}
+		}
+	}
+	xservice.GetGlobalTrafficManager().RetainServices(activeServices)
+
+	return nil
+}
+
+// healPersistedConfig 去重启动/重载时加载的落盘配置（R17-A 仅服务；
+// R18-F03 扩展到链与限流器；R18-INT 补 rate limiter；R2-A01-001 补齐
+// 全部 17 类命名切片；R20-F04 补无引用 conn limiter 剪除），并剥离
+// nil 项
+// （R19-F02：落盘 JSON null 读入后的内存形态，先剥离再加载、并重新落盘，
+// 否则 loader.Load 在首个 nil 类 panic、agent 退出且文件不被清理，
+// 重启后再次崩溃）。返回被去掉的重复名、无引用 conn limiter 名与 nil 项
+// 描述（全集去重 + nil 剥离 + 无引用剪除合并）。存量 gost.json
+// 若含重复服务名，loader.Load 会在第二个同名服务处失败（监听器 eager 绑定报
+// address already in use，或 Register 报 registry: duplicate object）；其余
+// 命名类别同名时同样在第二个同名项的 Register 处报 registry: duplicate
+// object——任一分支都使 program.Start 直接返回错误、agent 退出，故先去重
+// （保留首次出现）再加载；去重后把清理过的配置重新落盘，否则下次启动仍会读
+// 到毒化文件。去重了哪些名以 Warn 日志按类写明。落盘失败只告警、不阻塞启动
+// （下次启动会再次自愈）。各类各调一次 Heal*、各落盘一次（毒化多类时每类
+// 一次原子写；最终落盘文件含全部类别的愈合结果）。去重之后再剪无引用
+// conn limiter（R20-F04，见 config.PruneUnreferencedCLimiters）：存量孤儿
+// （如删转发/更新去限流后残留的 rule_conn_limit_<id>）在下次启动/重载时
+// 自愈，剪掉后同样重新落盘；user_conn_limit_* 永不剪。
+func healPersistedConfig(cfg *config.Config) []string {
+	// R3-A01-003: 自愈序本体已抽到 config.HealPersistedConfig 共用
+	// 入口（StripNil → HealDuplicates → HealOrphanCLimiters），本函数
+	// 只负责按启动口径打日志。本地管理 API 的重载入口同调共用入口，
+	// 两条加载路径自愈同序同果，不再各维护一份清单。
+	report := config.HealPersistedConfig(cfg)
+	// R19-F02: 先剥离 nil 项（落盘 JSON null 读入后的内存形态）并重新
+	// 落盘——nil 项拒绝落盘、不得进自愈保留；否则随后 loader.Load 在
+	// 首个 nil 类的 `.Name` 处 panic、agent 退出，且文件未被清理，
+	// 重启后再次崩溃（崩溃循环）。落盘失败只告警、不阻塞启动（下次
+	// 启动会再次自愈）。
+	if len(report.Stripped) > 0 {
+		logger.Default().Warnf("startup config self-heal: removed %s from persisted config", strings.Join(report.Stripped, ", "))
+		if report.StripPersistErr != nil {
+			logger.Default().Warnf("startup config self-heal: failed to persist nil-stripped config: %v", report.StripPersistErr)
+		}
+	}
+	// R2-A01-001: 去重走全集聚合（全部 17 类命名切片，枚举与 Config
+	// 结构由 x/config 的回归测试以反射断言差集 ∅）。此前只接线五类，
+	// 其余 12 类（hop / bypass / resolver 等）同名毒化时 loader.Load
+	// 直接 duplicate object 致命退出、文件无人清理、节点永久离线。
+	for _, heal := range report.Duplicates {
+		logger.Default().Warnf("startup config self-heal: removed duplicate %s(s) %v from persisted config", heal.Kind, heal.Removed)
+		if heal.Err != nil {
+			logger.Default().Warnf("startup config self-heal: failed to persist deduplicated config: %v", heal.Err)
+		}
+	}
+	// R20-F04: 剪无引用 conn limiter（存量孤儿清理）。去重之后、加载
+	// 之前：引用集按去重后的存活服务算；user_conn_limit_* 永不剪；
+	// 剪掉后重新落盘，否则下次启动仍会读到孤儿。落盘失败只告警、
+	// 不阻塞启动。
+	if len(report.Pruned) > 0 {
+		logger.Default().Warnf("startup config self-heal: removed unreferenced conn limiter(s) %v from persisted config", report.Pruned)
+		if report.PrunePersistErr != nil {
+			logger.Default().Warnf("startup config self-heal: failed to persist pruned config: %v", report.PrunePersistErr)
+		}
+	}
+	return report.Removed()
+}
+
+func buildApiService(cfg *config.APIConfig) (service.Service, error) {
+	if cfg == nil {
+		return nil, errors.New("management API configuration is required")
+	}
+	if cfg.Auth != nil && cfg.Auth.Username != "" && cfg.Auth.Password == "" {
+		return nil, errors.New("management API requires a non-empty password")
+	}
+	var authers []auth.Authenticator
+	if auther := auth_parser.ParseAutherFromAuth(cfg.Auth); auther != nil {
+		authers = append(authers, auther)
+	}
+	if cfg.Auther != "" {
+		if !registry.AutherRegistry().IsRegistered(cfg.Auther) {
+			return nil, fmt.Errorf("management API authenticator %q not found", cfg.Auther)
+		}
+		authers = append(authers, registry.AutherRegistry().Get(cfg.Auther))
+	}
+
+	var auther auth.Authenticator
+	if len(authers) > 0 {
+		auther = xauth.AuthenticatorGroup(authers...)
+	}
+
+	network := "tcp"
+	addr := cfg.Addr
+	if strings.HasPrefix(addr, "unix://") {
+		network = "unix"
+		addr = strings.TrimPrefix(addr, "unix://")
+	}
+	return api_service.NewService(
+		network, addr,
+		api_service.PathPrefixOption(cfg.PathPrefix),
+		api_service.AccessLogOption(cfg.AccessLog),
+		api_service.AutherOption(auther),
+	)
+}
+
+func buildMetricsService(cfg *config.MetricsConfig) (service.Service, error) {
+	auther := auth_parser.ParseAutherFromAuth(cfg.Auth)
+	if cfg.Auther != "" {
+		auther = registry.AutherRegistry().Get(cfg.Auther)
+	}
+
+	network := "tcp"
+	addr := cfg.Addr
+	if strings.HasPrefix(addr, "unix://") {
+		network = "unix"
+		addr = strings.TrimPrefix(addr, "unix://")
+	}
+	return metrics.NewService(
+		network, addr,
+		metrics.PathOption(cfg.Path),
+		metrics.AutherOption(auther),
+	)
+}

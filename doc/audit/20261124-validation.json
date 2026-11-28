@@ -1,0 +1,101 @@
+{
+  "changedCodeSHA256": "dcacf7e7f4907dc726e53e536f58a1cf4ddbb1ce95853723763784a8b01c531d",
+  "logs": [
+    {
+      "log": "/tmp/ovo-remediation-evidence/handler-scoped-final.jsonl",
+      "sha256": "dd25c249a6b8c7ec5b8f6a1fee160a5145b5000f21df2ddbf005301b7d2d245f",
+      "bytes": 786334,
+      "testPassEvents": 129,
+      "failEvents": 0,
+      "packageResults": [
+        {
+          "package": "go-backend/internal/http/handler",
+          "action": "pass"
+        }
+      ]
+    },
+    {
+      "log": "/tmp/ovo-remediation-evidence/backend-race-final.jsonl",
+      "sha256": "ec0ae3804ad33e235d5f32c2b4979658f06990d90b8e0329170b1ff66ae32cf9",
+      "bytes": 543491,
+      "testPassEvents": 112,
+      "failEvents": 0,
+      "packageResults": [
+        {
+          "package": "go-backend/internal/health",
+          "action": "pass"
+        },
+        {
+          "package": "go-backend/internal/store/repo",
+          "action": "pass"
+        },
+        {
+          "package": "go-backend/internal/http/handler",
+          "action": "pass"
+        }
+      ]
+    },
+    {
+      "log": "/tmp/ovo-remediation-evidence/agent-final.log",
+      "sha256": "132e7f0337158dd01b6d7db24d9f9f78915a82809c6bb7174d6f9e7df0ac1c8a",
+      "bytes": 281
+    },
+    {
+      "log": "/tmp/ovo-remediation-evidence/service-contracts-final.log",
+      "sha256": "01080312a125bdae405d43ebe1f64236dbfc58c11ff162a625af62cf1bf29334",
+      "bytes": 77
+    },
+    {
+      "log": "/tmp/ovo-remediation-evidence/ownership-final.log",
+      "sha256": "c04aadfa383379f5def33887c96466deebe31127f53d30e121189c5bdded6515",
+      "bytes": 385
+    },
+    {
+      "log": "/tmp/ovo-remediation-evidence/health-final.log",
+      "sha256": "d2e0de81fc6b765a4e9913f4ecd9fdb71d37aef873631e6eaf448841c07d832e",
+      "bytes": 39
+    },
+    {
+      "log": "/tmp/ovo-remediation-evidence/kernel-associated.log",
+      "sha256": "f59db84e2133f1fb66db43bc426e2ca327df1138e6fa379c4ac568aa291c2094",
+      "bytes": 39
+    },
+    {
+      "log": "/tmp/ovo-remediation-evidence/agent-main-auth.log",
+      "sha256": "aa2ab441dfe98d0dccbbb967bbdd8669085a236df26abf161023efe226ac9316",
+      "bytes": 36
+    },
+    {
+      "log": "/tmp/ovo-remediation-evidence/frontend-eslint.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "log": "/tmp/ovo-remediation-evidence/timeout-budgets.log",
+      "sha256": "d81c90d2d81275dcedf1b4e1f1b12a80642587689e4e3eed7de83c2f7b592d50",
+      "bytes": 85
+    },
+    {
+      "log": "/tmp/ovo-remediation-evidence/chain-final-target.log",
+      "sha256": "b790492cb475d2b10398b5f5a8ca382959886e312b0199c6ccd795b4ab2df2b3",
+      "bytes": 39
+    },
+    {
+      "log": "/tmp/ovo-remediation-evidence/backend-packages.log",
+      "sha256": "fab428caf9a59e242ac1af6cf5132a98b3b2fbf427bcacd7a635232ca8527e82",
+      "bytes": 1591584,
+      "note": "handler traversal interrupted during unrelated long-ACK test; repo and health passed. Not an overall PASS."
+    },
+    {
+      "log": "/tmp/ovo-remediation-evidence/agent-packages.log",
+      "sha256": "28eef8eb8315048476fafe857a2fa832bb8a12f765384d918afe0c74a3ccdf2b",
+      "bytes": 33887,
+      "note": "initial run had two API status-contract failures; fixed and verified in service-contracts-final and agent-final. Other listed packages passed."
+    },
+    {
+      "log": "/tmp/ovo-remediation-evidence/api-auth-final.log",
+      "sha256": "16d1d052cb3a57521f53a72d44fa0153f1eaecbecb6e1e3f812e6c5b2ba513a9",
+      "bytes": 37
+    }
+  ]
+}

@@ -1,0 +1,2616 @@
+import type {
+  SystemUpgradeCheckApiData,
+  SystemUpgradeReleaseApiItem,
+  SystemUpgradeStatusApiData,
+  SystemUpgradeVersionApiData,
+} from "@/api/types";
+
+import { useState, useEffect, useRef } from "react";
+import { useNavigate, useLocation } from "react-router-dom";
+import { AnimatePresence, motion } from "framer-motion";
+import toast from "react-hot-toast";
+
+import { Button } from "@/shadcn-bridge/heroui/button";
+import { Card, CardBody, CardHeader } from "@/shadcn-bridge/heroui/card";
+import { Input } from "@/shadcn-bridge/heroui/input";
+import { Spinner } from "@/shadcn-bridge/heroui/spinner";
+import { Divider } from "@/shadcn-bridge/heroui/divider";
+import { Switch } from "@/shadcn-bridge/heroui/switch";
+import { Select, SelectItem } from "@/shadcn-bridge/heroui/select";
+import { Checkbox } from "@/shadcn-bridge/heroui/checkbox";
+import {
+  Modal,
+  ModalBody,
+  ModalContent,
+  ModalFooter,
+  ModalHeader,
+} from "@/shadcn-bridge/heroui/modal";
+import {
+  updateConfigs,
+  exportBackup,
+  importBackup,
+  downloadImportAutoBackup,
+  getImportAutoBackupStatus,
+  type ImportAutoBackupStatus,
+  getStorageSummary,
+  getSystemUpgradeVersion,
+  getSystemUpgradeStatus,
+  checkSystemUpgrade,
+  runSystemUpgrade,
+} from "@/api";
+import { BackIcon, SettingsIcon } from "@/components/icons";
+import { NotifyCard } from "@/pages/config/notify-card";
+import { BackupImportReceiptPanel } from "@/pages/config/import-receipt";
+import { LatencySettings } from "@/pages/config/latency-card";
+import { SubFrontSettings } from "@/pages/config/sub-front-card";
+import { isAdmin } from "@/utils/auth";
+import { SUBSCRIPTION_FRONT_URLS_KEY } from "@/utils/subscription-front";
+import { getCachedConfigs, configCache, updateSiteConfig } from "@/config/site";
+import { SENSITIVE_CONFIG_KEYS } from "@/config/sensitive-keys";
+import {
+  DEFAULT_TUNNEL_QUALITY_INTERVAL_SEC,
+  MAX_TUNNEL_QUALITY_INTERVAL_SEC,
+  MIN_TUNNEL_QUALITY_INTERVAL_SEC,
+  parseTunnelQualityIntervalSeconds,
+  resolveTunnelQualityEnabled,
+  TUNNEL_QUALITY_ENABLED_CONFIG_KEY,
+  TUNNEL_QUALITY_INTERVAL_CONFIG_KEY,
+  validateTunnelQualityInterval,
+} from "@/config/tunnel-quality";
+import {
+  type UpdateReleaseChannel,
+  compareVersions,
+  getUpdateReleaseChannel,
+} from "@/utils/version-update";
+import {
+  convertBrandAssetToPngDataURL,
+  isPngDataURL,
+  type BrandAssetKind,
+} from "@/utils/brand-asset";
+
+// 简单的保存图标组件
+const SaveIcon = ({ className }: { className?: string }) => (
+  <svg
+    className={className}
+    fill="none"
+    stroke="currentColor"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    strokeWidth="2"
+    viewBox="0 0 24 24"
+  >
+    <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" />
+    <polyline points="17,21 17,13 7,13 7,21" />
+    <polyline points="7,3 7,8 15,8" />
+  </svg>
+);
+
+interface ConfigItem {
+  key: string;
+  label: string;
+  placeholder?: string;
+  description?: string;
+  type: "input" | "password" | "switch" | "select" | "bg_image";
+  // 写-only 凭据字段（R7-L8-03）：后端 config/get 对全角色 403、
+  // config/list 删除该键，表单永不回填已保存值——留空＝保留、
+  // 输入＝替换、显式清除并保存＝删除已保存值。
+  writeOnly?: boolean;
+  options?: { label: string; value: string; description?: string }[];
+  dependsOn?: string; // 依赖的配置项key
+  dependsValue?: string; // 依赖的配置项值
+}
+
+type BgImageKey =
+  | "app_bg_image"
+  | "app_bg_image_light"
+  | "app_bg_image_dark"
+  | "login_bg_image";
+
+const BRAND_PREVIEW_KEYS = ["app_logo", "app_favicon"] as const;
+
+type BrandPreviewKey = (typeof BRAND_PREVIEW_KEYS)[number];
+
+const isBrandPreviewKey = (key: string): key is BrandPreviewKey =>
+  BRAND_PREVIEW_KEYS.includes(key as BrandPreviewKey);
+
+const BRAND_FILE_ACCEPT = "image/png,image/jpeg,image/webp,image/svg+xml";
+
+const toBrandAssetKind = (key: BrandPreviewKey): BrandAssetKind => {
+  return key === "app_logo" ? "logo" : "favicon";
+};
+
+// 网站配置项定义
+const CONFIG_ITEMS: ConfigItem[] = [
+  {
+    key: "app_bg_image",
+    label: "主界面壁纸",
+    description:
+      "登录后主界面的背景。默认背景用于未单独设置壁纸的情况；也可单独上传一张壁纸覆盖默认背景（应用只有亮色模式，无需分模式上传）。",
+    type: "bg_image",
+  },
+  {
+    key: "login_bg_image",
+    label: "登录页壁纸",
+    description: "登录界面的背景壁纸，留空则跟随主界面壁纸。",
+    type: "bg_image",
+  },
+  {
+    key: "ip",
+    label: "面板后端地址",
+    placeholder: "如 https://panel.example.com 或 192.0.2.10:6365",
+    description:
+      "节点通过此地址回连面板，生成节点安装命令时使用。面板经 HTTPS（Caddy/nginx 反向代理）对外时必须填 https://域名（可带端口），明文面板填 http://IP:端口。只填裸地址（不带 scheme）时，生成命令的连接方式取自你当前访问面板的方式，可能与节点回连面板的方式不一致，请优先写明 https:// 或 http://。",
+    type: "input",
+  },
+  {
+    key: "panel_domain",
+    label: "面板域名",
+    placeholder: "请输入面板域名",
+    description:
+      "当前面板对外访问的域名。此项为预留配置，当前版本暂无功能读取使用，填写与否不影响面板运行",
+    type: "input",
+  },
+  {
+    key: "app_name",
+    label: "应用名称",
+    placeholder: "请输入应用名称",
+    description: "在浏览器标签页和导航栏显示的应用名称",
+    type: "input",
+  },
+  {
+    key: "app_logo",
+    label: "网页角标 Logo",
+    description: "用于页面左上角导航角标，上传后会自动转换为 PNG 并持久化保存",
+    type: "input",
+  },
+  {
+    key: "app_favicon",
+    label: "浏览器缩略图标",
+    description: "用于浏览器标签页图标，上传后会自动转换为 PNG 并持久化保存",
+    type: "input",
+  },
+  {
+    key: "hide_footer_brand",
+    label: "隐藏页面底部 OVO 版权信息",
+    description: "开启后页面底部不再显示 Powered by OVO",
+    type: "switch",
+  },
+  {
+    key: "forward_compact_mode",
+    label: "规则页面精简模式",
+    description: "开启后，规则页面列表使用 2.1.6-alpha8 样式（全局配置）",
+    type: "switch",
+  },
+  {
+    key: "monitor_tunnel_quality_enabled",
+    label: "实时隧道质量检测",
+    description:
+      "关闭后，前端停止自动刷新，后端停止实时隧道质量探测（全局配置）",
+    type: "switch",
+  },
+  {
+    key: TUNNEL_QUALITY_INTERVAL_CONFIG_KEY,
+    label: "隧道质量探测间隔",
+    placeholder: String(DEFAULT_TUNNEL_QUALITY_INTERVAL_SEC),
+    description:
+      "设置实时隧道质量检测的执行频率，单位为秒；允许 1–3600 秒，默认 1 秒。",
+    type: "input",
+    dependsOn: "monitor_tunnel_quality_enabled",
+    dependsValue: "true",
+  },
+  {
+    key: "monitor_retention_days",
+    label: "监控数据保留天数",
+    placeholder: "7",
+    description:
+      "按此天数清理节点指标、隧道指标、服务监控结果和隧道质量历史；允许 1–400 天，默认 7 天（配大时监控表按写入节奏长期累积，请按磁盘容量评估）。订阅流量小时桶（固定 400 天）与统计流量（固定 48 小时）为固定保留期，不受此设置影响。",
+    type: "input",
+  },
+  {
+    key: "captcha_enabled",
+    label: "启用验证码",
+    description: "开启后，用户登录时需要完成验证码验证",
+    type: "switch",
+  },
+  {
+    key: "cloudflare_site_key",
+    label: "Cloudflare Site Key",
+    placeholder: "请输入 Cloudflare Site Key",
+    description: "Cloudflare Turnstile 站点密钥",
+    type: "input",
+    dependsOn: "captcha_enabled",
+    dependsValue: "true",
+  },
+  {
+    key: "cloudflare_secret_key",
+    label: "Cloudflare Secret Key",
+    placeholder: "留空表示保留已保存的密钥，输入新密钥替换",
+    description: "Cloudflare Turnstile 密钥（仅写入，保存后不再回显）",
+    // F-116：密钥字段必须掩码显示，此前以明文 text 渲染（后端
+    // config_policy 也将其列为敏感键，前端显示口径须一致）。
+    // R7-L8-03：读面已关闭（config/get 全角色 403、config/list
+    // 删除），表单改 writeOnly hint 形态，不再回填已保存值。
+    type: "password",
+    writeOnly: true,
+    dependsOn: "captcha_enabled",
+    dependsValue: "true",
+  },
+  {
+    key: "allow_local_remote_addr",
+    label: "允许转发到本地地址",
+    description:
+      "开启后，普通用户创建或编辑规则时可将目标地址指向 127.0.0.1、10.x.x.x、172.16-31.x.x、192.168.x.x 等本地或内网地址。默认关闭以降低开放代理风险。",
+    type: "switch",
+  },
+];
+
+const BACKUP_TYPE_OPTIONS = [
+  { value: "users", label: "用户" },
+  { value: "nodes", label: "节点" },
+  { value: "tunnels", label: "隧道" },
+  { value: "forwards", label: "规则" },
+  { value: "userTunnels", label: "用户隧道权限" },
+  { value: "speedLimits", label: "限速规则" },
+  { value: "configs", label: "系统配置" },
+  { value: "inbounds", label: "内核与入站" },
+  // 后端 ExportPartial/Import 早已支持，前端清单曾漏列致「全选」仍丢三表（F-026）。
+  { value: "userInbounds", label: "用户入站分配" },
+  { value: "monitorPermissions", label: "监控权限" },
+  // B4/F-004/F-030：订阅分配与监控定义（后端本轮补齐备份，前端同步列出）。
+  { value: "userSubscriptions", label: "订阅分配" },
+  { value: "serviceMonitors", label: "监控定义" },
+  // R2-E3-F02：Passkey 公钥凭据（后端本轮补齐备份，前端同步列出）。
+  { value: "passkeys", label: "通行证密钥" },
+] as const;
+
+const BACKUP_TYPE_VALUES = BACKUP_TYPE_OPTIONS.map((option) => option.value);
+
+// 初始化时从缓存读取配置，避免闪烁
+const getInitialConfigs = (): Record<string, string> => {
+  if (typeof window === "undefined") return {};
+
+  // E1-04：敏感键（如 cloudflare_secret_key）不得进初始缓存读取清单
+  // ——敏感值只能经 API 响应进入页面状态，绝不从 localStorage 回读；
+  // 下方读取时再按 SENSITIVE_CONFIG_KEYS 整表过滤，将来清单新增
+  // 敏感键被误加进这里时自动失效，不靠人工逐键对账。
+  const configKeys = [
+    "app_name",
+    "captcha_enabled",
+    "cloudflare_site_key",
+    "forward_compact_mode",
+    TUNNEL_QUALITY_ENABLED_CONFIG_KEY,
+    TUNNEL_QUALITY_INTERVAL_CONFIG_KEY,
+    "monitor_retention_days",
+    "ip",
+    "panel_domain",
+    "app_logo",
+    "app_favicon",
+    "app_bg_image",
+    "app_bg_image_light",
+    "app_bg_image_dark",
+    "login_bg_image",
+    "allow_local_remote_addr",
+    "hide_footer_brand",
+    "subscription_front_urls",
+  ];
+  const initialConfigs: Record<string, string> = {};
+
+  try {
+    configKeys
+      .filter((key) => !SENSITIVE_CONFIG_KEYS.has(key))
+      .forEach((key) => {
+        // 经 site.ts 的统一缓存层读取，不再直拼 vite_config_ 前缀
+        // 裸读 localStorage（check-sensitive-keys 门钉住此面）。
+        const cachedValue = configCache.get(key);
+
+        if (cachedValue) {
+          initialConfigs[key] = cachedValue;
+        }
+      });
+  } catch {}
+
+  return initialConfigs;
+};
+
+export default function ConfigPage() {
+  const navigate = useNavigate();
+  const location = useLocation();
+
+  // 节点页零测试点提示的落点：带 state.scrollTo 跳转过来时，滚到
+  // 「延迟测试点」卡（state 导航，HashRouter 的演示版也不受影响）。
+  useEffect(() => {
+    if (
+      (location.state as { scrollTo?: string } | null)?.scrollTo !==
+      "latency-targets"
+    ) {
+      return;
+    }
+    const t = window.setTimeout(() => {
+      document
+        .getElementById("latency-targets")
+        ?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 100);
+
+    return () => window.clearTimeout(t);
+  }, [location.state]);
+
+  const initialConfigs = getInitialConfigs();
+  const [configs, setConfigs] =
+    useState<Record<string, string>>(initialConfigs);
+  const [loading, setLoading] = useState(
+    Object.keys(initialConfigs).length === 0,
+  );
+  const [saving, setSaving] = useState(false);
+  const [originalConfigs, setOriginalConfigs] =
+    useState<Record<string, string>>(initialConfigs);
+  const hasChanges =
+    Object.keys(configs).some((key) => configs[key] !== originalConfigs[key]) ||
+    Object.keys(originalConfigs).some(
+      (key) => originalConfigs[key] !== configs[key],
+    );
+  // R2-C3-01（IRL-3 同族）：配置初载失败必须留持久标记＋重试入口。
+  // 只加标记、不禁保存：handleSave 只发 changedPayload 差异键，载失败
+  // 显空默认值也不会整表清零。
+  const [configsLoadFailed, setConfigsLoadFailed] = useState(false);
+
+  const [exportTypes, setExportTypes] = useState<string[]>([]);
+  const [importTypes, setImportTypes] = useState<string[]>([]);
+  const [exporting, setExporting] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [exportSelectorOpen, setExportSelectorOpen] = useState(false);
+  const [importSelectorOpen, setImportSelectorOpen] = useState(false);
+  const [importFileName, setImportFileName] = useState("");
+  // 待确认的导入内容：选文件只解析暂存，必须经确认框才真正执行导入
+  // （D7-01：此前选文件即导入，零确认零语义说明）。
+  const [pendingImport, setPendingImport] = useState<{
+    fileName: string;
+    data: Record<string, unknown>;
+  } | null>(null);
+  const [importConfirmOpen, setImportConfirmOpen] = useState(false);
+  // 导入前自动备份快照状态（SEC-01 BC-01(b)）：快照只留存服务端 24 小时，
+  // 不再经导入回执下发到内存（SEC-01）；按钮仅在 status.exists 为真时
+  // 出现，点击走服务端下载端点。快照过期后服务端自动清理。
+  const [importAutoBackupStatus, setImportAutoBackupStatus] =
+    useState<ImportAutoBackupStatus | null>(null);
+  // 最近一次本地导入的完整回执（R2-C5-01）：toast 只报计数摘要，
+  // 回执全文（警告逐条点名、屏蔽恢复数、SSH/重推节点清单）在导入区
+  // 下方的披露面呈现，不随弹窗关闭丢失。
+  const [lastImportReceipt, setLastImportReceipt] = useState<Record<
+    string,
+    unknown
+  > | null>(null);
+  const backupFileInputRef = useRef<HTMLInputElement>(null);
+
+  const logoFileInputRef = useRef<HTMLInputElement>(null);
+  const faviconFileInputRef = useRef<HTMLInputElement>(null);
+  const bgImageFileInputRefs = useRef<
+    Partial<Record<BgImageKey, HTMLInputElement>>
+  >({});
+  const [bgImageUploading, setBgImageUploading] = useState<BgImageKey | null>(
+    null,
+  );
+
+  const updateChannel: UpdateReleaseChannel = getUpdateReleaseChannel();
+  const [systemUpgradeInfo, setSystemUpgradeInfo] =
+    useState<SystemUpgradeVersionApiData | null>(null);
+  const [systemUpgradeChecking, setSystemUpgradeChecking] = useState(false);
+  const [systemUpgradeExecuting, setSystemUpgradeExecuting] = useState(false);
+  const [systemUpgradeLoading, setSystemUpgradeLoading] = useState(true);
+  const [systemUpgradeModalOpen, setSystemUpgradeModalOpen] = useState(false);
+  const [systemUpgradeReleases, setSystemUpgradeReleases] = useState<
+    SystemUpgradeReleaseApiItem[]
+  >([]);
+  const [systemUpgradeCheckedChannel, setSystemUpgradeCheckedChannel] =
+    useState<UpdateReleaseChannel | null>(null);
+  const [systemUpgradeSelectedVersion, setSystemUpgradeSelectedVersion] =
+    useState("");
+  // P3-2：后端升级状态（进行中/上次结果），刷新页面后也能恢复展示
+  const [systemUpgradeStatus, setSystemUpgradeStatus] =
+    useState<SystemUpgradeStatusApiData | null>(null);
+  const systemUpgradePollRef = useRef<number | null>(null);
+  // F-L6-01：备份导入下发的在途标记（入口同步复核用，见 executePendingImport）。
+  const importInFlightRef = useRef(false);
+  const [previewLoadFailed, setPreviewLoadFailed] = useState<
+    Partial<Record<BrandPreviewKey, boolean>>
+  >({});
+  // W2-UX-01：壁纸预览加载失败标记（与品牌预览 previewLoadFailed 同范式）
+  const [bgPreviewLoadFailed, setBgPreviewLoadFailed] = useState<
+    Partial<Record<BgImageKey, boolean>>
+  >({});
+  const [brandUploading, setBrandUploading] = useState<
+    Partial<Record<BrandPreviewKey, boolean>>
+  >({});
+  const [storageSummary, setStorageSummary] = useState("加载中...");
+  const systemUpgradeReleasesMatchChannel =
+    systemUpgradeCheckedChannel === updateChannel;
+  const systemUpgradeHasConfirmedUpdate = Boolean(
+    systemUpgradeInfo?.hasUpdate &&
+      systemUpgradeReleasesMatchChannel &&
+      systemUpgradeReleases.length > 0,
+  );
+  const canTriggerSystemUpgrade = Boolean(
+    !systemUpgradeLoading &&
+      !systemUpgradeChecking &&
+      !systemUpgradeExecuting &&
+      systemUpgradeInfo?.capability.capable !== false &&
+      // P3-1：已确认无更新且未手动指定版本时禁用，避免同版本全量重装白跑一次。
+      (systemUpgradeInfo?.hasUpdate || systemUpgradeSelectedVersion !== ""),
+  );
+  const canOpenSystemUpgradeModal = Boolean(
+    systemUpgradeInfo?.capability.capable &&
+      systemUpgradeHasConfirmedUpdate &&
+      !systemUpgradeLoading &&
+      !systemUpgradeChecking &&
+      !systemUpgradeExecuting,
+  );
+
+  const canGoBack =
+    typeof window !== "undefined" &&
+    typeof window.history.state?.idx === "number" &&
+    window.history.state.idx > 0;
+
+  const handleBack = () => {
+    if (canGoBack) {
+      navigate(-1);
+
+      return;
+    }
+
+    navigate("/profile", { replace: true });
+  };
+
+  // 权限检查
+  useEffect(() => {
+    if (!isAdmin()) {
+      toast.error("权限不足，只有管理员可以访问此页面");
+      navigate("/dashboard", { replace: true });
+
+      return;
+    }
+  }, [navigate]);
+
+  // 加载配置数据（优先从缓存）
+  const loadConfigs = async (currentConfigs?: Record<string, string>) => {
+    const configsToCompare = currentConfigs || configs;
+    const hasInitialData = Object.keys(configsToCompare).length > 0;
+
+    // 如果已有缓存数据，不显示loading，静默更新
+    if (!hasInitialData) {
+      setLoading(true);
+    }
+
+    try {
+      const configData = await getCachedConfigs();
+
+      // 只有在数据有变化时才更新
+      const hasDataChanged =
+        JSON.stringify(configData) !== JSON.stringify(configsToCompare);
+
+      if (hasDataChanged) {
+        setConfigs((current) => {
+          const merged = { ...configData };
+
+          Object.entries(current).forEach(([key, value]) => {
+            if (value !== originalConfigs[key]) merged[key] = value;
+          });
+
+          return merged;
+        });
+        setOriginalConfigs({ ...configData });
+      } else {
+      }
+      setConfigsLoadFailed(false);
+    } catch {
+      // 只有在没有缓存数据时才显示错误
+      if (!hasInitialData) {
+        setConfigsLoadFailed(true);
+        toast.error("加载配置出错，请重试");
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const loadStorageSummary = async () => {
+    try {
+      const response = await getStorageSummary();
+
+      if (response.code === 0 && response.data?.databaseSizeText) {
+        setStorageSummary(response.data.databaseSizeText);
+
+        return;
+      }
+      setStorageSummary("获取失败");
+    } catch {
+      setStorageSummary("获取失败");
+    }
+  };
+
+  const loadSystemUpgradeInfo = async (channel = updateChannel) => {
+    setSystemUpgradeLoading(true);
+    try {
+      const response = await getSystemUpgradeVersion();
+
+      if (response.code === 0 && response.data) {
+        setSystemUpgradeInfo({
+          ...response.data,
+          channel,
+          hasUpdate:
+            response.data.channel === channel ? response.data.hasUpdate : false,
+          latestVersion:
+            response.data.channel === channel
+              ? response.data.latestVersion
+              : "",
+        });
+      } else {
+        setSystemUpgradeInfo(null);
+      }
+    } catch {
+      setSystemUpgradeInfo(null);
+    } finally {
+      setSystemUpgradeLoading(false);
+    }
+  };
+
+  // P3-2：拉取后端升级状态。升级中途后端容器重启会断连，请求失败静默忽略等下轮。
+  const fetchSystemUpgradeStatus =
+    async (): Promise<SystemUpgradeStatusApiData | null> => {
+      try {
+        const response = await getSystemUpgradeStatus();
+
+        if (response.code === 0 && response.data) {
+          setSystemUpgradeStatus(response.data);
+
+          return response.data;
+        }
+      } catch {
+        // 升级期间后端重启导致断连属正常，静默重试
+      }
+
+      return null;
+    };
+
+  const stopSystemUpgradePolling = () => {
+    if (systemUpgradePollRef.current !== null) {
+      window.clearInterval(systemUpgradePollRef.current);
+      systemUpgradePollRef.current = null;
+    }
+  };
+
+  // P3-2：升级发起后每 5 秒轮询后端状态，最长 10 分钟。观察到进行中→结束
+  // （或本次发起后产生新结果）即停止并刷新版本信息；超时自动停止。
+  const startSystemUpgradePolling = () => {
+    stopSystemUpgradePolling();
+    const startedAtMs = Date.now();
+    let ticks = 0;
+    let sawInProgress = false;
+    const maxTicks = 120; // 5s × 120 = 10 分钟
+
+    const pollOnce = async () => {
+      ticks += 1;
+      const status = await fetchSystemUpgradeStatus();
+
+      if (status?.inProgress) {
+        sawInProgress = true;
+      }
+
+      const finished =
+        status &&
+        !status.inProgress &&
+        (sawInProgress ||
+          (status.finishedAt &&
+            new Date(status.finishedAt).getTime() >= startedAtMs));
+
+      if (finished || ticks >= maxTicks) {
+        stopSystemUpgradePolling();
+
+        if (finished) {
+          void loadSystemUpgradeInfo();
+        }
+      }
+    };
+
+    void pollOnce();
+    systemUpgradePollRef.current = window.setInterval(pollOnce, 5000);
+  };
+
+  // 时间字符串兜底格式化，解析失败原样展示
+  const formatStatusTime = (value?: string): string => {
+    if (!value) {
+      return "";
+    }
+
+    const d = new Date(value);
+
+    return Number.isNaN(d.getTime()) ? value : d.toLocaleString();
+  };
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      loadConfigs(initialConfigs);
+      loadStorageSummary();
+      void loadSystemUpgradeInfo();
+      // 备份页加载即拉一次导入前自动备份快照状态，决定下载按钮是否出现
+      void loadImportAutoBackupStatus();
+      // 页面加载即拉一次升级状态：刷新后也能看到进行中/上次结果
+      void (async () => {
+        const status = await fetchSystemUpgradeStatus();
+
+        if (status?.inProgress) {
+          startSystemUpgradePolling();
+        }
+      })();
+    }, 100);
+
+    return () => clearTimeout(timer);
+  }, []);
+
+  // 组件卸载时停止轮询
+  useEffect(() => {
+    return () => stopSystemUpgradePolling();
+  }, []);
+
+  const handleCheckSystemUpgrade = async () => {
+    const channel = updateChannel;
+
+    setSystemUpgradeChecking(true);
+    try {
+      const response = await checkSystemUpgrade(channel);
+
+      if (response.code === 0 && response.data) {
+        const data = response.data as SystemUpgradeCheckApiData;
+
+        setSystemUpgradeInfo(data);
+        setSystemUpgradeReleases(data.releases || []);
+        setSystemUpgradeCheckedChannel(channel);
+        setSystemUpgradeSelectedVersion("");
+        if (data.latestVersion && !data.hasUpdate) {
+          toast.success("当前已是最新版本");
+
+          return false;
+        }
+        toast.success(
+          data.latestVersion
+            ? `已检查到最新版本 ${data.latestVersion}`
+            : "未获取到可用版本",
+        );
+
+        return Boolean(
+          data.capability.capable && data.hasUpdate && data.releases?.length,
+        );
+      } else {
+        setSystemUpgradeReleases([]);
+        setSystemUpgradeCheckedChannel(null);
+        toast.error(response.msg || "检查更新失败");
+      }
+    } catch {
+      setSystemUpgradeReleases([]);
+      setSystemUpgradeCheckedChannel(null);
+      toast.error("检查更新失败，请重试");
+    } finally {
+      setSystemUpgradeChecking(false);
+    }
+
+    return false;
+  };
+
+  const handleOpenSystemUpgradeModal = async () => {
+    if (!canOpenSystemUpgradeModal) {
+      const checked = await handleCheckSystemUpgrade();
+
+      if (!checked) {
+        return;
+      }
+    }
+    setSystemUpgradeModalOpen(true);
+  };
+
+  const handleConfirmSystemUpgrade = async () => {
+    if (systemUpgradeExecuting) return;
+    setSystemUpgradeExecuting(true);
+    try {
+      const response = await runSystemUpgrade(
+        systemUpgradeSelectedVersion || undefined,
+        updateChannel,
+      );
+
+      if (response.code === 0 && response.data) {
+        setSystemUpgradeModalOpen(false);
+        setSystemUpgradeSelectedVersion("");
+        // R8-003：成功分支必须透出后端回执 message——第二锚降级点名
+        // 只在该字段里（message = 固定文案＋「（降级点名）」），固定
+        // toast 会把单锚/双锚的区别吞掉，upgrade.md 的点名宣称在 UI
+        // 不成立。无 message 时才回退固定文案。
+        const receiptMessage = response.data.message?.trim();
+
+        toast.success(
+          receiptMessage
+            ? `${receiptMessage}，约 1 分钟后刷新页面`
+            : "升级已开始，约 1 分钟后刷新页面",
+          { duration: 8000 },
+        );
+        // P3-2：随后轮询后端升级状态，卡片会展示进行中与最终结果
+        startSystemUpgradePolling();
+      } else {
+        toast.error(response.msg || "面板升级失败");
+      }
+    } catch {
+      toast.error("面板升级失败，请重试");
+    } finally {
+      setSystemUpgradeExecuting(false);
+    }
+  };
+
+  const handleConfigChange = (key: string, value: string) => {
+    const newConfigs = { ...configs, [key]: value };
+
+    setConfigs(newConfigs);
+
+    if (isBrandPreviewKey(key)) {
+      setPreviewLoadFailed((prev) => ({ ...prev, [key]: false }));
+    }
+  };
+
+  // 保存配置
+  const handleSave = async () => {
+    const intervalValue = configs[TUNNEL_QUALITY_INTERVAL_CONFIG_KEY];
+    const intervalChanged =
+      intervalValue !== originalConfigs[TUNNEL_QUALITY_INTERVAL_CONFIG_KEY];
+    const intervalError = intervalChanged
+      ? validateTunnelQualityInterval(intervalValue || "")
+      : null;
+
+    if (intervalError) {
+      toast.error(intervalError);
+
+      return;
+    }
+
+    const effectiveConfigs = { ...configs };
+
+    // AP-7：订阅前置地址编辑行允许输入中留空行，但空行不得随保存下发——
+    // 此前后端校验整单拒绝（400）且回执看不出问题在空行。保存前滤掉
+    // 空白行，保存成功后编辑器状态同步为清洗后的值。
+    const rawFrontUrls = effectiveConfigs[SUBSCRIPTION_FRONT_URLS_KEY];
+
+    if (typeof rawFrontUrls === "string" && rawFrontUrls) {
+      try {
+        const parsed: unknown = JSON.parse(rawFrontUrls);
+
+        if (Array.isArray(parsed)) {
+          const cleaned = parsed.filter(
+            (v): v is string => typeof v === "string" && v.trim() !== "",
+          );
+
+          effectiveConfigs[SUBSCRIPTION_FRONT_URLS_KEY] = cleaned.length
+            ? JSON.stringify(cleaned)
+            : "";
+        }
+      } catch {
+        // 非 JSON 内容原样下发，交给后端校验报错点名
+      }
+    }
+    const frontUrlsCleaned =
+      effectiveConfigs[SUBSCRIPTION_FRONT_URLS_KEY] !==
+      configs[SUBSCRIPTION_FRONT_URLS_KEY];
+
+    setSaving(true);
+    try {
+      const changedKeys = Object.keys(effectiveConfigs).filter(
+        (key) => effectiveConfigs[key] !== originalConfigs[key],
+      );
+
+      if (changedKeys.length === 0) {
+        return;
+      }
+
+      const changedPayload: Record<string, string> = {};
+
+      changedKeys.forEach((key) => {
+        changedPayload[key] = effectiveConfigs[key] || "";
+      });
+
+      const response = await updateConfigs(changedPayload);
+
+      if (response.code === 0) {
+        toast.success("配置保存成功");
+        // T-001：延迟优选被丢弃时后端在信封 warning 里点名（network.ts
+        // 合同：must be surfaced），须原样透出，不得只报固定成功文案。
+        if (response.warning) {
+          toast(response.warning, { icon: "⚠️", duration: 12000 });
+        }
+
+        if (frontUrlsCleaned) {
+          // Only normalize the submitted field if it has not been edited
+          // again while saving. Other newer drafts must remain untouched.
+          setConfigs((current) =>
+            current[SUBSCRIPTION_FRONT_URLS_KEY] ===
+            configs[SUBSCRIPTION_FRONT_URLS_KEY]
+              ? {
+                  ...current,
+                  [SUBSCRIPTION_FRONT_URLS_KEY]:
+                    effectiveConfigs[SUBSCRIPTION_FRONT_URLS_KEY],
+                }
+              : current,
+          );
+        }
+
+        Object.entries(effectiveConfigs).forEach(([key, value]) => {
+          configCache.set(key, value);
+        });
+
+        setOriginalConfigs({ ...effectiveConfigs });
+
+        if (
+          changedKeys.some((key) =>
+            [
+              "app_name",
+              "app_logo",
+              "app_favicon",
+              "app_bg_image",
+              "app_bg_image_light",
+              "app_bg_image_dark",
+              "login_bg_image",
+            ].includes(key),
+          )
+        ) {
+          await updateSiteConfig(effectiveConfigs);
+        }
+
+        // 触发配置更新事件，通知其他组件
+        window.dispatchEvent(
+          new CustomEvent("configUpdated", {
+            detail: { changedKeys },
+          }),
+        );
+
+        // 如果隧道质量检测配置变更，通知 tunnel-monitor-view
+        if (
+          changedKeys.some((key) =>
+            [
+              TUNNEL_QUALITY_ENABLED_CONFIG_KEY,
+              TUNNEL_QUALITY_INTERVAL_CONFIG_KEY,
+            ].includes(key),
+          )
+        ) {
+          window.dispatchEvent(
+            new CustomEvent("monitorTunnelQualityEnabledChanged", {
+              detail: {
+                // R8-018：与开关显示共用同一判读（缺失＝开启），
+                // 不许再写 === "true"——键未落库时会误报 false。
+                enabled: resolveSwitchSelected(
+                  TUNNEL_QUALITY_ENABLED_CONFIG_KEY,
+                ),
+                intervalSec: parseTunnelQualityIntervalSeconds(
+                  configs[TUNNEL_QUALITY_INTERVAL_CONFIG_KEY],
+                ),
+              },
+            }),
+          );
+        }
+      } else {
+        toast.error("保存配置失败: " + response.msg);
+      }
+    } catch {
+      toast.error("保存配置出错，请重试");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // 后端「缺失＝开启」的开关键全集（枚举核对 1.9.3：config 页全部
+  // switch 键中仅此一键属此族——后端 prober 与
+  // isTunnelQualityMonitoringEnabled 均按 != "false" 判读，键缺失时
+  // 探测实际在跑；其余键 hide_footer_brand / forward_compact_mode /
+  // captcha_enabled / allow_local_remote_addr 的后端消费者均按
+  // === "true" 判读、缺失＝关闭，notify_enabled 同口径）。
+  // 显示判读与后端对齐：只归一显示、不写库，用户首次拨动才落值。
+  const SWITCH_DEFAULT_ON_KEYS = new Set([TUNNEL_QUALITY_ENABLED_CONFIG_KEY]);
+
+  const resolveSwitchSelected = (key: string): boolean => {
+    if (SWITCH_DEFAULT_ON_KEYS.has(key)) {
+      // 缺失＝开启族：与后端 !== "false" 判读逐字对齐（含保存广播，
+      // R8-018——四面共用 resolveTunnelQualityEnabled 单一判读点）。
+      return resolveTunnelQualityEnabled(configs[key]);
+    }
+
+    return configs[key] === "true";
+  };
+
+  // 检查配置项是否应该显示（依赖检查）
+  const shouldShowItem = (item: ConfigItem): boolean => {
+    // 品牌设置项在单独的卡片中展示
+    if (
+      ["app_name", "app_logo", "app_favicon", "hide_footer_brand"].includes(
+        item.key,
+      )
+    ) {
+      return false;
+    }
+
+    if (!item.dependsOn || !item.dependsValue) {
+      return true;
+    }
+
+    // 依赖项的可见性与开关显示同口径：缺失＝开启的键在未保存时按
+    // "true" 判读（如探测间隔项随质量检测开关的默认开启一同显示）。
+    const dependsRaw = configs[item.dependsOn];
+    const dependsEffective =
+      dependsRaw === undefined && SWITCH_DEFAULT_ON_KEYS.has(item.dependsOn)
+        ? "true"
+        : dependsRaw;
+
+    return dependsEffective === item.dependsValue;
+  };
+
+  const getBrandInputRef = (key: BrandPreviewKey) => {
+    return key === "app_logo" ? logoFileInputRef : faviconFileInputRef;
+  };
+
+  const triggerBrandFilePicker = (key: BrandPreviewKey) => {
+    if (brandUploading[key]) {
+      return;
+    }
+
+    getBrandInputRef(key).current?.click();
+  };
+
+  const clearBrandAsset = (key: BrandPreviewKey) => {
+    handleConfigChange(key, "");
+    setPreviewLoadFailed((prev) => ({ ...prev, [key]: false }));
+  };
+
+  const handleBrandFileChange = async (
+    key: BrandPreviewKey,
+    event: React.ChangeEvent<HTMLInputElement>,
+  ) => {
+    const file = event.target.files?.[0];
+
+    if (!file) {
+      return;
+    }
+
+    setBrandUploading((prev) => ({ ...prev, [key]: true }));
+
+    try {
+      const pngDataURL = await convertBrandAssetToPngDataURL(
+        file,
+        toBrandAssetKind(key),
+      );
+
+      handleConfigChange(key, pngDataURL);
+      // AP-2：与壁纸上传同口径——此处只是载入待保存值，落库后才生效，
+      // 此前直接报「上传成功」会让用户以为已生效。
+      toast.success(
+        key === "app_logo"
+          ? "Logo 上传成功，保存配置后生效"
+          : "Favicon 上传成功，保存配置后生效",
+      );
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "图片处理失败，请重试";
+
+      toast.error(message);
+    } finally {
+      setBrandUploading((prev) => ({ ...prev, [key]: false }));
+      event.target.value = "";
+    }
+  };
+
+  const handleBgImageUpload = async (
+    e: React.ChangeEvent<HTMLInputElement>,
+    key: BgImageKey,
+  ) => {
+    const file = e.target.files?.[0];
+
+    if (!file) return;
+
+    if (!file.type.startsWith("image/")) {
+      toast.error("只能上传图片文件");
+
+      return;
+    }
+
+    setBgImageUploading(key);
+    try {
+      const compressedImage = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+
+        reader.onload = (event) => {
+          const img = new Image();
+
+          img.onload = () => {
+            const canvas = document.createElement("canvas");
+            let width = img.width;
+            let height = img.height;
+            const MAX_WIDTH = 1920;
+            const MAX_HEIGHT = 1080;
+
+            if (width > height) {
+              if (width > MAX_WIDTH) {
+                height = Math.round((height * MAX_WIDTH) / width);
+                width = MAX_WIDTH;
+              }
+            } else {
+              if (height > MAX_HEIGHT) {
+                width = Math.round((width * MAX_HEIGHT) / height);
+                height = MAX_HEIGHT;
+              }
+            }
+
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext("2d");
+
+            if (!ctx) {
+              reject(new Error("Canvas context is null"));
+
+              return;
+            }
+            ctx.drawImage(img, 0, 0, width, height);
+
+            // Output as webp for better compression
+            const dataUrl = canvas.toDataURL("image/webp", 0.8);
+
+            resolve(dataUrl);
+          };
+          img.onerror = () => reject(new Error("图片加载失败"));
+          img.src = event.target?.result as string;
+        };
+        reader.onerror = () => reject(new Error("文件读取失败"));
+        reader.readAsDataURL(file);
+      });
+
+      handleConfigChange(key, compressedImage);
+      toast.success("壁纸上传成功，保存配置后生效");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "图片处理失败");
+    } finally {
+      setBgImageUploading(null);
+      e.target.value = "";
+    }
+  };
+
+  const renderBgImageUploader = (key: BgImageKey, label: string) => {
+    const bgImage = configs[key] || "";
+    const isDefault = key === "app_bg_image";
+    const isImage =
+      bgImage.startsWith("http") ||
+      bgImage.startsWith("data:") ||
+      bgImage.startsWith("/") ||
+      bgImage.startsWith("blob:");
+    const isTheme = bgImage === "theme";
+    const isWallpaper = bgImage === "wallpaper";
+    const isSolidColor = bgImage && !isImage && !isTheme && !isWallpaper;
+
+    return (
+      <div className="flex flex-col gap-3 w-full rounded-xl border border-divider p-4">
+        <div>
+          <p className="text-sm font-medium text-foreground">{label}</p>
+          {!isDefault && !bgImage && (
+            <p className="text-xs font-semibold text-foreground mt-1">
+              未单独设置，使用默认背景
+            </p>
+          )}
+          {isDefault && (configs.app_bg_image_light || "") && (
+            <p className="text-xs font-semibold text-warning-700 mt-1">
+              {/* W2-UX-02：App 生效优先级为浅色专属背景恒压默认背景，
+                  此前默认背景处只字未提，用户改了默认背景会以为不生效 */}
+              当前已设置「☀️
+              壁纸」，页面实际显示它；本处「默认背景」将在清除「☀️ 壁纸」后生效
+            </p>
+          )}
+        </div>
+        <div className="flex flex-wrap items-center gap-4">
+          <input
+            ref={(node) => {
+              if (node) bgImageFileInputRefs.current[key] = node;
+            }}
+            accept="image/*"
+            className="hidden"
+            type="file"
+            onChange={(event) => void handleBgImageUpload(event, key)}
+          />
+          <Button
+            color="primary"
+            isDisabled={bgImageUploading !== null && bgImageUploading !== key}
+            isLoading={bgImageUploading === key}
+            variant="flat"
+            onPress={() => bgImageFileInputRefs.current[key]?.click()}
+          >
+            上传图片
+          </Button>
+          {isDefault && (
+            <Button
+              color="secondary"
+              isDisabled={bgImageUploading !== null || isWallpaper}
+              variant="flat"
+              onPress={() => handleConfigChange(key, "wallpaper")}
+            >
+              内置壁纸
+            </Button>
+          )}
+          {isDefault && (
+            <Button
+              color="default"
+              isDisabled={bgImageUploading !== null || bgImage === "#ffffff"}
+              variant="flat"
+              onPress={() => handleConfigChange(key, "#ffffff")}
+            >
+              白色纯色
+            </Button>
+          )}
+          {bgImage && (
+            <Button
+              color="danger"
+              isDisabled={bgImageUploading !== null}
+              variant="flat"
+              onPress={() => handleConfigChange(key, "")}
+            >
+              {isDefault ? "恢复默认纯色" : "清除专属壁纸"}
+            </Button>
+          )}
+        </div>
+
+        {bgImage && isImage && (
+          <div className="relative rounded-xl overflow-hidden border border-divider">
+            {bgPreviewLoadFailed[key] ? (
+              <div className="h-32 flex items-center justify-center bg-background">
+                <span className="text-sm font-medium text-danger-700">
+                  壁纸图片加载失败，请检查地址或重新上传
+                </span>
+              </div>
+            ) : (
+              <>
+                <img
+                  alt={`${label}预览`}
+                  className="w-full max-h-48 object-cover opacity-80"
+                  src={bgImage}
+                  onError={() =>
+                    setBgPreviewLoadFailed((prev) => ({
+                      ...prev,
+                      [key]: true,
+                    }))
+                  }
+                  onLoad={() =>
+                    setBgPreviewLoadFailed((prev) => ({
+                      ...prev,
+                      [key]: false,
+                    }))
+                  }
+                />
+                <div className="absolute inset-0 bg-gradient-to-t from-black/70 to-transparent flex items-end p-4">
+                  <span className="rounded bg-black/70 px-1.5 py-0.5 text-white text-sm font-medium">
+                    预览效果
+                  </span>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
+        {bgImage && isWallpaper && (
+          <div className="relative rounded-xl border border-divider bg-background h-32 flex items-center justify-center">
+            <span className="text-foreground text-sm font-medium">
+              当前为内置壁纸
+            </span>
+          </div>
+        )}
+
+        {bgImage && isTheme && (
+          <div className="relative rounded-xl border border-divider bg-background h-32 flex items-center justify-center">
+            <span className="text-foreground text-sm font-medium">
+              当前为自适应纯色背景
+            </span>
+          </div>
+        )}
+
+        {bgImage && isSolidColor && (
+          <div
+            className="relative rounded-xl border border-divider h-32 flex items-center justify-center"
+            style={{ backgroundColor: bgImage }}
+          >
+            <span className="tray-plate px-2 py-1 rounded text-sm font-medium shadow-sm">
+              纯色背景 ({bgImage})
+            </span>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const renderBrandPreview = (key: BrandPreviewKey) => {
+    const previewUrl = (configs[key] || "").trim();
+    const appNamePreview = (configs.app_name || "").trim() || "应用名称";
+    const failed = previewLoadFailed[key] === true;
+    const showImage = previewUrl.length > 0 && !failed;
+
+    return (
+      <div className="mt-3 rounded-lg border border-divider glass-inset p-3">
+        <p className="text-xs font-semibold text-foreground">实时预览</p>
+        <div className="mt-2 rounded-md border border-default-200 bg-white px-3 py-2">
+          {key === "app_logo" ? (
+            <div className="flex h-10 items-center gap-2">
+              {showImage ? (
+                <img
+                  alt="logo preview"
+                  className="h-7 w-7 rounded-sm border border-default-200 object-cover"
+                  src={previewUrl}
+                  onError={() =>
+                    setPreviewLoadFailed((prev) => ({ ...prev, [key]: true }))
+                  }
+                  onLoad={() =>
+                    setPreviewLoadFailed((prev) => ({ ...prev, [key]: false }))
+                  }
+                />
+              ) : (
+                <div className="flex h-7 w-7 items-center justify-center rounded-sm bg-default-200 text-[10px] font-semibold text-foreground">
+                  LOGO
+                </div>
+              )}
+              <span className="truncate text-sm font-semibold text-foreground">
+                {appNamePreview}
+              </span>
+            </div>
+          ) : (
+            <div className="flex h-7 max-w-[260px] items-center gap-2 rounded border border-divider glass-inset px-2">
+              {showImage ? (
+                <img
+                  alt="favicon preview"
+                  className="h-4 w-4 rounded-sm object-contain"
+                  src={previewUrl}
+                  onError={() =>
+                    setPreviewLoadFailed((prev) => ({ ...prev, [key]: true }))
+                  }
+                  onLoad={() =>
+                    setPreviewLoadFailed((prev) => ({ ...prev, [key]: false }))
+                  }
+                />
+              ) : (
+                <div className="h-4 w-4 rounded-sm bg-default-300" />
+              )}
+              <span className="truncate text-xs font-semibold text-default-700">
+                {appNamePreview}
+              </span>
+            </div>
+          )}
+        </div>
+
+        {previewUrl.length === 0 ? (
+          <p className="mt-2 text-xs font-semibold text-foreground">
+            上传图片后会实时显示预览
+          </p>
+        ) : null}
+
+        {previewUrl.length > 0 && failed ? (
+          <p className="mt-2 text-xs font-semibold text-danger-700">
+            图片加载失败，请重新上传
+          </p>
+        ) : null}
+
+        {previewUrl.length > 0 && !isPngDataURL(previewUrl) ? (
+          <p className="mt-2 text-xs font-semibold text-warning-700">
+            当前是旧版 URL 配置，建议重新上传图片以启用无闪烁加载
+          </p>
+        ) : null}
+      </div>
+    );
+  };
+
+  const renderBrandAssetUploader = (
+    key: BrandPreviewKey,
+    isChanged: boolean,
+  ) => {
+    const value = (configs[key] || "").trim();
+    const uploading = brandUploading[key] === true;
+    const isLogo = key === "app_logo";
+
+    return (
+      <div
+        className={`rounded-lg border p-3 ${
+          isChanged ? "border-warning-300" : "border-default-200"
+        }`}
+      >
+        <input
+          ref={getBrandInputRef(key)}
+          accept={BRAND_FILE_ACCEPT}
+          className="hidden"
+          disabled={uploading}
+          type="file"
+          onChange={(event) => {
+            void handleBrandFileChange(key, event);
+          }}
+        />
+
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            color="primary"
+            isLoading={uploading}
+            size="sm"
+            variant="flat"
+            onPress={() => triggerBrandFilePicker(key)}
+          >
+            {value.length > 0
+              ? isLogo
+                ? "替换 Logo"
+                : "替换 Favicon"
+              : isLogo
+                ? "上传 Logo"
+                : "上传 Favicon"}
+          </Button>
+          <Button
+            isDisabled={value.length === 0 || uploading}
+            size="sm"
+            variant="light"
+            onPress={() => clearBrandAsset(key)}
+          >
+            清除
+          </Button>
+          <span className="text-xs font-semibold text-foreground">
+            仅支持图片文件，自动转换为 PNG
+          </span>
+        </div>
+
+        <p className="mt-2 text-xs font-semibold text-foreground">
+          {isLogo
+            ? "建议上传方形图片，系统会统一转换为 96x96 PNG"
+            : "建议上传方形图片，系统会统一转换为 64x64 PNG"}
+        </p>
+
+        {renderBrandPreview(key)}
+      </div>
+    );
+  };
+
+  // 渲染不同类型的配置项
+  const renderConfigItem = (item: ConfigItem) => {
+    const isChanged =
+      hasChanges && configs[item.key] !== originalConfigs[item.key];
+
+    switch (item.type) {
+      case "bg_image":
+        // 登录页壁纸：单个上传器；主界面壁纸：默认+单独壁纸两个上传器。
+        // 暗色模式已下线（2026-11-02），不再提供暗色壁纸上传器；
+        // app_bg_image_dark 配置键仅保留数据兼容搬运（仍随配置拉取/回写往返，界面不展示）。
+        if (item.key === "login_bg_image") {
+          return renderBgImageUploader("login_bg_image", item.label);
+        }
+
+        return (
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <div className="lg:col-span-2">
+              {renderBgImageUploader("app_bg_image", "默认背景")}
+            </div>
+            {renderBgImageUploader("app_bg_image_light", "☀️ 壁纸")}
+          </div>
+        );
+
+      case "input": {
+        if (isBrandPreviewKey(item.key)) {
+          return renderBrandAssetUploader(item.key, isChanged);
+        }
+
+        const isTunnelQualityInterval =
+          item.key === TUNNEL_QUALITY_INTERVAL_CONFIG_KEY;
+        const intervalValue = isTunnelQualityInterval
+          ? (configs[item.key] ?? String(DEFAULT_TUNNEL_QUALITY_INTERVAL_SEC))
+          : (configs[item.key] ?? "");
+        const intervalError =
+          isTunnelQualityInterval && configs[item.key] !== undefined
+            ? validateTunnelQualityInterval(intervalValue)
+            : null;
+
+        return (
+          <Input
+            classNames={{
+              input: "text-sm",
+              inputWrapper: isChanged
+                ? "border-warning-300 data-[hover=true]:border-warning-400"
+                : "",
+            }}
+            endContent={isTunnelQualityInterval ? "秒" : undefined}
+            errorMessage={intervalError || undefined}
+            isInvalid={Boolean(intervalError)}
+            max={
+              isTunnelQualityInterval
+                ? MAX_TUNNEL_QUALITY_INTERVAL_SEC
+                : undefined
+            }
+            min={
+              isTunnelQualityInterval
+                ? MIN_TUNNEL_QUALITY_INTERVAL_SEC
+                : undefined
+            }
+            placeholder={item.placeholder}
+            size="md"
+            step={isTunnelQualityInterval ? 1 : undefined}
+            type={isTunnelQualityInterval ? "number" : "text"}
+            value={intervalValue}
+            variant="bordered"
+            onChange={(e) => handleConfigChange(item.key, e.target.value)}
+          />
+        );
+      }
+
+      case "password": {
+        // F-116：敏感字段掩码渲染，与普通 input 共用变更处理。
+        const passwordInput = (
+          <Input
+            classNames={{
+              input: "text-sm",
+              inputWrapper: isChanged
+                ? "border-warning-300 data-[hover=true]:border-warning-400"
+                : "",
+            }}
+            placeholder={item.placeholder}
+            size="md"
+            type="password"
+            value={configs[item.key] ?? ""}
+            variant="bordered"
+            onChange={(e) => handleConfigChange(item.key, e.target.value)}
+          />
+        );
+
+        if (!item.writeOnly) {
+          return passwordInput;
+        }
+
+        // R7-L8-03 写-only 形态：后端不再下发已保存值，configs 里
+        // 该键缺席＝未改动（留空保留）；输入非空＝替换；键在场且
+        // 为空＝已显式清除（或输入后删空），保存时以空值下发删除
+        // 已保存值（后端对该键按可清除键处理）。
+        const draft = configs[item.key];
+        const clearPending = item.key in configs && (draft ?? "") === "";
+
+        return (
+          <div className="space-y-1">
+            {passwordInput}
+            <p className="text-xs font-semibold text-foreground">
+              {clearPending ? (
+                "保存后将删除已保存的值"
+              ) : draft ? (
+                "保存后替换已保存的值，保存后不再回显"
+              ) : (
+                <>
+                  已保存的值不会回显，留空表示保留 ·{" "}
+                  <button
+                    className="text-danger-700"
+                    type="button"
+                    onClick={() => handleConfigChange(item.key, "")}
+                  >
+                    清除已保存的值
+                  </button>
+                </>
+              )}
+            </p>
+          </div>
+        );
+      }
+
+      case "switch":
+        return (
+          <div className="inline-flex items-center gap-2">
+            <Switch
+              aria-label={item.label}
+              classNames={{
+                wrapper: isChanged ? "border-warning-300" : "",
+              }}
+              isSelected={resolveSwitchSelected(item.key)}
+              size="sm"
+              onValueChange={(checked) =>
+                handleConfigChange(item.key, checked ? "true" : "false")
+              }
+            />
+            <span className="text-sm text-foreground">
+              {resolveSwitchSelected(item.key) ? "已启用" : "已禁用"}
+            </span>
+          </div>
+        );
+
+      case "select":
+        return (
+          <Select
+            classNames={{
+              trigger: isChanged
+                ? "border-warning-300 data-[hover=true]:border-warning-400"
+                : "",
+            }}
+            placeholder="请选择验证码类型"
+            selectedKeys={configs[item.key] ? [configs[item.key]] : []}
+            size="md"
+            variant="bordered"
+            onSelectionChange={(keys) => {
+              const selectedKey = Array.from(keys)[0] as string;
+
+              if (selectedKey) {
+                handleConfigChange(item.key, selectedKey);
+              }
+            }}
+          >
+            {item.options?.map((option) => (
+              <SelectItem key={option.value} description={option.description}>
+                {option.label}
+              </SelectItem>
+            )) || []}
+          </Select>
+        );
+
+      default:
+        return null;
+    }
+  };
+
+  const handleExport = async () => {
+    if (exportTypes.length === 0) {
+      toast.error("请至少选择一种数据类型");
+
+      return;
+    }
+    setExporting(true);
+    try {
+      await exportBackup(exportTypes);
+      toast.success("导出成功");
+      setExportSelectorOpen(false);
+    } catch (error) {
+      // exportBackup 已把后端错误信封的 msg 抛成 Error（D5-01），原样透出
+      toast.error(
+        error instanceof Error && error.message
+          ? `导出失败: ${error.message}`
+          : "导出失败，请重试",
+      );
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const triggerImportFilePicker = () => {
+    if (importTypes.length === 0) {
+      toast.error("请先选择要导入的数据类型");
+
+      return;
+    }
+
+    setImportSelectorOpen(false);
+    requestAnimationFrame(() => backupFileInputRef.current?.click());
+  };
+
+  // 选文件只做解析与暂存，不直接导入：导入是覆盖型操作，必须经确认框
+  // 说明语义后再执行（D7-01）。
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+
+    if (backupFileInputRef.current) {
+      backupFileInputRef.current.value = "";
+    }
+
+    if (!file) return;
+
+    if (importTypes.length === 0) {
+      toast.error("请先选择要导入的数据类型");
+
+      return;
+    }
+
+    try {
+      const text = await file.text();
+      const data = JSON.parse(text);
+
+      setPendingImport({ fileName: file.name, data });
+      setImportConfirmOpen(true);
+    } catch {
+      toast.error("导入失败，请检查文件格式");
+    }
+  };
+
+  const executePendingImport = async () => {
+    // F-L6-01：入口同步复核。importing 只是渲染状态，确认按钮连点在渲染
+    // 提交前可双发两道并发导入（导入无 idemKey 兜底）；ref 在下发瞬间拦截。
+    if (!pendingImport || importInFlightRef.current) return;
+    importInFlightRef.current = true;
+
+    setImporting(true);
+    try {
+      const response = await importBackup({
+        ...pendingImport.data,
+        types: importTypes,
+      });
+
+      if (response.code === 0) {
+        // 只报计数摘要，不把整份回执倾倒进 toast（A10-10）；回执自 SEC-01
+        // 起不再含 autoBackup 快照内容，快照留存服务端，成功后刷新 status
+        // 决定下载按钮是否出现。
+        const data = (response.data ?? {}) as Record<string, unknown>;
+        const importedTotal = Object.entries(data).reduce(
+          (sum, [k, v]) =>
+            k.endsWith("Imported") && typeof v === "number" ? sum + v : sum,
+          0,
+        );
+        const skippedRows = data.skippedRows as
+          | Record<string, number>
+          | undefined;
+        const skippedTotal =
+          (typeof data.userSubscriptionsSkipped === "number"
+            ? data.userSubscriptionsSkipped
+            : 0) +
+          (skippedRows
+            ? Object.values(skippedRows).reduce(
+                (sum, v) => sum + (typeof v === "number" ? v : 0),
+                0,
+              )
+            : 0);
+        const warningCount = Array.isArray(data.importWarnings)
+          ? data.importWarnings.length
+          : 0;
+        const summary = [
+          `导入成功：共导入 ${importedTotal} 条记录`,
+          skippedTotal > 0 ? `跳过 ${skippedTotal} 条` : null,
+          warningCount > 0 ? `${warningCount} 条警告` : null,
+        ]
+          .filter(Boolean)
+          .join("，");
+
+        toast.success(summary);
+        // 回执全文留置披露面（importWarnings 逐条文本等，见导入区下方）。
+        setLastImportReceipt(data);
+        void loadImportAutoBackupStatus();
+        setImportTypes([]);
+        setImportFileName("");
+        setPendingImport(null);
+        setImportConfirmOpen(false);
+      } else {
+        toast.error("导入失败: " + response.msg);
+      }
+    } catch {
+      toast.error("导入失败，请检查文件格式");
+    } finally {
+      importInFlightRef.current = false;
+      setImporting(false);
+    }
+  };
+
+  // 拉取服务端导入前自动备份快照状态：失败静默（端点未合入/快照不存在
+  // 时按钮不出现，不弹错打扰备份页）。
+  const loadImportAutoBackupStatus = async () => {
+    try {
+      const response = await getImportAutoBackupStatus();
+
+      if (response.code === 0 && response.data) {
+        setImportAutoBackupStatus(response.data);
+      } else {
+        setImportAutoBackupStatus(null);
+      }
+    } catch {
+      setImportAutoBackupStatus(null);
+    }
+  };
+
+  // 下载服务端留存的导入前自动备份快照（可再导入恢复）。下载不删除快照；
+  // 无快照（404）时 toast 报错并刷新 status，按钮随之消失。
+  const handleDownloadImportAutoBackup = async () => {
+    try {
+      await downloadImportAutoBackup();
+    } catch (error) {
+      toast.error(
+        error instanceof Error && error.message
+          ? error.message
+          : "下载失败：暂无可下载的导入前自动备份",
+      );
+      void loadImportAutoBackupStatus();
+    }
+  };
+
+  const cancelPendingImport = () => {
+    setImportConfirmOpen(false);
+    setPendingImport(null);
+  };
+
+  const toggleTypeSelection = (
+    type: string,
+    setTypes: React.Dispatch<React.SetStateAction<string[]>>,
+  ) => {
+    setTypes((prev) =>
+      prev.includes(type)
+        ? prev.filter((item) => item !== type)
+        : [...prev, type],
+    );
+  };
+
+  const isAllTypesSelected = (types: string[]) =>
+    BACKUP_TYPE_VALUES.every((type) => types.includes(type));
+
+  const renderTypeSelection = (
+    label: string,
+    selectedTypes: string[],
+    setTypes: React.Dispatch<React.SetStateAction<string[]>>,
+  ) => {
+    const allSelected = isAllTypesSelected(selectedTypes);
+
+    return (
+      <div className="space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <span className="text-sm font-medium text-default-800">{label}</span>
+          <div className="flex items-center gap-2">
+            <Button
+              size="sm"
+              variant="flat"
+              onPress={() =>
+                setTypes(allSelected ? [] : [...BACKUP_TYPE_VALUES])
+              }
+            >
+              {allSelected ? "取消全选" : "全选"}
+            </Button>
+            <Button size="sm" variant="light" onPress={() => setTypes([])}>
+              清空
+            </Button>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          {BACKUP_TYPE_OPTIONS.map((option) => {
+            const isSelected = selectedTypes.includes(option.value);
+
+            return (
+              <button
+                key={option.value}
+                aria-pressed={isSelected}
+                className={`w-full px-4 py-3 rounded-lg border transition-all duration-200 cursor-pointer text-left ${
+                  isSelected
+                    ? "bg-primary-500/10 border-primary-300 shadow-sm"
+                    : "glass-card border-default-200 hover:border-primary-300 hover:shadow-sm"
+                }`}
+                type="button"
+                onClick={() => toggleTypeSelection(option.value, setTypes)}
+              >
+                <div className="flex items-center gap-3">
+                  <Checkbox
+                    classNames={{
+                      base: "pointer-events-none",
+                    }}
+                    color="primary"
+                    isSelected={isSelected}
+                    size="md"
+                  />
+                  <span
+                    className={`font-medium ${
+                      isSelected ? "text-default-900" : "text-default-800"
+                    }`}
+                  >
+                    {option.label}
+                  </span>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    );
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center min-h-[400px]">
+        <Spinner label="加载配置中..." size="lg" />
+      </div>
+    );
+  }
+
+  return (
+    <div className="p-6 max-w-4xl mx-auto">
+      {/* 页面标题 */}
+      <div className="flex items-center gap-3 mb-6">
+        <Button
+          isIconOnly
+          aria-label="返回上一页"
+          className="min-w-0 w-9 h-9"
+          size="sm"
+          variant="flat"
+          onPress={handleBack}
+        >
+          <BackIcon className="w-5 h-5" />
+        </Button>
+        <SettingsIcon className="w-8 h-8 text-primary-700" />
+        <div>
+          <h1 className="text-2xl font-bold">网站配置</h1>
+          <p className="text-foreground">管理网站的基本信息和显示设置</p>
+        </div>
+      </div>
+
+      {/* R2-C3-01：配置初载失败持久标记＋重试入口。失败时表单显示空默
+          认值，保存只发差异键、不会整表清零；但所见并非真实配置，
+          仍须点名提示，避免管理员误以为当前值就是真实值。 */}
+      {configsLoadFailed && (
+        <div className="mb-6 flex flex-wrap items-center gap-2 rounded-xl bg-danger-50 px-3 py-2">
+          <p className="text-xs font-semibold text-danger-700">
+            网站配置加载失败，当前表单显示的是空默认值，不是面板的真实配置；请重新加载后再编辑。
+          </p>
+          <Button
+            color="danger"
+            size="sm"
+            variant="flat"
+            onPress={() => loadConfigs()}
+          >
+            重新加载
+          </Button>
+        </div>
+      )}
+
+      <Card className="shadow-md mb-6">
+        <CardHeader className="pb-6">
+          <div className="flex items-center w-full">
+            <div>
+              <h2 className="text-xl font-semibold">品牌设置</h2>
+              <p className="text-sm text-foreground">
+                自定义面板名称、Logo、网站图标和底部版权信息
+              </p>
+            </div>
+          </div>
+        </CardHeader>
+        <Divider />
+        <CardBody className="pt-8">
+          <div className="space-y-6">
+            {CONFIG_ITEMS.filter((item) =>
+              [
+                "app_name",
+                "app_logo",
+                "app_favicon",
+                "hide_footer_brand",
+              ].includes(item.key),
+            ).map((item, index) => (
+              <div key={item.key}>
+                <div className="grid grid-cols-1 gap-6 md:grid-cols-[1fr_2fr]">
+                  <div className="space-y-1">
+                    <label className="text-sm font-semibold leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70">
+                      {item.label}
+                    </label>
+                    {item.description && (
+                      <p className="text-xs font-semibold text-foreground">
+                        {item.description}
+                      </p>
+                    )}
+                  </div>
+                  <div className="flex items-start">
+                    {renderConfigItem(item)}
+                  </div>
+                </div>
+                {index < 3 && <Divider className="mt-6" />}
+              </div>
+            ))}
+          </div>
+        </CardBody>
+      </Card>
+
+      <Card className="shadow-md">
+        <CardHeader className="pb-6">
+          <div className="flex items-center w-full">
+            <div>
+              <h2 className="text-xl font-semibold">基本设置</h2>
+              <p className="text-sm text-foreground">
+                配置网站的基本信息，这些设置会影响网站的显示效果
+              </p>
+            </div>
+          </div>
+        </CardHeader>
+
+        <Divider />
+
+        <CardBody className="space-y-6 pt-8 md:pt-8">
+          {CONFIG_ITEMS.map((item, index) => {
+            // 检查配置项是否应该显示
+            if (!shouldShowItem(item)) {
+              return null;
+            }
+
+            // 计算是否是最后一个显示的项目（用于决定是否显示分隔线）
+            const remainingItems = CONFIG_ITEMS.slice(index + 1).filter(
+              shouldShowItem,
+            );
+            const isLastItem = remainingItems.length === 0;
+
+            return (
+              <div key={item.key} className="space-y-3">
+                <div className="flex flex-col gap-1">
+                  <label className="text-sm font-medium text-foreground">
+                    {item.label}
+                  </label>
+                  {item.description && (
+                    <p className="text-xs font-semibold text-foreground">
+                      {item.description}
+                    </p>
+                  )}
+                </div>
+
+                {/* 渲染配置项 */}
+                {renderConfigItem(item)}
+
+                {/* 分隔线 */}
+                {!isLastItem && <Divider className="mt-6" />}
+              </div>
+            );
+          })}
+
+          <Divider className="my-2" />
+
+          <div className="space-y-3">
+            <div className="flex flex-col gap-1">
+              <p className="text-sm font-medium text-foreground">数据库占用</p>
+              <p className="text-xs font-semibold text-foreground">
+                当前后端数据库文件或实例占用空间，仅用于容量参考。
+              </p>
+            </div>
+            <div className="rounded-lg border border-divider glass-inset px-4 py-3 text-sm font-semibold text-default-800">
+              {storageSummary}
+            </div>
+          </div>
+
+          <Divider className="my-2" />
+
+          <div className="glass-card space-y-4 rounded-xl p-4">
+            <div className="space-y-1">
+              <p className="text-sm font-medium text-foreground">面板自升级</p>
+              <p className="text-xs font-semibold text-foreground">
+                检查当前版本、可用发布并在容器环境中触发面板升级。
+              </p>
+            </div>
+
+            {systemUpgradeLoading ? (
+              <div className="flex items-center gap-2 rounded-lg border border-divider glass-inset px-4 py-3 text-sm text-foreground">
+                <Spinner size="sm" />
+                正在加载升级状态...
+              </div>
+            ) : (
+              <div className="space-y-4 rounded-lg border border-divider glass-inset px-4 py-4 text-sm text-foreground">
+                <div className="grid gap-3 md:grid-cols-2">
+                  <div>
+                    <p className="text-xs font-semibold text-foreground">
+                      当前版本
+                    </p>
+                    <p className="mt-1 font-medium">
+                      {systemUpgradeInfo?.currentVersion || "未获取到版本信息"}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-xs font-semibold text-foreground">
+                      最新版本
+                    </p>
+                    <p className="mt-1 font-medium">
+                      {systemUpgradeInfo?.latestVersion || "未获取到可用版本"}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-xs font-semibold text-foreground">
+                      升级能力
+                    </p>
+                    <p className="mt-1 font-medium">
+                      {systemUpgradeInfo?.capability.capable
+                        ? "可升级"
+                        : "当前不可升级"}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="grid gap-3 md:grid-cols-2">
+                  <div>
+                    <p className="text-xs font-semibold text-foreground">
+                      部署目录
+                    </p>
+                    <p className="mt-1 break-all font-medium">
+                      {systemUpgradeInfo?.capability.deployDir ||
+                        "未获取到部署目录"}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-xs font-semibold text-foreground">
+                      后端容器
+                    </p>
+                    <p className="mt-1 break-all font-medium">
+                      {systemUpgradeInfo?.capability.backendContainer ||
+                        "未获取到容器信息"}
+                    </p>
+                  </div>
+                </div>
+
+                {!systemUpgradeInfo?.capability.capable && (
+                  <div className="rounded-lg border border-warning-300 bg-warning-500/10 px-4 py-3 text-warning-800">
+                    <p className="text-xs font-semibold">当前无法升级</p>
+                    <ul className="mt-2 list-disc space-y-1 pl-4 text-xs font-semibold">
+                      {(systemUpgradeInfo?.capability.reasons?.length
+                        ? systemUpgradeInfo.capability.reasons
+                        : ["暂未获取到不可升级原因"]
+                      ).map((reason) => (
+                        <li key={reason}>{reason}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                {/* R2-C5-04：待清理重复行（唯一索引迁移被挡）如实呈现：
+                    后端 /system/version 带结构化 pendingMigrations，此前
+                    前端已加载零渲染，管理员只能靠文档/SQL 发现。 */}
+                {systemUpgradeInfo?.pendingMigrations?.required && (
+                  <div className="rounded-lg border border-warning-300 bg-warning-500/10 px-4 py-3 text-warning-800">
+                    <p className="text-xs font-semibold">
+                      有待处理的数据清理：重复行挡住唯一索引迁移
+                    </p>
+                    <ul className="mt-2 list-disc space-y-1 pl-4 text-xs font-semibold">
+                      {(systemUpgradeInfo.pendingMigrations.tables ?? []).map(
+                        (t) => (
+                          <li key={`${t.table}-${t.sample ?? ""}`}>
+                            表 {t.table}：
+                            {t.duplicateGroups > 0
+                              ? `${t.duplicateGroups} 组重复`
+                              : "索引定义待处理"}
+                            {t.sample ? `（示例：${t.sample}）` : ""}
+                          </li>
+                        ),
+                      )}
+                    </ul>
+                    <p className="mt-2 text-xs font-semibold">
+                      处置：按升级指南清理上述重复行后重启面板，迁移会自动完成
+                      {systemUpgradeInfo.pendingMigrations.guide
+                        ? `（指引：${systemUpgradeInfo.pendingMigrations.guide}）`
+                        : ""}
+                      。清理前请先备份数据库。
+                    </p>
+                  </div>
+                )}
+
+                {/* R2-C5-04：管理员账号缺失（默认管理员 id=1 缺失且
+                    admin@user 已被占用）——后端只打 ERROR 日志并经
+                    /system/version 暴露，此前前端零渲染。系统不会自动
+                    提权任何账号，必须人工处理。 */}
+                {systemUpgradeInfo?.adminBootstrapRequired && (
+                  <div className="rounded-lg border border-danger-300 bg-danger-500/10 px-4 py-3 text-danger-800">
+                    <p className="text-xs font-semibold">
+                      面板缺少管理员账号，需人工处理
+                    </p>
+                    <p className="mt-2 text-xs font-semibold">
+                      默认管理员账号缺失且用户名 admin@user
+                      已被其他账号占用，系统不会自动补建、也不会把任何现有账号提权为管理员。处置办法：把占用该用户名的账号改名或删除后重启面板，系统会自动补建默认管理员；或停面板后经数据库直接补建管理员账号（重复行清理口径见
+                      doc/guide/upgrade.md）。
+                    </p>
+                  </div>
+                )}
+
+                {/* P3-2：升级状态来自后端状态接口，页面刷新/后端重启后不丢失 */}
+                {systemUpgradeStatus?.inProgress && (
+                  <div className="flex items-center gap-2 rounded-lg border border-primary-300 bg-primary-500/10 px-4 py-3 text-primary-800">
+                    <Spinner size="sm" />
+                    <p className="text-xs font-semibold">
+                      升级进行中
+                      {systemUpgradeStatus.version
+                        ? `：目标版本 ${systemUpgradeStatus.version}`
+                        : ""}
+                      {systemUpgradeStatus.startedAt
+                        ? `（开始于 ${formatStatusTime(systemUpgradeStatus.startedAt)}）`
+                        : ""}
+                      ，请勿重复发起
+                    </p>
+                  </div>
+                )}
+
+                {systemUpgradeStatus?.result && (
+                  <div
+                    className={
+                      systemUpgradeStatus.result === "success"
+                        ? "rounded-lg border border-success-500/25 bg-success-500/10 px-4 py-3 font-medium text-success-800"
+                        : "rounded-lg border border-danger-500/25 bg-danger-500/10 px-4 py-3 font-medium text-danger-800"
+                    }
+                  >
+                    <p className="text-xs font-semibold">
+                      上次升级
+                      {systemUpgradeStatus.result === "success"
+                        ? "成功"
+                        : systemUpgradeStatus.result === "rolled_back"
+                          ? "失败，已自动回滚到旧版本"
+                          : systemUpgradeStatus.result === "aborted"
+                            ? "已中止"
+                            : systemUpgradeStatus.result ===
+                                "helper_start_failed"
+                              ? "失败（升级助手启动失败）"
+                              : `失败（${systemUpgradeStatus.result}）`}
+                      {systemUpgradeStatus.finishedAt
+                        ? `（${formatStatusTime(systemUpgradeStatus.finishedAt)}）`
+                        : ""}
+                    </p>
+                  </div>
+                )}
+
+                {/* R8-003：状态轮询面同步透出第二锚降级点名（后端随状态
+                    落盘），使刷新/重启后面板上仍能区分单锚与双锚升级 */}
+                {systemUpgradeStatus?.anchorNote && (
+                  <div className="rounded-lg border border-warning-500/25 bg-warning-500/10 px-4 py-3 font-medium text-warning-800">
+                    <p className="text-xs font-semibold">
+                      本次升级校验提示：{systemUpgradeStatus.anchorNote}
+                    </p>
+                  </div>
+                )}
+
+                {/* J6-F01：状态面同步透出升级前 DB 快照点名（后端随状态
+                    落盘），SQLite 模式显示快照相对路径；PG 模式快照未
+                    落盘时以显式标记警告，不得以路径为空让运维误以为
+                    已有快照兜底 */}
+                {systemUpgradeStatus?.snapshotPath && (
+                  <div className="rounded-lg border border-divider glass-inset px-4 py-3 font-medium text-foreground">
+                    <p className="text-xs font-semibold">
+                      本次升级前数据库快照：
+                      {systemUpgradeStatus.snapshotPath}
+                      （位于部署目录内）
+                    </p>
+                  </div>
+                )}
+                {systemUpgradeStatus?.pgSnapshotDeferred && (
+                  <div className="rounded-lg border border-warning-500/25 bg-warning-500/10 px-4 py-3 font-medium text-warning-800">
+                    <p className="text-xs font-semibold">
+                      PostgreSQL 模式：本次升级前未生成数据库快照
+                    </p>
+                  </div>
+                )}
+
+                <div className="space-y-3">
+                  <div className="flex flex-col gap-1">
+                    <p className="text-sm font-medium text-foreground">
+                      可用发布版本
+                    </p>
+                    <p className="text-xs font-semibold text-foreground">
+                      选择指定版本后执行升级；留空则使用当前通道下最新可用版本。
+                    </p>
+                  </div>
+
+                  <Select
+                    aria-label="目标版本"
+                    isDisabled={
+                      !systemUpgradeReleasesMatchChannel ||
+                      systemUpgradeReleases.length === 0 ||
+                      systemUpgradeExecuting
+                    }
+                    placeholder={
+                      systemUpgradeReleasesMatchChannel &&
+                      systemUpgradeReleases.length > 0
+                        ? "留空时自动选择最新版本"
+                        : "请先检查当前通道更新"
+                    }
+                    selectedKeys={
+                      systemUpgradeSelectedVersion
+                        ? [systemUpgradeSelectedVersion]
+                        : []
+                    }
+                    size="md"
+                    variant="bordered"
+                    onSelectionChange={(keys) => {
+                      const selected = Array.from(keys)[0] as
+                        | string
+                        | undefined;
+
+                      setSystemUpgradeSelectedVersion(selected || "");
+                    }}
+                  >
+                    {(systemUpgradeReleasesMatchChannel
+                      ? systemUpgradeReleases
+                      : []
+                    ).map((release) => (
+                      <SelectItem
+                        key={release.version}
+                        description={release.publishedAt || "暂无发布时间"}
+                      >
+                        {release.name || release.version}
+                      </SelectItem>
+                    ))}
+                  </Select>
+                </div>
+              </div>
+            )}
+
+            <div className="flex flex-col gap-3 pt-1 sm:flex-row sm:justify-end">
+              <Button
+                isLoading={systemUpgradeChecking}
+                variant="flat"
+                onPress={handleCheckSystemUpgrade}
+              >
+                检查更新
+              </Button>
+              <Button
+                color="primary"
+                isDisabled={!canTriggerSystemUpgrade}
+                isLoading={systemUpgradeExecuting}
+                onPress={handleOpenSystemUpgradeModal}
+              >
+                立即升级
+              </Button>
+            </div>
+          </div>
+
+          <div className="flex justify-end pt-6 border-t border-divider/50 mt-4">
+            <Button
+              color="primary"
+              disabled={!hasChanges}
+              isLoading={saving}
+              startContent={<SaveIcon className="w-4 h-4" />}
+              onPress={handleSave}
+            >
+              {saving ? "保存中..." : "保存配置"}
+            </Button>
+          </div>
+        </CardBody>
+      </Card>
+
+      <NotifyCard
+        configs={configs}
+        originalConfigs={originalConfigs}
+        onChange={handleConfigChange}
+      />
+
+      {/* 延迟测试点配置（仅管理员可见） */}
+      {isAdmin() && (
+        <Card className="mt-6 shadow-md" id="latency-targets">
+          <CardHeader className="pb-2">
+            <h3 className="text-base font-semibold">延迟测试点</h3>
+            <p className="text-xs font-semibold text-foreground mt-1">
+              配置节点测量延迟的参考点，节点页将显示各节点到这些点的延迟
+            </p>
+          </CardHeader>
+          <CardBody>
+            <LatencySettings configs={configs} onChange={handleConfigChange} />
+          </CardBody>
+        </Card>
+      )}
+
+      {/* 订阅前置地址（仅管理员可见）：链接组装层设置，随页面统一保存 */}
+      {isAdmin() && (
+        <Card className="mt-6 shadow-md">
+          <CardHeader className="pb-2">
+            <h3 className="text-base font-semibold">订阅前置地址</h3>
+            <p className="text-xs font-semibold text-foreground mt-1">
+              面板域名被部分运营商阻断时，订阅链接可改走前置地址拉取
+            </p>
+          </CardHeader>
+          <CardBody>
+            <SubFrontSettings configs={configs} onChange={handleConfigChange} />
+          </CardBody>
+        </Card>
+      )}
+
+      {hasChanges && (
+        <Card className="mt-4 border-warning-200 shadow-sm overflow-hidden [&>div]:bg-warning-500/10">
+          <div className="h-10 flex items-center justify-center gap-2 text-warning-700">
+            <div className="w-2 h-2 bg-warning-500 rounded-full animate-pulse flex-shrink-0" />
+            <span className="text-sm font-semibold leading-none">
+              检测到配置变更，请记得保存您的修改
+            </span>
+          </div>
+        </Card>
+      )}
+
+      {/* 备份与恢复 */}
+      <Card className="mt-6 shadow-md">
+        <CardHeader className="pb-6">
+          <div className="flex justify-between items-center w-full">
+            <div>
+              <h2 className="text-xl font-semibold">数据备份与恢复</h2>
+              <p className="text-sm text-foreground">
+                导出或导入系统数据，支持选择特定数据类型
+              </p>
+            </div>
+          </div>
+        </CardHeader>
+
+        <Divider />
+
+        <CardBody className="space-y-6 pt-8 md:pt-8">
+          {/* 导出部分 */}
+          <div className="space-y-4">
+            <h3 className="text-lg font-medium">导出数据</h3>
+            <p className="text-sm text-foreground">
+              选择要导出的数据类型，导出为 JSON 格式文件
+            </p>
+            <p className="text-xs font-semibold text-foreground">
+              当前已选 {exportTypes.length} / {BACKUP_TYPE_VALUES.length}
+            </p>
+
+            <div className="flex justify-end gap-3 pt-4">
+              <Button
+                color="primary"
+                isLoading={exporting}
+                onPress={() => setExportSelectorOpen(true)}
+              >
+                {exporting ? "导出中..." : "选择并导出"}
+              </Button>
+            </div>
+          </div>
+
+          <Divider />
+
+          {/* 导入部分 */}
+          <div className="space-y-4">
+            <h3 className="text-lg font-medium">导入数据</h3>
+            <p className="text-sm text-foreground">
+              选择要导入的数据类型，支持从备份文件恢复数据
+            </p>
+            <p className="text-xs font-semibold text-foreground">
+              当前已选 {importTypes.length} / {BACKUP_TYPE_VALUES.length}
+            </p>
+
+            <input
+              ref={backupFileInputRef}
+              accept=".json"
+              className="hidden"
+              type="file"
+              onChange={handleFileChange}
+            />
+
+            <div className="flex justify-end gap-3 pt-4">
+              <Button
+                color="primary"
+                isLoading={importing}
+                variant="flat"
+                onPress={() => setImportSelectorOpen(true)}
+              >
+                {importing ? "导入中..." : "选择并导入"}
+              </Button>
+              {importFileName && (
+                <span className="self-center text-sm text-foreground">
+                  已选择: {importFileName}
+                </span>
+              )}
+            </div>
+            {importAutoBackupStatus?.exists && (
+              <div className="flex flex-wrap items-center justify-end gap-2">
+                <span className="text-xs font-semibold text-foreground">
+                  上次导入前已生成自动备份（范围同手动导出备份）
+                </span>
+                <Button
+                  size="sm"
+                  variant="flat"
+                  onPress={handleDownloadImportAutoBackup}
+                >
+                  下载导入前自动备份
+                </Button>
+              </div>
+            )}
+            {lastImportReceipt && (
+              <BackupImportReceiptPanel
+                data={lastImportReceipt}
+                title="最近一次导入结果"
+                onClose={() => setLastImportReceipt(null)}
+              />
+            )}
+          </div>
+        </CardBody>
+      </Card>
+
+      <Modal
+        backdrop="blur"
+        classNames={{
+          base: "!w-[calc(100%-32px)] !mx-auto sm:!w-full rounded-2xl overflow-hidden",
+        }}
+        isOpen={exportSelectorOpen}
+        onOpenChange={setExportSelectorOpen}
+      >
+        <ModalContent>
+          {(onClose) => (
+            <>
+              <ModalHeader>选择导出内容</ModalHeader>
+              <ModalBody>
+                {renderTypeSelection("导出内容", exportTypes, setExportTypes)}
+              </ModalBody>
+              <ModalFooter>
+                <Button variant="light" onPress={onClose}>
+                  取消
+                </Button>
+                <Button
+                  color="primary"
+                  isLoading={exporting}
+                  onPress={handleExport}
+                >
+                  {exporting ? "导出中..." : "确认导出"}
+                </Button>
+              </ModalFooter>
+            </>
+          )}
+        </ModalContent>
+      </Modal>
+
+      <Modal
+        backdrop="blur"
+        classNames={{
+          base: "!w-[calc(100%-32px)] !mx-auto sm:!w-full rounded-2xl overflow-hidden",
+        }}
+        isOpen={importSelectorOpen}
+        onOpenChange={setImportSelectorOpen}
+      >
+        <ModalContent>
+          {(onClose) => (
+            <>
+              <ModalHeader>选择导入内容</ModalHeader>
+              <ModalBody>
+                {renderTypeSelection("导入内容", importTypes, setImportTypes)}
+              </ModalBody>
+              <ModalFooter>
+                <Button variant="light" onPress={onClose}>
+                  取消
+                </Button>
+                <Button
+                  color="primary"
+                  isDisabled={importTypes.length === 0}
+                  onPress={triggerImportFilePicker}
+                >
+                  下一步选择文件
+                </Button>
+              </ModalFooter>
+            </>
+          )}
+        </ModalContent>
+      </Modal>
+
+      <Modal
+        backdrop="blur"
+        classNames={{
+          base: "!w-[calc(100%-32px)] !mx-auto sm:!w-full rounded-2xl overflow-hidden",
+        }}
+        isOpen={importConfirmOpen}
+        onOpenChange={(open) => {
+          if (!open && !importing) {
+            cancelPendingImport();
+          }
+        }}
+      >
+        <ModalContent>
+          <ModalHeader>确认导入备份</ModalHeader>
+          <ModalBody>
+            <div className="space-y-3 text-sm text-default-800">
+              <p>
+                即将导入文件
+                <span className="font-medium text-default-900">
+                  {" "}
+                  {pendingImport?.fileName || ""}{" "}
+                </span>
+                中所选类型的 {importTypes.length} 类数据。
+              </p>
+              <p>
+                导入按类型写入：与现有记录相同 ID
+                的数据会被备份文件中的内容覆盖，未包含在所选类型内的数据不受影响。
+              </p>
+              <p>
+                导入执行前，系统会先尝试生成一份导入前自动备份并保留在服务 端 24
+                小时，窗口期内可在此页下载、过期后自动清理，如结果不
+                符合预期，可下载该备份再导入恢复。自动备份的范围与手动导出
+                相同：只含备份所覆盖的各类数据，配置项按备份过滤口径剔除未
+                分类/敏感键，流量与监控的历史曲线不在备份范围内。若自动备
+                份生成失败（例如服务端目录不可写），导入仍会继续执行且此处
+                不会另行提示——重要数据请先手动导出一份备份，不要只依赖自
+                动备份。
+              </p>
+              <p>
+                点击「确认导入」后，导入一旦开始写入便会在服务端整单完成，
+                期间关闭页面或断开网络不影响导入完成、也无法取消；开始写入
+                前关闭页面则整单取消、不产生改动。
+              </p>
+            </div>
+          </ModalBody>
+          <ModalFooter>
+            <Button
+              isDisabled={importing}
+              variant="light"
+              onPress={cancelPendingImport}
+            >
+              取消
+            </Button>
+            <Button
+              color="primary"
+              isLoading={importing}
+              onPress={executePendingImport}
+            >
+              {importing ? "导入中..." : "确认导入"}
+            </Button>
+          </ModalFooter>
+        </ModalContent>
+      </Modal>
+
+      <Modal
+        backdrop="blur"
+        classNames={{
+          base: "!w-[calc(100%-32px)] !mx-auto sm:!w-full rounded-2xl overflow-hidden",
+        }}
+        isOpen={systemUpgradeModalOpen}
+        onOpenChange={(open) => {
+          if (!systemUpgradeExecuting) {
+            setSystemUpgradeModalOpen(open);
+          }
+        }}
+      >
+        <ModalContent>
+          {(onClose) => (
+            <>
+              <ModalHeader>确认面板升级</ModalHeader>
+              <ModalBody>
+                <div className="space-y-3 text-sm text-default-800">
+                  {/* P3-1：回显本次升级的目标版本，避免点了确认还不知道装到哪一版 */}
+                  <p className="font-medium text-default-900">
+                    {systemUpgradeSelectedVersion
+                      ? `本次将升级到指定版本 ${systemUpgradeSelectedVersion}`
+                      : systemUpgradeInfo?.latestVersion
+                        ? `本次将升级到最新版 ${systemUpgradeInfo.latestVersion}`
+                        : "本次将升级到最新版本"}
+                  </p>
+                  <p>
+                    升级过程需要访问 Docker
+                    Socket，并会在短时间内中断当前面板服务。
+                  </p>
+                  <p>
+                    请确认已经允许面板管理容器与宿主机 Docker
+                    交互，并且可以接受升级期间的临时不可用。
+                  </p>
+                  {/* O9-006：目标版本低于当前版本时显示降级警告。
+                      后端（O9-001）已拒绝降级；前端此处提前提示，避免白跑一次。 */}
+                  {systemUpgradeSelectedVersion &&
+                    systemUpgradeInfo?.currentVersion &&
+                    compareVersions(
+                      systemUpgradeSelectedVersion,
+                      systemUpgradeInfo.currentVersion,
+                    ) < 0 && (
+                      <div className="rounded-lg border border-danger-500/25 bg-danger-500/10 px-4 py-3 font-medium text-danger-800">
+                        <p className="text-xs font-semibold">
+                          降级警告：目标版本（
+                          {systemUpgradeSelectedVersion}）低于当前版本（
+                          {systemUpgradeInfo.currentVersion}
+                          ），后端将拒绝执行。请选择更高版本或留空使用最新版本。
+                        </p>
+                      </div>
+                    )}
+                  <div className="space-y-2 rounded-lg border border-warning-500/25 bg-warning-500/10 px-4 py-3 font-medium text-warning-800">
+                    <p className="text-xs font-semibold">升级前请确认</p>
+                    <ul className="list-disc space-y-1 pl-4 text-xs font-semibold">
+                      <li>Docker Socket 可用且挂载权限正常。</li>
+                      <li>当前面板允许短暂停止和重启。</li>
+                      <li>已选择正确的更新通道与目标版本。</li>
+                    </ul>
+                  </div>
+                </div>
+              </ModalBody>
+              <ModalFooter>
+                <Button
+                  isDisabled={systemUpgradeExecuting}
+                  variant="light"
+                  onPress={onClose}
+                >
+                  取消
+                </Button>
+                <Button
+                  color="primary"
+                  isDisabled={systemUpgradeExecuting}
+                  isLoading={systemUpgradeExecuting}
+                  onPress={handleConfirmSystemUpgrade}
+                >
+                  确认升级
+                </Button>
+              </ModalFooter>
+            </>
+          )}
+        </ModalContent>
+      </Modal>
+
+      {/* Floating Save Button (FAB) */}
+      <AnimatePresence>
+        {hasChanges && (
+          <motion.div
+            animate={{ y: 0, opacity: 1 }}
+            className="fixed bottom-6 right-6 z-50"
+            exit={{ y: 100, opacity: 0 }}
+            initial={{ y: 100, opacity: 0 }}
+            transition={{ type: "spring", damping: 20, stiffness: 300 }}
+          >
+            <Button
+              isIconOnly
+              className="w-12 h-12 rounded-full shadow-lg"
+              color="primary"
+              isLoading={saving}
+              size="lg"
+              onPress={handleSave}
+            >
+              {!saving && <SaveIcon className="w-5 h-5" />}
+            </Button>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}

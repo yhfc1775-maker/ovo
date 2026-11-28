@@ -1,0 +1,1184 @@
+package handler
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"go-backend/internal/monitoring"
+	"go-backend/internal/store/model"
+)
+
+const (
+	tunnelQualityProbeTimeout   = 8 * time.Second
+	tunnelQualityPingTimeoutMs  = 5000
+	tunnelQualityPruneInterval  = 10 * time.Minute
+	tunnelQualityReportInterval = 30 * time.Second // DB save interval
+)
+
+type TunnelQualityHop struct {
+	FromNodeID   int64   `json:"fromNodeId"`
+	FromNodeName string  `json:"fromNodeName"`
+	ToNodeID     int64   `json:"toNodeId"`
+	ToNodeName   string  `json:"toNodeName"`
+	Latency      float64 `json:"latency"`
+	Loss         float64 `json:"loss"`
+	TargetIP     string  `json:"targetIp,omitempty"`
+	TargetPort   int     `json:"targetPort,omitempty"`
+	// Untested（R6-L4-02）：目标段为 UDP 协议段时本跳未实测——
+	// Latency/Loss 保持 -1/100 未测哨兵，但语义是「未测」而非
+	// 「探测失败」：不判快照失败、不进成败聚合，呈现层据此走
+	// 中性形态。候选跳（TunnelQualityCandidateHop 内嵌本结构）
+	// 同口径。
+	Untested bool `json:"untested,omitempty"`
+}
+
+type TunnelQualityCandidateHop struct {
+	TunnelQualityHop
+	FromRole     string `json:"fromRole"`
+	ToRole       string `json:"toRole"`
+	HopIndex     int    `json:"hopIndex"`
+	Selected     bool   `json:"selected"`
+	ErrorMessage string `json:"errorMessage,omitempty"`
+}
+
+type tunnelQualityChainDetails struct {
+	PrimaryPath   []TunnelQualityHop          `json:"primaryPath,omitempty"`
+	CandidateHops []TunnelQualityCandidateHop `json:"candidateHops,omitempty"`
+}
+
+type tunnelQualityCandidateGroup struct {
+	role      string
+	roleIndex int
+	nodes     []chainNodeRecord
+}
+
+// tunnelQualitySnapshot is the in-memory latest probe result for a tunnel.
+type tunnelQualitySnapshot struct {
+	TunnelID           int64   `json:"tunnelId"`
+	EntryToExitLatency float64 `json:"entryToExitLatency"`
+	ExitToBingLatency  float64 `json:"exitToBingLatency"`
+	EntryToExitLoss    float64 `json:"entryToExitLoss"`
+	ExitToBingLoss     float64 `json:"exitToBingLoss"`
+	Success            bool    `json:"success"`
+	// EntryToExitPartialUntested（R8-024）：入口→出口聚合只含
+	// 实测跳、至少一跳未测（UDP 协议段）时为真——该总值是部分和，
+	// 呈现层须与全实测总值区分。落库列 entry_to_exit_partial 同步
+	// 持久化，历史行同带此标记。
+	EntryToExitPartialUntested bool   `json:"entryToExitPartialUntested,omitempty"`
+	ErrorMessage               string `json:"errorMessage,omitempty"`
+	Timestamp                  int64  `json:"timestamp"`
+	ChainDetails               string `json:"chainDetails,omitempty"`
+	ProbeTargetHost            string `json:"probeTargetHost,omitempty"`
+	ProbeTargetPort            int    `json:"probeTargetPort,omitempty"`
+
+	// internal fields for db reporting
+	lastDBWrite int64 `json:"-"`
+}
+
+// tunnelQualityProber runs periodic TCP ping probes against all enabled tunnels.
+// Design mirrors health.Checker: background goroutine with worker pool + scheduled cleanup.
+type tunnelQualityProber struct {
+	handler *Handler
+	cache   sync.Map // tunnelID (int64) → *tunnelQualitySnapshot
+	// storeMu 串行化 storeResult 的「读缓存→判时间戳/落库门→写缓存」
+	// 全程（R1-09-L2）：probeAll 轮次与节点重连探测两个调用方可并发
+	// 探同一隧道，无串行时两份快照会同穿 30 秒落库门写出重复历史行。
+	storeMu   sync.Mutex
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wake      chan struct{}
+	lastPrune int64
+	probing   int32 // atomic flag: 1 = probeAll running, 0 = idle
+	probeNode bestExitProbeFunc
+	// R3-B07-001：上一整轮 probeAll 的实际耗时（原子，纳秒）。
+	// loop 的实际周期 = 间隔 + 整轮耗时，pendingFreshWindow 推导
+	// 必须把整轮耗时计入，否则整轮超过间隔时相邻确认间隔恒大于
+	// 窗口、最优出口确认永不累积。
+	lastRoundDurationNs int64 // atomic
+
+	// D6-02：探测配置短时缓存（三键合读一次，替代每轮 2 次配置查询）。
+	cfgMu       sync.Mutex
+	cfgLoaded   bool
+	cfgLoadedAt time.Time
+	cfgValues   tunnelQualityProbeConfig
+	// D6-02：单轮缓存——同一节点在一轮内的多次 getNodeRecord 合并为
+	// 一次；隧道 IP 偏好整轮一次批量查询。probeAll 有防重入，轮不重叠。
+	roundMu       sync.Mutex
+	roundActive   bool
+	roundNodes    map[int64]*nodeRecord
+	roundNodeErrs map[int64]error
+	roundIPPref   map[int64]string
+	roundIPPrefOK bool
+}
+
+// newTunnelQualityProber creates a new prober (not yet running).
+func newTunnelQualityProber(h *Handler) *tunnelQualityProber {
+	return &tunnelQualityProber{
+		handler: h,
+		wake:    make(chan struct{}, 1),
+	}
+}
+
+// Start launches the background probe loop (call from jobs.go).
+func (p *tunnelQualityProber) Start(ctx context.Context) {
+	// Use the provided context so we stop with other background jobs.
+	p.ctx, p.cancel = context.WithCancel(ctx)
+	p.loop()
+}
+
+// Stop halts the background probe loop.
+func (p *tunnelQualityProber) Stop() {
+	if p == nil || p.cancel == nil {
+		return
+	}
+
+	p.cancel()
+}
+
+func (p *tunnelQualityProber) NotifyConfigChanged() {
+	if p == nil {
+		return
+	}
+	// D6-02：配置变更立即失效探测配置缓存，下一轮/下一次读即新值。
+	p.cfgMu.Lock()
+	p.cfgLoaded = false
+	p.cfgMu.Unlock()
+	if p.wake == nil {
+		return
+	}
+	select {
+	case p.wake <- struct{}{}:
+	default:
+	}
+}
+
+// GetAll returns all cached quality snapshots (latest per tunnel).
+func (p *tunnelQualityProber) GetAll() []tunnelQualitySnapshot {
+	var items []tunnelQualitySnapshot
+	p.cache.Range(func(_, value interface{}) bool {
+		if snap, ok := value.(*tunnelQualitySnapshot); ok {
+			items = append(items, *snap)
+		}
+		return true
+	})
+	return items
+}
+
+func (p *tunnelQualityProber) loop() {
+	// Initial delay to let the system boot up
+	select {
+	case <-time.After(5 * time.Second):
+	case <-p.ctx.Done():
+		return
+	}
+
+	// OBS-1: consecutive all-failed rounds back off exponentially
+	// (capped at tunnelQualityBackoffMax). Against dead egress each
+	// round burns ~2s DNS + 5s dial timeout per probe and the agent
+	// log fills with probe noise; without backoff the loop re-fires
+	// every ~7s (1s interval + ~6s round). A vacuous round
+	// (disabled / no tunnels / re-entrant skip) sends no probes, so
+	// it neither grows nor resets the streak.
+	failStreak := 0
+	applyRound := func() {
+		probed, succeeded := p.probeAll()
+		switch {
+		case probed == 0:
+			// Vacuous round: no probes sent, streak unchanged.
+		case succeeded == 0:
+			failStreak++
+			log.Printf("tunnel_quality_prober: probe round failed (0/%d tunnels succeeded); backing off to %s", probed, p.backoffDelay(failStreak))
+		default:
+			if failStreak > 0 {
+				log.Printf("tunnel_quality_prober: probe round recovered after %d failed rounds; backoff reset", failStreak)
+			}
+			failStreak = 0
+		}
+	}
+
+	// Run once immediately
+	applyRound()
+
+	for {
+		timer := time.NewTimer(p.backoffDelay(failStreak))
+		select {
+		case <-p.ctx.Done():
+			stopAndDrainTunnelQualityTimer(timer)
+			return
+		case <-p.wake:
+			stopAndDrainTunnelQualityTimer(timer)
+			// A config change invalidates the failure streak: the
+			// target or interval may have changed, so the next round
+			// runs on the fresh schedule, not the backed-off one.
+			failStreak = 0
+			continue
+		case <-timer.C:
+			applyRound()
+			p.maybePrune()
+		}
+	}
+}
+
+func stopAndDrainTunnelQualityTimer(timer *time.Timer) {
+	if timer == nil || timer.Stop() {
+		return
+	}
+	select {
+	case <-timer.C:
+	default:
+	}
+}
+
+// tunnelQualityProbeConfig 是一轮探测用到的三项配置的快照。
+type tunnelQualityProbeConfig struct {
+	interval  time.Duration
+	enabled   bool
+	retention int
+}
+
+// tunnelQualityConfigCacheTTL 是探测配置缓存有效期（D6-02）。
+// NotifyConfigChanged 会提前失效，TTL 只兜底未走通知的写路径。
+const tunnelQualityConfigCacheTTL = 5 * time.Second
+
+// probeConfig 三键合读一次并短时缓存：旧实现 probeInterval 与
+// retentionDays 各查一次、isEnabled 再查一次，一轮多次往返
+// vite_config。语义与逐个读完全一致（缺失/出错 → 默认值）。
+func (p *tunnelQualityProber) probeConfig() tunnelQualityProbeConfig {
+	defaults := tunnelQualityProbeConfig{
+		interval:  time.Duration(monitoring.DefaultTunnelQualityProbeIntervalSec) * time.Second,
+		enabled:   true,
+		retention: monitoring.DefaultMonitorRetentionDays,
+	}
+	if p == nil || p.handler == nil || p.handler.repo == nil {
+		return defaults
+	}
+	p.cfgMu.Lock()
+	defer p.cfgMu.Unlock()
+	if p.cfgLoaded && time.Since(p.cfgLoadedAt) < tunnelQualityConfigCacheTTL {
+		return p.cfgValues
+	}
+	cfg, err := p.handler.repo.GetConfigsByNames([]string{
+		monitoring.ConfigTunnelQualityProbeIntervalSec,
+		monitorTunnelQualityEnabledConfigKey,
+		monitoring.ConfigMonitorRetentionDays,
+	})
+	if err != nil {
+		return defaults
+	}
+	values := tunnelQualityProbeConfig{
+		interval: time.Duration(monitoring.TunnelQualityProbeIntervalSecondsFromConfigMap(cfg)) * time.Second,
+		// 与 isTunnelQualityMonitoringEnabled 同口径：缺失/异常视为
+		// 启用，仅显式 "false" 关闭。
+		enabled:   strings.TrimSpace(strings.ToLower(cfg[monitorTunnelQualityEnabledConfigKey])) != "false",
+		retention: monitoring.MonitoringRetentionDaysFromConfigMap(cfg),
+	}
+	p.cfgValues, p.cfgLoaded, p.cfgLoadedAt = values, true, time.Now()
+	return values
+}
+
+func (p *tunnelQualityProber) probeInterval() time.Duration {
+	if p == nil || p.handler == nil || p.handler.repo == nil {
+		return time.Duration(monitoring.DefaultTunnelQualityProbeIntervalSec) * time.Second
+	}
+	return p.probeConfig().interval
+}
+
+func (p *tunnelQualityProber) isEnabled() bool {
+	if p == nil || p.handler == nil {
+		return true
+	}
+
+	return p.probeConfig().enabled
+}
+
+func (p *tunnelQualityProber) retentionDays() int {
+	if p == nil || p.handler == nil || p.handler.repo == nil {
+		return monitoring.DefaultMonitorRetentionDays
+	}
+	return p.probeConfig().retention
+}
+
+// maybePrune deletes old quality rows periodically (mirrors PruneServiceMonitorResults).
+func (p *tunnelQualityProber) maybePrune() {
+	now := time.Now().UnixMilli()
+	if p.lastPrune > 0 && now-p.lastPrune < int64(tunnelQualityPruneInterval/time.Millisecond) {
+		return
+	}
+	p.lastPrune = now
+
+	h := p.handler
+	if h == nil || h.repo == nil {
+		return
+	}
+
+	cutoff := now - int64(time.Duration(p.retentionDays())*24*time.Hour/time.Millisecond)
+	if err := h.repo.PruneTunnelQualityResults(cutoff); err != nil {
+		log.Printf("tunnel_quality_prober: prune err=%v", err)
+	}
+}
+
+// tunnelQualityBackoffMax caps the probe failure backoff (OBS-1):
+// after nine consecutive all-failed rounds at the default 1s
+// interval the loop waits 5 minutes between rounds instead of
+// hammering a dead egress every ~7s.
+const tunnelQualityBackoffMax = 5 * time.Minute
+
+// backoffDelay is the loop's next sleep: the configured interval
+// doubled per consecutive all-failed round, capped. It deliberately
+// does NOT feed pendingFreshWindow, which keeps deriving from the
+// configured interval — best-exit confirmation windows must not
+// stretch with the outage backoff.
+func (p *tunnelQualityProber) backoffDelay(failStreak int) time.Duration {
+	base := p.probeInterval()
+	if failStreak <= 0 {
+		return base
+	}
+	d := base
+	for i := 0; i < failStreak; i++ {
+		d *= 2
+		if d >= tunnelQualityBackoffMax {
+			return tunnelQualityBackoffMax
+		}
+	}
+	return d
+}
+
+func (p *tunnelQualityProber) probeAll() (probed, succeeded int) {
+	if !p.isEnabled() {
+		return
+	}
+
+	// Skip if previous probe round is still running (interval < timeout guard)
+	if !atomic.CompareAndSwapInt32(&p.probing, 0, 1) {
+		return
+	}
+	defer atomic.StoreInt32(&p.probing, 0)
+	roundStart := time.Now()
+
+	h := p.handler
+	if h == nil || h.repo == nil {
+		return
+	}
+
+	tunnelIDs, err := h.repo.ListEnabledTunnelIDs()
+	if err != nil {
+		log.Printf("tunnel_quality_prober: list enabled tunnels err=%v", err)
+		return
+	}
+	// F-084: 每轮按当前 enabled 集合淘汰缓存——隧道删除/停用后快照
+	// 不再残留（淘汰须在 len==0 早退之前，覆盖"最后一个隧道被删"）。
+	enabled := make(map[int64]bool, len(tunnelIDs))
+	for _, id := range tunnelIDs {
+		enabled[id] = true
+	}
+	p.cache.Range(func(key, _ interface{}) bool {
+		if id, ok := key.(int64); ok && !enabled[id] {
+			p.cache.Delete(key)
+		}
+		return true
+	})
+	if len(tunnelIDs) == 0 {
+		return
+	}
+	probed = len(tunnelIDs)
+
+	// D6-02：开启轮内缓存（节点记录去重 + IP 偏好整轮批量预取）。
+	p.beginProbeRound(tunnelIDs)
+	defer p.endProbeRound()
+
+	// Probe tunnels concurrently with a worker limit
+	// (mirrors health.Checker worker pool pattern)
+	const maxWorkers = 20
+	sem := make(chan struct{}, maxWorkers)
+	var wg sync.WaitGroup
+
+	for _, tunnelID := range tunnelIDs {
+		select {
+		case <-p.ctx.Done():
+			return
+		default:
+		}
+
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(tid int64) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			p.probeTunnel(tid)
+		}(tunnelID)
+	}
+	wg.Wait()
+	// R3-B07-001：整轮耗时落盘供下一轮的新鲜度窗口推导（只有真正
+	// 跑完探测的轮才记录，前置早退不覆盖估计）。
+	atomic.StoreInt64(&p.lastRoundDurationNs, time.Since(roundStart).Nanoseconds())
+	// OBS-1：本轮成败按本轮快照计——只有时间戳落在本轮内且
+	// Success 的快照才算成功；旧轮残留的成功快照不得把失败轮
+	// 认作成功（否则退避永不触发）。
+	for _, tid := range tunnelIDs {
+		if v, ok := p.cache.Load(tid); ok {
+			if snap, ok := v.(*tunnelQualitySnapshot); ok && snap.Success && snap.Timestamp >= roundStart.UnixMilli() {
+				succeeded++
+			}
+		}
+	}
+	return
+}
+
+// pendingFreshWindow 推导最优出口确认新鲜度窗口（R3-B07-001）。
+//
+// 口径选型：窗口 = 2 × (探测间隔 + 上一整轮耗时)。loop() 在
+// probeAll 返回后才起间隔定时器，相邻两轮确认的实际间隔是
+// 「间隔 + 整轮耗时」；窗口须覆盖一个完整周期并留一倍余量。
+// Round 2 B07-003 的旧推导只取 2×间隔：默认间隔 1s 时整轮只要
+// 超过 1s（多候选对串行 TcpPing、单个慢目标 5s 超时都可达到），
+// 相邻确认间隔恒大于窗口、计数每轮重置为 1，3 轮确认永不达成，
+// 自动切换在默认配置下静默失效。
+//
+// 未选「状态机改按连续轮次计数」：observeScores 还被轮外路径喂
+// 数（节点重连探测直调 probeTunnel，无轮次身份），且探测停摆、
+// 间隔被调大等真实陈旧场景需要墙钟语义兜底；按周期推导的墙钟
+// 窗口对两类调用方一致成立，陈旧确认仍被作废（B07-003 语义不变）。
+func (p *tunnelQualityProber) pendingFreshWindow() time.Duration {
+	interval := p.probeInterval()
+	lastRound := time.Duration(atomic.LoadInt64(&p.lastRoundDurationNs))
+	if lastRound < 0 {
+		lastRound = 0
+	}
+	return 2 * (interval + lastRound)
+}
+
+// beginProbeRound 开启一轮的共享缓存：节点记录 map 清空待填，隧道
+// IP 偏好整轮一次批量查询（失败则读取方回退逐隧道查询）。
+func (p *tunnelQualityProber) beginProbeRound(tunnelIDs []int64) {
+	p.roundMu.Lock()
+	p.roundNodes = make(map[int64]*nodeRecord)
+	p.roundNodeErrs = make(map[int64]error)
+	p.roundIPPref = nil
+	p.roundIPPrefOK = false
+	p.roundActive = true
+	p.roundMu.Unlock()
+	if p.handler == nil || p.handler.repo == nil {
+		return
+	}
+	if prefs, err := p.handler.repo.ListTunnelIPPreferences(tunnelIDs); err == nil {
+		p.roundMu.Lock()
+		p.roundIPPref = prefs
+		p.roundIPPrefOK = true
+		p.roundMu.Unlock()
+	} else {
+		log.Printf("tunnel_quality_prober: batch ip preferences err=%v", err)
+	}
+}
+
+func (p *tunnelQualityProber) endProbeRound() {
+	p.roundMu.Lock()
+	defer p.roundMu.Unlock()
+	p.roundActive = false
+	p.roundNodes = nil
+	p.roundNodeErrs = nil
+	p.roundIPPref = nil
+	p.roundIPPrefOK = false
+}
+
+// nodeRecord 是 getNodeRecord 的轮内缓存包装（D6-02）：一轮内同一
+// 节点被选主跳/候选链路/best-exit 等多个阶段反复读取，旧实现每次
+// 都是一次 node 表查询（3 节点场景实测 10 次）。轮外（直调
+// probeTunnel 的路径）行为与 getNodeRecord 完全一致。
+func (p *tunnelQualityProber) nodeRecord(nodeID int64) (*nodeRecord, error) {
+	p.roundMu.Lock()
+	if p.roundActive {
+		if rec, ok := p.roundNodes[nodeID]; ok {
+			err := p.roundNodeErrs[nodeID]
+			p.roundMu.Unlock()
+			return rec, err
+		}
+	}
+	p.roundMu.Unlock()
+	rec, err := p.handler.getNodeRecord(nodeID)
+	p.roundMu.Lock()
+	if p.roundActive && p.roundNodes != nil {
+		p.roundNodes[nodeID] = rec
+		if err != nil {
+			p.roundNodeErrs[nodeID] = err
+		} else {
+			delete(p.roundNodeErrs, nodeID)
+		}
+	}
+	p.roundMu.Unlock()
+	return rec, err
+}
+
+// roundIPPreference 返回轮内批量预取的隧道 IP 偏好；第二返回值
+// false 表示本轮无批量结果（预取失败或不在轮内），调用方回退
+// GetTunnelIPPreference。
+func (p *tunnelQualityProber) roundIPPreference(tunnelID int64) (string, bool) {
+	p.roundMu.Lock()
+	defer p.roundMu.Unlock()
+	if p.roundActive && p.roundIPPrefOK {
+		return p.roundIPPref[tunnelID], true
+	}
+	return "", false
+}
+
+func (p *tunnelQualityProber) probeTunnel(tunnelID int64) {
+	h := p.handler
+	if h == nil || h.repo == nil {
+		return
+	}
+
+	now := time.Now().UnixMilli()
+	// B07-001/B07-002（Round 2）：两段量测值一律以 -1/100 哨兵起步，
+	// 只有真实探测成功才覆写为实测值。这样任何未测到的段——三条
+	// 前置早退（隧道不存在/目标不允许/配置不完整）、入口/出口离线
+	// 被门控跳过的段、以及类型1 本就不存在的「入口→出口」段——
+	// 落库与缓存都呈哨兵，绝不留 0/0 冒充完美样本。
+	snap := &tunnelQualitySnapshot{
+		TunnelID:           tunnelID,
+		Timestamp:          now,
+		EntryToExitLatency: -1,
+		EntryToExitLoss:    100,
+		ExitToBingLatency:  -1,
+		ExitToBingLoss:     100,
+	}
+
+	// Get tunnel chain info
+	tunnel, err := h.getTunnelRecord(tunnelID)
+	if err != nil {
+		snap.ErrorMessage = "隧道不存在"
+		p.storeResult(snap)
+		return
+	}
+	// R3X-011 下发面：存量坏探测目标整轮跳过质量探测（checked 内部
+	// 已打告警日志，快照保留原始目标并记跳过原因），不向任何节点
+	// 下发该目标的 TcpPing，也不用默认目标冒充探测。
+	probeTarget, probeTargetOK := checkedTunnelProbeTargetValues(tunnel.ProbeTargetHost, tunnel.ProbeTargetPort)
+	if !probeTargetOK {
+		snap.ProbeTargetHost = tunnel.ProbeTargetHost
+		snap.ProbeTargetPort = tunnel.ProbeTargetPort
+		snap.ErrorMessage = "探测目标地址不允许，已跳过质量探测"
+		p.storeResult(snap)
+		return
+	}
+	snap.ProbeTargetHost = probeTarget.Host
+	snap.ProbeTargetPort = probeTarget.Port
+
+	chainRows, err := h.listChainNodesForTunnel(tunnelID)
+	if err != nil || len(chainRows) == 0 {
+		snap.ErrorMessage = "隧道配置不完整"
+		p.storeResult(snap)
+		return
+	}
+
+	ipPreference, ipPrefBatched := p.roundIPPreference(tunnelID)
+	if !ipPrefBatched {
+		ipPreference = h.repo.GetTunnelIPPreference(tunnelID)
+	}
+	inNodes, midNodesGrouped, outNodes := splitChainNodeGroups(chainRows)
+
+	options := diagnosisExecOptions{
+		commandTimeout: tunnelQualityProbeTimeout,
+		pingTimeoutMS:  tunnelQualityPingTimeoutMs,
+		pingCount:      1,
+		timeoutMessage: "探测超时",
+	}
+	// R6-L4-02：段协议判定与诊断面同口径（段行协议优先、回退隧道
+	// 协议，见 chainSegmentProtocol）；UDP 协议段的质量面处置在
+	// 主跳/候选跳/最优出口评分三处一致：记未测、不喂假失败。
+	defaultProtocol := strings.ToLower(strings.TrimSpace(tunnel.Protocol))
+	roundPinger := newBestExitRoundPinger(p.pingNode)
+	p.probeBestExitOwners(tunnelID, inNodes, midNodesGrouped, outNodes, ipPreference, options, probeTarget, roundPinger, defaultProtocol)
+
+	entry, _, entryOnline := p.firstOnlineChainNode(inNodes)
+	exit, _, exitOnline := p.firstOnlineChainNode(outNodes)
+	selectedNodeIDs := make(map[string]int64, 2+len(midNodesGrouped))
+	if entryOnline {
+		selectedNodeIDs[tunnelQualityGroupKey("entry", 0)] = entry.NodeID
+	}
+	if exitOnline {
+		selectedNodeIDs[tunnelQualityGroupKey("exit", 0)] = exit.NodeID
+	}
+	var primaryHops []TunnelQualityHop
+
+	switch tunnel.Type {
+	case 1:
+		// Port forwarding: entry → public probe target only.
+		if entryOnline {
+			lat, loss, err := roundPinger(entry.NodeID, probeTarget.Host, probeTarget.Port, options)
+			if err == nil {
+				snap.ExitToBingLatency = lat
+				snap.ExitToBingLoss = loss
+				snap.Success = true
+			} else {
+				// B07-002：失败段写 -1/100 哨兵，与类型2 入口段口径
+				// 一致，不得留 0/0 冒充完美样本进历史/统计。
+				snap.ExitToBingLatency = -1
+				snap.ExitToBingLoss = 100
+				snap.ErrorMessage = latencyCommandError(err)
+			}
+		} else {
+			snap.ErrorMessage = "入口节点均不在线"
+		}
+	case 2:
+		// Tunnel forwarding: entry → exit + exit → Bing
+		probeOK := true
+
+		if !entryOnline {
+			probeOK = false
+			snap.ErrorMessage = "入口节点均不在线"
+			snap.EntryToExitLatency = -1
+			snap.EntryToExitLoss = 100
+		} else if !exitOnline {
+			probeOK = false
+			snap.ErrorMessage = "出口节点均不在线"
+			snap.EntryToExitLatency = -1
+			snap.EntryToExitLoss = 100
+		} else {
+			var totalLat float64
+			remainingSuccessProb := 1.0
+			measuredHops := 0
+			untestedHops := 0
+
+			nodesInPath := make([]chainNodeRecord, 0, 2+len(midNodesGrouped))
+			nodesInPath = append(nodesInPath, entry)
+			for midIndex, midGroup := range midNodesGrouped {
+				mid, _, online := p.firstOnlineChainNode(midGroup)
+				if !online {
+					probeOK = false
+					snap.ErrorMessage = "中间节点组均不在线"
+					break
+				}
+				nodesInPath = append(nodesInPath, mid)
+				selectedNodeIDs[tunnelQualityGroupKey("middle", midIndex)] = mid.NodeID
+			}
+			if probeOK {
+				nodesInPath = append(nodesInPath, exit)
+			}
+
+			for i := 0; i < len(nodesInPath)-1; i++ {
+				source := nodesInPath[i]
+				target := nodesInPath[i+1]
+
+				hop := TunnelQualityHop{
+					FromNodeID:   source.NodeID,
+					FromNodeName: source.NodeName,
+					ToNodeID:     target.NodeID,
+					ToNodeName:   target.NodeName,
+				}
+
+				targetNode, nodeErr := p.nodeRecord(target.NodeID)
+				if nodeErr != nil || !isTunnelProbeNodeOnline(targetNode) {
+					snap.ErrorMessage = "节点 " + target.NodeName + " 不可用"
+					probeOK = false
+					hop.Latency = -1
+					hop.Loss = 100
+					primaryHops = append(primaryHops, hop)
+					break
+				}
+
+				fromNode, _ := p.nodeRecord(source.NodeID)
+				targetIP, targetPort, resolveErr := resolveChainProbeTarget(fromNode, targetNode, target.Port, ipPreference, target.ConnectIP)
+				if resolveErr != nil {
+					snap.ErrorMessage = "解析节点 " + target.NodeName + " 失败: " + resolveErr.Error()
+					probeOK = false
+					hop.Latency = -1
+					hop.Loss = 100
+					primaryHops = append(primaryHops, hop)
+					break
+				}
+
+				hop.TargetIP = targetIP
+				hop.TargetPort = targetPort
+
+				// R6-L4-02：目标段为 UDP 协议段时链服务是 UDP 监听，
+				// TCP 探测恒失败——旧实现恒记 -1/100 失败并判整快照
+				// 失败，健康的 UDP 链被恒读成死链（且与手动诊断面
+				// 对同一段的结论相反）。UDP 不可实测：本跳记未测
+				// （哨兵值＋Untested 标记），不探测、不判失败、不进
+				// 延迟/丢包聚合。节点可用性与地址解析失败在上方已
+				// 按面板侧事实先行处理，不在此豁免。
+				if isUDPBasedProtocol(chainSegmentProtocol(target.Protocol, defaultProtocol)) {
+					hop.Untested = true
+					hop.Latency = -1
+					hop.Loss = 100
+					untestedHops++
+					primaryHops = append(primaryHops, hop)
+					continue
+				}
+
+				lat, loss, err := roundPinger(source.NodeID, targetIP, targetPort, options)
+				if err == nil {
+					hop.Latency = lat
+					hop.Loss = loss
+					totalLat += lat
+					remainingSuccessProb *= (1.0 - loss/100.0)
+					measuredHops++
+					primaryHops = append(primaryHops, hop)
+				} else {
+					probeOK = false
+					hop.Latency = -1
+					hop.Loss = 100
+					primaryHops = append(primaryHops, hop)
+					if snap.ErrorMessage == "" {
+						snap.ErrorMessage = latencyCommandError(err)
+					}
+					break
+				}
+			}
+
+			if probeOK && measuredHops > 0 {
+				// 聚合只含实测跳：未测（UDP）跳既不贡献延迟也不
+				// 拉高丢包（R6-L4-02）。全部跳未测时保持起步哨兵
+				// -1/100（与类型1「入口→出口段不存在」同形态），
+				// 不得以 0/0 冒充完美样本（B07-001）。
+				snap.EntryToExitLatency = totalLat
+				snap.EntryToExitLoss = (1.0 - remainingSuccessProb) * 100.0
+				// R8-024：混合形态（有实测跳＋有未测跳）时总值是
+				// 部分和，必须在聚合层留不完整标记——逐跳明细有
+				// 未测披露、聚合层此前没有，与全实测同形呈现。
+				snap.EntryToExitPartialUntested = untestedHops > 0
+			} else if !probeOK {
+				snap.EntryToExitLatency = -1
+				snap.EntryToExitLoss = 100
+			}
+		}
+
+		// Exit → Bing
+		if exitOnline {
+			lat, loss, err := roundPinger(exit.NodeID, probeTarget.Host, probeTarget.Port, options)
+			if err == nil {
+				snap.ExitToBingLatency = lat
+				snap.ExitToBingLoss = loss
+			} else {
+				// B07-002：同类型1，失败段写 -1/100 哨兵。
+				snap.ExitToBingLatency = -1
+				snap.ExitToBingLoss = 100
+				if snap.ErrorMessage == "" {
+					snap.ErrorMessage = latencyCommandError(err)
+				}
+				probeOK = false
+			}
+		}
+
+		snap.Success = probeOK
+	default:
+		// Unknown type: entry → public probe target.
+		if entryOnline {
+			lat, loss, err := roundPinger(entry.NodeID, probeTarget.Host, probeTarget.Port, options)
+			if err == nil {
+				snap.ExitToBingLatency = lat
+				snap.ExitToBingLoss = loss
+				snap.Success = true
+			} else {
+				// B07-002：同类型1，失败段写 -1/100 哨兵。
+				snap.ExitToBingLatency = -1
+				snap.ExitToBingLoss = 100
+				snap.ErrorMessage = latencyCommandError(err)
+			}
+		} else {
+			snap.ErrorMessage = "入口节点均不在线"
+		}
+	}
+
+	candidateHops := p.probeTunnelCandidateHops(
+		tunnel.Type,
+		inNodes,
+		midNodesGrouped,
+		outNodes,
+		selectedNodeIDs,
+		ipPreference,
+		options,
+		probeTarget,
+		roundPinger,
+		defaultProtocol,
+	)
+	if len(primaryHops) > 0 || len(candidateHops) > 0 {
+		details := tunnelQualityChainDetails{
+			PrimaryPath:   primaryHops,
+			CandidateHops: candidateHops,
+		}
+		if b, err := json.Marshal(details); err == nil {
+			snap.ChainDetails = string(b)
+		}
+	}
+
+	p.storeResult(snap)
+}
+
+func tunnelQualityGroupKey(role string, index int) string {
+	return fmt.Sprintf("%s:%d", role, index)
+}
+
+func (p *tunnelQualityProber) probeTunnelCandidateHops(
+	tunnelType int,
+	inNodes []chainNodeRecord,
+	chainHops [][]chainNodeRecord,
+	outNodes []chainNodeRecord,
+	selectedNodeIDs map[string]int64,
+	ipPreference string,
+	options diagnosisExecOptions,
+	probeTarget tunnelProbeTarget,
+	ping bestExitProbeFunc,
+	defaultProtocol string,
+) []TunnelQualityCandidateHop {
+	if p == nil || p.handler == nil || ping == nil {
+		return nil
+	}
+
+	if tunnelType != 2 {
+		return p.probePublicTargetCandidates("entry", 0, inNodes, selectedNodeIDs, options, probeTarget, ping)
+	}
+
+	groups := make([]tunnelQualityCandidateGroup, 0, 2+len(chainHops))
+	groups = append(groups, tunnelQualityCandidateGroup{role: "entry", roleIndex: 0, nodes: inNodes})
+	for i, hop := range chainHops {
+		groups = append(groups, tunnelQualityCandidateGroup{role: "middle", roleIndex: i, nodes: hop})
+	}
+	groups = append(groups, tunnelQualityCandidateGroup{role: "exit", roleIndex: 0, nodes: outNodes})
+
+	var items []TunnelQualityCandidateHop
+	for i := 0; i < len(groups)-1; i++ {
+		items = append(items, p.probeCandidateGroupLinks(
+			groups[i],
+			groups[i+1],
+			i,
+			selectedNodeIDs,
+			ipPreference,
+			options,
+			ping,
+			defaultProtocol,
+		)...)
+	}
+	items = append(items, p.probePublicTargetCandidates(
+		"exit",
+		0,
+		outNodes,
+		selectedNodeIDs,
+		options,
+		probeTarget,
+		ping,
+	)...)
+	return items
+}
+
+func (p *tunnelQualityProber) probeCandidateGroupLinks(
+	fromGroup tunnelQualityCandidateGroup,
+	toGroup tunnelQualityCandidateGroup,
+	hopIndex int,
+	selectedNodeIDs map[string]int64,
+	ipPreference string,
+	options diagnosisExecOptions,
+	ping bestExitProbeFunc,
+	defaultProtocol string,
+) []TunnelQualityCandidateHop {
+	items := make([]TunnelQualityCandidateHop, 0, len(fromGroup.nodes)*len(toGroup.nodes))
+	for _, source := range fromGroup.nodes {
+		for _, target := range toGroup.nodes {
+			item := TunnelQualityCandidateHop{
+				TunnelQualityHop: TunnelQualityHop{
+					FromNodeID:   source.NodeID,
+					FromNodeName: source.NodeName,
+					ToNodeID:     target.NodeID,
+					ToNodeName:   target.NodeName,
+					Latency:      -1,
+					Loss:         100,
+				},
+				FromRole: fromGroup.role,
+				ToRole:   toGroup.role,
+				HopIndex: hopIndex,
+				Selected: selectedNodeIDs[tunnelQualityGroupKey(fromGroup.role, fromGroup.roleIndex)] == source.NodeID &&
+					selectedNodeIDs[tunnelQualityGroupKey(toGroup.role, toGroup.roleIndex)] == target.NodeID,
+			}
+
+			sourceNode, sourceErr := p.nodeRecord(source.NodeID)
+			if sourceErr != nil || !isTunnelProbeNodeOnline(sourceNode) {
+				item.ErrorMessage = "来源节点不在线"
+				items = append(items, item)
+				continue
+			}
+			targetNode, targetErr := p.nodeRecord(target.NodeID)
+			if targetErr != nil || !isTunnelProbeNodeOnline(targetNode) {
+				item.ErrorMessage = "目标节点不在线"
+				items = append(items, item)
+				continue
+			}
+
+			targetIP, targetPort, resolveErr := resolveChainProbeTarget(sourceNode, targetNode, target.Port, ipPreference, target.ConnectIP)
+			if resolveErr != nil {
+				item.ErrorMessage = resolveErr.Error()
+				items = append(items, item)
+				continue
+			}
+			item.TargetIP = targetIP
+			item.TargetPort = targetPort
+			// R6-L4-02：候选跳与主跳同口径——目标为 UDP 协议段时
+			// 记未测（哨兵＋Untested、无误差文案），不以 TCP 恒测
+			// 冒充失败样本。
+			if isUDPBasedProtocol(chainSegmentProtocol(target.Protocol, defaultProtocol)) {
+				item.Untested = true
+				items = append(items, item)
+				continue
+			}
+			latency, loss, probeErr := ping(source.NodeID, targetIP, targetPort, options)
+			if probeErr != nil {
+				// R6X-016：候选跳逐跳错误串与快照头同口径过归类函数；
+				// 上方 resolveErr 解析失败串维持不归类（防过修对照在案）。
+				item.ErrorMessage = latencyCommandError(probeErr)
+				items = append(items, item)
+				continue
+			}
+			item.Latency = latency
+			item.Loss = loss
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
+func (p *tunnelQualityProber) probePublicTargetCandidates(
+	fromRole string,
+	fromIndex int,
+	nodes []chainNodeRecord,
+	selectedNodeIDs map[string]int64,
+	options diagnosisExecOptions,
+	probeTarget tunnelProbeTarget,
+	ping bestExitProbeFunc,
+) []TunnelQualityCandidateHop {
+	items := make([]TunnelQualityCandidateHop, 0, len(nodes))
+	for _, source := range nodes {
+		item := TunnelQualityCandidateHop{
+			TunnelQualityHop: TunnelQualityHop{
+				FromNodeID:   source.NodeID,
+				FromNodeName: source.NodeName,
+				ToNodeName:   formatTunnelProbeTarget(probeTarget),
+				Latency:      -1,
+				Loss:         100,
+				TargetIP:     probeTarget.Host,
+				TargetPort:   probeTarget.Port,
+			},
+			FromRole: fromRole,
+			ToRole:   "target",
+			HopIndex: fromIndex,
+			Selected: selectedNodeIDs[tunnelQualityGroupKey(fromRole, fromIndex)] == source.NodeID,
+		}
+		sourceNode, sourceErr := p.nodeRecord(source.NodeID)
+		if sourceErr != nil || !isTunnelProbeNodeOnline(sourceNode) {
+			item.ErrorMessage = "来源节点不在线"
+			items = append(items, item)
+			continue
+		}
+		latency, loss, probeErr := ping(source.NodeID, probeTarget.Host, probeTarget.Port, options)
+		if probeErr != nil {
+			// R6X-016：同 probeCandidateGroupLinks 口径，公网候选跳
+			// 错误串过 latencyCommandError 归类，与快照头同文案。
+			item.ErrorMessage = latencyCommandError(probeErr)
+			items = append(items, item)
+			continue
+		}
+		item.Latency = latency
+		item.Loss = loss
+		items = append(items, item)
+	}
+	return items
+}
+
+func isTunnelProbeNodeOnline(node *nodeRecord) bool {
+	return node != nil && node.Status == 1
+}
+
+func (p *tunnelQualityProber) firstOnlineChainNode(nodes []chainNodeRecord) (chainNodeRecord, *nodeRecord, bool) {
+	if p == nil || p.handler == nil {
+		return chainNodeRecord{}, nil, false
+	}
+	for _, candidate := range nodes {
+		node, err := p.nodeRecord(candidate.NodeID)
+		if err == nil && isTunnelProbeNodeOnline(node) {
+			return candidate, node, true
+		}
+	}
+	return chainNodeRecord{}, nil, false
+}
+
+func (p *tunnelQualityProber) probeBestExitOwners(tunnelID int64, inNodes []chainNodeRecord, chainHops [][]chainNodeRecord, outNodes []chainNodeRecord, ipPreference string, options diagnosisExecOptions, probeTarget tunnelProbeTarget, roundPinger bestExitProbeFunc, defaultProtocol string) {
+	if p == nil || p.handler == nil || p.handler.bestExit == nil || len(outNodes) <= 1 {
+		return
+	}
+	if !isBestTunnelStrategy(outNodes[0].Strategy) {
+		return
+	}
+	owners := bestExitChainOwners(inNodes, chainHops)
+	if len(owners) == 0 {
+		return
+	}
+	// B07-003/R3-B07-001：按当前探测周期（间隔 + 上一整轮耗时）
+	// 换算确认新鲜度窗口注入状态机，使切换的连续确认必须发生在
+	// 窗口之内，且窗口覆盖真实周期（见 pendingFreshWindow）。
+	p.handler.bestExit.setPendingFreshWindow(p.pendingFreshWindow())
+	nodeMap := make(map[int64]*nodeRecord, len(owners)+len(outNodes))
+	for _, owner := range owners {
+		if node, err := p.nodeRecord(owner.NodeID); err == nil && node != nil {
+			nodeMap[owner.NodeID] = node
+		}
+	}
+	for _, exit := range outNodes {
+		if node, err := p.nodeRecord(exit.NodeID); err == nil && node != nil {
+			nodeMap[exit.NodeID] = node
+		}
+	}
+	// R18-R2-F1-01: the reorder re-renders this owner's chain, so
+	// it needs the owner's full dialer group (the owners list
+	// itself: every owner dials the same exits) for the dialer
+	// gate — without it a verified dialer is re-rendered legacy
+	// and pushed over the running verified chain.
+	ownerIDs := make([]int64, 0, len(owners))
+	for _, owner := range owners {
+		if owner.NodeID > 0 {
+			ownerIDs = append(ownerIDs, owner.NodeID)
+		}
+	}
+	for _, owner := range owners {
+		if nodeMap[owner.NodeID] == nil {
+			continue
+		}
+		key := bestExitOwnerKey{TunnelID: tunnelID, OwnerNodeID: owner.NodeID}
+		p.handler.bestExit.ensureApplied(key, outNodes[0].NodeID, time.Now())
+		scores := evaluateBestExitOwner(owner, outNodes, nodeMap, ipPreference, options, probeTarget, roundPinger, defaultProtocol)
+		decision := p.handler.bestExit.observeScores(key, scores, time.Now())
+		if decision.Switch {
+			now := time.Now()
+			if err := p.handler.applyBestExitChainOrder(tunnelID, owner.NodeID, outNodes, decision.Scores, ipPreference, ownerIDs); err != nil {
+				log.Printf("best_exit: switch apply failed tunnel=%d owner=%d exit=%d err=%v", tunnelID, owner.NodeID, decision.ExitNodeID, err)
+				p.handler.bestExit.recordApplyFailure(key, decision.ExitNodeID, now)
+				continue
+			}
+			p.handler.bestExit.setApplied(key, decision.ExitNodeID, time.Now())
+		}
+	}
+}
+
+func (p *tunnelQualityProber) pingNode(nodeID int64, ip string, port int, options diagnosisExecOptions) (float64, float64, error) {
+	if p != nil && p.probeNode != nil {
+		return p.probeNode(nodeID, ip, port, options)
+	}
+	return p.tcpPingNode(nodeID, ip, port, options)
+}
+
+func (p *tunnelQualityProber) tcpPingNode(nodeID int64, ip string, port int, options diagnosisExecOptions) (latency float64, loss float64, err error) {
+	h := p.handler
+	if h == nil {
+		return 0, 100, nil
+	}
+
+	node, nodeErr := p.nodeRecord(nodeID)
+	if nodeErr != nil {
+		return 0, 100, nodeErr
+	}
+	if !isTunnelProbeNodeOnline(node) {
+		return 0, 100, errors.New("节点不在线")
+	}
+
+	pingData, pingErr := h.tcpPingViaNode(nodeID, ip, port, options)
+	if pingErr != nil {
+		return 0, 100, pingErr
+	}
+
+	// B07-001：agent 数据面全失败时命令本身 err=nil、报文 success=false，
+	// 数值字段不可单独作判据：FRM2 前组装层会丢弃探测算出的
+	// PacketLoss、失败报文呈零值，只看数值会把死链路读成 0ms/0%
+	// 丢包的完美样本并喂给最优出口评分；FRM2 后失败报文已如实携带
+	// PacketLoss（全失败=100），但分类口径不变（诊断面
+	// appendPathDiagnosis 与延迟面 latencyPointFrom 均查 success，
+	// 此前唯独质量面漏查）。success=false 一律归类为探测失败，
+	// 错误文案与延迟面同口径取 errorMessage。
+	if !asBool(pingData["success"], false) {
+		msg := strings.TrimSpace(asString(pingData["errorMessage"]))
+		if msg == "" {
+			msg = strings.TrimSpace(asString(pingData["message"]))
+		}
+		if msg == "" {
+			msg = "探测失败"
+		}
+		return 0, 100, errors.New(msg)
+	}
+
+	avgTime := asFloat(pingData["averageTime"], 0)
+	packetLoss := asFloat(pingData["packetLoss"], 100)
+
+	return avgTime, packetLoss, nil
+}
+
+func (p *tunnelQualityProber) storeResult(snap *tunnelQualitySnapshot) {
+	if snap == nil {
+		return
+	}
+
+	// R1-09-L2：整段串行（storeMu）＋时间戳守卫——并发调用方（轮次
+	// 探测与节点重连探测）对同一隧道交错时，先开始但后完成的旧快照
+	// 不得顶掉较新的缓存值；落库门在锁内读改写，同一 lastDBWrite
+	// 不能被两份快照同时穿过而在节流窗口内写出两行历史。
+	p.storeMu.Lock()
+	defer p.storeMu.Unlock()
+
+	// Update in-memory cache (latest per tunnel)
+	// Retain the lastDBWrite timestamp if it exists, so we only DB write every 30s
+	var lastWrite int64
+	if existing, ok := p.cache.Load(snap.TunnelID); ok {
+		if eg, ok := existing.(*tunnelQualitySnapshot); ok {
+			if eg.Timestamp > snap.Timestamp {
+				return
+			}
+			lastWrite = eg.lastDBWrite
+		}
+	}
+	snap.lastDBWrite = lastWrite
+
+	now := time.Now().UnixMilli()
+	writeToDB := false
+	if now-snap.lastDBWrite >= int64(tunnelQualityReportInterval/time.Millisecond) {
+		writeToDB = true
+		snap.lastDBWrite = now
+	}
+
+	p.cache.Store(snap.TunnelID, snap)
+
+	if !writeToDB {
+		return
+	}
+
+	// Persist to database (history)
+	h := p.handler
+	if h == nil || h.repo == nil {
+		return
+	}
+
+	successInt := 0
+	if snap.Success {
+		successInt = 1
+	}
+	partialInt := 0
+	if snap.EntryToExitPartialUntested {
+		partialInt = 1
+	}
+
+	q := &model.TunnelQuality{
+		TunnelID:           snap.TunnelID,
+		EntryToExitLatency: snap.EntryToExitLatency,
+		ExitToBingLatency:  snap.ExitToBingLatency,
+		EntryToExitLoss:    snap.EntryToExitLoss,
+		ExitToBingLoss:     snap.ExitToBingLoss,
+		EntryToExitPartial: partialInt,
+		Success:            successInt,
+		ErrorMessage:       snap.ErrorMessage,
+		Timestamp:          snap.Timestamp,
+		ChainDetails:       snap.ChainDetails,
+	}
+	if err := h.repo.InsertTunnelQuality(q); err != nil {
+		log.Printf("tunnel_quality_prober: insert db err=%v tunnel_id=%d", err, snap.TunnelID)
+	}
+}

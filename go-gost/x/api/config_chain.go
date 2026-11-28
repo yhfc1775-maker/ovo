@@ -1,0 +1,199 @@
+package api
+
+import (
+	"fmt"
+	"net/http"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+	"github.com/go-gost/core/logger"
+	"github.com/go-gost/x/config"
+	parser "github.com/go-gost/x/config/parsing/chain"
+	"github.com/go-gost/x/registry"
+)
+
+// swagger:parameters createChainRequest
+type createChainRequest struct {
+	// in: body
+	Data config.ChainConfig `json:"data"`
+}
+
+// successful operation.
+// swagger:response createChainResponse
+type createChainResponse struct {
+	Data Response
+}
+
+func createChain(ctx *gin.Context) {
+	// swagger:route POST /config/chains Chain createChainRequest
+	//
+	// Create a new chain, the name of chain must be unique in chain list.
+	//
+	//     Security:
+	//       basicAuth: []
+	//
+	//     Responses:
+	//       200: createChainResponse
+
+	var req createChainRequest
+	ctx.ShouldBindJSON(&req.Data)
+
+	name := strings.TrimSpace(req.Data.Name)
+	if name == "" {
+		writeError(ctx, NewError(http.StatusBadRequest, ErrCodeInvalid, "chain name is required"))
+		return
+	}
+	req.Data.Name = name
+
+	if registry.ChainRegistry().IsRegistered(name) {
+		writeError(ctx, NewError(http.StatusBadRequest, ErrCodeDup, fmt.Sprintf("chain %s already exists", name)))
+		return
+	}
+
+	v, err := parser.ParseChain(&req.Data, logger.Default())
+	if err != nil {
+		writeError(ctx, NewError(http.StatusInternalServerError, ErrCodeFailed, fmt.Sprintf("create chain %s failed: %s", name, err.Error())))
+		return
+	}
+
+	if !commitNamedConfig(ctx, registry.ChainRegistry(), name, v, false, func(c *config.Config) error {
+		// R18-F02/F-04: 按名 upsert（R17-A 同款）。成员已在配置中、但不在注册表里时
+		// （例如暂停后 loader 跳过注册），无去重 append 会把第二份同名项写进配置并落盘。
+		c.Chains = upsertNamed(c.Chains, &req.Data, func(v *config.ChainConfig) string { return v.Name })
+		return nil
+	}) {
+		return
+	}
+
+	ctx.JSON(http.StatusOK, Response{
+		Msg: "OK",
+	})
+}
+
+// swagger:parameters updateChainRequest
+type updateChainRequest struct {
+	// in: path
+	// required: true
+	// chain name
+	Chain string `uri:"chain" json:"chain"`
+	// in: body
+	Data config.ChainConfig `json:"data"`
+}
+
+// successful operation.
+// swagger:response updateChainResponse
+type updateChainResponse struct {
+	Data Response
+}
+
+func updateChain(ctx *gin.Context) {
+	// swagger:route PUT /config/chains/{chain} Chain updateChainRequest
+	//
+	// Update chain by name, the chain must already exist.
+	//
+	//     Security:
+	//       basicAuth: []
+	//
+	//     Responses:
+	//       200: updateChainResponse
+
+	var req updateChainRequest
+	ctx.ShouldBindUri(&req)
+	ctx.ShouldBindJSON(&req.Data)
+
+	name := strings.TrimSpace(req.Chain)
+
+	if !registry.ChainRegistry().IsRegistered(name) {
+		writeError(ctx, NewError(http.StatusBadRequest, ErrCodeNotFound, fmt.Sprintf("chain %s not found", name)))
+		return
+	}
+
+	req.Data.Name = name
+
+	v, err := parser.ParseChain(&req.Data, logger.Default())
+	if err != nil {
+		writeError(ctx, NewError(http.StatusInternalServerError, ErrCodeFailed, fmt.Sprintf("create chain %s failed: %s", name, err.Error())))
+		return
+	}
+
+	if !commitNamedConfig(ctx, registry.ChainRegistry(), name, v, false, func(c *config.Config) error {
+		for i := range c.Chains {
+			// R19-F02: nil 项跳过并记日志（原样保留，清理只走启动自愈），不得 panic。
+			if c.Chains[i] == nil {
+				logger.Default().Warnf("update chain: skipped nil chain entry at index %d", i)
+				continue
+			}
+			if c.Chains[i].Name == name {
+				c.Chains[i] = &req.Data
+				break
+			}
+		}
+		return nil
+	}) {
+		return
+	}
+
+	ctx.JSON(http.StatusOK, Response{
+		Msg: "OK",
+	})
+}
+
+// swagger:parameters deleteChainRequest
+type deleteChainRequest struct {
+	// in: path
+	// required: true
+	Chain string `uri:"chain" json:"chain"`
+}
+
+// successful operation.
+// swagger:response deleteChainResponse
+type deleteChainResponse struct {
+	Data Response
+}
+
+func deleteChain(ctx *gin.Context) {
+	// swagger:route DELETE /config/chains/{chain} Chain deleteChainRequest
+	//
+	// Delete chain by name.
+	//
+	//     Security:
+	//       basicAuth: []
+	//
+	//     Responses:
+	//       200: deleteChainResponse
+
+	var req deleteChainRequest
+	ctx.ShouldBindUri(&req)
+
+	name := strings.TrimSpace(req.Chain)
+
+	if !registry.ChainRegistry().IsRegistered(name) {
+		writeError(ctx, NewError(http.StatusBadRequest, ErrCodeNotFound, fmt.Sprintf("chain %s not found", name)))
+		return
+	}
+
+	var zero = registry.ChainRegistry().Get(name)
+	if !commitNamedConfig(ctx, registry.ChainRegistry(), name, zero, true, func(c *config.Config) error {
+		chains := c.Chains
+		c.Chains = nil
+		for _, s := range chains {
+			// R19-F02: nil 项原样保留并记日志，不得 panic（清理只走启动自愈）。
+			if s == nil {
+				logger.Default().Warnf("delete chain: kept nil chain entry as-is")
+				c.Chains = append(c.Chains, s)
+				continue
+			}
+			if s.Name == name {
+				continue
+			}
+			c.Chains = append(c.Chains, s)
+		}
+		return nil
+	}) {
+		return
+	}
+
+	ctx.JSON(http.StatusOK, Response{
+		Msg: "OK",
+	})
+}

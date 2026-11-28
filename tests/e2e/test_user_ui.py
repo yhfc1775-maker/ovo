@@ -1,0 +1,92 @@
+"""
+Test user management UI for OVO.
+Tests user CRUD operations through the web interface.
+"""
+
+import pytest
+from playwright.sync_api import Page, expect
+
+from pages import LoginPage, UserPage
+
+
+@pytest.mark.e2e
+@pytest.mark.slow
+@pytest.mark.reuse_login
+class TestUserManagementUI:
+    """User management UI E2E tests."""
+
+    @pytest.fixture(autouse=True)
+    def login(self, page: Page, frontend_url: str):
+        """Start authenticated via the reused storage state (reuse_login).
+
+        See test_dashboard.py: per-test form logins hit the backend's
+        10/min login bucket and get 429'd mid-run. goto("/") redirects
+        an authenticated session to /dashboard (LoginRoute).
+        """
+        login_page = LoginPage(page, frontend_url)
+        login_page.goto()
+        page.wait_for_url("**/dashboard**", timeout=15000, wait_until="commit")
+
+    def test_user_page_loads(self, page: Page, frontend_url: str):
+        """Test that user management page loads."""
+        user_page = UserPage(page, frontend_url)
+        user_page.goto()
+
+        assert "/user" in page.url
+
+    def test_user_list_displays(self, page: Page, frontend_url: str, test_user):
+        """Test that user list displays correctly."""
+        user_page = UserPage(page, frontend_url)
+        user_page.goto()
+
+        # The admin (role_id 0) is excluded from /user/list by design
+        # (ListUsers filters role_id != 0), so assert on a user that is
+        # actually listed: the API-created test_user fixture.
+        # The user page defaults to grid view (viewMode defaults to
+        # "grid" in src/pages/user.tsx and is only persisted to
+        # localStorage once toggled), so users render as cards and no
+        # <table> exists until the view is switched to list mode. The
+        # toggle is the icon-only button showing the List icon.
+        page.locator("button:has(svg.lucide-list)").first.click()
+        expect(page.locator("table").first).to_be_visible()
+        expect(page.locator(f"text={test_user.username}").first).to_be_visible()
+
+    def test_create_user_dialog(self, page: Page, frontend_url: str):
+        """Test opening create user dialog."""
+        user_page = UserPage(page, frontend_url)
+        user_page.goto()
+
+        create_btn = page.locator('button:has-text("创建"), button:has-text("新增")')
+        expect(create_btn.first).to_be_visible()
+        create_btn.first.click()
+        page.wait_for_timeout(500)
+
+        # The create modal header renders only when the dialog opens.
+        expect(page.locator("text=新增用户").first).to_be_visible()
+
+    def test_search_users(self, page: Page, frontend_url: str, test_user):
+        """Test user search functionality."""
+        user_page = UserPage(page, frontend_url)
+        user_page.goto()
+
+        # The search input is not rendered until the search toggle is
+        # opened: src/pages/user.tsx only renders the input when
+        # isSearchVisible is true (the 搜索 icon button sets it).
+        page.locator('button[aria-label="搜索"]').first.click()
+        search_input = page.locator('input[placeholder*="搜索"], input[placeholder*="search"]')
+        expect(search_input.first).to_be_visible()
+        search_input.first.fill(test_user.username)
+        search_input.first.press("Enter")
+
+        expect(page.locator(f"text={test_user.username}").first).to_be_visible()
+
+    def test_user_pagination(self, page: Page, frontend_url: str):
+        """Test user list pagination."""
+        user_page = UserPage(page, frontend_url)
+        user_page.goto()
+
+        pagination = page.locator('[data-testid="pagination"], .pagination, nav[aria-label*="pagination"]')
+        if pagination.count() > 0:
+            next_btn = page.locator('button:has-text("下一页"), button[aria-label*="next"]')
+            if next_btn.count() > 0 and not next_btn.first.is_disabled():
+                next_btn.first.click()

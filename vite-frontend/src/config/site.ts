@@ -1,0 +1,628 @@
+import { getConfigByName, getConfigs, getPublicConfigByName } from "@/api";
+import {
+  SENSITIVE_CONFIG_KEYS,
+  purgeSensitiveConfigCache,
+} from "@/config/sensitive-keys";
+import { isLoggedIn } from "@/utils/auth";
+import { SESSION_CLEARED_EVENT } from "@/utils/session";
+
+export { purgeSensitiveConfigCache };
+
+export type SiteConfig = typeof siteConfig;
+
+// 缓存相关常量
+const CACHE_PREFIX = "vite_config_";
+const VERSION = import.meta.env.VITE_APP_VERSION || "dev";
+// P2-1：WebView 下的 app_version 同样取构建注入的真实版本（发版流水线注入
+// VITE_APP_VERSION）。原先硬编码 "1.0.0" 与实际发版脱节、导致 App 内更新
+// 红标常亮；未注入（本地开发）时回退 "dev"，与 VERSION 保持一致避免误报。
+const APP_VERSION = import.meta.env.VITE_APP_VERSION || "dev";
+const DEFAULT_FAVICON = "/favicon.ico";
+const FAVICON_LINK_ID = "app-favicon";
+// E1-03：深色模式已裁定整删，深色壁纸键（dark 变体）不再进公开品牌
+// 配置清单——不再对每位访客公开拉取/缓存/回写该键（后端配置键本身
+// 保留数据兼容，配置页仍按原样搬运）。防复活由
+// check-dark-mode-pinned 断言④钉住（该门按字面量扫描本文件，注释里
+// 亦不得出现该键名）。
+const PUBLIC_BRAND_CONFIG_KEYS = [
+  "app_name",
+  "app_logo",
+  "app_favicon",
+  "app_bg_image",
+  "app_bg_image_light",
+  "login_bg_image",
+  "hide_footer_brand",
+] as const;
+// SENSITIVE_CONFIG_KEYS 与 purgeSensitiveConfigCache 已抽到零依赖的
+// @/config/sensitive-keys（单一真源在后端 config_policy.go，清单与
+// 同步要求见该文件注释），utils/session 的 clearSession 也要用它清除
+// 登出残留，抽成叶子模块避免循环导入（F-047）。
+const GITHUB_REPO =
+  import.meta.env.VITE_GITHUB_REPO || "https://github.com/yhfc1775-maker/ovo";
+
+const shouldPersistConfigKey = (key: string) => {
+  return !SENSITIVE_CONFIG_KEYS.has(key.trim().toLowerCase());
+};
+
+const readCachedConfigs = (keys: readonly string[]) => {
+  const cachedConfigs: Record<string, string> = {};
+  let hasCachedData = false;
+
+  keys.forEach((key) => {
+    const cachedValue = configCache.get(key);
+
+    if (cachedValue !== null) {
+      cachedConfigs[key] = cachedValue;
+      hasCachedData = true;
+    }
+  });
+
+  return { cachedConfigs, hasCachedData };
+};
+
+const readAllCachedSafeConfigs = () => {
+  const cachedConfigs: Record<string, string> = {};
+
+  Object.keys(localStorage).forEach((storageKey) => {
+    if (!storageKey.startsWith(CACHE_PREFIX)) {
+      return;
+    }
+
+    const key = storageKey.slice(CACHE_PREFIX.length).trim().toLowerCase();
+
+    if (!key || SENSITIVE_CONFIG_KEYS.has(key)) {
+      return;
+    }
+
+    const value = localStorage.getItem(storageKey);
+
+    if (value !== null) {
+      cachedConfigs[key] = value;
+    }
+  });
+
+  return cachedConfigs;
+};
+
+const fetchPublicBrandConfigs = async (): Promise<Record<string, string>> => {
+  const publicConfigMap: Record<string, string> = {};
+
+  await Promise.all(
+    PUBLIC_BRAND_CONFIG_KEYS.map(async (key) => {
+      try {
+        const response = await getPublicConfigByName(key);
+
+        if (
+          response.code === 0 &&
+          response.data &&
+          typeof response.data.value === "string"
+        ) {
+          const value = response.data.value;
+
+          publicConfigMap[key] = value;
+          configCache.set(key, value);
+          markConfigVerified(key);
+        }
+      } catch {
+        // ignore single key fetch error
+      }
+    }),
+  );
+
+  return publicConfigMap;
+};
+
+const getInitialConfig = () => {
+  if (typeof window === "undefined") {
+    return {
+      name: "OVO",
+      version: VERSION,
+      app_version: APP_VERSION,
+      github_repo: GITHUB_REPO,
+      app_logo: "",
+      app_favicon: "",
+      app_bg_image: "",
+      app_bg_image_light: "",
+      login_bg_image: "",
+      hide_footer_brand: false,
+    };
+  }
+
+  purgeSensitiveConfigCache();
+
+  const cachedAppName = localStorage.getItem(CACHE_PREFIX + "app_name");
+  const cachedAppLogo = localStorage.getItem(CACHE_PREFIX + "app_logo") || "";
+  const cachedAppFavicon =
+    localStorage.getItem(CACHE_PREFIX + "app_favicon") || "";
+  const cachedAppBgImage =
+    localStorage.getItem(CACHE_PREFIX + "app_bg_image") || "";
+  const cachedAppBgImageLight =
+    localStorage.getItem(CACHE_PREFIX + "app_bg_image_light") || "";
+  const cachedLoginBgImage =
+    localStorage.getItem(CACHE_PREFIX + "login_bg_image") || "";
+  const hideFooterBrand =
+    localStorage.getItem(CACHE_PREFIX + "hide_footer_brand") === "true";
+
+  if (cachedAppName) {
+    return {
+      name: cachedAppName,
+      version: VERSION,
+      app_version: APP_VERSION,
+      github_repo: GITHUB_REPO,
+      app_logo: cachedAppLogo,
+      app_favicon: cachedAppFavicon,
+      app_bg_image: cachedAppBgImage,
+      app_bg_image_light: cachedAppBgImageLight,
+      login_bg_image: cachedLoginBgImage,
+      hide_footer_brand: hideFooterBrand,
+    };
+  }
+
+  return {
+    name: "OVO",
+    version: VERSION,
+    app_version: APP_VERSION,
+    github_repo: GITHUB_REPO,
+    app_logo: cachedAppLogo,
+    app_favicon: cachedAppFavicon,
+    app_bg_image: cachedAppBgImage,
+    app_bg_image_light: cachedAppBgImageLight,
+    login_bg_image: cachedLoginBgImage,
+    hide_footer_brand: hideFooterBrand,
+  };
+};
+
+export const siteConfig = getInitialConfig();
+
+// W2-UX-01（访客侧）：壁纸探针失败须留可查状态＋派发事件，访客面
+// （登录页）据此提示「已用默认背景」，不再静默只剩纯色。
+export const WALLPAPER_LOAD_FAILED_EVENT = "wallpaper-load-failed";
+export const WALLPAPER_LOAD_SUCCEEDED_EVENT = "wallpaper-load-succeeded";
+let wallpaperFailedUrl: string | null = null;
+
+/** 当前壁纸是否探针失败（登录页挂载时即读，避免事件竞态）。 */
+export const isWallpaperLoadFailed = () => wallpaperFailedUrl !== null;
+
+// 预加载壁纸图片，避免等 CSS 变量设置后才开始下载
+const preloadWallpaper = (url: string | undefined | null) => {
+  if (!url || typeof document === "undefined") return;
+  const isImage =
+    url.startsWith("http") || url.startsWith("data:") || url.startsWith("/") || url.startsWith("blob:");
+  if (!isImage || url === "wallpaper" || url === "theme") return;
+  // 避免重复预加载同一张；曾失败的地址不走短路，须重探以确认是否恢复。
+  const id = "wallpaper-preload";
+  let link = document.getElementById(id) as HTMLLinkElement | null;
+  if (link && link.href === url && wallpaperFailedUrl !== url) return;
+  if (!link) {
+    link = document.createElement("link");
+    link.id = id;
+    link.rel = "preload";
+    link.as = "image";
+    document.head.appendChild(link);
+  }
+  link.href = url;
+  // 同时用 Image 对象触发下载，兼容不支持 preload 的情况；
+  // link[rel=preload] 的失败不一定可观测，以 Image 探针为准。
+  const img = new Image();
+
+  img.onload = () => {
+    if (wallpaperFailedUrl === url) {
+      wallpaperFailedUrl = null;
+      window.dispatchEvent(new Event(WALLPAPER_LOAD_SUCCEEDED_EVENT));
+    }
+  };
+  img.onerror = () => {
+    wallpaperFailedUrl = url;
+    window.dispatchEvent(
+      new CustomEvent(WALLPAPER_LOAD_FAILED_EVENT, { detail: { url } }),
+    );
+  };
+  img.src = url;
+};
+
+// 初始化时如果有缓存的壁纸，立即预加载
+preloadWallpaper(siteConfig.login_bg_image || siteConfig.app_bg_image);
+
+// 缓存工具函数
+export const configCache = {
+  // 获取缓存的配置
+  get: (key: string): string | null => {
+    const cacheKey = CACHE_PREFIX + key;
+
+    return localStorage.getItem(cacheKey);
+  },
+
+  // 设置缓存的配置
+  set: (key: string, value: string): void => {
+    const normalizedKey = key.trim().toLowerCase();
+
+    if (!shouldPersistConfigKey(normalizedKey)) {
+      configCache.remove(normalizedKey);
+
+      return;
+    }
+
+    const cacheKey = CACHE_PREFIX + normalizedKey;
+
+    localStorage.setItem(cacheKey, value);
+  },
+
+  // 删除指定配置的缓存
+  remove: (key: string): void => {
+    const cacheKey = CACHE_PREFIX + key;
+
+    localStorage.removeItem(cacheKey);
+  },
+
+  // 清空所有配置缓存
+  clear: (): void => {
+    // 获取所有localStorage的key
+    const keys = Object.keys(localStorage);
+
+    keys.forEach((key) => {
+      if (key.startsWith(CACHE_PREFIX)) {
+        localStorage.removeItem(key);
+      }
+    });
+  },
+};
+
+// F-L5-04：单项配置的复验计时。原先 getCachedConfig 缓存优先、永不
+// 复验，长会话内配置被其他浏览器/管理员修改后本机不可见（订阅前置
+// 域名、app_name 等），须整页刷新。改为 TTL 复验：新鲜期内用缓存，
+// 过期回源拉取（同 key 在途去重），失败有缓存回退缓存。
+const CONFIG_REVALIDATE_TTL_MS = 60 * 1000;
+const configVerifiedAt = new Map<string, number>();
+const configFetchInFlight = new Map<string, Promise<string | null>>();
+
+const markConfigVerified = (key: string): void => {
+  configVerifiedAt.set(key.trim().toLowerCase(), Date.now());
+};
+
+// E1-05：登出（含换账号）必须让复验状态失效——旧实现下 clearSession
+// 不触碰这两张表，同标签页 60 秒内换账号登录会直接命中上一会话的
+// 缓存值而不回源（全局配置串号）。clearSession 广播
+// SESSION_CLEARED_EVENT，本模块监听后整表复位；generation 计数防
+// 在途请求在复位后把旧会话的值回写缓存/复验表。
+let configVerificationGeneration = 0;
+
+export const resetConfigVerification = (): void => {
+  configVerificationGeneration += 1;
+  configVerifiedAt.clear();
+  configFetchInFlight.clear();
+};
+
+if (typeof window !== "undefined") {
+  window.addEventListener(SESSION_CLEARED_EVENT, resetConfigVerification);
+}
+
+const fetchConfigByName = (key: string): Promise<string | null> => {
+  const normalizedKey = key.trim().toLowerCase();
+  const inFlight = configFetchInFlight.get(normalizedKey);
+
+  if (inFlight) {
+    return inFlight;
+  }
+
+  const request = (async (): Promise<string | null> => {
+    // E1-05：在途期间发生登出复位（generation 变化）时，返回值仍交
+    // 调用方，但不得把旧会话的值回写缓存或刷新复验计时。
+    const generation = configVerificationGeneration;
+
+    try {
+      const response = await getConfigByName(key);
+
+      if (
+        response.code === 0 &&
+        response.data &&
+        typeof response.data.value === "string"
+      ) {
+        const value = response.data.value;
+
+        if (generation === configVerificationGeneration) {
+          if (shouldPersistConfigKey(key)) {
+            configCache.set(key, value);
+          }
+          markConfigVerified(normalizedKey);
+        }
+
+        return value;
+      }
+
+      return null;
+    } catch {
+      return null;
+    } finally {
+      configFetchInFlight.delete(normalizedKey);
+    }
+  })();
+
+  configFetchInFlight.set(normalizedKey, request);
+
+  return request;
+};
+
+// 获取单个配置（缓存优先，TTL 内不回源；过期回源复验）
+export const getCachedConfig = async (key: string): Promise<string | null> => {
+  const cachedValue = configCache.get(key);
+
+  if (cachedValue !== null) {
+    const verifiedAt =
+      configVerifiedAt.get(key.trim().toLowerCase()) ?? 0;
+
+    if (Date.now() - verifiedAt < CONFIG_REVALIDATE_TTL_MS) {
+      return cachedValue;
+    }
+
+    const freshValue = await fetchConfigByName(key);
+
+    if (freshValue !== null) {
+      return freshValue;
+    }
+
+    // 复验失败：回退缓存并刷新计时，避免失败期间每次调用都回源。
+    markConfigVerified(key);
+
+    return cachedValue;
+  }
+
+  return fetchConfigByName(key);
+};
+
+// 获取所有配置（优先从缓存）
+export const getCachedConfigs = async (): Promise<Record<string, string>> => {
+  const {
+    cachedConfigs: publicCachedConfigs,
+    hasCachedData: hasPublicCachedData,
+  } = readCachedConfigs(PUBLIC_BRAND_CONFIG_KEYS);
+
+  if (!isLoggedIn()) {
+    const publicConfigs = await fetchPublicBrandConfigs();
+
+    if (Object.keys(publicConfigs).length > 0) {
+      return { ...publicCachedConfigs, ...publicConfigs };
+    }
+
+    return publicCachedConfigs;
+  }
+
+  const cachedConfigs = readAllCachedSafeConfigs();
+  const hasCachedData = Object.keys(cachedConfigs).length > 0;
+
+  // 从API获取最新配置
+  try {
+    // E1-05：在途期间发生登出复位时，结果仍交调用方，但不回写
+    // 缓存/复验表（与 fetchConfigByName 同律）。
+    const generation = configVerificationGeneration;
+    const response = await getConfigs();
+
+    if (response.code === 0 && response.data) {
+      const configs = response.data;
+
+      if (generation === configVerificationGeneration) {
+        // 仅将安全配置存入缓存，敏感项会从 localStorage 中移除
+        Object.entries(configs).forEach(([key, value]) => {
+          const normalizedKey = key.trim().toLowerCase();
+
+          if (SENSITIVE_CONFIG_KEYS.has(normalizedKey)) {
+            configCache.remove(normalizedKey);
+
+            return;
+          }
+
+          if (shouldPersistConfigKey(normalizedKey)) {
+            configCache.set(normalizedKey, value as string);
+          }
+        });
+
+        // 全量拉取成功：本批 key 均为新鲜值，刷新复验计时。
+        Object.keys(configs).forEach((key) => markConfigVerified(key));
+      }
+
+      return configs;
+    }
+
+    if (hasCachedData) {
+      return cachedConfigs;
+    }
+
+    const publicConfigs = await fetchPublicBrandConfigs();
+    const merged = { ...publicCachedConfigs, ...publicConfigs };
+
+    // R2-C3-01：任一数据源都无数据时抛错，不得返回 {} 冒充「面板无配置」。
+    // 空对象成功（后端 code 0 返回 {}，全新面板亦可能）仍走上面的
+    // return configs，不受影响；本 throw 会落入下方 catch，catch 内再次
+    // 回落失败时同样抛错（失败后端上多一轮公开键探针，可接受）。
+    if (Object.keys(merged).length === 0) {
+      throw new Error("load configs failed: no data from any source");
+    }
+
+    return merged;
+  } catch {
+    // API失败时返回缓存的数据
+    if (hasCachedData) {
+      return cachedConfigs;
+    }
+
+    const publicConfigs = await fetchPublicBrandConfigs();
+    const merged = hasPublicCachedData
+      ? { ...publicCachedConfigs, ...publicConfigs }
+      : publicConfigs;
+
+    if (Object.keys(merged).length === 0) {
+      throw new Error("load configs failed: no data from any source");
+    }
+
+    return merged;
+  }
+};
+
+const updateDocumentFavicon = (faviconUrl: string) => {
+  if (typeof document === "undefined") {
+    return;
+  }
+
+  const normalized = faviconUrl.trim() || DEFAULT_FAVICON;
+
+  let iconLink = document.head.querySelector<HTMLLinkElement>(
+    `link#${FAVICON_LINK_ID}`,
+  );
+
+  if (!iconLink) {
+    iconLink = document.createElement("link");
+    iconLink.id = FAVICON_LINK_ID;
+    iconLink.rel = "icon";
+    document.head.appendChild(iconLink);
+  }
+
+  iconLink.rel = "icon";
+  iconLink.href = normalized;
+  if (normalized.startsWith("data:image/png")) {
+    iconLink.type = "image/png";
+  } else {
+    iconLink.removeAttribute("type");
+  }
+
+  let shortcutIconLink = document.head.querySelector<HTMLLinkElement>(
+    'link[rel="shortcut icon"]',
+  );
+
+  if (!shortcutIconLink) {
+    shortcutIconLink = document.createElement("link");
+    shortcutIconLink.rel = "shortcut icon";
+    document.head.appendChild(shortcutIconLink);
+  }
+
+  shortcutIconLink.href = normalized;
+  if (normalized.startsWith("data:image/png")) {
+    shortcutIconLink.type = "image/png";
+  } else {
+    shortcutIconLink.removeAttribute("type");
+  }
+
+  const duplicatedIcons = Array.from(
+    document.head.querySelectorAll<HTMLLinkElement>('link[rel="icon"]'),
+  ).filter((link) => link !== iconLink);
+
+  duplicatedIcons.forEach((link) => link.remove());
+};
+
+// 动态更新网站配置
+export const updateSiteConfig = async (configMap?: Record<string, string>) => {
+  // R2-C3-01：无参刷新是 App 后台静默刷新，任一数据源都无数据时
+  // getCachedConfigs 会抛错；此处吞掉保持既有静默行为（调用方为
+  // void fire-and-forget）。需感知失败的调用方（配置页）直接调
+  // getCachedConfigs 并自行 try/catch。
+  const resolvedConfigMap =
+    configMap ??
+    (await getCachedConfigs().catch((): Record<string, string> => ({})));
+
+  Object.entries(resolvedConfigMap).forEach(([key, value]) => {
+    const normalizedKey = key.trim().toLowerCase();
+
+    if (SENSITIVE_CONFIG_KEYS.has(normalizedKey)) {
+      configCache.remove(normalizedKey);
+
+      return;
+    }
+
+    if (shouldPersistConfigKey(normalizedKey)) {
+      configCache.set(normalizedKey, String(value));
+    }
+
+    markConfigVerified(normalizedKey);
+  });
+
+  const hasAppName = Object.prototype.hasOwnProperty.call(
+    resolvedConfigMap,
+    "app_name",
+  );
+  const hasAppLogo = Object.prototype.hasOwnProperty.call(
+    resolvedConfigMap,
+    "app_logo",
+  );
+  const hasAppFavicon = Object.prototype.hasOwnProperty.call(
+    resolvedConfigMap,
+    "app_favicon",
+  );
+  const hasAppBgImage = Object.prototype.hasOwnProperty.call(
+    resolvedConfigMap,
+    "app_bg_image",
+  );
+  const hasAppBgImageLight = Object.prototype.hasOwnProperty.call(
+    resolvedConfigMap,
+    "app_bg_image_light",
+  );
+  const hasLoginBgImage = Object.prototype.hasOwnProperty.call(
+    resolvedConfigMap,
+    "login_bg_image",
+  );
+
+  const appName = hasAppName
+    ? String(resolvedConfigMap.app_name || "").trim()
+    : siteConfig.name;
+  const appLogo = hasAppLogo
+    ? String(resolvedConfigMap.app_logo || "").trim()
+    : (siteConfig.app_logo || "").trim();
+  const appFavicon = hasAppFavicon
+    ? String(resolvedConfigMap.app_favicon || "").trim()
+    : (siteConfig.app_favicon || "").trim();
+  const appBgImage = hasAppBgImage
+    ? String(resolvedConfigMap.app_bg_image || "").trim()
+    : (siteConfig.app_bg_image || "").trim();
+  const appBgImageLight = hasAppBgImageLight
+    ? String(resolvedConfigMap.app_bg_image_light || "").trim()
+    : (siteConfig.app_bg_image_light || "").trim();
+  const loginBgImage = hasLoginBgImage
+    ? String(resolvedConfigMap.login_bg_image || "").trim()
+    : (siteConfig.login_bg_image || "").trim();
+
+  siteConfig.name = appName || "OVO";
+  siteConfig.app_logo = appLogo;
+  siteConfig.app_favicon = appFavicon;
+  siteConfig.app_bg_image = appBgImage;
+  siteConfig.app_bg_image_light = appBgImageLight;
+  siteConfig.login_bg_image = loginBgImage;
+  // 新壁纸地址回来后立即预加载，不等 CSS 变量生效
+  preloadWallpaper(loginBgImage || appBgImage);
+  if (
+    Object.prototype.hasOwnProperty.call(resolvedConfigMap, "hide_footer_brand")
+  ) {
+    siteConfig.hide_footer_brand =
+      resolvedConfigMap.hide_footer_brand === "true";
+  }
+
+  if (typeof document !== "undefined") {
+    document.title = siteConfig.name;
+    window.dispatchEvent(new Event("site-config-updated"));
+  }
+  updateDocumentFavicon(siteConfig.app_favicon);
+};
+
+// 清除配置缓存的工具函数（用于需要强制重拉配置的场景）
+export const clearConfigCache = (keys?: string[]) => {
+  if (keys && keys.length > 0) {
+    // 删除指定的配置缓存
+    keys.forEach((key) => {
+      configCache.remove(key);
+      configVerifiedAt.delete(key.trim().toLowerCase());
+    });
+  } else {
+    // 清空所有配置缓存
+    configCache.clear();
+    configVerifiedAt.clear();
+  }
+};
+
+// 在页面加载时异步更新配置（如果有更新的话）
+if (typeof window !== "undefined") {
+  if (typeof document !== "undefined") {
+    document.title = siteConfig.name;
+  }
+  updateDocumentFavicon(siteConfig.app_favicon);
+
+  // 延迟执行，避免阻塞初始渲染
+  setTimeout(() => {
+    void updateSiteConfig();
+  }, 50);
+}

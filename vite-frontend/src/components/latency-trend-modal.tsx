@@ -1,0 +1,301 @@
+import type { LatencyTrend } from "@/api/types";
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Loader2 } from "lucide-react";
+import {
+  CartesianGrid,
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
+
+import { getNodeLatencyHistory } from "@/api";
+import { ChartGlassTooltip } from "@/components/chart-glass-tooltip";
+import { Button } from "@/shadcn-bridge/heroui/button";
+import {
+  Modal,
+  ModalBody,
+  ModalContent,
+  ModalFooter,
+  ModalHeader,
+} from "@/shadcn-bridge/heroui/modal";
+
+const RANGES = [
+  { hours: 24, label: "24 小时" },
+  { hours: 72, label: "3 天" },
+  { hours: 168, label: "7 天" },
+];
+
+const COLORS = [
+  "#059669",
+  "#6366f1",
+  "#d97706",
+  "#ef4444",
+  "#8b5cf6",
+  "#0891b2",
+  "#ec4899",
+  "#65a30d",
+  "#ea580c",
+  "#475569",
+];
+
+function timeLabel(t: number, hours: number) {
+  const d = new Date(t);
+  const hm = `${String(d.getHours()).padStart(2, "0")}:${String(
+    d.getMinutes(),
+  ).padStart(2, "0")}`;
+
+  return hours > 24 ? `${d.getMonth() + 1}/${d.getDate()} ${hm}` : hm;
+}
+
+/** A node's latency to each reference point over time, one line per point. */
+export function LatencyTrendModal({
+  nodeId,
+  nodeName,
+  onClose,
+}: {
+  nodeId: number | null;
+  nodeName?: string;
+  onClose: () => void;
+}) {
+  const [hours, setHours] = useState(24);
+  const [trend, setTrend] = useState<LatencyTrend | null>(null);
+  const [loading, setLoading] = useState(false);
+  // IRL-3／R3-MR-02：初载失败常驻标记——失败与「这段时间还没有记录」
+  // 的无数据态必须可区分，不许拿空图冒充无数据。
+  const [trendLoadFailed, setTrendLoadFailed] = useState(false);
+  const [reloadKey, setReloadKey] = useState(0);
+  // 请求序号守卫（D5-04）：切换节点/范围时先清旧数据，迟到响应一律丢弃，
+  // 避免新请求失败后旧请求成功把上一个节点的数据持久显示到新标题下
+  const trendSeqRef = useRef(0);
+
+  useEffect(() => {
+    if (nodeId === null) return;
+    const seq = (trendSeqRef.current += 1);
+
+    setTrend(null);
+    setTrendLoadFailed(false);
+    setLoading(true);
+    getNodeLatencyHistory(nodeId, hours)
+      .then((res) => {
+        if (trendSeqRef.current !== seq) return;
+        if (res.code === 0) {
+          setTrend(res.data ?? null);
+        } else {
+          setTrend(null);
+          setTrendLoadFailed(true);
+        }
+      })
+      .catch(() => {
+        if (trendSeqRef.current !== seq) return;
+        setTrend(null);
+        setTrendLoadFailed(true);
+      })
+      .finally(() => {
+        if (trendSeqRef.current === seq) setLoading(false);
+      });
+  }, [nodeId, hours, reloadKey]);
+
+  useEffect(() => {
+    if (nodeId === null) setHours(24);
+  }, [nodeId]);
+
+  // One row per time with each point's latency and loss.
+  const rows = useMemo(() => {
+    const byTime = new Map<number, Record<string, number | null>>();
+
+    for (const p of trend?.points ?? []) {
+      for (const s of p.samples) {
+        const row = byTime.get(s.t) ?? { t: s.t };
+
+        row[p.name] = s.ms;
+        row[`${p.name}\u0000loss`] = s.lossPct;
+        byTime.set(s.t, row);
+      }
+    }
+
+    return [...byTime.values()].sort((a, b) => Number(a.t) - Number(b.t));
+  }, [trend]);
+
+  const points = trend?.points ?? [];
+
+  return (
+    <Modal
+      backdrop="blur"
+      classNames={{
+        base: "!w-[calc(100%-32px)] !mx-auto sm:!w-full rounded-2xl overflow-hidden",
+      }}
+      isOpen={nodeId !== null}
+      placement="center"
+      scrollBehavior="inside"
+      size="2xl"
+      onOpenChange={(v) => !v && onClose()}
+    >
+      <ModalContent>
+        <ModalHeader className="flex flex-col gap-0.5">
+          <h2 className="text-lg font-bold">延迟趋势</h2>
+          <p className="text-xs font-semibold text-foreground">
+            {nodeName ? `${nodeName} → 各测试点` : "节点 → 各测试点"}
+            ，每 3 分钟一次
+          </p>
+        </ModalHeader>
+        <ModalBody className="space-y-3">
+          <div className="flex gap-1 self-start rounded-lg bg-default-500/10 p-1">
+            {RANGES.map((r) => (
+              <button
+                key={r.hours}
+                className={`rounded-md px-3 py-1 text-xs transition-colors ${
+                  hours === r.hours
+                    ? "bg-tray font-semibold shadow-sm"
+                    : "text-foreground hover:text-default-800"
+                }`}
+                type="button"
+                onClick={() => setHours(r.hours)}
+              >
+                {r.label}
+              </button>
+            ))}
+          </div>
+
+          {loading && !trend ? (
+            <div className="flex h-52 items-center sm:h-64 justify-center">
+              <Loader2 className="h-5 w-5 animate-spin text-foreground" />
+            </div>
+          ) : trendLoadFailed ? (
+            <div className="flex h-52 flex-col items-center justify-center gap-3 sm:h-64">
+              <p className="text-sm font-semibold text-danger-700">
+                延迟趋势加载失败，请重试
+              </p>
+              <Button
+                size="sm"
+                variant="flat"
+                onPress={() => setReloadKey((k) => k + 1)}
+              >
+                重试
+              </Button>
+            </div>
+          ) : rows.length === 0 ? (
+            <p className="flex h-52 items-center sm:h-64 justify-center text-sm text-foreground">
+              这段时间还没有记录
+            </p>
+          ) : (
+            <div className="h-52 sm:h-64">
+              <ResponsiveContainer height="100%" width="100%">
+                <LineChart data={rows}>
+                  <CartesianGrid
+                    stroke="currentColor"
+                    strokeDasharray="3 3"
+                    strokeOpacity={0.15}
+                  />
+                  <XAxis
+                    dataKey="t"
+                    fontSize={11}
+                    minTickGap={32}
+                    tick={{ fill: "currentColor", fontWeight: 600 }}
+                    tickFormatter={(t: number) => timeLabel(t, hours)}
+                  />
+                  <YAxis
+                    fontSize={11}
+                    tick={{ fill: "currentColor", fontWeight: 600 }}
+                    tickFormatter={(v: number) => `${Math.round(v)}ms`}
+                    width={52}
+                  />
+                  <Tooltip
+                    content={
+                      <ChartGlassTooltip
+                        formatEntry={(entry) => {
+                          const loss = Number(
+                            (entry.payload as Record<string, unknown>)?.[
+                              `${String(entry.name)}\u0000loss`
+                            ] ?? 0,
+                          );
+
+                          return {
+                            name: String(entry.name),
+                            value:
+                              entry.value === null || entry.value === undefined
+                                ? "超时"
+                                : `${Number(entry.value).toFixed(0)}ms${
+                                    loss > 0 ? ` · 丢包 ${loss}%` : ""
+                                  }`,
+                          };
+                        }}
+                        formatLabel={(t) =>
+                          timeLabel(Number(t), hours > 24 ? 48 : 24)
+                        }
+                      />
+                    }
+                    cursor={{ stroke: "currentColor", strokeOpacity: 0.25 }}
+                  />
+                  {points.map((p, i) => (
+                    <Line
+                      key={p.name}
+                      connectNulls={false}
+                      dataKey={p.name}
+                      dot={false}
+                      isAnimationActive={false}
+                      name={p.name}
+                      stroke={COLORS[i % COLORS.length]}
+                      strokeWidth={1.5}
+                      type="monotone"
+                    />
+                  ))}
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          )}
+
+          {points.length > 0 && (
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs font-semibold">
+                <thead className="text-foreground">
+                  <tr className="border-b border-divider">
+                    <th className="py-1.5 text-left font-semibold">测试点</th>
+                    <th className="py-1.5 text-right font-semibold">平均</th>
+                    <th className="py-1.5 text-right font-semibold">最高</th>
+                    <th className="py-1.5 text-right font-semibold">平均丢包</th>
+                  </tr>
+                </thead>
+                <tbody className="font-mono">
+                  {points.map((p, i) => (
+                    <tr
+                      key={p.name}
+                      className="border-b border-divider last:border-0"
+                    >
+                      <td className="py-1.5 font-sans">
+                        <span
+                          className="mr-2 inline-block h-2 w-2 rounded-full"
+                          style={{ background: COLORS[i % COLORS.length] }}
+                        />
+                        {p.name}
+                      </td>
+                      <td className="py-1.5 text-right">
+                        {p.avgMs ? `${Math.round(p.avgMs)} ms` : "-"}
+                      </td>
+                      <td className="py-1.5 text-right">
+                        {p.maxMs ? `${p.maxMs} ms` : "-"}
+                      </td>
+                      <td
+                        className={`py-1.5 text-right ${p.lossPct >= 5 ? "text-rose-700" : ""}`}
+                      >
+                        {p.lossPct}%
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </ModalBody>
+        <ModalFooter>
+          <Button variant="light" onPress={onClose}>
+            关闭
+          </Button>
+        </ModalFooter>
+      </ModalContent>
+    </Modal>
+  );
+}

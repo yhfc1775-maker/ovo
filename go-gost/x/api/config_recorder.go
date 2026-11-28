@@ -1,0 +1,189 @@
+package api
+
+import (
+	"fmt"
+	"net/http"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+	"github.com/go-gost/core/logger"
+	"github.com/go-gost/x/config"
+	parser "github.com/go-gost/x/config/parsing/recorder"
+	"github.com/go-gost/x/registry"
+)
+
+// swagger:parameters createRecorderRequest
+type createRecorderRequest struct {
+	// in: body
+	Data config.RecorderConfig `json:"data"`
+}
+
+// successful operation.
+// swagger:response createRecorderResponse
+type createRecorderResponse struct {
+	Data Response
+}
+
+func createRecorder(ctx *gin.Context) {
+	// swagger:route POST /config/recorders Recorder createRecorderRequest
+	//
+	// Create a new recorder, the name of the recorder must be unique in recorder list.
+	//
+	//     Security:
+	//       basicAuth: []
+	//
+	//     Responses:
+	//       200: createRecorderResponse
+
+	var req createRecorderRequest
+	ctx.ShouldBindJSON(&req.Data)
+
+	name := strings.TrimSpace(req.Data.Name)
+	if name == "" {
+		writeError(ctx, NewError(http.StatusBadRequest, ErrCodeInvalid, "recorder name is required"))
+		return
+	}
+	req.Data.Name = name
+
+	if registry.RecorderRegistry().IsRegistered(name) {
+		writeError(ctx, NewError(http.StatusBadRequest, ErrCodeDup, fmt.Sprintf("recorder %s already exists", name)))
+		return
+	}
+	v := parser.ParseRecorder(&req.Data)
+
+	if !commitNamedConfig(ctx, registry.RecorderRegistry(), name, v, false, func(c *config.Config) error {
+		// R18-F02/F-04: 按名 upsert（R17-A 同款）。成员已在配置中、但不在注册表里时
+		// （例如暂停后 loader 跳过注册），无去重 append 会把第二份同名项写进配置并落盘。
+		c.Recorders = upsertNamed(c.Recorders, &req.Data, func(v *config.RecorderConfig) string { return v.Name })
+		return nil
+	}) {
+		return
+	}
+
+	ctx.JSON(http.StatusOK, Response{
+		Msg: "OK",
+	})
+}
+
+// swagger:parameters updateRecorderRequest
+type updateRecorderRequest struct {
+	// in: path
+	// required: true
+	Recorder string `uri:"recorder" json:"recorder"`
+	// in: body
+	Data config.RecorderConfig `json:"data"`
+}
+
+// successful operation.
+// swagger:response updateRecorderResponse
+type updateRecorderResponse struct {
+	Data Response
+}
+
+func updateRecorder(ctx *gin.Context) {
+	// swagger:route PUT /config/recorders/{recorder} Recorder updateRecorderRequest
+	//
+	// Update recorder by name, the recorder must already exist.
+	//
+	//     Security:
+	//       basicAuth: []
+	//
+	//     Responses:
+	//       200: updateRecorderResponse
+
+	var req updateRecorderRequest
+	ctx.ShouldBindUri(&req)
+	ctx.ShouldBindJSON(&req.Data)
+
+	name := strings.TrimSpace(req.Recorder)
+
+	if !registry.RecorderRegistry().IsRegistered(name) {
+		writeError(ctx, NewError(http.StatusBadRequest, ErrCodeNotFound, fmt.Sprintf("recorder %s not found", name)))
+		return
+	}
+
+	req.Data.Name = name
+
+	v := parser.ParseRecorder(&req.Data)
+
+	if !commitNamedConfig(ctx, registry.RecorderRegistry(), name, v, false, func(c *config.Config) error {
+		for i := range c.Recorders {
+			// R19-F02: nil 项跳过并记日志（原样保留，清理只走启动自愈），不得 panic。
+			if c.Recorders[i] == nil {
+				logger.Default().Warnf("update recorder: skipped nil recorder entry at index %d", i)
+				continue
+			}
+			if c.Recorders[i].Name == name {
+				c.Recorders[i] = &req.Data
+				break
+			}
+		}
+		return nil
+	}) {
+		return
+	}
+
+	ctx.JSON(http.StatusOK, Response{
+		Msg: "OK",
+	})
+}
+
+// swagger:parameters deleteRecorderRequest
+type deleteRecorderRequest struct {
+	// in: path
+	// required: true
+	Recorder string `uri:"recorder" json:"recorder"`
+}
+
+// successful operation.
+// swagger:response deleteRecorderResponse
+type deleteRecorderResponse struct {
+	Data Response
+}
+
+func deleteRecorder(ctx *gin.Context) {
+	// swagger:route DELETE /config/recorders/{recorder} Recorder deleteRecorderRequest
+	//
+	// Delete recorder by name.
+	//
+	//     Security:
+	//       basicAuth: []
+	//
+	//     Responses:
+	//       200: deleteRecorderResponse
+
+	var req deleteRecorderRequest
+	ctx.ShouldBindUri(&req)
+
+	name := strings.TrimSpace(req.Recorder)
+
+	if !registry.RecorderRegistry().IsRegistered(name) {
+		writeError(ctx, NewError(http.StatusBadRequest, ErrCodeNotFound, fmt.Sprintf("recorder %s not found", name)))
+		return
+	}
+
+	var zero = registry.RecorderRegistry().Get(name)
+	if !commitNamedConfig(ctx, registry.RecorderRegistry(), name, zero, true, func(c *config.Config) error {
+		recorders := c.Recorders
+		c.Recorders = nil
+		for _, s := range recorders {
+			// R19-F02: nil 项原样保留并记日志，不得 panic（清理只走启动自愈）。
+			if s == nil {
+				logger.Default().Warnf("delete recorder: kept nil recorder entry as-is")
+				c.Recorders = append(c.Recorders, s)
+				continue
+			}
+			if s.Name == name {
+				continue
+			}
+			c.Recorders = append(c.Recorders, s)
+		}
+		return nil
+	}) {
+		return
+	}
+
+	ctx.JSON(http.StatusOK, Response{
+		Msg: "OK",
+	})
+}

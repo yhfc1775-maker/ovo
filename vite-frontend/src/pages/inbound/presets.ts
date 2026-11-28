@@ -1,0 +1,760 @@
+import type { SplitRuleForm } from "./split-rules";
+import type {
+  InboundApiItem,
+  InboundMutationPayload,
+  KernelCapabilitiesApiData,
+  KernelProtocolCap,
+} from "@/api/types";
+
+export const PROTOCOL_LABELS: Record<string, string> = {
+  vless: "VLESS",
+  vmess: "VMess",
+  trojan: "Trojan",
+  shadowsocks: "Shadowsocks",
+  hysteria2: "Hysteria2",
+  tuic: "TUIC v5",
+  anytls: "AnyTLS",
+  snell: "Snell",
+  naive: "NaïveProxy",
+};
+
+export const KERNEL_LABELS: Record<string, string> = {
+  xray: "Xray",
+  singbox: "sing-box",
+  snell: "Snell",
+};
+
+export const TRANSPORT_LABELS: Record<string, string> = {
+  tcp: "TCP",
+  ws: "WebSocket",
+  grpc: "gRPC",
+  xhttp: "XHTTP",
+  quic: "QUIC",
+};
+
+export const SECURITY_LABELS: Record<string, string> = {
+  none: "无",
+  tls: "TLS",
+  reality: "Reality",
+  shadowtls: "ShadowTLS v3",
+};
+
+export const CERT_MODE_LABELS: Record<string, string> = {
+  self: "自动生成自签证书",
+  file: "使用节点上的证书文件",
+  acme: "自动申请证书（ACME）",
+};
+
+export const ACME_DNS_LABELS: Record<string, string> = {
+  "": "HTTP 验证（需要节点 80 端口）",
+  cloudflare: "Cloudflare DNS",
+  alidns: "阿里云 DNS",
+};
+
+export const KERNEL_STATUS: Record<
+  string,
+  { label: string; color: "success" | "warning" | "danger" | "default" }
+> = {
+  running: { label: "运行中", color: "success" },
+  stopped: { label: "已停止", color: "default" },
+  pending: { label: "待下发", color: "warning" },
+  error: { label: "异常", color: "danger" },
+};
+
+export interface InboundForm {
+  id?: number;
+  nodeId: string;
+  kernelType: string;
+  name: string;
+  protocol: string;
+  listen: string;
+  port: string;
+  uuid: string;
+  flowVision: boolean;
+  encryptionEnabled: boolean;
+  encryptionAuth: string;
+  encryptionMode: string;
+  encryptionSecret: string;
+  password: string;
+  method: string;
+  masquerade: string;
+  backendPort: number;
+  portHopping: string;
+  username: string;
+  transportType: string;
+  path: string;
+  host: string;
+  serviceName: string;
+  xhttpMode: string;
+  securityType: string;
+  sni: string;
+  alpn: string;
+  fingerprint: string;
+  certMode: string;
+  certFile: string;
+  keyFile: string;
+  realityDest: string;
+  realityPrivateKey: string;
+  realityShortIds: string;
+  realityMinClientVer: string;
+  shadowTlsPassword: string;
+  acmeEmail: string;
+  acmeDns: string;
+  acmeDnsKey: string;
+  acmeDnsSecret: string;
+  acmeDnsSet: boolean;
+  shareAddressMode: string;
+  shareHost: string;
+  remark: string;
+  extra: string;
+  relayOnly: boolean;
+  acceptProxyProtocol: boolean;
+  relayWhitelist: boolean;
+  whitelistExtra: string;
+  /** Chained outbound inbound id; "" leaves directly. */
+  outboundId: string;
+  outboundIpStrategy:
+    | "auto"
+    | "ipv4_only"
+    | "ipv6_only"
+    | "prefer_ipv4"
+    | "prefer_ipv6";
+  splitRules: SplitRuleForm[];
+  enabled: boolean;
+  /** Legacy read-only flag: the companion-era metering switch. The
+   * backend accepts it but ignores it (in-place metering is the
+   * ssSubscriptionUsers switch below); the form never sends it and no
+   * UI edits it. Kept so an edit form can still tell a legacy-metered
+   * origin (migration hint) from a never-metered one. */
+  meteringEnabled: boolean;
+  /** Read-only: in-place metering is currently live for this inbound. */
+  meteringActive: boolean;
+  /**
+   * In-place per-subscription SS users switch (Xray / sing-box SS,
+   * SS2022 + legacy). Default off: enabling it hard-invalidates the
+   * old shared password, so it must never default on.
+   */
+  ssSubscriptionUsers: boolean;
+  /** Per-inbound idle timeout (seconds) for Xray, "" = unset (default 300s). */
+  connIdleSeconds: string;
+}
+
+export interface Preset {
+  key: string;
+  label: string;
+  description: string;
+  kernel?: string; // only offered for this kernel
+  protocol: string;
+  transport: string;
+  security: string;
+  vision?: boolean;
+  needsDomain?: boolean;
+  certMode?: string;
+}
+
+export const PRESETS: Preset[] = [
+  {
+    key: "vless-reality-vision",
+    label: "VLESS + Reality + Vision",
+    description: "推荐：无需域名和证书，抗探测",
+    protocol: "vless",
+    transport: "tcp",
+    security: "reality",
+    vision: true,
+  },
+  {
+    key: "vless-xhttp-reality",
+    label: "VLESS + XHTTP + Reality",
+    description: "XHTTP 传输，适合中转/CDN 场景",
+    protocol: "vless",
+    transport: "xhttp",
+    security: "reality",
+  },
+  {
+    key: "ss2022",
+    label: "Shadowsocks 2022",
+    description: "轻量，客户端支持广泛",
+    protocol: "shadowsocks",
+    transport: "tcp",
+    security: "none",
+  },
+  {
+    key: "trojan-tls",
+    label: "Trojan + TLS（自签）",
+    description: "需要填写域名，自动生成自签证书",
+    protocol: "trojan",
+    transport: "tcp",
+    security: "tls",
+    needsDomain: true,
+  },
+  {
+    key: "vmess-ws-tls",
+    label: "VMess + WS + TLS",
+    description: "兼容老客户端",
+    protocol: "vmess",
+    transport: "ws",
+    security: "tls",
+    needsDomain: true,
+  },
+  {
+    key: "hysteria2",
+    label: "Hysteria2",
+    description: "基于 QUIC，弱网/高延迟线路表现好（自签证书）",
+    kernel: "singbox",
+    protocol: "hysteria2",
+    transport: "quic",
+    security: "tls",
+  },
+  {
+    key: "tuic",
+    label: "TUIC v5",
+    description: "基于 QUIC，BBR 拥塞控制（自签证书）",
+    kernel: "singbox",
+    protocol: "tuic",
+    transport: "quic",
+    security: "tls",
+  },
+  {
+    key: "anytls",
+    label: "AnyTLS",
+    description: "TLS 内多路复用，减少 TLS-in-TLS 特征",
+    kernel: "singbox",
+    protocol: "anytls",
+    transport: "tcp",
+    security: "tls",
+  },
+  {
+    key: "ss2022-shadowtls",
+    label: "SS2022 + ShadowTLS",
+    description: "握手伪装成访问真实网站（仅 TCP）",
+    kernel: "singbox",
+    protocol: "shadowsocks",
+    transport: "tcp",
+    security: "shadowtls",
+  },
+  {
+    key: "naive",
+    label: "NaïveProxy",
+    description: "伪装成正常 HTTPS 访问，需要域名（自动申请证书）",
+    kernel: "singbox",
+    protocol: "naive",
+    transport: "tcp",
+    security: "tls",
+    needsDomain: true,
+    certMode: "acme",
+  },
+];
+
+/** Presets the given kernel can serve with its exact transport + security. */
+export function presetsFor(
+  caps: KernelCapabilitiesApiData | null,
+  kernelType: string,
+): Preset[] {
+  return PRESETS.filter((p) => {
+    if (p.kernel && p.kernel !== kernelType) return false;
+    const cap = protocolCap(caps, kernelType, p.protocol);
+
+    return Boolean(
+      cap?.transports.some(
+        (t) => t.type === p.transport && t.securities.includes(p.security),
+      ),
+    );
+  });
+}
+
+export function emptyForm(
+  caps: KernelCapabilitiesApiData | null,
+  nodeId = "",
+): InboundForm {
+  return {
+    nodeId,
+    kernelType: "xray",
+    name: "",
+    protocol: "vless",
+    listen: "::",
+    port: "",
+    uuid: "",
+    flowVision: true,
+    encryptionEnabled: false,
+    encryptionAuth: "x25519",
+    encryptionMode: "native",
+    encryptionSecret: "",
+    password: "",
+    method: caps?.defaults.ssMethod ?? "2022-blake3-aes-128-gcm",
+    masquerade: "",
+    backendPort: 0,
+    portHopping: "",
+    username: "",
+    transportType: "tcp",
+    path: "",
+    host: "",
+    serviceName: "",
+    xhttpMode: "auto",
+    securityType: "reality",
+    sni: caps?.defaults.realitySni ?? "",
+    alpn: "",
+    fingerprint: caps?.defaults.fingerprint ?? "chrome",
+    certMode: "self",
+    certFile: "",
+    keyFile: "",
+    realityDest: "",
+    realityPrivateKey: "",
+    realityShortIds: "",
+    realityMinClientVer: "",
+    shadowTlsPassword: "",
+    acmeEmail: "",
+    acmeDns: "",
+    acmeDnsKey: "",
+    acmeDnsSecret: "",
+    acmeDnsSet: false,
+    shareAddressMode: "auto",
+    shareHost: "",
+    remark: "",
+    extra: "",
+    relayOnly: false,
+    acceptProxyProtocol: false,
+    relayWhitelist: false,
+    whitelistExtra: "",
+    outboundId: "",
+    outboundIpStrategy: "auto",
+    splitRules: [],
+    enabled: true,
+    // S-3 (SWEEP): the companion-era metering switch defaults OFF now
+    // (it was default-ON under S05) — it is a read-only legacy flag,
+    // never sent (see toPayload), so a default true would only lie to
+    // the migration hint on a create form.
+    meteringEnabled: false,
+    meteringActive: false,
+    // In-place subscription users default OFF (see InboundForm):
+    // enabling hard-invalidates the old shared password, so a new
+    // inbound must never silently ship with it on.
+    ssSubscriptionUsers: false,
+    connIdleSeconds: "",
+  };
+}
+
+/** A name still holding a template or protocol label was filled in by us. */
+export function isAutoName(name: string): boolean {
+  const n = name.trim();
+
+  return (
+    n === "" ||
+    PRESETS.some((p) => p.label === n) ||
+    Object.values(PROTOCOL_LABELS).includes(n)
+  );
+}
+
+export function applyPreset(
+  form: InboundForm,
+  preset: Preset,
+  caps: KernelCapabilitiesApiData | null,
+): InboundForm {
+  const realitySni = caps?.defaults.realitySni ?? "";
+  // A borrowed public site (Reality / ShadowTLS) must not leak into a TLS
+  // SNI and vice versa; QUIC/AnyTLS fall back to the server default.
+  const borrowed = (t: string) => t === "reality" || t === "shadowtls";
+  let sni = form.sni;
+
+  if (borrowed(preset.security)) {
+    sni = borrowed(form.securityType) && form.sni ? form.sni : realitySni;
+  } else if (borrowed(form.securityType)) {
+    sni = "";
+  }
+
+  return {
+    ...form,
+    protocol: preset.protocol,
+    transportType: preset.transport,
+    securityType: preset.security,
+    flowVision: Boolean(preset.vision),
+    sni,
+    certMode:
+      preset.certMode ?? (form.certMode === "acme" ? "self" : form.certMode),
+    name: isAutoName(form.name) ? preset.label : form.name,
+  };
+}
+
+/**
+ * Strict CHG-01 IEPL shape (IRL-1): the 「IEPL专用」 badge may only claim an
+ * inbound that matches the frozen preset form field-for-field — VLESS over
+ * TCP, no security layer, ENC on with ML-KEM-768 auth in xorpub appearance,
+ * no SNI, no Vision flow, and the unlimited (-1) idle timeout the preset
+ * applies. A plain encryptionAuth check lit the badge for any ENC inbound
+ * (Reality / x25519 / manual variants alike).
+ */
+export function isIeplForm(item: InboundApiItem): boolean {
+  const s = item.settings;
+
+  return (
+    item.protocol === "vless" &&
+    item.transport.type === "tcp" &&
+    item.security.type === "none" &&
+    s.encryptionAuth === "mlkem768" &&
+    s.encryptionMode === "xorpub" &&
+    !s.flow &&
+    !item.security.sni &&
+    item.connIdleSeconds === -1
+  );
+}
+
+/**
+ * Decoded secret lengths the backend demands per ENC auth mode
+ * (ValidateEncryptionSecret: x25519 = 32-byte private key, mlkem768 =
+ * 64-byte seed). The two lengths are disjoint, so a secret minted for one
+ * auth mode can never validate for the other (IRL-4).
+ */
+export const ENCRYPTION_SECRET_BYTES: Record<string, number> = {
+  x25519: 32,
+  mlkem768: 64,
+};
+
+function base64UrlDecodeLength(value: string): number {
+  const normalized = (value ?? "")
+    .trim()
+    .replace(/-/g, "+")
+    .replace(/_/g, "/");
+
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(normalized)) return -1;
+  try {
+    return atob(normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "="))
+      .length;
+  } catch {
+    return -1;
+  }
+}
+
+/** Whether `secret` decodes to the exact byte length `auth` requires. */
+export function encryptionSecretMatchesAuth(
+  auth: string,
+  secret: string,
+): boolean {
+  const want = ENCRYPTION_SECRET_BYTES[auth];
+
+  return want !== undefined && base64UrlDecodeLength(secret) === want;
+}
+
+/** Mint a fresh server secret of the exact shape `auth` requires. */
+export function generateEncryptionSecret(auth: string): string {
+  const bytes = new Uint8Array(ENCRYPTION_SECRET_BYTES[auth] ?? 32);
+
+  crypto.getRandomValues(bytes);
+  let binary = "";
+
+  bytes.forEach((b) => {
+    binary += String.fromCharCode(b);
+  });
+
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/**
+ * The secret to keep when the form's ENC auth becomes `auth`: the current
+ * one if it already matches the new auth's length, otherwise a freshly
+ * generated one. An update that posts an empty secret makes the backend
+ * refill the OLD stored secret (R2X-030 semantics), so clearing the field
+ * cannot rescue a length-mismatched secret — the form must carry a valid
+ * new secret itself (IRL-4). `rotated` tells the caller a new secret was
+ * minted, so the UI can warn that distributed clients must re-import.
+ */
+export function secretForAuth(
+  auth: string,
+  current: string,
+): { secret: string; rotated: boolean } {
+  if (current && encryptionSecretMatchesAuth(auth, current)) {
+    return { secret: current, rotated: false };
+  }
+
+  return {
+    secret: generateEncryptionSecret(auth),
+    rotated: Boolean(current),
+  };
+}
+
+export function formFromItem(item: InboundApiItem): InboundForm {  return {
+    id: item.id,
+    nodeId: String(item.nodeId),
+    kernelType: item.kernelType,
+    name: item.name,
+    protocol: item.protocol,
+    listen: item.listen,
+    port: String(item.port),
+    uuid: item.settings.uuid ?? "",
+    flowVision: Boolean(item.settings.flow),
+    encryptionEnabled: Boolean(item.settings.encryptionAuth),
+    encryptionAuth: item.settings.encryptionAuth ?? "x25519",
+    encryptionMode: item.settings.encryptionMode ?? "native",
+    encryptionSecret: item.settings.encryptionSecret ?? "",
+    password: item.settings.password ?? "",
+    method: item.settings.method ?? "",
+    masquerade: item.settings.masquerade ?? "",
+    backendPort: item.settings.backendPort ?? 0,
+    portHopping: item.settings.portHopping ?? "",
+    username: item.settings.username ?? "",
+    transportType: item.transport.type || "tcp",
+    path: item.transport.path ?? "",
+    host: item.transport.host ?? "",
+    serviceName: item.transport.serviceName ?? "",
+    xhttpMode: item.transport.mode || "auto",
+    securityType: item.security.type || "none",
+    sni: item.security.sni ?? "",
+    alpn: (item.security.alpn ?? []).join(","),
+    fingerprint: item.security.fingerprint ?? "",
+    certMode: item.security.certMode || "self",
+    certFile: item.security.certFile ?? "",
+    keyFile: item.security.keyFile ?? "",
+    realityDest: item.security.realityDest ?? "",
+    realityPrivateKey: item.security.realityPrivateKey ?? "",
+    realityShortIds: (item.security.realityShortIds ?? []).join(","),
+    realityMinClientVer: item.security.realityMinClientVer ?? "",
+    shadowTlsPassword: item.security.shadowTlsPassword ?? "",
+    acmeEmail: item.security.acmeEmail ?? "",
+    acmeDns: item.security.acmeDns ?? "",
+    acmeDnsKey: "",
+    acmeDnsSecret: "",
+    acmeDnsSet: Boolean(item.security.acmeDnsSet),
+    shareAddressMode:
+      item.shareAddressMode ?? (item.shareHost ? "custom" : "auto"),
+    shareHost: item.shareHost,
+    remark: item.remark,
+    extra: item.extra,
+    relayOnly: item.relayOnly,
+    acceptProxyProtocol: item.acceptProxyProtocol,
+    relayWhitelist: item.relayWhitelist,
+    whitelistExtra: item.whitelistExtra,
+    outboundId: item.outboundId ? String(item.outboundId) : "",
+    outboundIpStrategy: item.outboundIpStrategy || "auto",
+    splitRules: splitFormFromItem(item),
+    enabled: item.enabled,
+    meteringEnabled: item.meteringEnabled,
+    meteringActive: item.meteringActive,
+    // The backend does not send this field yet (I1 pending); ?? false
+    // keeps the switch deterministically off until it does.
+    ssSubscriptionUsers: item.ssSubscriptionUsers ?? false,
+    connIdleSeconds: item.connIdleSeconds ? String(item.connIdleSeconds) : "",
+  };
+}
+
+/** An inbound's 分流 rules as edited. */
+export function splitFormFromItem(item: InboundApiItem): SplitRuleForm[] {
+  return (item.splitRules ?? []).map((r) => ({
+    categories: r.categories ?? [],
+    domains: (r.domains ?? []).join(", "),
+    ips: (r.ips ?? []).join(", "),
+    action: r.action,
+    outboundId: r.outboundId ? String(r.outboundId) : "",
+  }));
+}
+
+export function splitPayload(
+  rules: SplitRuleForm[],
+): InboundMutationPayload["splitRules"] {
+  return rules.map((r) => ({
+    categories: r.categories,
+    domains: splitList(r.domains),
+    ips: splitList(r.ips),
+    action: r.action,
+    outboundId: r.action === "proxy" ? Number(r.outboundId) || 0 : undefined,
+  }));
+}
+
+export const uuidProtocols = ["vless", "vmess", "tuic"];
+export const passwordProtocols = [
+  "trojan",
+  "shadowsocks",
+  "hysteria2",
+  "tuic",
+  "anytls",
+  "naive",
+];
+
+/** TLS on these protocols defaults its SNI server-side, so it is optional. */
+export const sniOptionalProtocols = ["hysteria2", "tuic", "anytls"];
+
+function splitList(v: string): string[] {
+  return v
+    .split(/[,，\s]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+export function visionAllowed(form: InboundForm): boolean {
+  return (
+    form.protocol === "vless" &&
+    form.transportType === "tcp" &&
+    (form.securityType !== "none" || form.encryptionEnabled)
+  );
+}
+
+export function toPayload(form: InboundForm): InboundMutationPayload {
+  const usesUUID = uuidProtocols.includes(form.protocol);
+  const usesPassword = passwordProtocols.includes(form.protocol);
+
+  return {
+    id: form.id,
+    nodeId: form.nodeId ? Number(form.nodeId) : undefined,
+    kernelType: form.kernelType,
+    name: form.name.trim(),
+    protocol: form.protocol,
+    listen: form.listen.trim(),
+    port: form.port.trim() ? Number(form.port) : 0,
+    settings: {
+      uuid: usesUUID ? form.uuid.trim() : undefined,
+      flow:
+        visionAllowed(form) && form.flowVision ? "xtls-rprx-vision" : undefined,
+      encryptionAuth:
+        form.kernelType === "xray" && form.protocol === "vless" && form.encryptionEnabled
+          ? form.encryptionAuth
+          : undefined,
+      encryptionMode:
+        form.kernelType === "xray" && form.protocol === "vless" && form.encryptionEnabled
+          ? form.encryptionMode
+          : undefined,
+      encryptionSecret:
+        form.kernelType === "xray" && form.protocol === "vless" && form.encryptionEnabled
+          ? form.encryptionSecret || undefined
+          : undefined,
+      password: usesPassword ? form.password.trim() : undefined,
+      method: form.protocol === "shadowsocks" ? form.method : undefined,
+      masquerade:
+        form.protocol === "hysteria2" ? form.masquerade.trim() : undefined,
+      backendPort: form.backendPort || undefined,
+      portHopping:
+        form.protocol === "hysteria2"
+          ? form.portHopping.trim() || undefined
+          : undefined,
+      username:
+        form.protocol === "naive"
+          ? form.username.trim() || undefined
+          : undefined,
+    },
+    transport: {
+      type: form.transportType,
+      path: form.path.trim() || undefined,
+      host: form.host.trim() || undefined,
+      serviceName: form.serviceName.trim() || undefined,
+      mode: form.transportType === "xhttp" ? form.xhttpMode : undefined,
+    },
+    security: {
+      type: form.securityType,
+      sni: form.sni.trim() || undefined,
+      alpn: form.alpn.trim() ? splitList(form.alpn) : undefined,
+      fingerprint: form.fingerprint.trim() || undefined,
+      certMode: form.securityType === "tls" ? form.certMode : undefined,
+      certFile: form.certFile.trim() || undefined,
+      keyFile: form.keyFile.trim() || undefined,
+      realityDest:
+        form.securityType === "reality"
+          ? form.realityDest.trim() || undefined
+          : undefined,
+      realityPrivateKey:
+        form.securityType === "reality"
+          ? form.realityPrivateKey.trim() || undefined
+          : undefined,
+      realityShortIds:
+        form.securityType === "reality" && form.realityShortIds.trim()
+          ? splitList(form.realityShortIds)
+          : undefined,
+      realityMinClientVer:
+        form.securityType === "reality"
+          ? form.realityMinClientVer.trim() || undefined
+          : undefined,
+      shadowTlsPassword:
+        form.securityType === "shadowtls"
+          ? form.shadowTlsPassword.trim() || undefined
+          : undefined,
+      ...(form.securityType === "tls" && form.certMode === "acme"
+        ? {
+            acmeEmail: form.acmeEmail.trim() || undefined,
+            acmeDns: form.acmeDns || undefined,
+            // Empty keeps the stored credentials when editing.
+            acmeDnsKey: form.acmeDnsKey.trim() || undefined,
+            acmeDnsSecret: form.acmeDnsSecret.trim() || undefined,
+          }
+        : {}),
+    },
+    extra: form.extra.trim(),
+    shareAddressMode: form.shareAddressMode,
+    shareHost:
+      form.shareAddressMode === "custom" ? form.shareHost.trim() : "",
+    remark: form.remark.trim(),
+    relayOnly: form.relayOnly || form.acceptProxyProtocol,
+    acceptProxyProtocol: form.acceptProxyProtocol,
+    relayWhitelist: form.relayWhitelist,
+    whitelistExtra: form.relayWhitelist ? form.whitelistExtra.trim() : "",
+    outboundId: Number(form.outboundId) || 0,
+    outboundIpStrategy: form.outboundIpStrategy,
+    splitRules: splitPayload(form.splitRules),
+    enabled: form.enabled,
+    // S-3 (SWEEP): meteringEnabled is no longer sent. The backend
+    // accepts it but ignores it (the companion-era switch is dead —
+    // its stored value only feeds the migration hint), so sending
+    // the form's default-on value served nothing and kept the dead
+    // switch looking alive. In-place metering is ssSubscriptionUsers
+    // below; omitting the field keeps the stored legacy value.
+    // In-place subscription users: SS only, Xray / sing-box only, any
+    // method (SS2022 + legacy, V-line Q2/Q4). Unlike metering there is
+    // no shape gate — the per-user passwords live in this same inbound,
+    // so relay / PROXY protocol / chained outbound / split rules still
+    // apply to it as a whole. Any other shape sends false so a stale
+    // true never reaches the backend. The nft / kernel-version gate
+    // stays server-side (I2): it refuses the save with its own reason.
+    ssSubscriptionUsers:
+      form.protocol === "shadowsocks" &&
+      (form.kernelType === "xray" || form.kernelType === "singbox")
+        ? form.ssSubscriptionUsers
+        : false,
+    // "" sends 0 = unset (Xray default 300s); an explicit number sets it;
+    // 0 is the legal clear value on Xray (148-P3-1); "-1" sends -1 =
+    // unlimited (renders as 31536000). A non-Xray inbound
+    // never carries a value: a stale stored value is cleared to 0 on
+    // save so editing it is no longer blocked (148-P3-2).
+    connIdleSeconds:
+      form.kernelType !== "xray"
+        ? 0
+        : form.connIdleSeconds.trim()
+          ? Number(form.connIdleSeconds)
+          : 0,
+  };
+}
+
+export function protocolCap(
+  caps: KernelCapabilitiesApiData | null,
+  kernelType: string,
+  protocol: string,
+): KernelProtocolCap | undefined {
+  return caps?.kernels
+    .find((k) => k.type === kernelType)
+    ?.protocols?.find((p) => p.protocol === protocol);
+}
+
+export function describeInbound(item: InboundApiItem): string {
+  if (item.importedSummary) return item.importedSummary;
+  const parts = [PROTOCOL_LABELS[item.protocol] ?? item.protocol];
+
+  const implicitTransport = [
+    "shadowsocks",
+    "snell",
+    "hysteria2",
+    "tuic",
+    "anytls",
+    "naive",
+  ];
+
+  if (!implicitTransport.includes(item.protocol)) {
+    parts.push(TRANSPORT_LABELS[item.transport.type] ?? item.transport.type);
+  }
+  if (item.security.type && item.security.type !== "none") {
+    parts.push(SECURITY_LABELS[item.security.type] ?? item.security.type);
+  }
+  if (item.settings.flow) {
+    parts.push("Vision");
+  }
+  if (item.security.certMode === "acme") {
+    parts.push("ACME");
+  }
+  if (item.settings.portHopping) {
+    parts.push("端口跳跃");
+  }
+
+  return parts.join(" + ");
+}

@@ -1,0 +1,119 @@
+/**
+ * 服务端下发的 WebAuthn 字段解码失败（数据/兼容问题）专用错误，
+ * 与用户取消（浏览器直接抛 DOMException）区分：调用方据此提示
+ * 「数据无效」而非「已取消或失败」（E1-06）。
+ */
+export class PasskeyDataError extends Error {
+  constructor(message = "通行证密钥数据无效") {
+    super(message);
+    this.name = "PasskeyDataError";
+  }
+}
+
+// Convert the WebAuthn JSON wire format to the browser's ArrayBuffer format.
+function decode(value: string): ArrayBuffer {
+  // 与 utils/jwt.ts 同款 base64url 还原：替换 -/_ 后必须补齐
+  // padding——旧实现变量名叫 padded 却从未补位，严格 atob 的引擎
+  // （旧 Android WebView）对长度 ≡2,3 (mod 4) 的合法无填充串抛错，
+  // 且异常被调用方与用户取消一并收成同一文案，无从区分。
+  const base64 = value.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
+
+  try {
+    const bytes = Uint8Array.from(atob(padded), (character) =>
+      character.charCodeAt(0),
+    );
+
+    return bytes.buffer;
+  } catch {
+    throw new PasskeyDataError("通行证密钥数据无效（base64url 解码失败）");
+  }
+}
+
+function encode(value: ArrayBuffer): string {
+  const bytes = new Uint8Array(value);
+  let binary = "";
+
+  bytes.forEach((byte) => {
+    binary += String.fromCharCode(byte);
+  });
+
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+export async function createPasskey(options: {
+  publicKey: Record<string, unknown>;
+}) {
+  const source = options.publicKey as unknown as {
+    challenge: string;
+    user: { id: string };
+    excludeCredentials?: Array<{ id: string }>;
+  };
+  const publicKey: PublicKeyCredentialCreationOptions = {
+    ...(options.publicKey as unknown as PublicKeyCredentialCreationOptions),
+    challenge: decode(source.challenge),
+    user: {
+      ...(source.user as unknown as PublicKeyCredentialUserEntity),
+      id: decode(source.user.id),
+    },
+    excludeCredentials: source.excludeCredentials?.map((item) => ({
+      ...(item as unknown as PublicKeyCredentialDescriptor),
+      id: decode(item.id),
+    })),
+  };
+  const credential = (await navigator.credentials.create({
+    publicKey,
+  })) as PublicKeyCredential | null;
+
+  if (!credential) throw new Error("未创建通行证密钥");
+  const result = credential.response as AuthenticatorAttestationResponse;
+
+  return {
+    id: credential.id,
+    rawId: encode(credential.rawId),
+    type: credential.type,
+    response: {
+      attestationObject: encode(result.attestationObject),
+      clientDataJSON: encode(result.clientDataJSON),
+      transports: result.getTransports?.() || [],
+    },
+  };
+}
+
+export async function getPasskey(options: {
+  publicKey: Record<string, unknown>;
+}) {
+  const source = options.publicKey as unknown as {
+    challenge: string;
+    allowCredentials?: Array<{ id: string }>;
+  };
+  const publicKey: PublicKeyCredentialRequestOptions = {
+    ...(options.publicKey as unknown as PublicKeyCredentialRequestOptions),
+    challenge: decode(source.challenge),
+    allowCredentials: source.allowCredentials?.map((item) => ({
+      ...(item as unknown as PublicKeyCredentialDescriptor),
+      id: decode(item.id),
+    })),
+  };
+  const credential = (await navigator.credentials.get({
+    publicKey,
+  })) as PublicKeyCredential | null;
+
+  if (!credential) throw new Error("未选择通行证密钥");
+  const result = credential.response as AuthenticatorAssertionResponse;
+
+  return {
+    id: credential.id,
+    rawId: encode(credential.rawId),
+    type: credential.type,
+    response: {
+      authenticatorData: encode(result.authenticatorData),
+      clientDataJSON: encode(result.clientDataJSON),
+      signature: encode(result.signature),
+      userHandle: result.userHandle ? encode(result.userHandle) : null,
+    },
+  };
+}

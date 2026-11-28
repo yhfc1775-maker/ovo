@@ -1,0 +1,135 @@
+package handler
+
+import (
+	"encoding/json"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"go-backend/internal/store/repo"
+)
+
+// 复扫（fix/final-resweep）：从头机械重推发现的新增同族残留。
+// 先红后绿：每项修复前应失败，修复后须通过；含合法对照（防过修）。
+
+// R-03：配置 `notify_webhook_url` 保存面接受 `https://a..b/hook`。
+// normalizeAndValidateConfigValue default 直通，仅使用期（validateNotifyURL）
+// DNS fail-closed；与 L1-F-08 同形。
+func TestResweepNotifyWebhookURLConfigRejectsEmptyLabel(t *testing.T) {
+	for _, u := range []string{"https://a..b/hook", "https://a...b/x"} {
+		if _, err := normalizeAndValidateConfigValue("notify_webhook_url", u); err == nil {
+			t.Errorf("normalizeAndValidateConfigValue(notify_webhook_url, %q) = nil, want error", u)
+		} else if !strings.Contains(err.Error(), "空标签") {
+			t.Errorf("normalizeAndValidateConfigValue(notify_webhook_url, %q) = %v, want empty-label error", u, err)
+		}
+	}
+	for _, u := range []string{"", "https://example.com/hook", "https://203.0.113.9/hook"} {
+		if _, err := normalizeAndValidateConfigValue("notify_webhook_url", u); err != nil {
+			t.Errorf("normalizeAndValidateConfigValue(notify_webhook_url, %q) = %v, want nil", u, err)
+		}
+	}
+}
+
+// X-04：配置 `notify_telegram_api_base` 保存面接受 `https://a..b/`。
+// normalizeAndValidateConfigValue 中该键无 case，落入 default 原样放行；
+// 与 R-03（notify_webhook_url）同型同口径。前端 notify-card.tsx 两键均为
+// 纯文本输入、webhook 亦无前端校验，故前端不动。
+func TestResweepNotifyTelegramAPIBaseConfigRejectsEmptyLabel(t *testing.T) {
+	for _, u := range []string{"https://a..b/", "https://a...b/"} {
+		if _, err := normalizeAndValidateConfigValue("notify_telegram_api_base", u); err == nil {
+			t.Errorf("normalizeAndValidateConfigValue(notify_telegram_api_base, %q) = nil, want error", u)
+		} else if !strings.Contains(err.Error(), "空标签") {
+			t.Errorf("normalizeAndValidateConfigValue(notify_telegram_api_base, %q) = %v, want empty-label error", u, err)
+		}
+	}
+	for _, u := range []string{"", "https://example.com/", "https://api.telegram.org", "https://203.0.113.9/"} {
+		if _, err := normalizeAndValidateConfigValue("notify_telegram_api_base", u); err != nil {
+			t.Errorf("normalizeAndValidateConfigValue(notify_telegram_api_base, %q) = %v, want nil", u, err)
+		}
+	}
+}
+
+// R-02：一键测算探测 ReferenceHost / SpeedtestURL 接受空标签主机名。
+// nodeTune probe 动作只做 SplitHostPort / scheme 前缀检查，两值透传给 agent
+// 拨号/下载，探测期才 loud 失败。Handler 边界测试：修复前应走到
+// sendNodeCommand（无空标签文案），修复后须在校验期以空标签拒。
+func TestResweepTuneProbeRejectsEmptyLabelInputs(t *testing.T) {
+	r, err := repo.Open(filepath.Join(t.TempDir(), "tune-probe.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = r.Close() })
+	h := New(r, "test-secret")
+	nodeID := seedRelayTargetNode(t, r, "tune-node", "198.51.100.21")
+
+	call := func(payload map[string]interface{}) (int, string) {
+		res := httptest.NewRecorder()
+		h.nodeTune(res, newAuthenticatedJSONRequest(t, payload))
+		var env struct {
+			Code int    `json:"code"`
+			Msg  string `json:"msg"`
+		}
+		if err := json.Unmarshal(res.Body.Bytes(), &env); err != nil {
+			t.Fatalf("decode: %v body=%s", err, res.Body.String())
+		}
+		return env.Code, env.Msg
+	}
+
+	code, msg := call(map[string]interface{}{
+		"id": nodeID, "action": "probe", "referenceHost": "a..b:443",
+	})
+	if code == 0 || !strings.Contains(msg, "空标签") {
+		t.Fatalf("R-02: probe referenceHost=a..b:443 must be rejected naming empty label, got code=%d msg=%s", code, msg)
+	}
+	// 合法对照：须越过校验期（走到节点命令下发失败，而非空标签拒）。
+	// 无 wsServer 时下发失败文案为“调优失败”，不含“空标签”。
+	code, msg = call(map[string]interface{}{
+		"id": nodeID, "action": "probe", "referenceHost": "example.com:443",
+	})
+	if strings.Contains(msg, "空标签") {
+		t.Fatalf("R-02: probe referenceHost=example.com:443 must pass validation, got code=%d msg=%s", code, msg)
+	}
+	// The speedtestURL cases that used to sit here are gone with the
+	// speed leg: the field no longer parses at all (strict decode
+	// rejects it as an unknown field — covered in
+	// node_tune_faces_test.go), so there is no validation path left
+	// for it to exercise.
+}
+
+// R-04（写面）：nftables 节点 SSH 配置 host `a..b` 被接受并落库。
+// persistNodeSSHConfig 只查非空 + 端口范围，显式 sshConfig.host 无主机名校验。
+func TestResweepNodeSSHConfigRejectsEmptyLabelHost(t *testing.T) {
+	r, err := repo.Open(filepath.Join(t.TempDir(), "ssh-host.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = r.Close() })
+	h := New(r, "test-secret")
+	nodeID := seedRelayTargetNode(t, r, "ssh-node", "198.51.100.22")
+	now := time.Now().UnixMilli()
+
+	req := map[string]interface{}{
+		"serverIp": "198.51.100.22",
+		"sshConfig": map[string]interface{}{
+			"host": "a..b", "port": 22, "username": "root",
+			"authType": "password", "password": "x",
+		},
+	}
+	if err := h.persistNodeSSHConfig(nodeID, req, "nftables", now, false); err == nil {
+		t.Fatal("R-04: persistNodeSSHConfig(host=a..b) = nil, want error")
+	} else if !strings.Contains(err.Error(), "空标签") {
+		t.Fatalf("R-04: persistNodeSSHConfig(host=a..b) = %v, want empty-label error", err)
+	}
+	// 合法对照：域名与 IP 字面量放行。
+	for _, host := range []string{"example.com", "203.0.113.9"} {
+		req["sshConfig"] = map[string]interface{}{
+			"host": host, "port": 22, "username": "root",
+			"authType": "password", "password": "x",
+		}
+		if err := h.persistNodeSSHConfig(nodeID, req, "nftables", now, false); err != nil {
+			t.Fatalf("R-04: persistNodeSSHConfig(host=%q) = %v, want nil", host, err)
+		}
+	}
+}

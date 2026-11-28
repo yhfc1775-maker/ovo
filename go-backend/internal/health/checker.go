@@ -1,0 +1,552 @@
+package health
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"net"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"go-backend/internal/monitoring"
+	"go-backend/internal/store/model"
+	"go-backend/internal/store/repo"
+	"go-backend/internal/ws"
+)
+
+type nodeCommander interface {
+	SendCommand(nodeID int64, cmdType string, data interface{}, timeout time.Duration) (ws.CommandResult, error)
+}
+
+const serviceMonitorReportInterval = 30 * time.Second // DB write interval per monitor
+
+type Checker struct {
+	repo      *repo.Repository
+	commander nodeCommander
+	lastRun   map[int64]int64
+	inFlight  map[int64]struct{}
+
+	// In-memory latest result per monitor (for real-time API reads)
+	latestResults map[int64]*model.ServiceMonitorResult
+	lastDBWrite   map[int64]int64 // last DB write timestamp per monitorID
+
+	mu       sync.RWMutex
+	cancel   context.CancelFunc
+	wg       sync.WaitGroup
+	checking int32 // atomic flag: 1 = runChecks running, 0 = idle
+}
+
+// tcpDialContext 是本地 TCP 健康检查的拨号面（C3-04 的总截止期
+// 经它生效）；抽为包级变量与 monitorLookupIP 同式，供测试替换
+// 为确定性桩（真实黑洞 IP 的拨号耗时随运行环境网络形态漂移，
+// 不适合做时长断言的真值源）。
+var tcpDialContext = (&net.Dialer{}).DialContext
+
+func NewChecker(repo *repo.Repository, commander nodeCommander) *Checker {
+	return &Checker{
+		repo:          repo,
+		commander:     commander,
+		lastRun:       make(map[int64]int64),
+		inFlight:      make(map[int64]struct{}),
+		latestResults: make(map[int64]*model.ServiceMonitorResult),
+		lastDBWrite:   make(map[int64]int64),
+	}
+}
+
+// SeedLatestCachedForTesting 仅供测试：把一条最新结果直接写入内存
+// 缓存，复刻调度器已跑过该监控后的状态（生产路径由 runChecks 写）。
+func (c *Checker) SeedLatestCachedForTesting(result *model.ServiceMonitorResult) {
+	if c == nil || result == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.latestResults[result.MonitorID] = result
+}
+
+// GetLatestCached returns the in-memory latest results (updated every 1s).
+// Returns nil if no results are cached.
+func (c *Checker) GetLatestCached() []*model.ServiceMonitorResult {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	results := make([]*model.ServiceMonitorResult, 0, len(c.latestResults))
+	for _, r := range c.latestResults {
+		results = append(results, r)
+	}
+	return results
+}
+
+func (c *Checker) Start(ctx context.Context) {
+	c.mu.Lock()
+	ctx, cancel := context.WithCancel(ctx)
+	c.cancel = cancel
+	c.mu.Unlock()
+
+	c.runChecks(ctx)
+
+	for {
+		limits := c.loadServiceMonitorLimits()
+		scanInterval := time.Duration(limits.CheckerScanIntervalSec) * time.Second
+		if scanInterval <= 0 {
+			scanInterval = 1 * time.Second
+		}
+
+		timer := time.NewTimer(scanInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+			c.runChecks(ctx)
+		}
+	}
+}
+
+func (c *Checker) Stop() {
+	c.mu.Lock()
+	if c.cancel != nil {
+		c.cancel()
+	}
+	c.mu.Unlock()
+	c.wg.Wait()
+}
+
+func (c *Checker) RunOnce(m *model.ServiceMonitor) (*model.ServiceMonitorResult, error) {
+	return c.RunOnceContext(context.Background(), m)
+}
+
+func (c *Checker) RunOnceContext(ctx context.Context, m *model.ServiceMonitor) (*model.ServiceMonitorResult, error) {
+	if c == nil {
+		return nil, errors.New("checker not initialized")
+	}
+	if m == nil {
+		return nil, errors.New("monitor is nil")
+	}
+	limits := c.loadServiceMonitorLimits()
+	result := c.executeCheckContext(ctx, m, time.Now().UnixMilli(), limits)
+	// R1-09-L1：手动执行的结果同步回写内存最新缓存（与调度写缓存
+	// 同点），否则总览读面在缓存完整时走纯缓存快径，手动结果被
+	// 上一调度轮遮蔽直到下一轮。只写 latestResults、不动 lastRun
+	// ——手动执行不重置调度节律；时间戳守卫防与并发调度轮乱序覆盖。
+	c.mu.Lock()
+	if existing := c.latestResults[m.ID]; existing == nil || existing.Timestamp <= result.Timestamp {
+		c.latestResults[m.ID] = result
+	}
+	c.mu.Unlock()
+	return result, nil
+}
+
+func (c *Checker) runChecks(ctx context.Context) {
+	// Skip if previous round is still running (interval < timeout guard)
+	if !atomic.CompareAndSwapInt32(&c.checking, 0, 1) {
+		return
+	}
+	defer atomic.StoreInt32(&c.checking, 0)
+
+	if c == nil || c.repo == nil {
+		return
+	}
+
+	limits := c.loadServiceMonitorLimits()
+	monitors, err := c.repo.ListEnabledServiceMonitors()
+	if err != nil {
+		log.Printf("service monitor scheduler failed op=list_enabled err=%v", err)
+		return
+	}
+	// F-084（变体同修）: 每轮按当前 enabled 集合淘汰缓存——监控删除/
+	// 停用后其实测结果不再被 cache 优先的读取路径返回。淘汰须在
+	// len==0 早退之前；在途检查完成时可能回写已停用条目，下一轮再淘。
+	enabled := make(map[int64]bool, len(monitors))
+	for _, m := range monitors {
+		enabled[m.ID] = true
+	}
+	c.mu.Lock()
+	for id := range c.latestResults {
+		if !enabled[id] {
+			delete(c.latestResults, id)
+		}
+	}
+	for id := range c.lastRun {
+		if !enabled[id] {
+			delete(c.lastRun, id)
+		}
+	}
+	for id := range c.lastDBWrite {
+		if !enabled[id] {
+			delete(c.lastDBWrite, id)
+		}
+	}
+	c.mu.Unlock()
+	if len(monitors) == 0 {
+		return
+	}
+
+	// Use persisted result timestamps to avoid restart bursts.
+	latest, err := c.repo.GetLatestServiceMonitorResults()
+	if err != nil {
+		log.Printf("service monitor scheduler failed op=get_latest_results err=%v", err)
+		latest = nil
+	}
+	persistedLast := make(map[int64]int64, len(latest))
+	for _, r := range latest {
+		if r.MonitorID <= 0 || r.Timestamp <= 0 {
+			continue
+		}
+		persistedLast[r.MonitorID] = r.Timestamp
+	}
+
+	now := time.Now().UnixMilli()
+	due := make([]model.ServiceMonitor, 0, len(monitors))
+	for _, m := range monitors {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		intervalSec := m.IntervalSec
+		if intervalSec <= 0 {
+			intervalSec = limits.DefaultIntervalSec
+		}
+		if intervalSec < limits.MinIntervalSec {
+			intervalSec = limits.MinIntervalSec
+		}
+		intervalMs := int64(intervalSec) * 1000
+
+		c.mu.Lock()
+		if _, ok := c.inFlight[m.ID]; ok {
+			c.mu.Unlock()
+			continue
+		}
+
+		lastSeen := persistedLast[m.ID]
+		if v := c.lastRun[m.ID]; v > lastSeen {
+			lastSeen = v
+		}
+		if lastSeen > 0 && intervalMs > 0 && now-lastSeen < intervalMs {
+			c.mu.Unlock()
+			continue
+		}
+
+		c.inFlight[m.ID] = struct{}{}
+		// Use now as a best-effort guard against overlapping scans; the final
+		// timestamp is updated again when the result is persisted.
+		c.lastRun[m.ID] = now
+		c.mu.Unlock()
+
+		due = append(due, m)
+	}
+	if len(due) == 0 {
+		return
+	}
+
+	workerLimit := limits.WorkerLimit
+	if workerLimit <= 0 {
+		workerLimit = 1
+	}
+	if workerLimit > len(due) {
+		workerLimit = len(due)
+	}
+
+	jobs := make(chan model.ServiceMonitor, len(due))
+	for _, m := range due {
+		jobs <- m
+	}
+	close(jobs)
+
+	reportIntervalMs := int64(serviceMonitorReportInterval / time.Millisecond)
+
+	// R18-B11-03：轮次在全部 worker 完成前不算结束——此前 defer 在
+	// runChecks 返回（派生完 worker 即返回）时就把 checking 标志清
+	// 零，守卫只串行化了微秒级的分发循环，下一轮可在本轮 worker
+	// 仍在跑时分发，并发拨号数可达 2 × WorkerLimit。现等本轮
+	// worker 全部完成后再返回（defer 随之清标志）；关机取消时不等
+	// ——ctx.Done 即提前返回，关机时延与修前一致（在途检查仍挂在
+	// c.wg 上由 Stop() 接管，见 R18-B11-04 纪要）。
+	roundWG := sync.WaitGroup{}
+	for i := 0; i < workerLimit; i++ {
+		c.wg.Add(1)
+		roundWG.Add(1)
+		go func() {
+			defer c.wg.Done()
+			defer roundWG.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case m, ok := <-jobs:
+					if !ok {
+						return
+					}
+					ts := time.Now().UnixMilli()
+					result := c.executeCheckContext(ctx, &m, ts, limits)
+
+					// R18-B11-02：写缓存须与 RunOnce 同式时间戳守卫——
+					// 旧代码无条件覆盖，调度轮可把手动执行的新结果
+					// 覆盖回陈旧的调度结果（RunOnce 侧守卫是单边的）。
+					// lastRun 同理只向前推进，不被旧时间戳回拨
+					//（回拨会让该监控被提前再次调度）。
+					c.mu.Lock()
+					if existing := c.latestResults[m.ID]; existing == nil || existing.Timestamp <= result.Timestamp {
+						c.latestResults[m.ID] = result
+					}
+					if result.Timestamp > c.lastRun[m.ID] {
+						c.lastRun[m.ID] = result.Timestamp
+					}
+					delete(c.inFlight, m.ID)
+
+					// Only write to DB every 30s per monitor
+					lastWrite := c.lastDBWrite[m.ID]
+					writeToDB := ts-lastWrite >= reportIntervalMs
+					if writeToDB {
+						c.lastDBWrite[m.ID] = ts
+					}
+					c.mu.Unlock()
+
+					if writeToDB {
+						if err := c.repo.InsertServiceMonitorResult(result); err != nil {
+							log.Printf("monitoring write failed op=service_monitor_result.insert monitor_id=%d err=%v", result.MonitorID, err)
+						}
+					}
+				}
+			}
+		}()
+	}
+	roundDone := make(chan struct{})
+	go func() {
+		roundWG.Wait()
+		close(roundDone)
+	}()
+	select {
+	case <-roundDone:
+	case <-ctx.Done():
+	}
+}
+
+func (c *Checker) executeCheck(m *model.ServiceMonitor, timestamp int64, limits monitoring.ServiceMonitorLimits) *model.ServiceMonitorResult {
+	return c.executeCheckContext(context.Background(), m, timestamp, limits)
+}
+
+func (c *Checker) executeCheckContext(ctx context.Context, m *model.ServiceMonitor, timestamp int64, limits monitoring.ServiceMonitorLimits) *model.ServiceMonitorResult {
+	result := &model.ServiceMonitorResult{
+		MonitorID: m.ID,
+		NodeID:    m.NodeID,
+		Timestamp: timestamp,
+	}
+
+	timeoutSec := m.TimeoutSec
+	if timeoutSec <= 0 {
+		timeoutSec = limits.DefaultTimeoutSec
+	}
+	if timeoutSec < limits.MinTimeoutSec {
+		timeoutSec = limits.MinTimeoutSec
+	}
+	if timeoutSec > limits.MaxTimeoutSec {
+		timeoutSec = limits.MaxTimeoutSec
+	}
+
+	timeout := time.Duration(timeoutSec) * time.Second
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	// When nodeId is set, run checks on the specified node.
+	if m.NodeID > 0 {
+		// R4X-008：存量硬拒目标在分发面跳过（创建/更新面校验拦不住
+		// 本批之前已存的坏目标）——不下发、结果记政策拒绝，与
+		// checkedTunnelProbeTargetValues 的存量处置同型。仅硬拒
+		// 子集，LAN 目标照常下发。
+		if err := ValidateNodeMonitorTargetContext(ctx, m.Type, m.Target); err != nil {
+			log.Printf("service monitor %d: node target skipped: %v", m.ID, err)
+			result.Success = 0
+			result.ErrorMessage = err.Error()
+			return result
+		}
+		c.checkOnNodeContext(ctx, m, timeoutSec, timeout, result)
+		return result
+	}
+
+	switch strings.ToLower(strings.TrimSpace(m.Type)) {
+	case "tcp":
+		c.checkTCPContext(ctx, m.Target, timeout, result)
+	case "icmp":
+		result.Success = 0
+		result.ErrorMessage = "ICMP 监控必须指定执行节点"
+	default:
+		result.Success = 0
+		result.ErrorMessage = fmt.Sprintf("不支持的检查类型: %s", m.Type)
+	}
+
+	return result
+}
+
+func (c *Checker) loadServiceMonitorLimits() monitoring.ServiceMonitorLimits {
+	defaults := monitoring.DefaultServiceMonitorLimits()
+	if c == nil || c.repo == nil {
+		return defaults
+	}
+	cfg, err := c.repo.GetConfigsByNames([]string{
+		monitoring.ConfigServiceMonitorCheckerScanIntervalSec,
+		monitoring.ConfigServiceMonitorWorkerLimit,
+		monitoring.ConfigServiceMonitorMinIntervalSec,
+		monitoring.ConfigServiceMonitorDefaultIntervalSec,
+		monitoring.ConfigServiceMonitorMinTimeoutSec,
+		monitoring.ConfigServiceMonitorDefaultTimeoutSec,
+		monitoring.ConfigServiceMonitorMaxTimeoutSec,
+	})
+	if err != nil {
+		return defaults
+	}
+	return monitoring.ServiceMonitorLimitsFromConfigMap(cfg)
+}
+
+type serviceMonitorCheckRequest struct {
+	MonitorID  int64  `json:"monitorId"`
+	Type       string `json:"type"`
+	Target     string `json:"target"`
+	TimeoutSec int    `json:"timeoutSec"`
+}
+
+func (c *Checker) checkOnNode(m *model.ServiceMonitor, timeoutSec int, timeout time.Duration, result *model.ServiceMonitorResult) {
+	c.checkOnNodeContext(context.Background(), m, timeoutSec, timeout, result)
+}
+
+func (c *Checker) checkOnNodeContext(ctx context.Context, m *model.ServiceMonitor, timeoutSec int, timeout time.Duration, result *model.ServiceMonitorResult) {
+	if c == nil || m == nil || result == nil {
+		return
+	}
+	if c.commander == nil {
+		result.Success = 0
+		result.ErrorMessage = "节点检查不可用"
+		return
+	}
+
+	checkType := strings.ToLower(strings.TrimSpace(m.Type))
+	if checkType != "tcp" && checkType != "icmp" {
+		result.Success = 0
+		result.ErrorMessage = fmt.Sprintf("不支持的检查类型: %s", m.Type)
+		return
+	}
+	if strings.TrimSpace(m.Target) == "" {
+		result.Success = 0
+		result.ErrorMessage = "检查目标为空"
+		return
+	}
+
+	req := serviceMonitorCheckRequest{
+		MonitorID:  m.ID,
+		Type:       checkType,
+		Target:     m.Target,
+		TimeoutSec: timeoutSec,
+	}
+
+	cmdTimeout := timeout
+	if cmdTimeout < 2*time.Second {
+		cmdTimeout = 2 * time.Second
+	}
+	cmdTimeout = cmdTimeout + 2*time.Second
+
+	var cmdRes ws.CommandResult
+	var err error
+	if contextual, ok := c.commander.(interface {
+		SendCommandContext(context.Context, int64, string, interface{}, time.Duration) (ws.CommandResult, error)
+	}); ok {
+		cmdRes, err = contextual.SendCommandContext(ctx, m.NodeID, "ServiceMonitorCheck", req, cmdTimeout)
+	} else {
+		cmdRes, err = c.commander.SendCommand(m.NodeID, "ServiceMonitorCheck", req, cmdTimeout)
+	}
+	if err != nil {
+		result.Success = 0
+		result.ErrorMessage = err.Error()
+		return
+	}
+	if cmdRes.Data == nil {
+		result.Success = 0
+		result.ErrorMessage = "节点返回为空"
+		return
+	}
+
+	if v, ok := cmdRes.Data["success"]; ok {
+		if b, ok := v.(bool); ok {
+			if b {
+				result.Success = 1
+			} else {
+				result.Success = 0
+			}
+		}
+	}
+	if v, ok := cmdRes.Data["latencyMs"]; ok {
+		if f, ok := v.(float64); ok {
+			result.LatencyMs = f
+		}
+	}
+	if v, ok := cmdRes.Data["errorMessage"]; ok {
+		if s, ok := v.(string); ok {
+			result.ErrorMessage = s
+		}
+	}
+}
+
+func (c *Checker) checkTCP(target string, timeout time.Duration, result *model.ServiceMonitorResult) {
+	c.checkTCPContext(context.Background(), target, timeout, result)
+}
+
+func (c *Checker) checkTCPContext(parent context.Context, target string, timeout time.Duration, result *model.ServiceMonitorResult) {
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	start := time.Now()
+	fail := func(msg string) {
+		result.LatencyMs = float64(time.Since(start).Milliseconds())
+		result.Success = 0
+		result.ErrorMessage = msg
+	}
+
+	// AUDIT-R2 (F1X-001): 拨号前校验目标（纵深防御，拦截存量坏数据）。
+	host, port, err := net.SplitHostPort(target)
+	if err != nil {
+		fail("目标地址格式错误（应为 host:port）")
+		return
+	}
+	// AUDIT-R2 (R5R2-001): 解析→校验→直接拨已校验的 IP 字面量，
+	// 不再二次解析，消除 validate 与 dial 之间的 DNS TOCTOU 窗口
+	//（参照 H-15 secureFetchDialContext 模式；TCP 无 Host 头语义，直拨 IP 等价）。
+	ips, err := resolveValidatedMonitorIPsContext(ctx, host)
+	if err != nil {
+		fail(err.Error())
+		return
+	}
+	// C3-04：全部 IP 共用一个总截止期。此前每 IP 用满 timeout，
+	// N 个解析 IP 的最坏总时长是 N×timeout，违反 monitoring.md
+	// 的单检 60s 帽（一个多 A/AAAA 的黑洞目标可串行饿死 worker
+	// 池）。现以剩余预算逐个拨号，预算耗尽即停。
+	var conn net.Conn
+	for _, ip := range ips {
+		if err = ctx.Err(); err != nil {
+			break
+		}
+		conn, err = tcpDialContext(ctx, "tcp", net.JoinHostPort(ip.String(), port))
+		if err == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	latency := time.Since(start)
+	if err == nil && ctx.Err() != nil {
+		_ = conn.Close()
+		err = ctx.Err()
+	}
+
+	result.LatencyMs = float64(latency.Milliseconds())
+
+	if err != nil {
+		result.Success = 0
+		result.ErrorMessage = err.Error()
+		return
+	}
+	_ = conn.Close()
+	result.Success = 1
+}

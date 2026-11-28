@@ -1,0 +1,2252 @@
+package handler
+
+import (
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"go-backend/internal/http/response"
+	"go-backend/internal/kernel"
+	"go-backend/internal/store/model"
+	"go-backend/internal/store/repo"
+)
+
+var subscriptionCheckInterval = time.Minute
+
+// subSyncMu keeps the loop and the traffic-triggered syncs from pushing the
+// same kernels at once.
+var subSyncMu sync.Mutex
+
+// subPipeline is the JSON form of the stored subscription options.
+// Since 2.1.2 the only stored processing-era options are the relay
+// scope (Lines + RelayIDs); the processing block (regions/protocols/
+// include/exclude/rename/flag/prefix/dedupe/sort/region groups/info
+// nodes), the subscription chain options and rules/scripts were
+// removed, and their stored keys are ignored on read and dropped on
+// the next save.
+type subPipeline struct {
+	// Lines is the relay scope （中转范围三档）: "" keeps every
+	// endpoint, "direct" keeps direct endpoints only, "relay" keeps
+	// relayed endpoints only. It keeps the historical "lines" JSON
+	// key on purpose: before 2.1.2 the same key carried the same
+	// three-state scope inside the removed processing block, so a
+	// stored value keeps its exact meaning. It applies only when no
+	// RelayIDs whitelist is present.
+	Lines string `json:"lines"`
+	// RelayIDs is the exact endpoint whitelist (0 = direct, >0 =
+	// relay id): when non-empty it is the operative scope filter and
+	// takes precedence over Lines (see kernel.FilterEndpoints). It is
+	// carried verbatim on parse and on save — never folded into
+	// Lines. (2.1.2 folded it into Lines at parse time, which widened
+	// a partial whitelist to its whole tier; that fold is removed so
+	// stored pre-2.1.2 whitelists mean their exact set again.)
+	RelayIDs []int64 `json:"relayIds,omitempty"`
+	// Templates 按客户端槽位选订阅模板（kernel.TemplateClash /
+	// Templates 按客户端槽位选订阅模板（kernel.TemplateClash /
+	// TemplateSingbox / TemplateSurge / TemplateStash /
+	// TemplateShadowrocket → 模板 ID）。选了模板的格式渲染进模板骨架；
+	// 模板正文在渲染时按 ID 加载（见 Handler.subOptions），不落订阅行。
+	Templates map[string]int64 `json:"templates,omitempty"`
+}
+
+// UnmarshalJSON decodes the options object leniently. Request
+// decoding runs with DisallowUnknownFields, but the options object
+// must keep tolerating keys removed in 2.1.2: old clients still send
+// them, and they are ignored here and dropped on the next save.
+// relayIds is captured verbatim — never folded into Lines.
+func (p *subPipeline) UnmarshalJSON(data []byte) error {
+	type alias subPipeline
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	*p = subPipeline(a)
+	return nil
+}
+
+func (p subPipeline) options() kernel.SubOptions {
+	return kernel.SubOptions{Lines: p.Lines, RelayIDs: p.RelayIDs}
+}
+
+func (p *subPipeline) normalize() error {
+	if p.Lines != "relay" && p.Lines != "direct" {
+		p.Lines = ""
+	}
+	// 模板槽位归一化：只保留已知槽位与正 ID，未知槽位静默丢弃；
+	// 模板存在性与格式匹配在保存时由 checkPipelineTemplates 校验。
+	templates := map[string]int64{}
+	for _, slot := range kernel.TemplateSlots {
+		if id := p.Templates[slot]; id > 0 {
+			templates[slot] = id
+		}
+	}
+	p.Templates = templates
+	return p.options().Validate()
+}
+
+func parsePipeline(raw string) subPipeline {
+	var p subPipeline
+	_ = json.Unmarshal([]byte(raw), &p)
+	if p.Templates == nil {
+		p.Templates = map[string]int64{}
+	}
+	return p
+}
+
+type errText string
+
+func (e errText) Error() string { return string(e) }
+
+func parseIDList(s string) []int64 {
+	var out []int64
+	seen := map[int64]bool{}
+	for _, part := range strings.Split(s, ",") {
+		id, err := strconv.ParseInt(strings.TrimSpace(part), 10, 64)
+		if err == nil && id > 0 && !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+func formatIDList(ids []int64) string {
+	sorted := append([]int64(nil), ids...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	parts := make([]string, len(sorted))
+	for i, id := range sorted {
+		parts[i] = strconv.FormatInt(id, 10)
+	}
+	return strings.Join(parts, ",")
+}
+
+// randomHex / newUUID：X-P3-14（L-03-3）随机源失败 fail-closed。
+// 旧实现忽略 rand 错误、落全零 token/UUID（可预测凭据）。
+func randomHex(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := cryptoRandRead(b); err != nil {
+		// RAW291：随机源错误只含操作系统熵源失败，不含任何
+		// 内部状态——但仍以固定文案回执，不拼 err 原文。
+		return "", errText("生成随机凭据失败")
+	}
+	return hex.EncodeToString(b), nil
+}
+
+func newUUID() (string, error) {
+	b := make([]byte, 16)
+	if _, err := cryptoRandRead(b); err != nil {
+		// RAW291：同 randomHex，固定文案。
+		return "", errText("生成随机凭据失败")
+	}
+	b[6] = b[6]&0x0f | 0x40
+	b[8] = b[8]&0x3f | 0x80
+	h := hex.EncodeToString(b)
+	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32], nil
+}
+
+// subActive reports whether the link works (and, for share subscriptions,
+// whether its credentials must be on the kernels).
+func subActive(s *model.Subscription, now time.Time) bool {
+	return s.Enabled == 1 && (s.ExpireTime == 0 || s.ExpireTime > now.UnixMilli()) && !subOverQuota(s)
+}
+
+// subInactiveReason is why the link no longer works, as the name of
+// the placeholder node served instead (see openSubscription); "" while
+// it is active.
+func subInactiveReason(s *model.Subscription, now time.Time) string {
+	switch {
+	case subActive(s, now):
+		return ""
+	case s.Enabled != 1:
+		return "⚠️ 订阅已停用，请联系管理员"
+	case subOverQuota(s):
+		return "⚠️ 流量已用完，请联系管理员"
+	}
+	return "⚠️ 订阅已过期，请联系管理员"
+}
+
+// subUsed F2-04: the sum must saturate — two restored near-MaxInt64
+// counters summed with a plain add wrap negative, which read as
+// "no usage" and kept subOverQuota false forever (live-d scenario 3:
+// MaxInt64 + MaxInt64 wrapped to -2).
+func subUsed(s *model.Subscription) int64 {
+	return repo.SaturatingAddInt64(s.UploadBytes, s.DownloadBytes)
+}
+
+func subOverQuota(s *model.Subscription) bool {
+	return s.TrafficLimit > 0 && subUsed(s) >= s.TrafficLimit
+}
+
+// lastResetAt is the most recent monthly reset moment at or before now for
+// reset day d (local time), clamped to the month's length.
+func lastResetAt(d int, now time.Time) time.Time {
+	at := func(y int, m time.Month) time.Time {
+		last := time.Date(y, m+1, 0, 0, 0, 0, 0, now.Location()).Day()
+		day := d
+		if day > last {
+			day = last
+		}
+		return time.Date(y, m, day, 0, 0, 0, 0, now.Location())
+	}
+	t := at(now.Year(), now.Month())
+	if t.After(now) {
+		t = at(now.Year(), now.Month()-1)
+	}
+	return t
+}
+
+// subTrafficSince is when the subscription's current used-traffic
+// counters started accumulating (creation or the last traffic reset).
+// Rows predating the traffic_since column fall back to the reset time,
+// then to creation time, so no data backfill is needed.
+func subTrafficSince(s *model.Subscription) int64 {
+	if s.TrafficSince > 0 {
+		return s.TrafficSince
+	}
+	if s.TrafficResetTime > 0 {
+		return s.TrafficResetTime
+	}
+	return s.CreatedTime
+}
+
+// subDueReset reports whether the monthly reset is due.
+func subDueReset(s *model.Subscription, now time.Time) bool {
+	if s.ResetDay <= 0 || !isShare(s) {
+		return false
+	}
+	return s.TrafficResetTime < lastResetAt(s.ResetDay, now).UnixMilli()
+}
+
+// applyUserCounters adds a node's per-user traffic to the subscriptions
+// and cuts off the ones that reached their limit right away.
+func (h *Handler) applyUserCounters(nodeID int64, epoch string, counters []agentUserCounter, now int64) {
+	if err := h.applyUserCounterSamples(nodeID, epoch, counters, now); err != nil {
+		log.Printf("subscription traffic apply failed node_id=%d err=%v", nodeID, err)
+		return
+	}
+	h.syncSubscriptions(time.UnixMilli(now))
+}
+
+// applyUserCounterSamples 只把用户计数样本入账（基线推进＋订阅累
+// 计＋小时桶），不做凭据同步/限额切断。供下发后 settle 在
+// per-kernel apply 锁内调用：syncSubscriptions 会经
+// applyKernelsForInbounds 回头取同一 kernel 的 apply 锁（不可重
+// 入），锁内同步必自锁；同步与切断由周期轮询的 applyUserCounters
+// 全量面在 ≤60s 内补做，切断判据读已入账累计值，不漏不重。
+func (h *Handler) applyUserCounterSamples(nodeID int64, epoch string, counters []agentUserCounter, now int64) error {
+	samples, err := h.scopedSubscriptionSamples(nodeID, counters)
+	if err != nil {
+		return err
+	}
+	if len(samples) == 0 {
+		return nil
+	}
+	return h.repo.ApplySubscriptionCounterSamples(nodeID, epoch, samples, now)
+}
+
+// scopedSubscriptionSamples F2-01: a node's per-user samples book only
+// against subscriptions that node actually serves. The serving set is
+// derived mechanically from the same source the pull/mount faces use —
+// subInboundIDs (SourceAll / explicit list / source-derived) resolved
+// to node_inbound.node_id. (The companion era added the nodes hosting
+// metering companions of those inbounds; companions live on the
+// origin's own node, so that expansion was a no-op, and there are no
+// companions anymore.) Foreign or unknown subscription IDs are dropped
+// with an aggregated warn (mirroring the unaccounted-inbound pattern
+// in applyInboundCounterChunk): baselines are keyed per reporting
+// node, so an unchecked foreign sample would mint a baseline and book
+// every later delta against a subscription the node never served,
+// forcing its quota cutoff at the sync that follows. A lookup failure
+// aborts the whole poll/settle cycle — counters are cumulative,
+// so the next successful poll books the full delta against the old
+// baseline and nothing is lost.
+func (h *Handler) scopedSubscriptionSamples(nodeID int64, counters []agentUserCounter) ([]repo.SubscriptionCounterSample, error) {
+	if len(counters) == 0 {
+		return nil, nil
+	}
+	subs, err := h.repo.ListSubscriptions()
+	if err != nil {
+		return nil, fmt.Errorf("读取订阅计量归属失败: %w", markRepoError(err))
+	}
+	rows, err := h.repo.ListNodeInbounds()
+	if err != nil {
+		return nil, fmt.Errorf("读取订阅计量入站失败: %w", markRepoError(err))
+	}
+	byID := make(map[int64]*model.Subscription, len(subs))
+	for i := range subs {
+		byID[subs[i].ID] = &subs[i]
+	}
+	nodeOfInbound := make(map[int64]int64, len(rows))
+	for _, r := range rows {
+		nodeOfInbound[r.ID] = r.NodeID
+	}
+	serving := make(map[int64]map[int64]bool, len(counters))
+	resolve := func(s *model.Subscription) map[int64]bool {
+		if set, ok := serving[s.ID]; ok {
+			return set
+		}
+		set := map[int64]bool{}
+		ids := subInboundIDs(s, rows)
+		for _, id := range ids {
+			if n, ok := nodeOfInbound[id]; ok {
+				set[n] = true
+			}
+		}
+		serving[s.ID] = set
+		return set
+	}
+	out := make([]repo.SubscriptionCounterSample, 0, len(counters))
+	dropped := make(map[int64]int)
+	for _, c := range counters {
+		s, ok := byID[c.ID]
+		if !ok || !resolve(s)[nodeID] {
+			dropped[c.ID]++
+			continue
+		}
+		out = append(out, repo.SubscriptionCounterSample{SubscriptionID: c.ID, Direction: c.Dir, Bytes: c.Bytes})
+	}
+	for id, n := range dropped {
+		log.Printf("subscription traffic sample foreign op=foreign_subscription node_id=%d subscription_id=%d samples=%d action=dropped", nodeID, id, n)
+	}
+	return out, nil
+}
+
+func isShare(s *model.Subscription) bool { return s.Kind == model.SubscriptionShare }
+
+func kernelUser(s *model.Subscription) kernel.User {
+	return kernel.User{ID: s.ID, UUID: s.UUID, Password: s.Password}
+}
+
+// subInboundIDs resolves the subscription's sources against the inbounds.
+func subInboundIDs(s *model.Subscription, rows []model.NodeInbound) []int64 {
+	// Companion inbounds are never subscription sources: every caller
+	// of this choke point (user mounts, endpoint building, push sets,
+	// list views) speaks about origins only. Metering retargeting
+	// happens later, at endpoint construction.
+	filtered := make([]model.NodeInbound, 0, len(rows))
+	for _, r := range rows {
+		if r.CompanionOf == 0 {
+			filtered = append(filtered, r)
+		}
+	}
+	rows = filtered
+	if s.SourceAll == 1 {
+		ids := make([]int64, 0, len(rows))
+		for _, r := range rows {
+			ids = append(ids, r.ID)
+		}
+		return ids
+	}
+	ids := subExplicitIDs(s, rows)
+	picked := make(map[int64]bool, len(ids))
+	for _, id := range ids {
+		picked[id] = true
+	}
+	sources := map[int64]bool{}
+	for _, id := range parseIDList(s.SourceIDs) {
+		sources[id] = true
+	}
+	for _, r := range rows {
+		if r.SourceID != 0 && sources[r.SourceID] && !picked[r.ID] {
+			ids = append(ids, r.ID)
+		}
+	}
+	return ids
+}
+
+// subExplicitIDs are the inbounds picked one by one (still existing).
+func subExplicitIDs(s *model.Subscription, rows []model.NodeInbound) []int64 {
+	known := make(map[int64]bool, len(rows))
+	for _, r := range rows {
+		known[r.ID] = true
+	}
+	var ids []int64
+	for _, id := range parseIDList(s.InboundIDs) {
+		if known[id] {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// activeUsersByInbound maps inbound ids to the share subscriptions whose
+// credentials the kernels must currently accept. In-place SS metering:
+// users stay keyed by the origin inbound itself — the origin carries
+// them as multi-user clients, so there is no origin→companion remap
+// anymore (the companion era is over; see subscription_metering.go).
+func (h *Handler) activeUsersByInbound(now time.Time) (map[int64][]kernel.User, error) {
+	return h.rawActiveUsersByInbound(now)
+}
+
+// uncountableSubWarned dedupes the L4-08 over-capacity warning:
+// rawActiveUsersByInbound runs on every kernel push / sync cycle, so
+// the warning fires once per subscription id per process, not per push.
+var uncountableSubWarned sync.Map
+
+// warnUncountableSubscription logs loudly, once per subscription,
+// when an active share subscription's id exceeds the socket-mark
+// metering capacity (kernel.MaxUserMarkID): markedUsers drops it, so
+// its traffic is never metered and its TrafficLimit never triggers.
+// Before L4-08 this drop was silent apart from a code comment.
+func warnUncountableSubscription(s *model.Subscription) {
+	if s == nil || s.ID <= kernel.MaxUserMarkID {
+		return
+	}
+	if _, loaded := uncountableSubWarned.LoadOrStore(s.ID, struct{}{}); loaded {
+		return
+	}
+	log.Printf("subscription metering capacity exceeded: subscription_id=%d name=%q exceeds the per-user mark limit %d; this subscription's traffic will NOT be metered and its traffic limit will NOT trigger (L4-08)", s.ID, s.Name, kernel.MaxUserMarkID)
+}
+
+// rawActiveUsersByInbound is activeUsersByInbound before any
+// remap — which, since the companion era ended, is the same map:
+// users are keyed by the inbound the subscription sources (the
+// origin). Metering reconcile reads demand from this form.
+func (h *Handler) rawActiveUsersByInbound(now time.Time) (map[int64][]kernel.User, error) {
+	subs, err := h.repo.ListSubscriptions()
+	if err != nil {
+		return nil, fmt.Errorf("读取订阅凭据失败: %w", markRepoError(err))
+	}
+	var rows []model.NodeInbound
+	rowsLoaded := false
+	out := map[int64][]kernel.User{}
+	for i := range subs {
+		s := &subs[i]
+		// R10-02（I-F3-01）纵深防御：删除墓碑永不进 payload——即使
+		// 墓碑行被任何写路径改回 Enabled=1∧PendingDelete=1 的状态机
+		// 外组合，凭据也不下发，使 completePendingSubscriptionDelete
+		// 的「墓碑已排除」前提由构造保证、而非靠各入口约定。
+		if s.PendingDelete == 1 {
+			continue
+		}
+		if !isShare(s) || !subActive(s, now) {
+			continue
+		}
+		warnUncountableSubscription(s)
+		if !rowsLoaded {
+			if rows, err = h.repo.ListNodeInbounds(); err != nil {
+				return nil, fmt.Errorf("读取订阅入站失败: %w", markRepoError(err))
+			}
+			rowsLoaded = true
+		}
+		for _, id := range h.subAllInboundIDs(s, rows) {
+			out[id] = append(out[id], kernelUser(s))
+		}
+	}
+	return out, nil
+}
+
+// applyKernelsForInbounds pushes the kernels serving the given inbounds,
+// once each. Imported nodes have no kernel and are skipped. When
+// several pushes fail, a real failure takes precedence over a
+// still-confirming one (F2-APPLY-01 同族)：pending 绝不能遮住真
+// 失败，真失败也绝不能把 pending 写成「下发失败」。
+// In-place SS metering: the origin's own kernel carries the users, so
+// a credential push applies exactly the origins' kernels — there is
+// no companion kernel to expand to anymore (the C-03 split follow-up
+// this replaced is gone with the companions).
+func (h *Handler) applyKernelsForInbounds(ids []int64) error {
+	seen := map[int64]bool{}
+	var firstErr, firstPending error
+	applyOne := func(row *model.NodeInbound) {
+		if row == nil || isExternalInbound(row) || seen[row.KernelID] {
+			return
+		}
+		seen[row.KernelID] = true
+		if err := h.applyKernel(row.KernelID, false); err != nil {
+			if errors.Is(err, errApplyConfirmPending) {
+				if firstPending == nil {
+					firstPending = err
+				}
+				return
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	for _, id := range ids {
+		row, err := h.repo.GetNodeInbound(id)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("读取订阅目标入站失败: %w", markRepoError(err))
+			}
+			continue
+		}
+		if row == nil {
+			continue
+		}
+		applyOne(row)
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+	return firstPending
+}
+
+// pushFailureMsg 把下发失败拼进成功回执 Msg 前的净化（RAW291）：
+// 仓储错误（repoError 标记，如 applyKernel 的 GetNodeKernel 读失败）
+// 只留固定前缀、原文只记日志；数据面下发错误（节点不在线、agent
+// 拒收）原样附后——那是管理员排查所需的诊断信息。
+// F2-APPLY-01 同族：确认待定不是失败——把「，但下发到节点失败」
+// 尾缀换成「，下发已发出，正在确认生效状态」；带后缀的文案
+// （「，后台将自动重试」）保留后缀。绝不把 pending 写成失败。
+func pushFailureMsg(prefix string, err error) string {
+	if errors.Is(err, errApplyConfirmPending) {
+		if i := strings.Index(prefix, "，但下发到节点失败"); i >= 0 {
+			return prefix[:i] + "，下发已发出，正在确认生效状态" + prefix[i+len("，但下发到节点失败"):]
+		}
+		return prefix + "，下发已发出，正在确认生效状态"
+	}
+	if isRepoError(err) {
+		log.Printf("push failure (storage): %v", err)
+		return prefix
+	}
+	return prefix + ": " + err.Error()
+}
+
+// syncSubscriptions pushes credential changes for share subscriptions
+// whose active state differs from what the kernels last received.
+// C-02（流量审计）：超限分享订阅的原站共享口令轮换。
+//
+// 只撤用户不够（非原地原站）：原站共享口令仍在分发（直连端点
+// 无 live 伴生时回退原站、中转端点恒指原站、已分发链接在客户端
+// 缓存），超限后原站继续服务且不再计数。超限跃迁时把该订阅全部
+// 非原地 SS 原站的共享口令轮换为新口令（SS2022 按方法生成合法长
+// 度 PSK，其余走随机口令），落库后由同一轮同步的 kernel 下发带上去。
+//
+// 原地原站不在此列：用户从原站用户集撤下后，其缓存链接已硬失效
+// ——V 线 Q1：配 users 后裸站密钥被拒；Q3-A：删用户后该用户口令的
+// 新握手失败。轮换原站 iPSK 不再堵任何洞，反而让该原站全部订阅
+// 的链接同时失效（它们都嵌同一站密钥作 `station:user` 前半段），
+// 外加站主的裸链接。原地原站的截断由 syncSubscriptions 的常规下
+// 发完成（用户集重推），不打轮换戳、不停放 AppliedActive。
+//
+// 幂等键：QuotaRotatedAt 与 subTrafficSince 比较——本计费回合
+// 已轮换过则跳过；流量重置使 TrafficSince 前进，下一回合可再
+// 轮换；部署时已超限的存量订阅 stamp=0，首次同步即轮换。任一
+// 原站落库失败时不打戳，下轮重试（已轮换的原站会被再轮一次，
+// 无害）。返回本轮是否轮换了至少一个原站——轮换过即须强制走
+// 一次 kernel 下发（哪怕 AppliedActive 已是 0），否则新口令
+// 到不了内核。
+//
+// 不在范围：非 SS 原站（逐用户 UUID，撤用户即生效）、外部入站
+// （KernelID=0，无内核可推）、伴生本体（只轮原站）、原地计量原站
+// （撤用户即硬失效，见上）；停用/过期导致的失活不轮换（爆炸半径：
+// 每次停用/过期都换共享口令，全部共用该口令的订阅都要重拉链接——
+// C-(5)：下方的 Enabled/过期门即此口径的实现，注释与代码曾分叉，
+// 见 subscription.md:114/139）。
+func (h *Handler) rotateQuotaOriginPasswords(s *model.Subscription, rows *[]model.NodeInbound, now time.Time) bool {
+	if !isShare(s) || !subOverQuota(s) {
+		return false
+	}
+	// C-(5)：停用/过期订阅不轮换——失活同步已把凭据从节点撤下，
+	// 再换共享口令无任何截断收益，只会逼全部共口令订阅重拉链接。
+	// 注意 subActive 不能直接作门：它含 !subOverQuota，与本函数
+	// 的超限前提恒互斥；此处只取它的 Enabled+未过期两项。
+	if s.Enabled != 1 || (s.ExpireTime > 0 && s.ExpireTime <= now.UnixMilli()) {
+		return false
+	}
+	if s.QuotaRotatedAt >= subTrafficSince(s) {
+		return false
+	}
+	if *rows == nil {
+		loaded, err := h.repo.ListNodeInbounds()
+		if err != nil {
+			log.Printf("subscription %d over quota: cannot list inbounds for origin password rotation: %v", s.ID, err)
+			return false
+		}
+		*rows = loaded
+	}
+	byID := make(map[int64]*model.NodeInbound, len(*rows))
+	for i := range *rows {
+		byID[(*rows)[i].ID] = &(*rows)[i]
+	}
+	rotated, failed := false, false
+	for _, id := range subInboundIDs(s, *rows) {
+		row := byID[id]
+		if row == nil || row.CompanionOf > 0 || isExternalInbound(row) || row.Protocol != kernel.ProtocolShadowsocks {
+			continue
+		}
+		// 原地计量原站不轮换：用户从原站用户集撤下后，其缓存链接
+		// 已硬失效（V Q1：配 users 后裸站密钥被拒；Q3-A：删用户后
+		// 该用户口令的新握手失败）——轮换原站 iPSK 不再堵任何洞，
+		// 反而让该原站全部订阅的链接同时失效（它们都嵌同一站密钥
+		// 作 `station:user` 前半段），外加站主的裸链接。截断由
+		// syncSubscriptions 的常规下发完成（用户集重推）。
+		if row.SSSubscriptionUsers == 1 {
+			continue
+		}
+		in, err := inboundFromModel(*row)
+		if err != nil {
+			log.Printf("subscription %d over quota: origin inbound %d settings unparsable, password not rotated: %v", s.ID, row.ID, err)
+			failed = true
+			continue
+		}
+		in.Settings.Password = kernel.ShadowsocksPassword(in.Settings.Method)
+		if err := applyInboundToModel(in, row); err != nil {
+			log.Printf("subscription %d over quota: origin inbound %d password rotation failed to serialize: %v", s.ID, row.ID, err)
+			failed = true
+			continue
+		}
+		if err := h.repo.SaveNodeInbound(row); err != nil {
+			log.Printf("subscription %d over quota: origin inbound %d rotated password failed to persist: %v", s.ID, row.ID, err)
+			failed = true
+			continue
+		}
+		rotated = true
+		log.Printf("subscription %d over quota: rotated shared password of origin inbound %d (node %d)", s.ID, row.ID, row.NodeID)
+	}
+	if rotated && !failed {
+		s.QuotaRotatedAt = now.UnixMilli()
+		// C-02 live 补：已截断（AppliedActive 已是 0）的存量超限
+		// 订阅，下发失败时下轮不再重试——active==AppliedActive
+		// 直接 continue，新口令只落库、到不了内核。沿用
+		// R5R8-001 的 -1 停放：AppliedActive=-1 使 active !=
+		// AppliedActive 恒成立，sync 循环每轮重试下发直至成功
+		// （成功后由下发块写回 active）；轮换戳已打，下轮不
+		// 再轮换、无口令 churn。
+		s.AppliedActive = -1
+		if err := h.repo.SaveSubscription(s); err != nil {
+			log.Printf("subscription %d: failed to record quota rotation stamp: %v", s.ID, err)
+		}
+	}
+	return rotated
+}
+
+func (h *Handler) syncSubscriptions(now time.Time) {
+	subSyncMu.Lock()
+	defer subSyncMu.Unlock()
+	// SS 原地计量残留清理（节流）：删伴生时代遗留的伴生行及其
+	// 内核，使其与原入站开关和活跃分享订阅需求一致。失败只记日
+	// 志，下轮重试。
+	h.maybeCleanupStaleCompanions()
+	// B4/F-058: 先重试未完成的订阅删除（墓碑）。下发成功才硬删行+分配；
+	// 失败留待下一轮。与下方凭据轮换/状态同步的 AppliedActive 机制相互
+	// 独立，本块不读写 AppliedActive。
+	if pending, err := h.repo.ListPendingDeleteSubscriptions(); err == nil {
+		for i := range pending {
+			if err := h.completePendingSubscriptionDelete(&pending[i]); err != nil {
+				log.Printf("subscription %d: pending delete push failed, will retry: %v", pending[i].ID, err)
+			}
+		}
+	}
+	subs, err := h.repo.ListSubscriptions()
+	if err != nil {
+		return
+	}
+	var rows []model.NodeInbound
+	for i := range subs {
+		s := &subs[i]
+		if s.PendingDelete == 1 {
+			continue // 墓碑由上方 F-058 删除块独占处理
+		}
+		if subDueReset(s, now) {
+			if err := h.repo.ResetSubscriptionTraffic(s.ID, now.UnixMilli()); err == nil {
+				s.UploadBytes, s.DownloadBytes = 0, 0
+				if h.notifier != nil {
+					h.notifier.clearAlerts(fmt.Sprintf("subflow:%d:", s.ID))
+					// R4X-014：重置即恢复——与回落两处成对口径对齐，
+					// 连带清该订阅流量子型的指纹，否则重置后同文案
+					// 再越界被 30 分钟指纹窗抑制（R3X-030 同根变体）。
+					h.notifier.forgetSubQuotaFlow(s.Name)
+				}
+			} else {
+				// D-05：月度自动重置失败此前静默——订阅流量被悄悄留
+				// 到下月，管理员在任何面都看不到。记日志，下轮重试。
+				log.Printf("subscription %d: monthly traffic reset failed, will retry: %v", s.ID, err)
+			}
+		}
+		// C-02：超限分享订阅的非原地原站共享口令必须失效（原地计
+		// 量原站除外：撤用户即硬失效，不轮换，见
+		// rotateQuotaOriginPasswords）。轮换过即强制走一次下发
+		// （哪怕 AppliedActive 已是 0），否则新口令到不了内核；轮换时 AppliedActive 已停放为 -1（R5R8-001
+		// 同款），下发失败时 -1 保留、下轮 active != AppliedActive
+		// 恒成立而重试（口令不重复轮换）；下发成功后由下发块写回
+		// active（见 F7X-001）。
+		rotated := h.rotateQuotaOriginPasswords(s, &rows, now)
+		active := boolToInt(isShare(s) && subActive(s, now))
+		if active == s.AppliedActive && !rotated {
+			continue
+		}
+		if rows == nil {
+			if rows, err = h.repo.ListNodeInbounds(); err != nil {
+				return
+			}
+		}
+		// AUDIT-R8 (F7X-001): 下发失败时不更新 AppliedActive，留待下轮循环重试。
+		// 旧代码无条件更新，导致失败后永不重试（凭据撤销失效）。
+		if err := h.applyKernelsForInbounds(h.subAllInboundIDs(s, rows)); err != nil {
+			log.Printf("subscription %d kernel push failed: %v", s.ID, err)
+		} else {
+			_ = h.repo.UpdateSubscriptionApplied(s.ID, active)
+		}
+	}
+}
+
+func (h *Handler) runSubscriptionLoop(ctx context.Context) {
+	defer h.jobsWG.Done()
+	ticker := time.NewTicker(subscriptionCheckInterval)
+	defer ticker.Stop()
+	for {
+		h.syncSubscriptions(time.Now())
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// subEndpoints are the subscription's endpoints before its pipeline: the
+// selected inbounds and their relays, with the share credentials where
+// the protocol allows.
+func (h *Handler) subEndpoints(s *model.Subscription, rows []model.NodeInbound) []kernel.Endpoint {
+	return h.subEndpointsMemo(s, rows)
+}
+
+// subEndpointsMemo is subEndpoints. In-place SS metering needs no memo
+// anymore: endpoints stay on the origin and ForUser stamps the
+// per-user credential, so there is no applied gate to evaluate per
+// request.
+func (h *Handler) subEndpointsMemo(s *model.Subscription, rows []model.NodeInbound) []kernel.Endpoint {
+	return h.subEndpointsForIDs(s, rows, subInboundIDs(s, rows))
+}
+
+// subAllInboundIDs are every inbound a subscription draws from: its own
+// sources, resolved by subInboundIDs. Credential pushes, membership
+// checks and traffic attribution must use this set.
+func (h *Handler) subAllInboundIDs(s *model.Subscription, rows []model.NodeInbound) []int64 {
+	return subInboundIDs(s, rows)
+}
+
+// subRenderEndpointsMemo is what a subscription renders: its own
+// sources (which the caller passes through the subscription's pipeline
+// at render time). Subscriptions render exactly subEndpointsMemo.
+func (h *Handler) subRenderEndpointsMemo(s *model.Subscription, rows []model.NodeInbound) []kernel.Endpoint {
+	return h.subEndpointsMemo(s, rows)
+}
+
+func (h *Handler) subRenderEndpoints(s *model.Subscription, rows []model.NodeInbound) []kernel.Endpoint {
+	return h.subRenderEndpointsMemo(s, rows)
+}
+
+// subEndpointsForIDs is subEndpointsMemo for an explicit inbound id set:
+// same endpoint building, credential stamping and relay scope, driven
+// by ids instead of the subscription's own sources.
+func (h *Handler) subEndpointsForIDs(s *model.Subscription, rows []model.NodeInbound, ids []int64) []kernel.Endpoint {
+	want := map[int64]bool{}
+	for _, id := range ids {
+		want[id] = true
+	}
+	selected := make([]model.NodeInbound, 0, len(want))
+	for _, row := range rows {
+		// Companion inbounds are never subscription sources: any
+		// stale companion row left behind is ignored here (the
+		// stale-companion cleanup removes it; it never serves).
+		if want[row.ID] && row.CompanionOf == 0 {
+			selected = append(selected, row)
+		}
+	}
+	endpoints, _ := h.inboundEndpoints(selected)
+	if s != nil && isShare(s) {
+		ku := kernelUser(s)
+		byID := make(map[int64]*model.NodeInbound, len(rows))
+		for i := range rows {
+			byID[rows[i].ID] = &rows[i]
+		}
+		kept := endpoints[:0]
+		for i := range endpoints {
+			e := endpoints[i]
+			// In-place SS metering: direct SS endpoints stay on the
+			// origin — ForUser below stamps the per-subscription
+			// credential (SS2022: combined iPSK:uPSK; legacy SS:
+			// the user's own password). Relay endpoints keep
+			// pointing at the origin as before, and their password
+			// is stamped the same way: the relay forwards the
+			// client's bytes to the origin, so the per-user password
+			// is end-to-end and the relay leg is metered too (like
+			// the natively per-user protocols).
+			if e.Proxy == nil {
+				e.Inbound = e.Inbound.ForUser(ku)
+			}
+			// F5 (C-03), in-place form: fail closed when the
+			// per-subscription credential cannot be derived for an
+			// endpoint on an in-place origin (ForUser left the bare
+			// station key in place — a working single-user
+			// credential that must never be served; SS2022 PSKs are
+			// base64 and never contain ':'). For legacy SS the
+			// derivation is the user password itself, so only an
+			// empty stamped password is underivable there. Both
+			// legs are covered: a relay leg on an in-place origin
+			// carries the same derived password end-to-end, so a
+			// bare station key on it would be the same unmetered
+			// hole as on the direct leg.
+			if (e.Direct || e.RelayID > 0) && e.Proxy == nil &&
+				e.Inbound.Protocol == kernel.ProtocolShadowsocks {
+				if row := byID[e.Inbound.ID]; row != nil && row.SSSubscriptionUsers == 1 {
+					pw := e.Inbound.Settings.Password
+					if kernel.SS2022KeyLen(e.Inbound.Settings.Method) > 0 {
+						if !strings.Contains(pw, ":") {
+							log.Printf("subscription %d: drop origin endpoint of inbound %d: per-subscription credential underivable", s.ID, e.Inbound.ID)
+							continue
+						}
+					} else if pw == "" {
+						log.Printf("subscription %d: drop origin endpoint of inbound %d: per-subscription credential underivable", s.ID, e.Inbound.ID)
+						continue
+					}
+				}
+			}
+			kept = append(kept, e)
+		}
+		endpoints = kept
+	}
+	if s == nil {
+		return endpoints
+	}
+	// 中转范围在装配层先过滤一遍（计数/预览/拉取共用此口径）；
+	// 渲染流水线里 kernel.FilterEndpoints 还会再过一次，幂等。
+	// relayIds 白名单非空时是精确端点集过滤并优先于 lines 三档，
+	// 无白名单时才按 lines 收紧（见 kernel.FilterEndpoints）。
+	return kernel.FilterEndpoints(endpoints, parsePipeline(s.Options).options())
+}
+
+// filterInboundRowsByUserAssignments 保留用户被分配的入站行
+// （openSubscription ?user= 拉取侧第一段过滤，FIX2-B/V5-1）。
+// B10-001 起 mine 计数不再共用本过滤：mine 的卡片是独立链接
+// （无 ?user=），按全量口径计数，见 userSubscriptionMine。
+func filterInboundRowsByUserAssignments(rows []model.NodeInbound, assignments []repo.UserInboundAssignment) []model.NodeInbound {
+	allowedInbound := make(map[int64]bool, len(assignments))
+	for _, a := range assignments {
+		allowedInbound[a.InboundID] = true
+	}
+	filtered := make([]model.NodeInbound, 0, len(rows))
+	for _, row := range rows {
+		if allowedInbound[row.ID] {
+			filtered = append(filtered, row)
+		}
+	}
+	return filtered
+}
+
+// filterEndpointsByUserAssignments 按用户分配收紧端点（拉取侧第二段
+// 过滤）：中转端点需该 relay 的分配，直连端点需 relayID=0 的分配。
+func filterEndpointsByUserAssignments(endpoints []kernel.Endpoint, assignments []repo.UserInboundAssignment) []kernel.Endpoint {
+	directAllowed := make(map[int64]bool)
+	relayAllowed := make(map[int64]bool)
+	for _, a := range assignments {
+		if a.RelayID == 0 {
+			directAllowed[a.InboundID] = true
+		} else {
+			relayAllowed[a.RelayID] = true
+		}
+	}
+	filtered := make([]kernel.Endpoint, 0, len(endpoints))
+	for _, e := range endpoints {
+		if e.RelayID > 0 {
+			if relayAllowed[e.RelayID] {
+				filtered = append(filtered, e)
+			}
+		} else if e.Direct {
+			// Assignments are written against the origin inbound,
+			// and endpoints point at the origin (no retargeting
+			// anymore), so the endpoint answers to its own id.
+			if directAllowed[e.Inbound.ID] {
+				filtered = append(filtered, e)
+			}
+		}
+	}
+	return filtered
+}
+
+// ---- API ----
+
+type subscriptionView struct {
+	ID         int64   `json:"id"`
+	Name       string  `json:"name"`
+	Kind       string  `json:"kind"`
+	Token      string  `json:"token"`
+	Path       string  `json:"path"`
+	SourceAll  bool    `json:"sourceAll"`
+	InboundIDs []int64 `json:"inboundIds"`
+	SourceIDs  []int64 `json:"sourceIds"`
+	// SharedIDs are selected inbounds of a share subscription that can't
+	// carry per-user credentials (Shadowsocks, imported nodes).
+	SharedIDs  []int64     `json:"sharedIds"`
+	Options    subPipeline `json:"options"`
+	ExpireTime int64       `json:"expireTime"`
+	Enabled    bool        `json:"enabled"`
+	Active     bool        `json:"active"`
+	// PendingDelete（R10-02/I-F3-01）：删除墓碑行对管理员可见——
+	// 此前墓碑与普通已禁用订阅在列表中同形、带完整编辑入口，
+	// 管理员把残留行重新启用即打穿删除完成路径的前提。前端据此
+	// 呈「删除中」态并禁用开关；后端 save/reset/resetTraffic 对
+	// 墓碑行一律拒绝（见各入口守卫）。
+	PendingDelete bool   `json:"pendingDelete"`
+	Remark        string `json:"remark"`
+	NodeCount     int    `json:"nodeCount"`
+	// Traffic (share subscriptions; bytes).
+	UploadBytes   int64 `json:"uploadBytes"`
+	DownloadBytes int64 `json:"downloadBytes"`
+	TrafficLimit  int64 `json:"trafficLimit"`
+	ResetDay      int   `json:"resetDay"`
+	// TrafficSince is when the used-traffic counters started counting
+	// (creation or last reset), resolved via subTrafficSince.
+	TrafficSince int64 `json:"trafficSince"`
+	OverQuota    bool  `json:"overQuota"`
+	// IsDefault 标记"默认订阅"（个人订阅链接的载体）：排序第一条，由 subscriptionList 回填。
+	IsDefault bool `json:"isDefault"`
+	// ExcludedCompanionIDs 是本次 save 校验时被排除的伴生入站 ID
+	// （B-06：伴生入站不能作订阅源，B10-002：排除须对管理员可见）。
+	// 仅 subscriptionSave 的响应回填；列表等其他视图恒空、omitempty 不出现。
+	ExcludedCompanionIDs []int64 `json:"excludedCompanionIds,omitempty"`
+	// MeteringUnsupported（L4-08）：订阅 ID 超出 socket mark 计量
+	// 编码上限（kernel.MaxUserMarkID）时为 true——该订阅的流量永不
+	// 计量、TrafficLimit 永不触发，须对管理员显式可见，不许静默。
+	// C-07：非分享（个人）订阅同样永不计量——其计数只由分享订阅
+	// 的 kernel 用户样本写，个人订阅的 UploadBytes/DownloadBytes
+	// 恒为 0，TrafficLimit 永不触发；视图构建单点回填，列表/
+	// 保存/详情同口径。
+	MeteringUnsupported bool `json:"meteringUnsupported,omitempty"`
+	// AppliedActive 是上次推到内核的 active 态（0 未下发／1 已下发／
+	// -1 待同步），与计算值 Active 对照才知道“已断开”是否真实落地
+	// （D-02）：Active 为真而 AppliedActive 为 0/-1 时凭据尚未下发，
+	// Active 为假而 AppliedActive 为 1 时凭据仍在节点上。
+	AppliedActive int `json:"appliedActive"`
+	// MeteringStatus 是本订阅的计量状态（D-03，仅分享订阅）：
+	// "metered" 全源可计量、"partial" 部分源未计量、"unmetered" 全源
+	// 未计量；MeteringReason 为未计量／部分计量时的原因（首个 distinct
+	// 成因）。非分享订阅不适用，两字段均为空。R4A-01：徽标按实际下
+	// 发端点算——SS 源存在中转端点即 partial／unmetered（中转端点不
+	// 计量），直连伴生端点仍报 metered；非 SS 源的中转端点仍计量。
+	MeteringStatus string `json:"meteringStatus,omitempty"`
+	MeteringReason string `json:"meteringReason,omitempty"`
+	// LastReportedAt 是本订阅计量计数最近一次上报的时刻（毫秒，
+	// SubscriptionCounter.UpdatedTime 的最大值；0＝从未上报）。
+	// 订阅视图只有 TrafficSince（计数起点）时数字会静默冻结，
+	// D-06 要求流量数旁给出新鲜度。由调用方回填（批量查一次）。
+	LastReportedAt int64 `json:"lastReportedAt,omitempty"`
+	// ZeroEndpointReason 是本订阅当前渲染 0 个端点的原因（C-08）：
+	// 订阅启用且未过期未超限、但拉取为空时才有值；停用／过期／超限
+	// 走占位节点自带原因，本字段为空。
+	ZeroEndpointReason string `json:"zeroEndpointReason,omitempty"`
+}
+
+// subFormatAlias resolves format aliases shared by the pull side
+// (openSubscription) and the count side (nodeCountFormat) — X-P3-2
+// (B-F2): the two used to resolve aliases independently and the count
+// side missed stash, silently falling back to base64 counts for a
+// format clients actually receive as Clash. Add new aliases here only.
+//
+// 1.4.0 (DA-7): stash is no longer aliased to Clash — it resolves to
+// the first-class kernel.FormatStash on BOTH sides (pull renders the
+// Stash variant; SubscriptionNodeCount counts it through the same
+// ClashProxy gate), keeping the count/actual equality X-P3-2 restored.
+func subFormatAlias(format string) string {
+	format = strings.ToLower(strings.TrimSpace(format))
+	if format == "stash" {
+		return kernel.FormatStash
+	}
+	return format
+}
+
+// nodeCountFormat resolves the format a subscription view's NodeCount is
+// computed for (A5-02/BC-11): the request's explicit format when it names
+// a supported one, else the format a bare UA-less subscription request
+// yields — base64. An unknown value falls back instead of failing the
+// whole view.
+func nodeCountFormat(format string) string {
+	// FIX2-B（V5-2）：与拉取侧（openSubscription 先 ToLower）同口径
+	// 大小写不敏感；此前 "Clash" 在计数侧静默回落 base64、与实得
+	// 格式分叉且无任何提示。
+	format = subFormatAlias(format)
+	switch format {
+	case kernel.FormatClash, kernel.FormatStash, kernel.FormatSingbox, kernel.FormatSurge,
+		kernel.FormatLoon, kernel.FormatQX, kernel.FormatShadowrocket, kernel.FormatBase64:
+		return format
+	}
+	return kernel.FormatBase64
+}
+
+func (h *Handler) subscriptionView(s *model.Subscription, rows []model.NodeInbound, now time.Time, format string) subscriptionView {
+	return h.subscriptionViewMemo(s, rows, now, format, nil)
+}
+
+// subscriptionViewMemo is subscriptionView with an applied-gate memo
+// (Y-01): list handlers pass one memo for the whole request so the
+// applied gate is evaluated once per kernel across all views in the
+// response, instead of twice per view.
+func (h *Handler) subscriptionViewMemo(s *model.Subscription, rows []model.NodeInbound, now time.Time, format string, memo *kernelAppliedMemo) subscriptionView {
+	return h.subscriptionViewForAssignmentsMemo(s, rows, now, format, nil, memo)
+}
+
+// subscriptionViewForAssignments 在 subscriptionView 基础上按用户入站
+// 分配收紧 NodeCount（FIX2-B/V5-1）：assignments 为 nil 表示全量
+// 口径；非 nil（含空集）时先按拉取侧同一组过滤函数收紧行与端点，
+// 使显示数与该用户经 ?user=&sig= 个性化链接实际拉到的节点数恒等。
+// 空集 = 该用户个性化链接拉到 0 个节点。注意「我的订阅」（mine）
+// 呈现的是独立链接而非个性化链接，B10-001 起 mine 恒传 nil 按
+// 全量口径计数；本收紧口径只对个性化链接视图成立。
+func (h *Handler) subscriptionViewForAssignments(s *model.Subscription, rows []model.NodeInbound, now time.Time, format string, assignments []repo.UserInboundAssignment) subscriptionView {
+	return h.subscriptionViewForAssignmentsMemo(s, rows, now, format, assignments, nil)
+}
+
+// subSourcesGone reports whether a subscription explicitly selected
+// inbounds/sources but none of them still exist — as opposed to having
+// selected nothing at all. subInboundIDs silently drops unknown ids,
+// so callers that need the distinction must check the raw selection.
+func subSourcesGone(s *model.Subscription) bool {
+	return s.SourceAll == 0 && (len(parseIDList(s.InboundIDs)) > 0 || len(parseIDList(s.SourceIDs)) > 0)
+}
+
+// reasonInplaceNotLive 是 subMeteringSourceReason 的原地未下发
+// 成因；D-OBS-01：截断进行中原地配置重推时该成因是瞬态，
+// subMeteringStatus 对已有计数的超限订阅抑制它，不翻未计量徽标。
+const reasonInplaceNotLive = "原地多用户配置未下发到节点，不计量"
+
+// subMeteringSourceReason 报告一个分享订阅源不能产生计量流量的原因
+// （"" 表示该源可计量）：导入节点共用凭据；SS 源按原地开关／资格／
+// 形态／下发逐级定因。与视图 shared 判定同口径，另把解析失败的入站
+// 也判为未计量（shared 判定静默将其当作可计量）。
+// inplaceApplied 是该源内核的下发确认态（kernelAppliedCached）：
+// 开关开着但配置未确认时，源尚未真正计量（瞬态或节点离线），须如
+// 实报未计量而非把“已开”当作“已计量”。
+func subMeteringSourceReason(row *model.NodeInbound, inplaceApplied bool) string {
+	if isExternalInbound(row) {
+		return "导入节点共用凭据，不计量"
+	}
+	in, err := inboundFromModel(*row)
+	if err != nil {
+		return "入站配置无法解析，不计量"
+	}
+	// SS origins must NOT take the SupportsUsers early return below:
+	// I1 made an in-place SS origin user-capable, so it would report
+	// "" (metered) here even while its config is unapplied, its shape
+	// excluded, or its front ShadowTLS. SS always runs the in-place
+	// chain (switch / eligibility / shape / applied) instead.
+	if in.SupportsUsers() && in.Protocol != kernel.ProtocolShadowsocks {
+		return ""
+	}
+	if !inboundInplaceSS(row) {
+		// 伴生时代的存量开关（MeteringEnabled）不再产生计量：
+		// 伴生已下线，须由管理员显式开启原地多用户（接受 Q1 的
+		// 旧链接失效代价）才能重新计量；此处点名迁移路径而非
+		// 静默报“开关已关”。
+		if row.MeteringEnabled == 1 {
+			return "订阅计量（伴生）已下线，请开启原地多用户，不计量"
+		}
+		return "原地多用户未开启，不计量"
+	}
+	if !ssMeteringEligible(in) {
+		if in.Security.Type == kernel.SecurityShadowTLS {
+			return "ShadowTLS 前置入站，不计量"
+		}
+		return "Shadowsocks 加密方式不支持订阅计量，不计量"
+	}
+	if block := ssMeteringShapeBlock(row); block != "" {
+		return block
+	}
+	if !inplaceApplied {
+		return reasonInplaceNotLive
+	}
+	return ""
+}
+
+// subMeteringStatus 是分享订阅的计量状态（D-03）：全源可计量返回
+// ("metered", "")；全源未计量返回 ("unmetered", 首个 distinct 成因)；
+// 部分源未计量返回 ("partial", "其中 N 个源未计量（成因）")。非分享
+// 订阅不适用，返回 ("", "")。ID 超限（meteringUnsupported）为订阅级
+// 永久不计量，优先于源级成因。D-OBS-01 例外：超限且已有计数的订阅，
+// 原地未下发成因视为截断重建中的瞬态、不计未计量。
+// R4A-01（中转腿）已随伴生一道退役：原地计量的 SS 源，其中转腿与
+// 直连腿一样带按用户口令端到端（ForUser 给中转端点盖章——中转端点
+// 的 Proxy 只在导入节点上才有值），同样计量；未原地计量的源本就
+// 按源级成因计未计量，中转腿不再单独改写成因。endpoints 参数保留
+// 作调用方签名兼容（现不再参与判定）。
+func (h *Handler) subMeteringStatus(s *model.Subscription, rows []model.NodeInbound, memo *kernelAppliedMemo, endpoints []kernel.Endpoint) (string, string) {
+	if !isShare(s) {
+		return "", ""
+	}
+	if s.ID > kernel.MaxUserMarkID {
+		return "unmetered", "订阅 ID 超出计量编码上限，流量永不计量"
+	}
+	ids := h.subAllInboundIDs(s, rows)
+	if len(ids) == 0 {
+		if subSourcesGone(s) {
+			return "unmetered", "所选入站均不存在，流量不计量"
+		}
+		return "unmetered", "未选择任何入站，流量不计量"
+	}
+	byID := make(map[int64]model.NodeInbound, len(rows))
+	for _, r := range rows {
+		byID[r.ID] = r
+	}
+	// kernelAppliedCached 读失败即未下发：徽标向未计量方向倾斜
+	// ——安全显示方向（绝不把无法确认的计量报成已计量）。
+	// 端点下发本身在 subEndpointsForIDs 里 fail closed（F5）。
+	seenReason := map[string]bool{}
+	var firstReason string
+	recordReason := func(reason string) {
+		if !seenReason[reason] {
+			seenReason[reason] = true
+			if firstReason == "" {
+				firstReason = reason
+			}
+		}
+	}
+	unmetered := 0
+	for _, id := range ids {
+		row := byID[id]
+		if row.CompanionOf > 0 {
+			continue
+		}
+		reason := subMeteringSourceReason(&row, h.kernelAppliedCached(row.KernelID, memo))
+		if reason != "" {
+			// D-OBS-01：截断进行中（超限且已有计数）原地配置
+			// 重推，原地未下发只是瞬态——该源不计未计量，徽标
+			// 不翻 unmetered（已用数旁挂“未计量”易误读为全程
+			// 未计）。其余成因（开关关／形态不符／下发阻塞）
+			// 照常计；非超限时原地缺失仍如实报未计量。本路径
+			// 无“原地重推中”的独立信号，超限即截断进行中的信号。
+			if reason == reasonInplaceNotLive && subOverQuota(s) && subUsed(s) > 0 {
+				continue
+			}
+			unmetered++
+			recordReason(reason)
+		}
+	}
+	if unmetered == 0 {
+		return "metered", ""
+	}
+	if unmetered == len(ids) {
+		return "unmetered", firstReason
+	}
+	return "partial", fmt.Sprintf("其中 %d 个源未计量（%s）", unmetered, firstReason)
+}
+
+// subYieldsNothing reports whether a subscription yields no endpoints
+// even before any view filtering: its source rows (from the full row
+// set) build zero endpoints through inboundEndpoints. The subscription's
+// own relay scope (lines/relayIds) and request filters (?user=/?relay=/
+// ?inbound=) are NOT applied here — their empty results are the filter's
+// answer, not a broken subscription, and must keep the F-080 empty
+// render (relay scope must render no node URIs; FIX2-B personalized
+// pull counts 0 for unassigned users).
+func (h *Handler) subYieldsNothing(s *model.Subscription, rows []model.NodeInbound) bool {
+	ids := subInboundIDs(s, rows)
+	if len(ids) == 0 {
+		return true
+	}
+	want := make(map[int64]bool, len(ids))
+	for _, id := range ids {
+		want[id] = true
+	}
+	selected := make([]model.NodeInbound, 0, len(ids))
+	for _, row := range rows {
+		if want[row.ID] && row.CompanionOf == 0 {
+			selected = append(selected, row)
+		}
+	}
+	endpoints, _ := h.inboundEndpoints(selected)
+	return len(endpoints) == 0
+}
+
+// subZeroEndpointReason 报告订阅当前渲染 0 个端点的原因（C-08，
+// 仅行级判定，不查节点／中转视图）：停用／过期／超限走占位节点自带
+// 原因，本函数返回 ""；源为空／全缺／全停用／全仅中转或仅本机监听
+// 时点名；源本身能产出端点、却被订阅的中转范围筛空时点名范围原因
+// （无范围时落到通用原因——伴生凭据不可推导等深层成因已在服务端
+// 日志留痕）。
+func (h *Handler) subZeroEndpointReason(s *model.Subscription, rows []model.NodeInbound, now time.Time) string {
+	if subInactiveReason(s, now) != "" {
+		return ""
+	}
+	ids := h.subAllInboundIDs(s, rows)
+	if len(ids) == 0 {
+		if subSourcesGone(s) {
+			return "所选入站均不存在，拉取为空"
+		}
+		if s.SourceAll == 1 && len(rows) == 0 {
+			return "系统中没有任何入站，拉取为空"
+		}
+		return "该订阅未选择任何入站，拉取为空"
+	}
+	// 源本身能产出端点、渲染却为空：中转范围筛空。无范围时落到通用
+	// 原因——此时只剩伴生凭据不可推导（F5/C-03）一种可能，通用原因
+	// 已覆盖。
+	if h != nil && h.repo != nil && !h.subYieldsNothing(s, rows) {
+		pipe := parsePipeline(s.Options)
+		if pipe.Lines != "" || len(pipe.RelayIDs) > 0 {
+			return "按订阅的中转范围筛选后无可用节点，拉取为空"
+		}
+	}
+	byID := make(map[int64]model.NodeInbound, len(rows))
+	for _, r := range rows {
+		byID[r.ID] = r
+	}
+	var present []model.NodeInbound
+	for _, id := range ids {
+		if row, ok := byID[id]; ok && row.CompanionOf == 0 {
+			present = append(present, row)
+		}
+	}
+	if len(present) == 0 {
+		return "所选入站均不存在，拉取为空"
+	}
+	allDisabled := true
+	allRelayOnly := true
+	for _, row := range present {
+		if row.Enabled == 1 {
+			allDisabled = false
+		}
+		if row.RelayOnly != 1 && !isLoopbackListen(row.Listen) {
+			allRelayOnly = false
+		}
+	}
+	if allDisabled {
+		return "所选入站均已停用，拉取为空"
+	}
+	if allRelayOnly {
+		return "所选入站均为仅中转或仅本机监听，且其中转未就绪，拉取为空"
+	}
+	return "该订阅当前没有可用节点（中转未就绪、分享地址无效或格式过滤），请检查入站与中转状态"
+}
+
+func (h *Handler) subscriptionViewForAssignmentsMemo(s *model.Subscription, rows []model.NodeInbound, now time.Time, format string, assignments []repo.UserInboundAssignment, memo *kernelAppliedMemo) subscriptionView {
+	if memo == nil {
+		memo = &kernelAppliedMemo{}
+	}
+	if assignments != nil {
+		rows = filterInboundRowsByUserAssignments(rows, assignments)
+	}
+	ids := h.subAllInboundIDs(s, rows)
+	byID := make(map[int64]model.NodeInbound, len(rows))
+	for _, r := range rows {
+		byID[r.ID] = r
+	}
+	shared := []int64{}
+	if isShare(s) {
+		for _, id := range ids {
+			row := byID[id]
+			if isExternalInbound(&row) {
+				shared = append(shared, id)
+				continue
+			}
+			in, err := inboundFromModel(row)
+			if err != nil || (in.SupportsUsers() && in.Protocol != kernel.ProtocolShadowsocks) {
+				// Native per-user protocol (or unparseable row, which
+				// the metering-status path reports unmetered but the
+				// shared determination silently treats as metered,
+				// same as before): not shared. An in-place SS origin
+				// is user-capable too (I1) but must NOT take this
+				// early exit — it is shared until its multi-user
+				// config is live on the node (check below).
+				continue
+			}
+			// In-place SS origin: shared only while its config is
+			// not live on the node — once the origin's kernel has
+			// acked the multi-user config, new pulls carry
+			// per-subscription credentials and are counted.
+			if inboundInplaceSS(&row) && h.kernelAppliedCached(row.KernelID, memo) {
+				continue
+			}
+			shared = append(shared, id)
+		}
+	}
+	selected := []int64{}
+	sourceIDs := []int64{}
+	if s.SourceAll != 1 {
+		selected = append(selected, subExplicitIDs(s, rows)...)
+		sourceIDs = append(sourceIDs, parseIDList(s.SourceIDs)...)
+	}
+	pipe := parsePipeline(s.Options)
+	// A5-02/BC-11：NodeCount 按目标格式的实际渲染数计（与该格式的客户
+	// 端实得一致），不再是格式过滤前的终结点数。sing-box 口径按现行
+	// 客户端（1.14+，含导入 Snell）计，与真机实测对齐。
+	format = nodeCountFormat(format)
+	countOpts := pipe.options()
+	if format == kernel.FormatSingbox {
+		countOpts.SingboxSnell = true
+		// 1.14+ 口径含 Naive（≥1.13），与 SingboxSnell 同置 true。
+		countOpts.SingboxNaive = true
+	}
+	endpoints := h.subRenderEndpointsMemo(s, rows)
+	if len(assignments) > 0 {
+		endpoints = filterEndpointsByUserAssignments(endpoints, assignments)
+	}
+	meteringStatus, meteringReason := h.subMeteringStatus(s, rows, memo, endpoints)
+	var zeroEndpointReason string
+	if len(endpoints) == 0 {
+		zeroEndpointReason = h.subZeroEndpointReason(s, rows, now)
+	}
+	return subscriptionView{
+		ID: s.ID, Name: s.Name, Kind: s.Kind, Token: s.Token, Path: "/api/v1/open_api/sub/" + s.Token,
+		SourceAll: s.SourceAll == 1, InboundIDs: selected, SourceIDs: sourceIDs, SharedIDs: shared, Options: pipe,
+		ExpireTime: s.ExpireTime, Enabled: s.Enabled == 1, Active: subActive(s, now), PendingDelete: s.PendingDelete == 1, Remark: s.Remark,
+		NodeCount:   kernel.SubscriptionNodeCount(format, endpoints, countOpts),
+		UploadBytes: s.UploadBytes, DownloadBytes: s.DownloadBytes, TrafficLimit: s.TrafficLimit,
+		ResetDay: s.ResetDay, TrafficSince: subTrafficSince(s), OverQuota: subOverQuota(s),
+		// C-07：非分享订阅永不计量（见 MeteringUnsupported 字段注释）。
+		// F4 分支的旧谓词 isShare(s) && s.ID > MaxUserMarkID 在此作废——
+		// 它漏掉了非分享订阅（C-07 的修法），以 F1 的新谓词为准。
+		MeteringUnsupported: !isShare(s) || s.ID > kernel.MaxUserMarkID,
+		AppliedActive:       s.AppliedActive,
+		MeteringStatus:      meteringStatus,
+		MeteringReason:      meteringReason,
+		ZeroEndpointReason:  zeroEndpointReason,
+	}
+}
+
+// fillLastReportedAt backfills LastReportedAt for views built in this
+// request (one batched query over subscription_counter; a query failure
+// leaves 0 = unknown and never fails the response — freshness is
+// advisory, the counters themselves are authoritative).
+func (h *Handler) fillLastReportedAt(views []subscriptionView) {
+	if h == nil || h.repo == nil || len(views) == 0 {
+		return
+	}
+	ids := make([]int64, 0, len(views))
+	for i := range views {
+		ids = append(ids, views[i].ID)
+	}
+	updates, err := h.repo.LastSubscriptionCounterUpdates(ids)
+	if err != nil {
+		return
+	}
+	for i := range views {
+		views[i].LastReportedAt = updates[views[i].ID]
+	}
+}
+
+func (h *Handler) subscriptionList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+	subs, err := h.repo.ListSubscriptions()
+	if err != nil {
+		respondInternalError(w, "subscriptionList", err)
+		return
+	}
+	if len(subs) == 0 {
+		// Start everyone off with one; deleting it later is the user's call.
+		def, err := h.repo.DefaultSubscription(time.Now().UnixMilli())
+		if err != nil {
+			respondInternalError(w, "subscriptionList", err)
+			return
+		}
+		subs = append(subs, *def)
+	}
+	rows, err := h.repo.ListNodeInbounds()
+	if err != nil {
+		respondInternalError(w, "subscriptionList", err)
+		return
+	}
+	// 请求体可选：format 指定 NodeCount 的目标格式口径（A5-02/BC-11）。
+	var listReq struct {
+		Format string `json:"format"`
+	}
+	_ = decodeJSON(r.Body, &listReq)
+	now := time.Now()
+	// One F4 gate memo for the whole list request (Y-01): the applied
+	// gate is evaluated once per kernel across all views rendered here.
+	gateMemo := &kernelAppliedMemo{}
+	items := make([]subscriptionView, 0, len(subs))
+	for i := range subs {
+		items = append(items, h.subscriptionViewMemo(&subs[i], rows, now, listReq.Format, gateMemo))
+	}
+	// 回填默认订阅标记（个人订阅链接的载体 = 排序第一条）。DefaultSubscription
+	// 在无订阅时会新建一条，与上方空列表分支的既有行为一致；此处失败不阻断
+	// 列表返回，标记保持 false。
+	if def, derr := h.repo.DefaultSubscription(now.UnixMilli()); derr == nil && def != nil {
+		for i := range items {
+			items[i].IsDefault = items[i].ID == def.ID
+		}
+	}
+	// D-06：回填各订阅计量计数最近上报时刻（批量一次），列表／详情
+	// 的流量数旁据此显示新鲜度。
+	h.fillLastReportedAt(items)
+	response.WriteJSON(w, response.OK(map[string]interface{}{
+		"items": items,
+	}))
+}
+
+type subscriptionRequest struct {
+	ID         int64       `json:"id"`
+	Name       string      `json:"name"`
+	Kind       string      `json:"kind"`
+	SourceAll  bool        `json:"sourceAll"`
+	InboundIDs []int64     `json:"inboundIds"`
+	SourceIDs  []int64     `json:"sourceIds"`
+	Options    subPipeline `json:"options"`
+	ExpireTime int64       `json:"expireTime"`
+	Enabled    *bool       `json:"enabled"`
+	Remark     string      `json:"remark"`
+	// TrafficLimit is in bytes (0 = unlimited); ResetDay 1-28 (0 = never).
+	TrafficLimit int64 `json:"trafficLimit"`
+	ResetDay     int   `json:"resetDay"`
+	// Format optionally names the target format for the returned view's
+	// NodeCount (A5-02/BC-11); it is not persisted.
+	Format string `json:"format"`
+}
+
+// validate checks the request and returns the inbound ids it selects.
+// It discards the excluded-companion detail validateDetailed reports;
+// callers that render a response use validateDetailed so the exclusion
+// is visible to the caller (B10-002).
+func (req *subscriptionRequest) validate(rows []model.NodeInbound) ([]int64, error) {
+	ids, _, err := req.validateDetailed(rows)
+	return ids, err
+}
+
+// validateDetailed is validate plus the companion inbound ids it
+// excluded. Inbound ids that do not exist at all are a hard error
+// (B10-002: silently dropping them left admins believing a mistyped
+// or deleted inbound was selected — the assignment surface
+// userSubscriptionSet refuses unknown ids outright, and save now
+// matches that stance). Companion ids keep the B-06 exclusion (they can
+// never be subscription sources), but are returned so the save/preview
+// responses can name them instead of dropping them silently.
+func (req *subscriptionRequest) validateDetailed(rows []model.NodeInbound) ([]int64, []int64, error) {
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" || len([]rune(req.Name)) > 100 {
+		return nil, nil, errText("请填写名称（最多 100 个字）")
+	}
+	// Every subscription has its own credentials.
+	req.Kind = model.SubscriptionShare
+	if req.ExpireTime < 0 {
+		req.ExpireTime = 0
+	}
+	if req.TrafficLimit < 0 {
+		req.TrafficLimit = 0
+	}
+	if req.ResetDay < 0 || req.ResetDay > 28 {
+		return nil, nil, errText("每月重置日只能是 1–28 号")
+	}
+	if err := req.Options.normalize(); err != nil {
+		return nil, nil, err
+	}
+	// Companion inbounds are never subscription sources (the same
+	// choke point subInboundIDs enforces at read time): exclude them
+	// here so a crafted save cannot store an id every reader would
+	// then silently drop (B-06; the assignment surface refuses them
+	// outright). Ids that match no inbound row at all are a different
+	// case — a typo or a since-deleted inbound — and are refused
+	// outright (B10-002), never silently dropped.
+	known := make(map[int64]bool, len(rows))
+	companion := make(map[int64]bool, len(rows))
+	for _, r := range rows {
+		if r.CompanionOf == 0 {
+			known[r.ID] = true
+		} else {
+			companion[r.ID] = true
+		}
+	}
+	var ids []int64
+	var excluded []int64
+	var unknown []int64
+	seenExcluded := make(map[int64]bool)
+	seenUnknown := make(map[int64]bool)
+	for _, id := range req.InboundIDs {
+		switch {
+		case known[id]:
+			ids = append(ids, id)
+		case companion[id]:
+			if !seenExcluded[id] {
+				seenExcluded[id] = true
+				excluded = append(excluded, id)
+			}
+		case !seenUnknown[id]:
+			seenUnknown[id] = true
+			unknown = append(unknown, id)
+		}
+	}
+	if len(unknown) > 0 {
+		return nil, nil, errText(fmt.Sprintf("入站不存在: %v", unknown))
+	}
+	var sources []int64
+	for _, id := range req.SourceIDs {
+		if id > 0 {
+			sources = append(sources, id)
+		}
+	}
+	req.SourceIDs = sources
+	if !req.SourceAll && len(ids) == 0 && len(sources) == 0 {
+		return nil, nil, errText("请至少选择一个入站或订阅源，或选择全部")
+	}
+	return ids, excluded, nil
+}
+
+// subscriptionSourceRefError 是订阅源引用校验的定型失败：文案由
+// 未知源 ID 列表唯一确定，不含仓储原文。调用方以 errors.As 分流
+// 后原样回执（msg 字段访问），仓储故障仍走通用文案。R2-A01：
+// TestR4F1SubscriptionSourceRefIntegrity 的定型恢复（取代此前
+// errText 形态——errText 在本函数外仍用于纯校验面，见 validateDetailed）。
+type subscriptionSourceRefError struct {
+	msg string
+}
+
+func (e *subscriptionSourceRefError) Error() string { return e.msg }
+
+// checkSubscriptionSourceRefs（R4-F1-01）：订阅对订阅源的引用在保存
+// 时验存在——SourceIDs 此前仅过滤正数，未验的幽灵 ID 被计入「至少
+// 选一个」的非空判定后落库、渲染为空且无人知晓。与入站（B10-002
+// 「入站不存在」）同口径：未知源 ID 硬拒并点名。删除面的对称处置
+// （删源时清理引用并回执点名）见 remoteSourceDelete。（2.1.2 起
+// Options 内的链式按源引用已随订阅链式删除，本检查只剩 SourceIDs。）
+func (h *Handler) checkSubscriptionSourceRefs(req *subscriptionRequest) error {
+	if len(req.SourceIDs) == 0 {
+		return nil
+	}
+	sources, err := h.repo.ListRemoteSources()
+	if err != nil {
+		// R2-F4-01：仓储直通，标记后由调用方守卫泛化。
+		return markRepoError(err)
+	}
+	known := make(map[int64]bool, len(sources))
+	for _, s := range sources {
+		known[s.ID] = true
+	}
+	var unknown []int64
+	seen := make(map[int64]bool)
+	for _, id := range req.SourceIDs {
+		if id > 0 && !known[id] && !seen[id] {
+			seen[id] = true
+			unknown = append(unknown, id)
+		}
+	}
+	if len(unknown) > 0 {
+		return &subscriptionSourceRefError{msg: fmt.Sprintf("订阅源不存在: %v", unknown)}
+	}
+	return nil
+}
+
+// relayOnlySelectedWarning is the save receipt's naming of the
+// selected inbounds that can never appear in the subscription
+// (R2-02 防静默面 ①, user decision 2026-11-11: warn only, never
+// materialize endpoints or change scope semantics). A relay-only
+// inbound serves no direct endpoint (see inboundEndpoints); without
+// a live relay endpoint of its own it is absent under every scope —
+// before this warning the save answered 操作成功， the pulls came
+// back empty and nothing anywhere said why. Inbounds that do have a
+// live relay endpoint are NOT named: they appear through it, so the
+// warning's claim stays exact. "" when nothing is lost.
+func (h *Handler) relayOnlySelectedWarning(s *model.Subscription, rows []model.NodeInbound) string {
+	ids := h.subAllInboundIDs(s, rows)
+	if len(ids) == 0 {
+		return ""
+	}
+	live := make(map[int64]bool)
+	relays, err := h.relayViews(0)
+	if err != nil {
+		// 与装配面同口径：中转视图查询失败已由 inboundEndpoints
+		// 记日志（M-003）；此处按无在册中转端点继续点名——回执宁可
+		// 多点一个实际经坏视图丢失的节点，不可再静默。
+		log.Printf("relayOnlySelectedWarning: relayViews failed for subscription %d: %v", s.ID, err)
+	} else {
+		for _, rel := range relays {
+			if rel.ForwardExists && rel.ForwardStatus == 1 && len(rel.Entries) > 0 {
+				live[rel.InboundID] = true
+			}
+		}
+	}
+	byID := make(map[int64]model.NodeInbound, len(rows))
+	for _, r := range rows {
+		byID[r.ID] = r
+	}
+	var names []string
+	seen := make(map[int64]bool, len(ids))
+	for _, id := range ids {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		if row, ok := byID[id]; ok && row.RelayOnly == 1 && !live[id] {
+			names = append(names, row.Name)
+		}
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("以下节点为纯中转导入节点，不可订阅、不会出现在订阅中：%s", strings.Join(names, "、"))
+}
+
+// customEmptyRelayFallbackWarning names the A-01 (AUDIT-R215) fallback
+// on the save receipt: the request carried relayIds as an explicit
+// empty set (custom mode, zero endpoints checked), so FilterEndpoints
+// falls back to the three-tier Lines scope by established semantics
+// (user_subscription_test.go:190 pins the fallback; it is not changed
+// here). Key-in-field vs absent is what tells the two apart: a
+// three-tier save sends no relayIds key (nil), a custom-empty save
+// sends relayIds: [] (non-nil, length 0). "" when no fallback happened.
+func customEmptyRelayFallbackWarning(opts subPipeline) string {
+	if opts.RelayIDs == nil || len(opts.RelayIDs) > 0 {
+		return ""
+	}
+	return fmt.Sprintf("自定义中转范围已选 0 个端点，将按三档「%s」回落下发", relayScopeTierName(opts.Lines))
+}
+
+func relayScopeTierName(lines string) string {
+	switch lines {
+	case "relay":
+		return "只要中转"
+	case "direct":
+		return "只要直连"
+	default:
+		return "全部"
+	}
+}
+
+func (h *Handler) subscriptionSave(w http.ResponseWriter, r *http.Request) {
+	// R2-K2 family closure (B11-001): the response awaits
+	// applyKernelsForInbounds for the saved subscription's kernels,
+	// each with the conditional kernelApplyTimeout bound; arm the
+	// write relief.
+	extendWriteDeadline(w, kernelApplyWriteDeadline)
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+	var req subscriptionRequest
+	if err := decodeJSON(r.Body, &req); err != nil {
+		response.WriteJSON(w, response.ErrDefault("请求参数错误"))
+		return
+	}
+	rows, err := h.repo.ListNodeInbounds()
+	if err != nil {
+		respondInternalError(w, "subscriptionSave", err)
+		return
+	}
+	ids, excludedCompanions, err := req.validateDetailed(rows)
+	if err != nil {
+		// RAW291 Type C：validateDetailed 只产 errText 固定校验
+		// 文案（名称/重置日/入站不存在等用户输入校验），原样回。
+		response.WriteJSON(w, response.ErrDefault(err.Error()))
+		return
+	}
+	if err := h.checkSubscriptionSourceRefs(&req); err != nil {
+		// R2-A01：未知订阅源定型文案原样回（TestR4F1），仓储故障才泛化。
+		var sre *subscriptionSourceRefError
+		if errors.As(err, &sre) {
+			response.WriteJSON(w, response.ErrDefault(sre.msg))
+			return
+		}
+		respondInternalError(w, "subscriptionSave", err)
+		return
+	}
+	if err := h.checkPipelineTemplates(req.Options); err != nil {
+		if respondInternalIfRepoError(w, "subscriptionSave", err) {
+			return
+		}
+		// Only typed validation messages may leave the handler.
+		var te errText
+		if errors.As(err, &te) {
+			response.WriteJSON(w, response.ErrDefault(string(te)))
+			return
+		}
+		respondInternalError(w, "subscriptionSave", err)
+		return
+	}
+	// X-P3-27（L-11-2）：新建分支接入 Idempotency-Key 机制（更新分支
+	// req.ID>0 不参与，更新本身按 ID 定位、无防重语义变化）。
+	if req.ID == 0 {
+		var finish func()
+		var replayed bool
+		w, finish, replayed = h.idemBegin(w, r, idemUserID(r), "subscription:create")
+		defer finish()
+		if replayed {
+			return
+		}
+	}
+
+	now := time.Now()
+	var s *model.Subscription
+	var before []int64
+	if req.ID > 0 {
+		if s, err = h.repo.GetSubscription(req.ID); err != nil || s == nil {
+			response.WriteJSON(w, response.ErrDefault("订阅不存在"))
+			return
+		}
+		// R10-02（I-F3-01）：墓碑是吸收态——删除完成前拒绝一切保存，
+		// 不许把墓碑改回启用（Enabled=1∧PendingDelete=1 会让凭据重入
+		// payload、删除完成后成无人撤销的孤儿）。
+		if s.PendingDelete == 1 {
+			response.WriteJSON(w, response.ErrDefault("订阅删除中，无法保存"))
+			return
+		}
+		if isShare(s) {
+			before = h.subAllInboundIDs(s, rows)
+		}
+	} else {
+		token, tokenErr := randomHex(16)
+		if tokenErr != nil {
+			// RAW291：随机源失败为内部错误，原文只记日志。
+			respondInternalError(w, "subscriptionSave: randomHex failed", tokenErr)
+			return
+		}
+		s = &model.Subscription{Token: token, Enabled: 1, CreatedTime: now.UnixMilli(), TrafficSince: now.UnixMilli()}
+	}
+	s.Name = req.Name
+	s.Kind = req.Kind
+	if isShare(s) && (s.UUID == "" || s.Password == "") {
+		uuid, uuidErr := newUUID()
+		if uuidErr != nil {
+			// RAW291：随机源失败为内部错误，原文只记日志。
+			respondInternalError(w, "subscriptionSave: newUUID failed", uuidErr)
+			return
+		}
+		pw, pwErr := randomHex(16)
+		if pwErr != nil {
+			// RAW291：同上。
+			respondInternalError(w, "subscriptionSave: randomHex failed", pwErr)
+			return
+		}
+		s.UUID, s.Password = uuid, pw
+	}
+	s.SourceAll = boolToInt(req.SourceAll)
+	s.InboundIDs = formatIDList(ids)
+	s.SourceIDs = formatIDList(req.SourceIDs)
+	opts, _ := json.Marshal(req.Options)
+	s.Options = string(opts)
+	s.ExpireTime = req.ExpireTime
+	s.Remark = strings.TrimSpace(req.Remark)
+	s.TrafficLimit = req.TrafficLimit
+	// X-P3-24（L-09-6）：重置时间与订阅本体同事务落库（见
+	// SaveSubscriptionWithResetTime），不再先 Mark 后 Save 分两步。
+	resetDayChanged := req.ResetDay != s.ResetDay && req.ResetDay > 0
+	if resetDayChanged {
+		// Count from now: a newly set reset day must not wipe this month.
+		s.TrafficResetTime = now.UnixMilli()
+		s.TrafficSince = now.UnixMilli()
+	}
+	s.ResetDay = req.ResetDay
+	if req.Enabled != nil {
+		s.Enabled = boolToInt(*req.Enabled)
+	}
+	s.UpdatedTime = now.UnixMilli()
+	// AUDIT-R8 (F7X-001): 不再乐观标记 AppliedActive。先保存（保持旧值），
+	// 下发成功后直接更新 AppliedActive；失败则不更新，留待 syncSubscriptions 循环重试。
+	newAppliedActive := boolToInt(isShare(s) && subActive(s, now))
+	var saveErr error
+	if resetDayChanged && s.ID > 0 {
+		saveErr = h.repo.SaveSubscriptionWithResetTime(s, s.TrafficResetTime)
+	} else {
+		saveErr = h.repo.SaveSubscription(s)
+	}
+	if saveErr != nil {
+		respondInternalError(w, "subscriptionSave", saveErr)
+		return
+	}
+	push := before
+	if isShare(s) {
+		push = append(push, h.subAllInboundIDs(s, rows)...)
+	}
+	// B10-002：响应视图回填本次被排除的伴生入站，管理员可见。
+	view := h.subscriptionView(s, rows, now, req.Format)
+	view.ExcludedCompanionIDs = excludedCompanions
+	// R2-02（防静默面 ①）：所选节点含无在册中转端点的纯中转导入
+	// 节点时，回执 warning 逐个点名——它们在任何范围档位下都不
+	// 会出现在订阅中，保存面是管理员当刻唯一能得知的面。下发成
+	// 功/失败两条出口同带（warning 为 omitempty，无点名时信封与
+	// 此前逐字一致）。
+	warning := h.relayOnlySelectedWarning(s, rows)
+	// A-01 (AUDIT-R215): 自定义空勾选回落须在保存回执点名——界面
+	// 当刻显示「已选 0 个端点」，拉取却按三档出端点；不点名即静默。
+	// 两条 warning 同属一个回执，以「；」并成一条（前端单 toast 透出）。
+	if fb := customEmptyRelayFallbackWarning(req.Options); fb != "" {
+		if warning != "" {
+			warning += "；"
+		}
+		warning += fb
+	}
+	if err := h.applyKernelsForInbounds(push); err != nil {
+		// 下发失败或确认待定：不更新 AppliedActive，循环会重试；
+		// 仅提示用户（pending 不是失败，见 pushFailureMsg）。
+		// RAW291：仓储原文经 pushFailureMsg 换成固定文案。
+		response.WriteJSON(w, response.R{Code: 0, Msg: pushFailureMsg("已保存，但下发到节点失败", err), Data: view, TS: time.Now().UnixMilli(), Warning: warning})
+		return
+	}
+	// 下发成功：更新 AppliedActive。
+	_ = h.repo.UpdateSubscriptionApplied(s.ID, newAppliedActive)
+	s.AppliedActive = newAppliedActive
+	response.WriteJSON(w, response.R{Code: 0, Msg: "操作成功", Data: view, TS: time.Now().UnixMilli(), Warning: warning})
+}
+
+func (h *Handler) respondAfterSubPush(w http.ResponseWriter, inboundIDs []int64, data interface{}) {
+	msg := "操作成功"
+	if err := h.applyKernelsForInbounds(inboundIDs); err != nil {
+		// RAW291：仓储原文经 pushFailureMsg 换成固定文案。
+		msg = pushFailureMsg("已保存，但下发到节点失败", err)
+	}
+	response.WriteJSON(w, response.R{Code: 0, Msg: msg, Data: data, TS: time.Now().UnixMilli()})
+}
+
+func (h *Handler) subscriptionDelete(w http.ResponseWriter, r *http.Request) {
+	id := idFromBody(r, w)
+	if id <= 0 {
+		return
+	}
+	s, err := h.repo.GetSubscription(id)
+	if err != nil {
+		respondInternalError(w, "subscriptionDelete", err)
+		return
+	}
+	if s == nil {
+		// X-P3-28（L-11-3，V-12）：不存在幂等成功。
+		response.WriteJSON(w, response.OKEmpty())
+		return
+	}
+	// B4/F-058: 删除改为两阶段。此前行先删、下发失败仅改响应文案，行已
+	// 不在，60s 同步循环无从重试，节点侧凭据成为孤儿。现在先落墓碑
+	// （pending_delete + 禁用，链接立即失效、凭据退出 payload），下发
+	// 成功后才硬删；失败则墓碑保留，由 syncSubscriptions 循环重试完成。
+	// B4/F-136: 硬删与清分配在同一 repo 事务内完成（旧两步第二步失败
+	// 仅打日志、分配行残留）。
+	if err := h.repo.MarkSubscriptionPendingDelete(id); err != nil {
+		respondInternalError(w, "subscriptionDelete", err)
+		return
+	}
+	s.PendingDelete = 1
+	s.Enabled = 0
+	if err := h.completePendingSubscriptionDelete(s); err != nil {
+		log.Printf("subscription %d: delete push failed, tombstone kept for retry: %v", id, err)
+		// RAW291：仓储原文经 pushFailureMsg 换成固定文案。
+		response.WriteJSON(w, response.R{Code: 0, Msg: pushFailureMsg("已标记删除，但下发到节点失败，后台将自动重试", err), Data: nil, TS: time.Now().UnixMilli()})
+		return
+	}
+	response.WriteJSON(w, response.R{Code: 0, Msg: "操作成功", Data: nil, TS: time.Now().UnixMilli()})
+}
+
+// completePendingSubscriptionDelete pushes the credential removal for a
+// tombstoned subscription and, only on success, hard-deletes the row
+// together with its assignments in one transaction. The push list is
+// computed from the subscription's (former) inbounds; the payload itself
+// is rendered from current DB state, in which the tombstone is excluded
+// by construction: rawActiveUsersByInbound always skips pending-delete
+// rows (R10-02), regardless of their enabled flag.
+func (h *Handler) completePendingSubscriptionDelete(s *model.Subscription) error {
+	var push []int64
+	if isShare(s) {
+		rows, err := h.repo.ListNodeInbounds()
+		if err != nil {
+			// RAW291：仓储直通错误标 repoError，调用点凭此标记
+			// 把仓储原文换成固定文案；下发错误不经此标记。
+			return markRepoError(err)
+		}
+		push = h.subAllInboundIDs(s, rows)
+	}
+	if err := h.applyKernelsForInbounds(push); err != nil {
+		return err
+	}
+	if err := h.repo.DeleteSubscriptionWithAssignments(s.ID); err != nil {
+		// RAW291：同上。
+		return markRepoError(err)
+	}
+	// P1-07: the row is gone, so its one-shot warning dedupe entry can
+	// be reclaimed (a future subscription reusing the id must warn
+	// again rather than inherit the silence).
+	uncountableSubWarned.Delete(s.ID)
+	return nil
+}
+
+// rotateSubscriptionCredentials is the one full reset rotation: new
+// token, new UUID/password for share subscriptions, persisted, then
+// pushed to the kernels. X-P3-13（L-03-2）：主路径 subscriptionReset
+// 与 legacy inboundSubInfo reset 共用此实现——legacy 此前只换 token、
+// 不下发，经它重置的旧配置其实仍有效；不另写第二套轮换。
+// Returns the inbound rows (for view rendering), a push error (the
+// rotation itself is already persisted; AppliedActive is parked at -1
+// so the sync loop retries the push), or a persistence error.
+func (h *Handler) rotateSubscriptionCredentials(s *model.Subscription) (rows []model.NodeInbound, applyErr error, err error) {
+	// R10-02（I-F3-01）：轮换咽喉点同守墓碑——主路径 subscriptionReset
+	// 与 legacy inboundSubInfo reset 共用此实现，任一面都不得对墓碑
+	// 轮换凭据（行将被硬删、轮换产物指向 404）。
+	if s.PendingDelete == 1 {
+		return nil, nil, errText("订阅删除中，无法重置")
+	}
+	// 集成收口：随机源失败 fail-closed（批次 8 X-P3-14 的新签名）与
+	// 共享全轮换（批次 7 X-P3-13）在此合并——生成失败直接报错返回，
+	// 不落库、不下发。
+	token, tokenErr := randomHex(16)
+	if tokenErr != nil {
+		return nil, nil, tokenErr
+	}
+	s.Token = token
+	if isShare(s) {
+		uuid, uuidErr := newUUID()
+		if uuidErr != nil {
+			return nil, nil, uuidErr
+		}
+		pw, pwErr := randomHex(16)
+		if pwErr != nil {
+			return nil, nil, pwErr
+		}
+		s.UUID, s.Password = uuid, pw
+	}
+	s.UpdatedTime = time.Now().UnixMilli()
+	if err := h.repo.UpdateSubscriptionCredentials(s); err != nil {
+		// RAW291：仓储直通错误标 repoError，调用点 guard 后
+		// 改走通用文案；随机源失败为固定文案不经此标记。
+		return nil, nil, markRepoError(err)
+	}
+	rows, listErr := h.repo.ListNodeInbounds()
+	if listErr != nil {
+		// R3-MR-01：入站读失败时下发集不可知——按下方 push 失败同
+		// 漏斗处置：AppliedActive 停在 -1 待 sync 循环重试、把错误
+		// 作为 applyErr 回执披露（pushFailureMsg 对仓储错误只留固定
+		// 文案）。禁止拿空集继续：那会让 applyKernels 空转「成功」
+		// 并记成已下发，新凭据永不下发、旧凭据继续有效却报成功。
+		_ = h.repo.UpdateSubscriptionApplied(s.ID, -1)
+		return nil, markRepoError(listErr), nil
+	}
+	var push []int64
+	if isShare(s) {
+		push = h.subAllInboundIDs(s, rows)
+	}
+	// AUDIT-R8 (R5R8-001): 凭据轮换后下发失败时，强制标记 AppliedActive=-1（需同步），
+	// 使 syncSubscriptions 循环的 active != AppliedActive 恒成立从而重试。
+	// 成功后恢复正常值。否则旧凭据永不失效（F7.14 承诺被违背）。
+	if err := h.applyKernelsForInbounds(push); err != nil {
+		_ = h.repo.UpdateSubscriptionApplied(s.ID, -1)
+		return rows, err, nil
+	}
+	_ = h.repo.UpdateSubscriptionApplied(s.ID, boolToInt(isShare(s) && subActive(s, time.Now())))
+	return rows, nil, nil
+}
+
+// subscriptionReset issues a new link; a share subscription also gets new
+// credentials, so a leaked link or imported config stops working.
+func (h *Handler) subscriptionReset(w http.ResponseWriter, r *http.Request) {
+	// C1-06：凭据轮换接入幂等——同键重试回放首轮回执（含首轮新
+	// token），不再二次轮换使刚分发的链接失效（scope 登记见
+	// idempotency.go）。
+	var finish func()
+	var replayed bool
+	w, finish, replayed = h.idemBegin(w, r, idemUserID(r), "subscription:reset")
+	defer finish()
+	if replayed {
+		return
+	}
+	id := idFromBody(r, w)
+	if id <= 0 {
+		return
+	}
+	s, err := h.repo.GetSubscription(id)
+	if err != nil || s == nil {
+		response.WriteJSON(w, response.ErrDefault("订阅不存在"))
+		return
+	}
+	// R10-02（I-F3-01）：墓碑行拒绝轮换——对即将硬删的行换凭据只会
+	// 产出一枚指向 404 的新 token，且轮换下发面同属墓碑可达操作面。
+	if s.PendingDelete == 1 {
+		response.WriteJSON(w, response.ErrDefault("订阅删除中，无法重置"))
+		return
+	}
+	rows, applyErr, err := h.rotateSubscriptionCredentials(s)
+	if err != nil {
+		respondInternalError(w, "subscriptionReset", err)
+		return
+	}
+	if applyErr != nil {
+		// RAW291：仓储原文经 pushFailureMsg 换成固定文案。
+		response.WriteJSON(w, response.R{Code: 0, Msg: pushFailureMsg("已重置，但下发到节点失败", applyErr), Data: h.subscriptionView(s, rows, time.Now(), ""), TS: time.Now().UnixMilli()})
+		return
+	}
+	response.WriteJSON(w, response.R{Code: 0, Msg: "操作成功", Data: h.subscriptionView(s, rows, time.Now(), ""), TS: time.Now().UnixMilli()})
+}
+
+// subscriptionResetTraffic zeroes a share subscription's traffic and puts
+// it back on the nodes if the limit had cut it off.
+func (h *Handler) subscriptionResetTraffic(w http.ResponseWriter, r *http.Request) {
+	id := idFromBody(r, w)
+	if id <= 0 {
+		return
+	}
+	s, err := h.repo.GetSubscription(id)
+	if err != nil || s == nil {
+		response.WriteJSON(w, response.ErrDefault("订阅不存在"))
+		return
+	}
+	// R10-02（I-F3-01）：墓碑行拒绝重置流量（同 save/reset 口径）。
+	if s.PendingDelete == 1 {
+		response.WriteJSON(w, response.ErrDefault("订阅删除中，无法重置流量"))
+		return
+	}
+	now := time.Now()
+	if err := h.repo.ResetSubscriptionTraffic(id, now.UnixMilli()); err != nil {
+		respondInternalError(w, "subscriptionResetTraffic", err)
+		return
+	}
+	if h.notifier != nil {
+		h.notifier.clearAlerts(fmt.Sprintf("subflow:%d:", id))
+		// R4X-014：同周期重置面——连带清指纹（s 为重置前已取的订阅行，
+		// 名称即指纹消息前缀所需）。
+		h.notifier.forgetSubQuotaFlow(s.Name)
+	}
+	h.syncSubscriptions(now)
+	s, _ = h.repo.GetSubscription(id)
+	if s == nil {
+		// R10-03（I-F3-02）兜底：请求内的 syncSubscriptions 可能已完成
+		// 该订阅的删除（入口读取后被标记墓碑并当场完成），回读为空
+		// 属正常收口——按已删除回执返回，不对 nil 解引用渲染视图
+		// （基线此处 panic、生产经 recover 变 500 且回执丢失）。
+		response.WriteJSON(w, response.R{Code: 0, Msg: "操作成功，订阅已删除", Data: nil, TS: time.Now().UnixMilli()})
+		return
+	}
+	rows, err := h.repo.ListNodeInbounds()
+	if err != nil {
+		// R3-MR-01：视图渲染读失败不得装空集回「已重置」——流量
+		// 重置虽已落库，回执视图须诚实失败（与本函数其余读错同口径）。
+		respondInternalError(w, "subscriptionResetTraffic", err)
+		return
+	}
+	view := h.subscriptionView(s, rows, now, "")
+	views := []subscriptionView{view}
+	h.fillLastReportedAt(views)
+	view = views[0]
+	// D-05：重置回执须含下发结果。syncSubscriptions 失败只记日志，
+	// 以往回执仍是「操作成功」——以 AppliedActive 实态与期望值对照
+	// （保存路径 :1355-1365 的 pushFailureMsg 范例同口径）：分享订阅
+	// 且当前应启用时 AppliedActive 须为 1，否则凭据未落地。
+	if expectedApplied := boolToInt(isShare(s) && subActive(s, now)); s.AppliedActive != expectedApplied {
+		response.WriteJSON(w, response.R{Code: 0, Msg: "已重置，但下发到节点失败，后台将自动重试", Data: view, TS: time.Now().UnixMilli()})
+		return
+	}
+	response.WriteJSON(w, response.OK(view))
+}
+
+type subPreviewItem struct {
+	Name     string `json:"name"`
+	Original string `json:"original"`
+	Protocol string `json:"protocol"`
+	Line     string `json:"line"` // "direct" or "relay"
+	// SourceID is the remote source of an imported node; Own marks the
+	// panel's own nodes.
+	SourceID int64 `json:"sourceId,omitempty"`
+	Own      bool  `json:"own,omitempty"`
+}
+
+// subscriptionPreview runs an (unsaved) subscription's pipeline and lists
+// the resulting nodes, plus how many the filters dropped.
+func (h *Handler) subscriptionPreview(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+	var req subscriptionRequest
+	if err := decodeJSON(r.Body, &req); err != nil {
+		response.WriteJSON(w, response.ErrDefault("请求参数错误"))
+		return
+	}
+	if req.Name == "" {
+		req.Name = "preview"
+	}
+	rows, err := h.repo.ListNodeInbounds()
+	if err != nil {
+		respondInternalError(w, "subscriptionPreview", err)
+		return
+	}
+	ids, excludedCompanions, err := req.validateDetailed(rows)
+	if err != nil {
+		// RAW291 Type C：validateDetailed 只产 errText 固定校验
+		// 文案（名称/重置日/入站不存在等用户输入校验），原样回。
+		response.WriteJSON(w, response.ErrDefault(err.Error()))
+		return
+	}
+	options, _ := json.Marshal(req.Options)
+	draft := &model.Subscription{SourceAll: boolToInt(req.SourceAll), InboundIDs: formatIDList(ids), SourceIDs: formatIDList(req.SourceIDs),
+		Options: string(options)}
+	source := h.subRenderEndpoints(draft, rows)
+	// R18-B5-03：total 须计流水线前的端点集——subRenderEndpoints 已
+	// 过了一遍 FilterEndpoints，ApplySubOptions 再过同一遍，故
+	// len(source)-len(items) 恒为 0。用一份除 Options 为空外完全相同
+	// 的草稿重算未过滤集（空流水线不过滤）；items 与 formatSkipped
+	// 仍用过滤后的 source，不变。
+	totalDraft := &model.Subscription{SourceAll: draft.SourceAll, InboundIDs: draft.InboundIDs, SourceIDs: draft.SourceIDs, Options: "{}"}
+	total := len(h.subRenderEndpoints(totalDraft, rows))
+	opts := req.Options.options()
+	// R18-B5-01：预览的 formatSkipped 与列表 NodeCount 同口径——
+	// sing-box 1.14+ 含 Snell 导入、1.13+ 含 Naive；不置这两旗时
+	// 预览会把受支持的 Snell/Naive 节点误报为 sing-box 不支持。
+	// ApplySubOptions/FilterEndpoints 只用 Lines/RelayIDs，不受此影响。
+	opts.SingboxSnell = true
+	opts.SingboxNaive = true
+	result := kernel.ApplySubOptions(source, opts)
+	items := make([]subPreviewItem, 0, len(result))
+	for _, e := range result {
+		line := "relay"
+		if e.Direct {
+			line = "direct"
+		}
+		items = append(items, subPreviewItem{Name: e.Name, Original: e.Original,
+			Protocol: kernel.EndpointProtocol(e), Line: line, SourceID: e.SourceID, Own: e.Proxy == nil && e.SourceID == 0})
+	}
+	resp := map[string]interface{}{
+		"items":   items,
+		"total":   total,
+		"dropped": total - len(items),
+	}
+	// W3/P-003：按格式点名略过——某些协议/格式组合在某些投递格式里
+	// 无表达（如 Snell 进不了 Surge），此前列表 NodeCount 静默变小、
+	// 预览零提示，管理员无从知道少了谁。此处对全部格式用与计数同源
+	// 的谓词（SubscriptionFormatSkipped）逐格式列出被略过的节点名，
+	// 前端在预览处呈现「N 个节点不被该格式支持：…」。
+	formatSkipped := map[string][]string{}
+	for _, format := range kernel.SubscriptionFormats() {
+		if names := kernel.SubscriptionFormatSkipped(format, source, opts); len(names) > 0 {
+			formatSkipped[format] = names
+		}
+	}
+	if len(formatSkipped) > 0 {
+		resp["formatSkipped"] = formatSkipped
+	}
+	if len(excludedCompanions) > 0 {
+		// B10-002：与 save 同口径，预览也标注被排除的伴生入站。
+		resp["excludedCompanionIds"] = excludedCompanions
+	}
+	response.WriteJSON(w, response.OK(resp))
+}
+
+// inboundSubInfo is the pre-3.1 single-subscription API: the default
+// subscription's link; reset rotates it.
+func (h *Handler) inboundSubInfo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+	var req struct {
+		Reset bool `json:"reset"`
+	}
+	_ = decodeJSON(r.Body, &req)
+	s, err := h.repo.DefaultSubscription(time.Now().UnixMilli())
+	if err != nil {
+		respondInternalError(w, "inboundSubInfo: DefaultSubscription failed", err)
+		return
+	}
+	userID, roleID, authErr := userRoleFromRequest(r)
+	if req.Reset {
+		// 换 token 是管理员操作（F-001 回归点：reset 仍仅管理员）。
+		if authErr != nil || roleID != 0 {
+			response.WriteJSON(w, response.Err(403, "无权限，仅管理员可操作"))
+			return
+		}
+		// C1-06：reset 分支与 subscriptionReset 同为凭据轮换，接入
+		// 幂等（管理员校验通过后才占位：403 不落缓存、未授权者
+		// 不能预占键）。回放命中时首轮回执（含新 token）原样返回，
+		// 函数尾部的共用 OK 回执不会再执行。
+		var finish func()
+		var replayed bool
+		w, finish, replayed = h.idemBegin(w, r, idemUserID(r), "inbound-sub-info:reset")
+		defer finish()
+		if replayed {
+			return
+		}
+		// X-P3-13（L-03-2）：与主路径共用全轮换（token+UUID/密码+下发
+		// 内核），不再只换 token——否则经此路重置的旧配置仍能连接。
+		_, applyErr, err := h.rotateSubscriptionCredentials(s)
+		if err != nil {
+			// RAW291 Type B：混合错误——SaveSubscription 仓储错误
+			// （已标 repoError）改走通用文案；随机源失败与墓碑拒绝
+			// 为固定文案，原样回。
+			if respondInternalIfRepoError(w, "inboundSubInfo: rotateSubscriptionCredentials failed", err) {
+				return
+			}
+			response.WriteJSON(w, response.Err(-2, err.Error()))
+			return
+		}
+		if applyErr != nil {
+			// RAW291：仓储原文经 pushFailureMsg 换成固定文案。
+			response.WriteJSON(w, response.R{Code: 0, Msg: pushFailureMsg("已重置，但下发到节点失败", applyErr), Data: map[string]interface{}{
+				"token": s.Token,
+				"path":  "/api/v1/open_api/sub/" + s.Token,
+			}, TS: time.Now().UnixMilli()})
+			return
+		}
+	} else {
+		// F-001：读分支只给被分配的用户（用户 2026-10-20 裁决：默认订阅
+		// 只给被分配的用户）。未分配用户拿到 token 即可绕过订阅分配、
+		// 不带 ?user= 拉全量节点，故响应中不得包含 token。
+		// 注意 authErr 必须先判：claims 解析失败时 roleID 恒为 0，
+		// 若先看 roleID 会把未认证请求误当管理员放行。
+		if authErr != nil {
+			response.WriteJSON(w, response.Err(401, "未登录或token已过期"))
+			return
+		}
+		if roleID != 0 {
+			allowed, err := h.canReadDefaultSubscription(userID, s)
+			if err != nil {
+				respondInternalError(w, "inboundSubInfo: canReadDefaultSubscription failed", err)
+				return
+			}
+			if !allowed {
+				legacyAllowed, err := h.canReadLegacyDefaultSubscription(userID, s)
+				if err != nil {
+					respondInternalError(w, "inboundSubInfo: legacy assignments", err)
+					return
+				}
+				if !legacyAllowed {
+					response.WriteJSON(w, response.Err(403, "无权限，默认订阅未分配给当前用户"))
+					return
+				}
+				// The restriction is in the credential itself, not removable query parameters.
+				token := h.scopedSubscriptionToken(s, userID)
+				response.WriteJSON(w, response.OK(map[string]interface{}{
+					"token": token, "path": "/api/v1/open_api/sub/" + token,
+				}))
+				return
+			}
+		}
+	}
+	response.WriteJSON(w, response.OK(map[string]interface{}{
+		"token": s.Token,
+		"path":  "/api/v1/open_api/sub/" + s.Token,
+	}))
+}
+
+// canReadDefaultSubscription grants the shared bare token only for a whole-subscription assignment.
+func (h *Handler) canReadDefaultSubscription(userID int64, s *model.Subscription) (bool, error) {
+	ids, err := h.repo.ListUserSubscriptionIDs(userID)
+	if err != nil {
+		return false, err
+	}
+	for _, id := range ids {
+		if id == s.ID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// Legacy partial assignments receive a scoped capability, never the shared token.
+func (h *Handler) canReadLegacyDefaultSubscription(userID int64, s *model.Subscription) (bool, error) {
+	assigned, err := h.repo.ListUserInboundIDs(userID)
+	if err != nil {
+		return false, err
+	}
+	if len(assigned) == 0 {
+		return false, nil
+	}
+	rows, err := h.repo.ListNodeInbounds()
+	if err != nil {
+		return false, err
+	}
+	member := make(map[int64]bool, len(assigned))
+	for _, id := range h.subAllInboundIDs(s, rows) {
+		member[id] = true
+	}
+	for _, id := range assigned {
+		if member[id] {
+			return true, nil
+		}
+	}
+	return false, nil
+}

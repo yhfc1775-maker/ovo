@@ -1,0 +1,213 @@
+export interface NodeSystemInfo {
+  // Optional: a node that has not reported a figure leaves it undefined,
+  // and the UI hides the meter instead of showing a fabricated 0%.
+  cpuUsage?: number;
+  memoryUsage?: number;
+  uploadTraffic: number;
+  downloadTraffic: number;
+  uploadSpeed: number;
+  downloadSpeed: number;
+  uptime: number;
+  diskUsage?: number;
+  load1?: number;
+  load5?: number;
+  load15?: number;
+  tcpConns?: number;
+  udpConns?: number;
+  netInSpeed?: number;
+  netOutSpeed?: number;
+}
+
+type RawSystemInfo = Record<string, string | number | undefined>;
+
+const toInteger = (value: string | number | undefined): number => {
+  return Number.parseInt(String(value ?? 0), 10) || 0;
+};
+
+// R18-E2-03：agent 上报的实时数值是节点方自述、未经校验的，越界值
+// 不得直通渲染（cpu 500% / InfinityP / -5B）。百分比钳到 0–100，
+// load 与速率/计数钳到 ≥0；非有限值按缺失处理（undefined→隐藏，
+// 不伪造 0——伪造的 0 还会遮住 netIn/OutSpeed 的派生回退，见下）。
+const toFiniteNumber = (
+  value: string | number | undefined,
+): number | undefined => {
+  const v =
+    typeof value === "number" ? value : Number.parseFloat(String(value ?? ""));
+
+  return Number.isFinite(v) ? v : undefined;
+};
+
+const clampPercent = (
+  value: string | number | undefined,
+): number | undefined => {
+  const v = toFiniteNumber(value);
+
+  if (v === undefined) return undefined;
+
+  return Math.min(100, Math.max(0, v));
+};
+
+const clampNonNegative = (
+  value: string | number | undefined,
+): number | undefined => {
+  const v = toFiniteNumber(value);
+
+  if (v === undefined) return undefined;
+
+  return Math.max(0, v);
+};
+
+const clampNonNegativeInt = (
+  value: string | number | undefined,
+): number | undefined => {
+  const v = toFiniteNumber(value);
+
+  if (v === undefined) return undefined;
+
+  return Math.max(0, Math.trunc(v));
+};
+
+const parseRawSystemInfo = (messageData: unknown): RawSystemInfo | null => {
+  if (typeof messageData === "string") {
+    try {
+      const parsed = JSON.parse(messageData);
+
+      if (parsed && typeof parsed === "object") {
+        return parsed as RawSystemInfo;
+      }
+
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  if (messageData && typeof messageData === "object") {
+    return messageData as RawSystemInfo;
+  }
+
+  return null;
+};
+
+/**
+ * Heuristic to verify the parsed object actually contains system-info fields.
+ * Prevents non-metric messages (command responses, etc.) from being mistakenly
+ * treated as system info, which would reset all values to 0 and cause UI flicker.
+ */
+const SYSTEM_INFO_KEYS = [
+  "uptime",
+  "cpu_usage",
+  "memory_usage",
+  "disk_usage",
+  "bytes_received",
+  "bytes_transmitted",
+  "net_in_speed",
+  "net_out_speed",
+  "tcp_conns",
+  "udp_conns",
+  "load1",
+  "load5",
+  "load15",
+] as const;
+
+const looksLikeSystemInfo = (raw: RawSystemInfo): boolean => {
+  let matched = 0;
+
+  for (const key of SYSTEM_INFO_KEYS) {
+    if (key in raw && raw[key] !== undefined) {
+      matched++;
+      if (matched >= 3) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+};
+
+export const buildNodeSystemInfo = (
+  messageData: unknown,
+  previous: NodeSystemInfo | null | undefined,
+): NodeSystemInfo | null => {
+  const raw = parseRawSystemInfo(messageData);
+
+  if (!raw || !looksLikeSystemInfo(raw)) {
+    return null;
+  }
+
+  // R2-050: the three counters follow the same keep-previous rule as
+  // the metric merge path in node.tsx ("frame ?? last ?? 0"). A frame
+  // that passes the >=3-key gate but omits the counters must not zero
+  // the node's cumulative traffic / uptime; fall back to the previous
+  // snapshot, and to 0 only when there is none.
+  const uploadTraffic =
+    raw.bytes_transmitted === undefined
+      ? (previous?.uploadTraffic ?? 0)
+      : toInteger(raw.bytes_transmitted);
+  const downloadTraffic =
+    raw.bytes_received === undefined
+      ? (previous?.downloadTraffic ?? 0)
+      : toInteger(raw.bytes_received);
+  const uptime =
+    raw.uptime === undefined ? (previous?.uptime ?? 0) : toInteger(raw.uptime);
+
+  let uploadSpeed = 0;
+  let downloadSpeed = 0;
+
+  if (previous && previous.uptime) {
+    const timeDiff = uptime - previous.uptime;
+
+    if (timeDiff > 0 && timeDiff <= 10) {
+      const uploadDiff = uploadTraffic - previous.uploadTraffic;
+      const downloadDiff = downloadTraffic - previous.downloadTraffic;
+
+      if (uploadTraffic >= previous.uploadTraffic && uploadDiff >= 0) {
+        uploadSpeed = uploadDiff / timeDiff;
+      }
+
+      if (downloadTraffic >= previous.downloadTraffic && downloadDiff >= 0) {
+        downloadSpeed = downloadDiff / timeDiff;
+      }
+    }
+  }
+
+  return {
+    cpuUsage:
+      raw.cpu_usage === undefined ? undefined : clampPercent(raw.cpu_usage),
+    memoryUsage:
+      raw.memory_usage === undefined
+        ? undefined
+        : clampPercent(raw.memory_usage),
+    uploadTraffic,
+    downloadTraffic,
+    uploadSpeed,
+    downloadSpeed,
+    uptime,
+    diskUsage:
+      raw.disk_usage === undefined ? undefined : clampPercent(raw.disk_usage),
+    // Same undefined-preserving rule as the usage figures above
+    // (A-F-02 family): a snapshot that omits a key leaves it undefined
+    // instead of fabricating 0 — consumers read these through ?? chains
+    // (e.g. netOutSpeed ?? derived uploadSpeed), so a fabricated 0
+    // would also shadow the derived fallback.
+    load1: raw.load1 === undefined ? undefined : clampNonNegative(raw.load1),
+    load5: raw.load5 === undefined ? undefined : clampNonNegative(raw.load5),
+    load15: raw.load15 === undefined ? undefined : clampNonNegative(raw.load15),
+    tcpConns:
+      raw.tcp_conns === undefined
+        ? undefined
+        : clampNonNegativeInt(raw.tcp_conns),
+    udpConns:
+      raw.udp_conns === undefined
+        ? undefined
+        : clampNonNegativeInt(raw.udp_conns),
+    netInSpeed:
+      raw.net_in_speed === undefined
+        ? undefined
+        : clampNonNegative(raw.net_in_speed),
+    netOutSpeed:
+      raw.net_out_speed === undefined
+        ? undefined
+        : clampNonNegative(raw.net_out_speed),
+  };
+};

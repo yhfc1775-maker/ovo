@@ -1,0 +1,125 @@
+package config
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+)
+
+var (
+	persistPath   string
+	persistMu     sync.Mutex
+	persistEnable bool
+)
+
+// SetPersistPath sets the file path where runtime config changes will be
+// automatically persisted. Call this once during agent startup before any
+// OnUpdate mutations occur.
+func SetPersistPath(path string) {
+	persistMu.Lock()
+	defer persistMu.Unlock()
+	persistPath = path
+}
+
+func PersistPath() string {
+	persistMu.Lock()
+	defer persistMu.Unlock()
+	return persistPath
+}
+
+// EnablePersist turns on automatic persistence. Call this after the initial
+// config has been loaded (e.g. after program.Start) so that startup loading
+// does not trigger redundant disk writes.
+func EnablePersist() {
+	persistMu.Lock()
+	defer persistMu.Unlock()
+	persistEnable = true
+}
+
+// PersistNow writes cfg to the configured persist path atomically, without
+// requiring persistence to be enabled. Used by startup self-heal: after
+// deduplicating a poisoned persisted config, the healed config must reach
+// disk before the next start reads it again, otherwise the next start
+// would read the poisoned file once more.
+func PersistNow(cfg *Config) error {
+	persistMu.Lock()
+	path := persistPath
+	persistMu.Unlock()
+
+	if path == "" {
+		return errors.New("config persist: persist path not set")
+	}
+	if cfg == nil {
+		return errors.New("config persist: nil config")
+	}
+	return writeConfigFile(path, cfg)
+}
+
+// persist writes the current global config to the configured file atomically.
+func persist() error {
+	return persistCandidate(Global())
+}
+
+// Does not read Global: OnUpdate holds globalMux while committing a candidate.
+func persistCandidate(cfg *Config) error {
+	persistMu.Lock()
+	defer persistMu.Unlock()
+	path := persistPath
+	enabled := persistEnable
+
+	if !enabled || path == "" {
+		return nil
+	}
+
+	if cfg == nil {
+		return nil
+	}
+
+	return writeConfigFile(path, cfg)
+}
+
+// writeConfigFile marshals cfg as indented JSON and replaces path atomically
+// (temp file + rename). It prints the same diagnostics persist() used to.
+func writeConfigFile(path string, cfg *Config) error {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(cfg); err != nil {
+		fmt.Printf("⚠️ config persist: marshal failed: %v\n", err)
+		return fmt.Errorf("config persist: marshal failed: %w", err)
+	}
+
+	// Atomic write: write to temp file then rename
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".gost-*.tmp")
+	if err != nil {
+		fmt.Printf("⚠️ config persist: create temp file failed: %v\n", err)
+		return fmt.Errorf("config persist: create temp file failed: %w", err)
+	}
+	tmpName := tmp.Name()
+
+	if _, err := tmp.Write(buf.Bytes()); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		fmt.Printf("⚠️ config persist: write failed: %v\n", err)
+		return fmt.Errorf("config persist: write failed: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		fmt.Printf("⚠️ config persist: close temp file failed: %v\n", err)
+		return fmt.Errorf("config persist: close temp file failed: %w", err)
+	}
+
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
+		fmt.Printf("⚠️ config persist: rename failed: %v\n", err)
+		return fmt.Errorf("config persist: rename failed: %w", err)
+	}
+
+	fmt.Printf("💾 节点配置已持久化到 %s\n", path)
+	return nil
+}

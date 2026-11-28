@@ -1,0 +1,237 @@
+{
+  "inbounds": [
+    {
+      "ignore_client_bandwidth": true,
+      "listen": "::",
+      "listen_port": 443,
+      "masquerade": "https://www.bing.com",
+      "tag": "in-1",
+      "tls": {
+        "alpn": [
+          "h3"
+        ],
+        "certificate": [
+          "-----BEGIN CERTIFICATE-----",
+          "MIIB",
+          "-----END CERTIFICATE-----"
+        ],
+        "enabled": true,
+        "key": [
+          "-----BEGIN EC PRIVATE KEY-----",
+          "MHcC",
+          "-----END EC PRIVATE KEY-----"
+        ],
+        "server_name": "www.bing.com"
+      },
+      "type": "hysteria2",
+      "users": [
+        {
+          "password": "hy2-secret"
+        }
+      ]
+    },
+    {
+      "congestion_control": "bbr",
+      "listen": "::",
+      "listen_port": 8443,
+      "tag": "in-2",
+      "tls": {
+        "alpn": [
+          "h3"
+        ],
+        "certificate": [
+          "-----BEGIN CERTIFICATE-----",
+          "MIIB",
+          "-----END CERTIFICATE-----"
+        ],
+        "enabled": true,
+        "key": [
+          "-----BEGIN EC PRIVATE KEY-----",
+          "MHcC",
+          "-----END EC PRIVATE KEY-----"
+        ],
+        "server_name": "www.bing.com"
+      },
+      "type": "tuic",
+      "users": [
+        {
+          "password": "tuic-secret",
+          "uuid": "0b6e4c38-8f0e-4a3e-9d2d-7a1c2b3c4d5e"
+        }
+      ]
+    },
+    {
+      "listen": "::",
+      "listen_port": 9443,
+      "tag": "in-3",
+      "tls": {
+        "certificate": [
+          "-----BEGIN CERTIFICATE-----",
+          "MIIB",
+          "-----END CERTIFICATE-----"
+        ],
+        "enabled": true,
+        "key": [
+          "-----BEGIN EC PRIVATE KEY-----",
+          "MHcC",
+          "-----END EC PRIVATE KEY-----"
+        ],
+        "server_name": "www.bing.com"
+      },
+      "type": "anytls",
+      "users": [
+        {
+          "password": "anytls-secret"
+        }
+      ]
+    },
+    {
+      "detour": "in-4-ss",
+      "handshake": {
+        "server": "www.microsoft.com",
+        "server_port": 443
+      },
+      "listen": "::",
+      "listen_port": 10443,
+      "tag": "in-4",
+      "type": "shadowtls",
+      "users": [
+        {
+          "password": "stls-secret-123"
+        }
+      ],
+      "version": 3
+    },
+    {
+      "listen": "127.0.0.1",
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "AAAAAAAAAAAAAAAAAAAAAA==",
+      "tag": "in-4-ss",
+      "type": "shadowsocks"
+    },
+    {
+      "listen": "::",
+      "listen_port": 11443,
+      "tag": "in-5",
+      "tls": {
+        "enabled": true,
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "www.example.com",
+            "server_port": 443
+          },
+          "private_key": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA",
+          "short_id": [
+            "0123456789abcdef"
+          ]
+        },
+        "server_name": "www.example.com"
+      },
+      "type": "vless",
+      "users": [
+        {
+          "flow": "xtls-rprx-vision",
+          "uuid": "0b6e4c38-8f0e-4a3e-9d2d-7a1c2b3c4d5e"
+        }
+      ]
+    }
+  ],
+  "log": {
+    "level": "warn"
+  },
+  "outbounds": [
+    {
+      "tag": "direct",
+      "type": "direct"
+    }
+  ],
+  "route": {
+    "final": "direct",
+    "rules": [
+      {
+        "action": "reject",
+        "ip_cidr": [
+          "0.0.0.0/8",
+          "10.0.0.0/8",
+          "100.64.0.0/10",
+          "127.0.0.0/8",
+          "169.254.0.0/16",
+          "172.16.0.0/12",
+          "192.0.0.0/24",
+          "192.0.2.0/24",
+          "192.168.0.0/16",
+          "198.18.0.0/15",
+          "198.51.100.0/24",
+          "203.0.113.0/24",
+          "224.0.0.0/4",
+          "240.0.0.0/4",
+          "::/128",
+          "::1/128",
+          "100::/64",
+          "2001:db8::/32",
+          "fc00::/7",
+          "fe80::/10",
+          "ff00::/8",
+          "::ffff:0.0.0.0/104",
+          "::ffff:10.0.0.0/104",
+          "::ffff:100.64.0.0/106",
+          "::ffff:127.0.0.0/104",
+          "::ffff:169.254.0.0/112",
+          "::ffff:172.16.0.0/108",
+          "::ffff:192.0.0.0/120",
+          "::ffff:192.0.2.0/120",
+          "::ffff:192.168.0.0/112",
+          "::ffff:198.18.0.0/111",
+          "::ffff:198.51.100.0/120",
+          "::ffff:203.0.113.0/120",
+          "::ffff:224.0.0.0/100",
+          "::ffff:240.0.0.0/100"
+        ]
+      },
+      {
+        "action": "resolve"
+      },
+      {
+        "action": "reject",
+        "ip_cidr": [
+          "0.0.0.0/8",
+          "10.0.0.0/8",
+          "100.64.0.0/10",
+          "127.0.0.0/8",
+          "169.254.0.0/16",
+          "172.16.0.0/12",
+          "192.0.0.0/24",
+          "192.0.2.0/24",
+          "192.168.0.0/16",
+          "198.18.0.0/15",
+          "198.51.100.0/24",
+          "203.0.113.0/24",
+          "224.0.0.0/4",
+          "240.0.0.0/4",
+          "::/128",
+          "::1/128",
+          "100::/64",
+          "2001:db8::/32",
+          "fc00::/7",
+          "fe80::/10",
+          "ff00::/8",
+          "::ffff:0.0.0.0/104",
+          "::ffff:10.0.0.0/104",
+          "::ffff:100.64.0.0/106",
+          "::ffff:127.0.0.0/104",
+          "::ffff:169.254.0.0/112",
+          "::ffff:172.16.0.0/108",
+          "::ffff:192.0.0.0/120",
+          "::ffff:192.0.2.0/120",
+          "::ffff:192.168.0.0/112",
+          "::ffff:198.18.0.0/111",
+          "::ffff:198.51.100.0/120",
+          "::ffff:203.0.113.0/120",
+          "::ffff:224.0.0.0/100",
+          "::ffff:240.0.0.0/100"
+        ]
+      }
+    ]
+  }
+}

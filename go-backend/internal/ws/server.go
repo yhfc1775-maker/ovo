@@ -1,0 +1,1637 @@
+package ws
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/gorilla/websocket"
+
+	"go-backend/internal/auth"
+	"go-backend/internal/clientip"
+	"go-backend/internal/security"
+	"go-backend/internal/store/repo"
+)
+
+type encryptedMessage struct {
+	Encrypted bool   `json:"encrypted"`
+	Data      string `json:"data"`
+	Timestamp int64  `json:"timestamp"`
+}
+
+type broadcastMessage struct {
+	ID   int64  `json:"id"`
+	Type string `json:"type"`
+	Data string `json:"data"`
+}
+
+type connWrap struct {
+	conn *websocket.Conn
+	mu   sync.Mutex
+}
+
+type nodeSession struct {
+	nodeID         int64
+	secret         string
+	conn           *connWrap
+	crypto         *security.AESCrypto // 缓存的 AES 加密器，避免每条消息重建
+	pongDeadline   atomic.Int64
+	lifecycleGuard bool
+}
+
+type adminSession struct {
+	userID int64
+	claims auth.Claims
+	conn   *connWrap
+	queue  *realtimeQueue
+}
+
+type monitorSession struct {
+	userID int64
+	claims auth.Claims
+	conn   *connWrap
+	queue  *realtimeQueue
+}
+
+// realtimeQueue 是每会话一条的广播发送队列及其字节记账（R2-P1-F09）。
+// 此前队列只有深度帽（16 条）：载荷源是节点上行帧原文，单条可达入站
+// 读上限 10MiB，慢消费者可让单会话滞留 16×10MiB=160MiB。现加字节
+// 预算作第二道帽：入队按帧长原子记账，记账与准入均为 O(1)、不加锁。
+type realtimeQueue struct {
+	ch           chan []byte
+	queuedBytes  atomic.Int64 // 已准入、尚未被 writer 取走的字节数
+	dropped      atomic.Int64 // 被后盾（字节预算或深度帽）丢弃的帧数
+	droppedBytes atomic.Int64 // 被后盾丢弃的字节数
+}
+
+func newRealtimeQueue() *realtimeQueue {
+	return &realtimeQueue{ch: make(chan []byte, wsBroadcastQueueSize)}
+}
+
+// offer 非阻塞投递一帧，返回 false 表示本帧被后盾丢弃（计数已记账）。
+// 准入条件：准入后 queuedBytes 不超过字节预算；或队列为空且单帧不
+// 超过入站读上限——单条合法大帧（上限 10MiB 大于预算）不被预算饿死，
+// 此时队列滞留至多为该单帧。深度帽满同样丢弃（沿用 D2-04 丢新帧语义）。
+func (q *realtimeQueue) offer(payload []byte) bool {
+	n := int64(len(payload))
+	total := q.queuedBytes.Add(n)
+	if total > wsBroadcastQueueBytes && total != n {
+		q.queuedBytes.Add(-n)
+		q.noteDrop(n)
+		return false
+	}
+	select {
+	case q.ch <- payload:
+		return true
+	default:
+		q.queuedBytes.Add(-n)
+		q.noteDrop(n)
+		return false
+	}
+}
+
+func (q *realtimeQueue) noteDrop(n int64) {
+	q.dropped.Add(1)
+	q.droppedBytes.Add(n)
+}
+
+type commandResponse struct {
+	Type      string          `json:"type"`
+	Success   bool            `json:"success"`
+	Message   string          `json:"message"`
+	Data      json.RawMessage `json:"data,omitempty"`
+	RequestID string          `json:"requestId,omitempty"`
+}
+
+type pendingRequest struct {
+	nodeID int64
+	ch     chan CommandResult
+}
+
+const (
+	wsPingPeriod = 15 * time.Second
+	wsPongWait   = 45 * time.Second
+	wsWriteWait  = 5 * time.Second
+	// Max inbound WebSocket message size (10MB). Prevents a malicious or
+	// compromised peer from exhausting server memory with a single huge frame.
+	wsMaxMessageSize = 10 << 20
+	// D2-03: 同一用户可并存的实时会话上限（admin / monitor 各自计）。
+	// 前端全局共享一条连接，10 条足够多标签/多设备并存；超限拒新连接。
+	wsMaxSessionsPerUser = 10
+	// D2-04/D6-01: 每会话广播发送队列深度。队列满即丢弃该会话的本条
+	// 实时消息（metric/status 均为最新值语义，可丢），绝不阻塞广播方。
+	wsBroadcastQueueSize = 16
+	// R2-P1-F09: 每会话广播队列字节预算（深度帽之外的第二道帽）。
+	// 取值依据：仓内每会话队列的既有合规档为 4–6MiB（UDP 接收队列
+	// 4MiB、pht 接收队列约 6MiB），8MiB 与之同档；512MiB 小机上进程
+	// 软帽约 358MiB，单会话滞留从最坏 160MiB 压到稳态 ≤8MiB（单条
+	// 合法大帧至多 10MiB，见 realtimeQueue.offer 的空队列准入）。
+	wsBroadcastQueueBytes = 8 << 20
+	// R2-P1-F09: 广播丢弃聚合日志窗口——窗口内丢弃只计数、至多打
+	// 一条汇总，不逐帧打日志。
+	wsBroadcastDropLogWindow = 30 * time.Second
+	// D2-03: /system-info 未认证失败尝试按 IP 限流的窗口与上限。
+	// 每次失败鉴权都要打一次 DB（GetNodeBySecret / token 校验），
+	// 无限流时伪造 secret 洪泛可独占单连接 SQLite。
+	wsAuthFailWindow       = time.Minute
+	wsAuthFailMaxPerWindow = 60
+	wsAuthFailMaxHosts     = 4096
+)
+
+// CommandRejectedError is only produced for a correlated authenticated agent
+// response. Transport failures (including synthetic disconnect results) never
+// implement AgentRejected: callers must retain uncertainty for those failures.
+type CommandRejectedError struct{ Message string }
+
+func (e *CommandRejectedError) Error() string       { return e.Message }
+func (e *CommandRejectedError) AgentRejected() bool { return true }
+func IsCommandRejected(err error) bool {
+	var rejected *CommandRejectedError
+	return errors.As(err, &rejected)
+}
+
+type CommandResult struct {
+	agentRejected bool
+	Type          string                 `json:"type"`
+	Success       bool                   `json:"success"`
+	Message       string                 `json:"message"`
+	Data          map[string]interface{} `json:"data,omitempty"`
+}
+
+type Server struct {
+	repo              *repo.Repository
+	jwtSecret         string
+	upgrader          websocket.Upgrader
+	onNodeOnline      func(nodeID int64)
+	onNodeMetric      func(nodeID int64, info SystemInfo)
+	onNodeOffline     func(nodeID int64)
+	onNodeLateCommand func(nodeID, attemptID int64, command string, result CommandResult)
+	getUserAuthState  func(userID int64) (*auth.UserAuthState, error)
+	// Keep session replacement and its database/status effects in the same
+	// order. Stripes bound lock storage without holding the global map lock
+	// during database I/O; unrelated nodes normally use different locks.
+	nodeLifecycle [64]sync.Mutex
+
+	mu       sync.RWMutex
+	admins   map[*adminSession]struct{}
+	monitors map[*monitorSession]struct{}
+	nodes    map[int64]*nodeSession
+	byConn   map[*websocket.Conn]*nodeSession
+	pending  map[string]pendingRequest
+	// R2X-022：在途 Upgrade 的会话名额预留（按用户+入口计）。
+	// 与 admins/monitors 同受 s.mu 保护：计数与预留必须在同一把锁内
+	// 原子完成，否则计数检查与会话登记之间的 Upgrade 窗口可被并发突破。
+	wsReserved map[wsSessionReservationKey]int
+
+	// R2-P1-F09: 全服广播丢弃聚合计数（原子，无锁热路径）。
+	broadcastDropped      atomic.Int64
+	broadcastDroppedBytes atomic.Int64
+	lastBroadcastDropLog  atomic.Int64
+
+	authFail *wsAuthFailLimiter
+
+	// R-WS-TICKET：浏览器通道的短期单次票据表（进程内，不落库）。
+	tickets *wsTicketStore
+}
+
+// wsAuthFailLimiter 记录 /system-info 的未认证失败尝试（按 IP 固定窗口）。
+// 只对失败计数：正常 agent 重连与浏览器连接不受影响。
+type wsAuthFailBucket struct {
+	count       int
+	windowStart time.Time
+	lastSeen    time.Time
+}
+
+type wsAuthFailLimiter struct {
+	mu      sync.Mutex
+	buckets map[string]*wsAuthFailBucket
+}
+
+func newWSAuthFailLimiter() *wsAuthFailLimiter {
+	return &wsAuthFailLimiter{buckets: make(map[string]*wsAuthFailBucket)}
+}
+
+// blocked 报告该 IP 在当前窗口内失败次数是否已达上限。
+func (l *wsAuthFailLimiter) blocked(ip string, now time.Time) bool {
+	if l == nil {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b, ok := l.buckets[ip]
+	if !ok || now.Sub(b.windowStart) >= wsAuthFailWindow {
+		return false
+	}
+	return b.count >= wsAuthFailMaxPerWindow
+}
+
+func (l *wsAuthFailLimiter) recordFailure(ip string, now time.Time) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b, ok := l.buckets[ip]
+	if !ok {
+		// R18-C4-03：满桶时淘汰最旧活跃桶并告警（与
+		// loginUsernameLimiter.evictIfNeededLocked 同口径），绝不
+		// 静默丢弃新 IP 的失败记账（旧实现满桶直接 return，
+		// fail-open：4096 桶打满后新 IP 永不计数、限流失效）。
+		l.evictIfNeededLocked(now)
+		l.buckets[ip] = &wsAuthFailBucket{count: 1, windowStart: now, lastSeen: now}
+		return
+	}
+	b.lastSeen = now
+	if now.Sub(b.windowStart) >= wsAuthFailWindow {
+		b.count = 1
+		b.windowStart = now
+		return
+	}
+	b.count++
+}
+
+// evictIfNeededLocked 淘汰策略（与 loginUsernameLimiter 同形态）：
+// 优先清理过期桶；无过期桶时按 lastSeen 淘汰最旧活跃桶并告警；
+// 绝不让新键无条件挤占，也绝不让 map 无界增长。调用方须持 l.mu。
+func (l *wsAuthFailLimiter) evictIfNeededLocked(now time.Time) {
+	if len(l.buckets) < wsAuthFailMaxHosts {
+		return
+	}
+	for k, v := range l.buckets {
+		if now.Sub(v.windowStart) >= wsAuthFailWindow {
+			delete(l.buckets, k)
+		}
+	}
+	if len(l.buckets) < wsAuthFailMaxHosts {
+		return
+	}
+	var oldestKey string
+	var oldest time.Time
+	first := true
+	for k, v := range l.buckets {
+		if first || v.lastSeen.Before(oldest) {
+			oldestKey, oldest, first = k, v.lastSeen, false
+		}
+	}
+	if oldestKey != "" {
+		log.Printf("warning: ws auth fail limiter full (%d buckets), evicting oldest active bucket", len(l.buckets))
+		delete(l.buckets, oldestKey)
+	}
+}
+
+type SystemInfo struct {
+	Uptime           uint64  `json:"uptime"`
+	BytesReceived    uint64  `json:"bytes_received"`
+	BytesTransmitted uint64  `json:"bytes_transmitted"`
+	BootID           string  `json:"boot_id"`
+	CPUUsage         float64 `json:"cpu_usage"`
+	MemoryUsage      float64 `json:"memory_usage"`
+	DiskUsage        float64 `json:"disk_usage"`
+	Load1            float64 `json:"load1"`
+	Load5            float64 `json:"load5"`
+	Load15           float64 `json:"load15"`
+	TCPConns         int64   `json:"tcp_conns"`
+	UDPConns         int64   `json:"udp_conns"`
+	NetInSpeed       int64   `json:"net_in_speed"`
+	NetOutSpeed      int64   `json:"net_out_speed"`
+	// ConntrackCount/ConntrackMax（包 K）：宿主机连接跟踪表用
+	// 量，加法字段，旧 agent 不发为 0。
+	ConntrackCount int64 `json:"conntrack_count"`
+	ConntrackMax   int64 `json:"conntrack_max"`
+	// agent 内存面（包 K 扩围）：进程 RSS/总内存/活跃会话/
+	// 预算拒绝累计，与 socket SystemInfo 同名字段镜像。
+	AgentRSSBytes       int64 `json:"agent_rss_bytes"`
+	MemTotalBytes       int64 `json:"mem_total_bytes"`
+	ActiveSessions      int64 `json:"active_sessions"`
+	BudgetRejectedTotal int64 `json:"budget_rejected_total"`
+	BudgetEvictedTotal  int64 `json:"budget_evicted_total"`
+	// ConnlogMarkedForwards is the agent-reported count of
+	// currently loaded forward services carrying the connlog entry
+	// mark (nil = the agent did not report it: old agent, or no
+	// report yet). Pointer on purpose: a reported 0 means "mark
+	// absent" and is a mismatch when the node switch is on, while
+	// nil means "unknown" and must never be read as a mismatch.
+	ConnlogMarkedForwards *int64 `json:"connlog_marked_forwards,omitempty"`
+}
+
+func (s *Server) SetNodeOnlineHook(fn func(nodeID int64)) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.onNodeOnline = fn
+	s.mu.Unlock()
+}
+
+// SetNodeLateCommandHook reconciles attempt-bound async replies after their
+// pending wait ended, including replies received after a panel process restart.
+func (s *Server) SetNodeLateCommandHook(fn func(int64, int64, string, CommandResult)) {
+	s.mu.Lock()
+	s.onNodeLateCommand = fn
+	s.mu.Unlock()
+}
+
+func (s *Server) SetNodeOfflineHook(fn func(nodeID int64)) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.onNodeOffline = fn
+	s.mu.Unlock()
+}
+
+// DisconnectNode 主动断开指定节点的 agent 会话（D2-05）。
+// 删节点后调用：移除会话、在途命令以失败收尾、关连接并广播离线。
+// 节点行已删除，此处不再写 DB 状态。
+func (s *Server) DisconnectNode(nodeID int64) { s.disconnectNodeSession(nodeID, nil) }
+
+func (s *Server) disconnectNodeSession(nodeID int64, expected *nodeSession) bool {
+	if s == nil {
+		return true
+	}
+	lifecycle := s.nodeLifecycleLock(nodeID)
+	lifecycle.Lock()
+	defer lifecycle.Unlock()
+	s.mu.Lock()
+	ns, ok := s.nodes[nodeID]
+	if expected != nil && (ns != expected || !nodeSessionExpired(ns)) {
+		s.mu.Unlock()
+		return ns != expected
+	}
+	if ok {
+		delete(s.nodes, nodeID)
+		if ns != nil && ns.conn != nil && ns.conn.conn != nil {
+			delete(s.byConn, ns.conn.conn)
+		}
+	}
+	s.mu.Unlock()
+	if !ok || ns == nil {
+		return true
+	}
+	s.failPendingForNode(nodeID, "节点连接已断开")
+	if ns.conn != nil && ns.conn.conn != nil {
+		_ = ns.conn.conn.Close()
+	}
+	s.broadcastStatus(nodeID, 0)
+	if expected != nil {
+		if s.repo != nil {
+			_ = s.repo.UpdateNodeStatus(nodeID, 0)
+		}
+		s.mu.RLock()
+		hook := s.onNodeOffline
+		s.mu.RUnlock()
+		if hook != nil {
+			go hook(nodeID)
+		}
+	}
+	return true
+}
+
+// validateNodeSession 是节点会话的 keepalive 复验（D2-05）：
+// 节点仍存在且 secret 与建连时一致才有效——覆盖删节点（DB 侧
+// 直接删除）与 secret 轮换两种存量会话失效场景。无 repo 的嵌入
+// 场景无法复验，按有效处理（生产装配恒有 repo）。
+func (s *Server) validateNodeSession(nodeID int64, secret string) bool {
+	if s == nil || s.repo == nil {
+		return true
+	}
+	node, err := s.repo.GetNodeBySecret(secret)
+	return err == nil && node != nil && node.ID == nodeID
+}
+
+// IsNodeOnline reports whether the node has a live agent connection.
+func (s *Server) IsNodeOnline(nodeID int64) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ns, ok := s.nodes[nodeID]
+	return ok && !nodeSessionExpired(ns)
+}
+
+// NodeHasLifecycleGuard is tied to the live authenticated connection, not a
+// version string: backports deliberately keep the same release version.
+func (s *Server) NodeHasLifecycleGuard(nodeID int64) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ns := s.nodes[nodeID]
+	return ns != nil && !nodeSessionExpired(ns) && ns.lifecycleGuard
+}
+
+// BroadcastNodeStatus 把节点状态变更推送给 admin/monitor 实时会话。
+// 供面板侧状态对账（R4B03-001）在复位 DB status 时与断开路径同口径
+// 广播，使前端在线呈现不必等下一次列表拉取。
+func (s *Server) BroadcastNodeStatus(nodeID int64, status int) {
+	if s == nil {
+		return
+	}
+	s.broadcastStatus(nodeID, status)
+}
+
+func (s *Server) SetNodeMetricHook(fn func(nodeID int64, info SystemInfo)) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.onNodeMetric = fn
+	s.mu.Unlock()
+}
+
+func NewServer(repo *repo.Repository, jwtSecret string) *Server {
+	return &Server{
+		repo:      repo,
+		jwtSecret: jwtSecret,
+		upgrader: websocket.Upgrader{
+			CheckOrigin: func(r *http.Request) bool { return true },
+		},
+		admins:     make(map[*adminSession]struct{}),
+		monitors:   make(map[*monitorSession]struct{}),
+		nodes:      make(map[int64]*nodeSession),
+		byConn:     make(map[*websocket.Conn]*nodeSession),
+		pending:    make(map[string]pendingRequest),
+		wsReserved: make(map[wsSessionReservationKey]int),
+		authFail:   newWSAuthFailLimiter(),
+		tickets:    newWSTicketStore(),
+	}
+}
+
+func (s *Server) SetUserAuthStateLookup(fn func(userID int64) (*auth.UserAuthState, error)) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.getUserAuthState = fn
+	s.mu.Unlock()
+}
+
+// wsClientIP 是 WS 鉴权失败限流的键（L8-F-02 / R5-FC）：与登录、
+// gh 镜像共用 internal/clientip 的可信代理链解析——标准反代部署
+// 下 RemoteAddr 恒为代理机地址，裸键会让全体客户端共用一个失败
+// 桶（一人狂试、全站握手被连带 429）。解析不出任何地址时记入
+// 共享 UnresolvedKey 桶并告警（fail-closed 记账），不跳过限流、
+// 也不以含端口的原始串为键（端口轮换即绕过）。
+func wsClientIP(r *http.Request) string {
+	if key, ok := clientip.RateLimitKey(r); ok {
+		return key
+	}
+	log.Printf("warning: ws auth rate limit: cannot resolve client IP from RemoteAddr %q, accounting into shared bucket", r.RemoteAddr)
+	return clientip.UnresolvedKey
+}
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	typeVal := query.Get("type")
+	// F08 第 ① 步：节点 secret 取自 X-OVO-Node-Secret 头（优先）
+	// 或 URL query（回退）；query 暂不下掉——agent 未发头，见
+	// doc/guide/install.md“反向代理”节。secret 绝不进日志。
+	secret := nodeSecretFromRequest(r)
+	clientIP := wsClientIP(r)
+	now := time.Now()
+
+	// D2-03：失败鉴权已达上限的 IP 直接 429，不再打 DB。
+	if s.authFail.blocked(clientIP, now) {
+		http.Error(w, "too many requests", http.StatusTooManyRequests)
+		return
+	}
+	forbidden := func() {
+		s.authFail.recordFailure(clientIP, now)
+		http.Error(w, "forbidden", http.StatusForbidden)
+	}
+
+	if typeVal == "1" {
+		node, err := s.repo.GetNodeBySecret(secret)
+		if err != nil || node == nil {
+			forbidden()
+			return
+		}
+		s.handleNode(w, r, node.ID, secret)
+		return
+	}
+
+	if typeVal == "0" {
+		// R-WS-TICKET：浏览器通道只认短期单次票据（登录态 JWT 经
+		// Authorization 头向 POST /api/v1/system-info/ticket 换取）。
+		// 查询参数里的裸 JWT 不再被接受——本分支不读 secret 参数；
+		// secret 仅保留给 type=1 的 agent 节点通道（节点密钥）。
+		claims, ok := s.consumeWSTicketClaims(query.Get("ticket"))
+		if !ok {
+			forbidden()
+			return
+		}
+		userID, err := strconv.ParseInt(claims.Sub, 10, 64)
+		if err != nil {
+			forbidden()
+			return
+		}
+		if claims.RoleID == 0 {
+			if !s.validateAdminSession(userID, claims) {
+				forbidden()
+				return
+			}
+			s.handleAdmin(w, r, userID, claims)
+			return
+		}
+		if !s.validateMonitorSession(userID, claims) {
+			forbidden()
+			return
+		}
+		s.handleMonitor(w, r, userID, claims)
+		return
+	}
+
+	http.Error(w, "bad request", http.StatusBadRequest)
+}
+
+// userSessionCounts 返回该用户当前 admin / monitor 会话数（D2-03 上限判定）。
+func (s *Server) userSessionCounts(userID int64) (admins int, monitors int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for sess := range s.admins {
+		if sess.userID == userID {
+			admins++
+		}
+	}
+	for sess := range s.monitors {
+		if sess.userID == userID {
+			monitors++
+		}
+	}
+	return admins, monitors
+}
+
+// wsSessionKind 区分每用户会话上限的两个入口（各自计 10，互不占用）。
+type wsSessionKind string
+
+const (
+	wsSessionKindAdmin   wsSessionKind = "admin"
+	wsSessionKindMonitor wsSessionKind = "monitor"
+)
+
+type wsSessionReservationKey struct {
+	userID int64
+	kind   wsSessionKind
+}
+
+// registeredWSSessionsLocked 返回该用户该入口已登记的会话数。
+// 调用方须持有 s.mu（读或写）。
+func (s *Server) registeredWSSessionsLocked(userID int64, kind wsSessionKind) int {
+	count := 0
+	switch kind {
+	case wsSessionKindAdmin:
+		for sess := range s.admins {
+			if sess.userID == userID {
+				count++
+			}
+		}
+	case wsSessionKindMonitor:
+		for sess := range s.monitors {
+			if sess.userID == userID {
+				count++
+			}
+		}
+	}
+	return count
+}
+
+// reserveWSSession 是 admin/monitor 两入口共用的会话名额预留（R2X-022）。
+// 在同一把 s.mu 内原子完成「计数（已登记会话 + 在途预留）+ 预留」：
+// 预留成功后 Upgrade 失败必须 releaseWSSessionReservation 回滚，
+// Upgrade 成功必须经 activate*WSSession 在同一次加锁内把预留原子
+// 转换为已登记会话——任何路径都不得直接绕过预留登记会话。
+func (s *Server) reserveWSSession(userID int64, kind wsSessionKind) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.wsReserved == nil {
+		s.wsReserved = make(map[wsSessionReservationKey]int)
+	}
+	key := wsSessionReservationKey{userID: userID, kind: kind}
+	if s.registeredWSSessionsLocked(userID, kind)+s.wsReserved[key] >= wsMaxSessionsPerUser {
+		return false
+	}
+	s.wsReserved[key]++
+	return true
+}
+
+// releaseWSSessionReservation 回滚一份未转为登记会话的预留
+// （Upgrade 失败路径）。调用方须确保该预留尚未被 activate 消费。
+func (s *Server) releaseWSSessionReservation(userID int64, kind wsSessionKind) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.consumeWSReservationLocked(userID, kind)
+}
+
+// consumeWSReservationLocked 在持有 s.mu 时消费一份预留；无预留时无操作。
+func (s *Server) consumeWSReservationLocked(userID int64, kind wsSessionKind) {
+	key := wsSessionReservationKey{userID: userID, kind: kind}
+	if s.wsReserved[key] > 1 {
+		s.wsReserved[key]--
+		return
+	}
+	delete(s.wsReserved, key)
+}
+
+// activateAdminWSSession 在同一次加锁内「预留−1 + admin 会话入 map」
+// 原子转换：转换瞬间总数（登记+预留）不变，并发计数永不出现空窗。
+func (s *Server) activateAdminWSSession(userID int64, session *adminSession) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.consumeWSReservationLocked(userID, wsSessionKindAdmin)
+	if s.admins == nil {
+		s.admins = make(map[*adminSession]struct{})
+	}
+	s.admins[session] = struct{}{}
+}
+
+// activateMonitorWSSession 同 activateAdminWSSession，monitor 入口。
+func (s *Server) activateMonitorWSSession(userID int64, session *monitorSession) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.consumeWSReservationLocked(userID, wsSessionKindMonitor)
+	if s.monitors == nil {
+		s.monitors = make(map[*monitorSession]struct{})
+	}
+	s.monitors[session] = struct{}{}
+}
+
+// wsReservationCount 返回该用户该入口当前在途预留数（测试与诊断用）。
+func (s *Server) wsReservationCount(userID int64, kind wsSessionKind) int {
+	if s == nil {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.wsReserved[wsSessionReservationKey{userID: userID, kind: kind}]
+}
+
+// runRealtimeWriter 是每会话独立的广播写 goroutine（D2-04/D6-01）：
+// 广播方只往会话队列非阻塞投递，慢消费者只会拖住自己的 writer——
+// 写失败即关连接逐出（读循环随之退出并清理会话），不阻塞任何人。
+func runRealtimeWriter(cw *connWrap, queue *realtimeQueue, done <-chan struct{}) {
+	for {
+		select {
+		case <-done:
+			return
+		case msg := <-queue.ch:
+			queue.queuedBytes.Add(-int64(len(msg)))
+			if err := writeWSMessage(cw, websocket.TextMessage, msg); err != nil {
+				_ = cw.conn.Close()
+				return
+			}
+		}
+	}
+}
+
+func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request, userID int64, claims auth.Claims) {
+	// R2X-022：Upgrade 前原子预留名额（与 handleMonitor 共用同一 helper），
+	// 计数与登记不再隔着 Upgrade 形成 check-then-act 窗口。
+	if !s.reserveWSSession(userID, wsSessionKindAdmin) {
+		http.Error(w, "too many sessions", http.StatusTooManyRequests)
+		return
+	}
+	conn, err := s.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		s.releaseWSSessionReservation(userID, wsSessionKindAdmin)
+		return
+	}
+	conn.SetReadLimit(wsMaxMessageSize)
+	cw := &connWrap{conn: conn}
+	_ = conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	})
+	done := make(chan struct{})
+	session := &adminSession{userID: userID, claims: claims, conn: cw, queue: newRealtimeQueue()}
+	go runRealtimeWriter(cw, session.queue, done)
+	go startKeepalive(cw, done, func() bool {
+		return s.validateAdminSession(session.userID, session.claims)
+	})
+
+	// 同一次加锁内把预留原子转换为已登记会话。
+	s.activateAdminWSSession(userID, session)
+
+	defer func() {
+		close(done)
+		s.mu.Lock()
+		delete(s.admins, session)
+		s.mu.Unlock()
+		_ = conn.Close()
+	}()
+
+	for {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+	}
+}
+
+func (s *Server) handleMonitor(w http.ResponseWriter, r *http.Request, userID int64, claims auth.Claims) {
+	// R2X-022：与 handleAdmin 共用同一预留 helper（见 handleAdmin 注）。
+	if !s.reserveWSSession(userID, wsSessionKindMonitor) {
+		http.Error(w, "too many sessions", http.StatusTooManyRequests)
+		return
+	}
+	conn, err := s.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		s.releaseWSSessionReservation(userID, wsSessionKindMonitor)
+		return
+	}
+	conn.SetReadLimit(wsMaxMessageSize)
+	cw := &connWrap{conn: conn}
+	_ = conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	})
+	done := make(chan struct{})
+	session := &monitorSession{userID: userID, claims: claims, conn: cw, queue: newRealtimeQueue()}
+	go runRealtimeWriter(cw, session.queue, done)
+	go startKeepalive(cw, done, func() bool {
+		return s.validateMonitorSession(session.userID, session.claims)
+	})
+
+	// 同一次加锁内把预留原子转换为已登记会话。
+	s.activateMonitorWSSession(userID, session)
+
+	defer func() {
+		close(done)
+		s.mu.Lock()
+		delete(s.monitors, session)
+		s.mu.Unlock()
+		_ = conn.Close()
+	}()
+
+	for {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+	}
+}
+
+func (s *Server) handleNode(w http.ResponseWriter, r *http.Request, nodeID int64, secret string) {
+	conn, err := s.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	conn.SetReadLimit(wsMaxMessageSize)
+	cw := &connWrap{conn: conn}
+	ns := &nodeSession{nodeID: nodeID, secret: secret, conn: cw, lifecycleGuard: r.URL.Query().Get("lifecycleGuard") == "1"}
+	ns.pongDeadline.Store(time.Now().Add(wsPongWait).UnixNano())
+	_ = conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	conn.SetPongHandler(func(string) error {
+		deadline := time.Now().Add(wsPongWait)
+		ns.pongDeadline.Store(deadline.UnixNano())
+		return conn.SetReadDeadline(deadline)
+	})
+	done := make(chan struct{})
+	// D2-05：节点会话与用户会话对齐——keepalive 周期复验节点仍存在
+	// 且 secret 未轮换；删节点/换 secret 后存量会话最迟一个周期被踢线。
+	go startKeepalive(cw, done, func() bool {
+		return s.validateNodeSession(nodeID, secret)
+	})
+
+	// F2-04：握手自报按「参数在场」落库——缺参不再塌缩成 0/空
+	// 串覆写既有版本与能力位（老 agent 不带能力位、或参数被中
+	// 间层剥离时，旧实现会把真实值清零）。
+	query := r.URL.Query()
+	connectionIP, _ := clientip.RateLimitKey(r)
+	onlineReport := repo.NodeOnlineReport{Status: 1, ConnectionID: strconv.FormatInt(time.Now().UnixNano(), 10), ConnectionIP: connectionIP, ConnectedAt: time.Now().UnixMilli()}
+	if query.Has("version") {
+		v := query.Get("version")
+		onlineReport.Version = &v
+	}
+	if query.Has("http") {
+		n := parseIntDefault(query.Get("http"), 0)
+		onlineReport.HTTP = &n
+	}
+	if query.Has("tls") {
+		n := parseIntDefault(query.Get("tls"), 0)
+		onlineReport.TLS = &n
+	}
+	if query.Has("socks") {
+		n := parseIntDefault(query.Get("socks"), 0)
+		onlineReport.Socks = &n
+	}
+	// NU-07：握手自报的运行中二进制 SHA-256（agent 侧
+	// runningBinarySHA，见 go-gost/x/socket/websocket_reporter.go）。
+	// 在场且合法才落库；非法值按未自报处理（只记一行不带值的日志，
+	// 不让脏值污染核验比对）；缺参时 BinarySHA 保持 nil，仓储层按
+	// 会话绑定口径清空旧值。
+	if query.Has("binSha") {
+		if sha := validNodeBinarySHA(query.Get("binSha")); sha != "" {
+			onlineReport.BinarySHA = &sha
+		} else if strings.TrimSpace(query.Get("binSha")) != "" {
+			log.Printf("node online binSha ignored node_id=%d: malformed sha256", nodeID)
+		}
+	}
+
+	lifecycle := s.nodeLifecycleLock(nodeID)
+	lifecycle.Lock()
+	s.mu.Lock()
+	if old, ok := s.nodes[nodeID]; ok {
+		_ = old.conn.conn.Close()
+		delete(s.byConn, old.conn.conn)
+	}
+	// 初始化 AES 加密器并缓存（仅创建一次）
+	var nodeCrypto *security.AESCrypto
+	if strings.TrimSpace(secret) != "" {
+		nodeCrypto, _ = security.NewAESCrypto(secret)
+	}
+	ns.crypto = nodeCrypto
+	s.nodes[nodeID] = ns
+	s.byConn[conn] = ns
+	s.mu.Unlock()
+
+	if err := s.repo.UpdateNodeOnlineReport(nodeID, onlineReport); err != nil {
+		log.Printf("node online status write failed node_id=%d: %v", nodeID, err)
+		s.mu.Lock()
+		delete(s.nodes, nodeID)
+		delete(s.byConn, conn)
+		s.mu.Unlock()
+		lifecycle.Unlock()
+		close(done)
+		_ = conn.Close()
+		return
+	}
+	s.broadcastStatus(nodeID, 1)
+
+	s.mu.RLock()
+	onlineHook := s.onNodeOnline
+	s.mu.RUnlock()
+	if onlineHook != nil {
+		go onlineHook(nodeID)
+	}
+	lifecycle.Unlock()
+	go s.watchNodePongDeadline(ns, done)
+
+	defer func() {
+		close(done)
+		lifecycle.Lock()
+		defer lifecycle.Unlock()
+		needOfflineBroadcast := false
+		s.mu.Lock()
+		current, ok := s.nodes[nodeID]
+		if ok && current.conn != nil && current.conn.conn == conn {
+			delete(s.nodes, nodeID)
+			needOfflineBroadcast = true
+		}
+		delete(s.byConn, conn)
+		s.mu.Unlock()
+		if needOfflineBroadcast {
+			s.failPendingForNode(nodeID, "节点连接已断开")
+			_ = s.repo.UpdateNodeStatus(nodeID, 0)
+			s.broadcastStatus(nodeID, 0)
+			s.mu.RLock()
+			offlineHook := s.onNodeOffline
+			s.mu.RUnlock()
+			if offlineHook != nil {
+				go offlineHook(nodeID)
+			}
+		}
+		_ = conn.Close()
+	}()
+
+	for {
+		_, payload, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+
+		msg := decryptIfNeeded(payload, ns.crypto, secret)
+		s.tryResolvePending(nodeID, msg)
+
+		var parsed struct {
+			Type      string `json:"type"`
+			RequestID string `json:"requestId"`
+		}
+		_ = json.Unmarshal([]byte(msg), &parsed)
+		// D2-02：带 requestId 的是命令的定向响应，已由 tryResolvePending
+		// 回执给等待方，绝不广播（旧实现经 default 分支把响应原文推给
+		// 全部 admin+monitor 会话，越过其 REST 可见范围）。
+		if parsed.RequestID != "" {
+			continue
+		}
+		if parsed.Type != "" {
+			switch parsed.Type {
+			case "UninstallResult":
+				// C4-G2：agent 卸载终局上报（受理回执之外的第二
+				// 段），落待卸载登记状态；不进广播白名单。
+				s.handleUninstallResult(nodeID, msg)
+				continue
+			case "metric":
+				// Agent 新版指标消息：{type:"metric", data:{...}}
+				var envelope struct {
+					Data json.RawMessage `json:"data"`
+				}
+				if err := json.Unmarshal([]byte(msg), &envelope); err == nil && len(envelope.Data) > 0 {
+					// 解析 SystemInfo 并调用 hook
+					var sysInfo SystemInfo
+					if json.Unmarshal(envelope.Data, &sysInfo) == nil {
+						s.mu.RLock()
+						onMetric := s.onNodeMetric
+						s.mu.RUnlock()
+						if onMetric != nil {
+							// X-P3-30（L-12-1）：直调。hook 本体仅内存
+							// 追加、短命；旧实现每帧起 goroutine 无背压，
+							// 高频帧可瞬时堆积 goroutine。
+							onMetric(nodeID, sysInfo)
+						}
+					}
+					// 广播内层 data 给前端（保持平坦结构兼容性）
+					s.broadcastTyped(nodeID, "metric", string(envelope.Data))
+				}
+				continue
+			case "UpgradeProgress":
+				s.broadcastTyped(nodeID, "upgrade_progress", msg)
+				continue
+			default:
+				// D2-02：广播改白名单制——仅 metric / upgrade_progress
+				// 进实时广播。未知类型一律不广播（旧 default 全量广播是
+				// fail-open：未来新增 agent 上行类型会自动进入 monitor
+				// 可见集）。只记类型名，不记原文（原文可能含敏感数据）。
+				// R2-X2-02 例外：agent 解析前错误六型是封闭诊断集，
+				// 其中解密前即失败的型（DecryptError / NoDecryptor /
+				// 解密前外层 StaleTimestamp 预筛）无 requestId 可挂靠
+				// （requestId 在未解密内层、构造上不可得），其 message
+				// 是面板侧唯一能拿到失败明示原因的通道——仅对这六型
+				// 记下经单行化＋截断的 message，仍不广播、不改
+				// fail-closed。解密后的内层拒绝（MissingInnerTimestamp
+				// / StaleTimestamp，R18-R2-D1-03）已带 requestId，
+				// 走 tryResolvePending 精确结清，不到这里。
+				// F2-05：在记日志之外，把该帧按连接关联到本节点最早
+				// 的在途命令并以点名真因结清——等待方不再等满泛化
+				// 超时才知道是时钟偏差/解密失败。
+				if cmdReason, ok := agentPreParseErrorCommandReason(parsed.Type, msg); ok {
+					if s.failOldestPendingForNode(nodeID, cmdReason) {
+						log.Printf("websocket: agent pre-parse error type=%q from node %d settled oldest pending command: %s", parsed.Type, nodeID, cmdReason)
+						continue
+					}
+				}
+				if reason, ok := agentPreParseErrorReason(parsed.Type, msg); ok {
+					log.Printf("websocket: agent pre-parse error type=%q from node %d: %s", parsed.Type, nodeID, reason)
+					continue
+				}
+				log.Printf("websocket: dropping non-whitelisted agent message type=%q from node %d", parsed.Type, nodeID)
+				continue
+			}
+		}
+
+		// 兼容旧版 Agent：无 type 字段的系统信息消息
+		if looksLikeSystemInfoMessage(msg) {
+			var sysInfo SystemInfo
+			if err := json.Unmarshal([]byte(msg), &sysInfo); err == nil {
+				s.mu.RLock()
+				onMetric := s.onNodeMetric
+				s.mu.RUnlock()
+				if onMetric != nil {
+					// X-P3-30（L-12-1）：同 metric 分支，直调不另起 goroutine。
+					onMetric(nodeID, sysInfo)
+				}
+				s.broadcastTyped(nodeID, "metric", msg)
+				continue
+			}
+		}
+
+		// D2-02：无 type 且不像系统信息的消息同样不广播（白名单制）。
+	}
+}
+
+// watchNodePongDeadline removes an expired session even when the read loop is
+// blocked in metric ingestion or a database callback. Pongs are processed by
+// the reader; mere membership and successful TCP writes are not liveness proof.
+func (s *Server) watchNodePongDeadline(ns *nodeSession, done <-chan struct{}) {
+	for {
+		remaining := time.Until(time.Unix(0, ns.pongDeadline.Load()))
+		if remaining <= 0 {
+			if s.disconnectNodeSession(ns.nodeID, ns) {
+				return
+			}
+			continue
+		}
+		timer := time.NewTimer(remaining)
+		select {
+		case <-done:
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+}
+func nodeSessionExpired(ns *nodeSession) bool {
+	return ns != nil && ns.pongDeadline.Load() > 0 && time.Now().UnixNano() >= ns.pongDeadline.Load()
+}
+
+// agentPreParseErrorTypes 是 agent 在命令解析前即失败时回的封闭
+// 错误型集（go-gost/x/socket/websocket_reporter.go 的 sendErrorResponse
+// 调用点全集）。这六型的 message 由 agent 本地错误值生成，是诊断
+// 信息而非命令载荷。R18-R2-D1-02：D1-01 新增的第六型
+// MissingInnerTimestamp 在此补齐，否则旧面板升新 agent 后面板
+// 的结构化原因映射漏掉它，日志侧走不到命名分支。
+var agentPreParseErrorTypes = map[string]bool{
+	"StaleTimestamp":        true,
+	"DecryptError":          true,
+	"NoDecryptor":           true,
+	"DecompressError":       true,
+	"ParseError":            true,
+	"MissingInnerTimestamp": true,
+}
+
+// sanitizeAgentLogText 是 agent 文本进日志前的统一脱敏口径（R18-C4-04）：
+// 换行/回车折空格（防日志注入伪造行），按 256 rune 截断——与
+// agentPreParseErrorReason（R2-X2-02）的既有口径共用，卸载路径
+// 日志点（handleUninstallResult 的 warnings 与失败原因）与预解析错误
+// 口径均走它。注意：这只管日志面，入库/回显的原因原文不动。
+func sanitizeAgentLogText(s string) string {
+	text := strings.NewReplacer("\r", " ", "\n", " ").Replace(s)
+	if r := []rune(text); len(r) > 256 {
+		text = string(r[:256]) + "…"
+	}
+	return text
+}
+
+// agentPreParseErrorReason 为 R2-X2-02 的日志侧关联口径：仅当消息
+// 类型属解析前错误六型时，提取其 message 并做日志安全化（换行折
+// 空格、防日志注入；按 256 rune 截断）。非六型或无 message 时返回
+// false，调用方维持只记类型名的既有口径。
+func agentPreParseErrorReason(msgType, msg string) (string, bool) {
+	if !agentPreParseErrorTypes[msgType] {
+		return "", false
+	}
+	var body struct {
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(msg), &body); err != nil || body.Message == "" {
+		return "", false
+	}
+	return sanitizeAgentLogText(body.Message), true
+}
+
+func looksLikeSystemInfoMessage(msg string) bool {
+	// Keep this as a cheap heuristic so that arbitrary JSON objects don't get
+	// misclassified as metrics (SystemInfo unmarshal would otherwise succeed with
+	// all-zero values).
+	if strings.TrimSpace(msg) == "" {
+		return false
+	}
+	if !strings.Contains(msg, "{") {
+		return false
+	}
+
+	keys := []string{
+		"\"uptime\"",
+		"\"cpu_usage\"",
+		"\"memory_usage\"",
+		"\"disk_usage\"",
+		"\"bytes_received\"",
+		"\"bytes_transmitted\"",
+		"\"net_in_speed\"",
+		"\"net_out_speed\"",
+		"\"tcp_conns\"",
+		"\"udp_conns\"",
+		"\"load1\"",
+		"\"load5\"",
+		"\"load15\"",
+	}
+	matched := 0
+	for _, k := range keys {
+		if strings.Contains(msg, k) {
+			matched++
+			if matched >= 3 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s *Server) SendCommand(nodeID int64, cmdType string, data interface{}, timeout time.Duration) (CommandResult, error) {
+	return s.SendCommandContext(context.Background(), nodeID, cmdType, data, timeout)
+}
+
+// ErrNodeOffline 是 SendCommandContext 在写出前即失败的哨兵：
+// 会话不存在、被替换或已过 Pong 截止，命令一个字节都没发出去——调用方据此判定“确定
+// 未下发”（IL-NU-03）。写出后的一切失败（超时/断连/通道关
+// 闭）都不是这个错，命令可能已到达 agent，必须按“可能已下
+// 发”跟踪，不得当作未下发释放互斥。
+var ErrNodeOffline = errors.New("节点不在线")
+
+// SendCommandContext X-P3-26：带上下文的 SendCommand 变体——ctx 取消时
+// 立即清理 pending 并返回 ctx.Err()，不再等满 timeout（批量升级/下发在
+// 请求取消后须停止派发与等待）。
+func (s *Server) SendCommandContext(ctx context.Context, nodeID int64, cmdType string, data interface{}, timeout time.Duration) (CommandResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return CommandResult{}, err
+	}
+	if s == nil {
+		return CommandResult{}, errors.New("server not initialized")
+	}
+	if strings.TrimSpace(cmdType) == "" {
+		return CommandResult{}, errors.New("command type is empty")
+	}
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+
+	s.mu.RLock()
+	ns, ok := s.nodes[nodeID]
+	s.mu.RUnlock()
+	if !ok || ns == nil || ns.conn == nil || ns.conn.conn == nil || nodeSessionExpired(ns) {
+		return CommandResult{}, ErrNodeOffline
+	}
+
+	requestID := fmt.Sprintf("%d_%d", nodeID, time.Now().UnixNano())
+	if asyncNodeLifecycleCommand(cmdType) {
+		if payload, ok := data.(map[string]interface{}); ok {
+			field := "attemptId"
+			if cmdType == "UninstallAgent" {
+				field = "issuedAt"
+			}
+			if attempt, ok := payload[field].(int64); ok && attempt > 0 && attempt <= int64(^uint64(0)>>1)/int64(time.Millisecond) {
+				requestID = fmt.Sprintf("%d_%s_%d", nodeID, cmdType, attempt*int64(time.Millisecond))
+				// Uninstall retries deliberately reuse issuedAt; preserve a unique request
+				// suffix so overlapping same-key receipts cannot overwrite a waiter.
+				if cmdType == "UninstallAgent" {
+					requestID += fmt.Sprintf("_%d", time.Now().UnixNano())
+				}
+			}
+		}
+	}
+	ch := make(chan CommandResult, 1)
+
+	s.mu.Lock()
+	s.pending[requestID] = pendingRequest{nodeID: nodeID, ch: ch}
+	s.mu.Unlock()
+
+	cleanup := func() {
+		s.mu.Lock()
+		if p, exists := s.pending[requestID]; exists {
+			delete(s.pending, requestID)
+			close(p.ch)
+		}
+		s.mu.Unlock()
+	}
+
+	cmdPayload := map[string]interface{}{
+		"type":      cmdType,
+		"data":      data,
+		"requestId": requestID,
+		// R18-D1-01: the authoritative command timestamp lives
+		// INSIDE the AES-GCM payload — the agent validates this
+		// field after decryption. The wrapper's outer timestamp
+		// below is only a pre-screen and must never be trusted
+		// for replay defence.
+		"timestamp": time.Now().UnixMilli(),
+	}
+	// DB-5：TcpPing 附带面板侧超时预算，
+	// 新 agent 据此在节点侧排队/放弃；老 agent 忽略未知字段照常工作。
+	if cmdType == "TcpPing" {
+		cmdPayload["timeoutMs"] = timeout.Milliseconds()
+	}
+	rawCmd, err := json.Marshal(cmdPayload)
+	if err != nil {
+		cleanup()
+		return CommandResult{}, err
+	}
+
+	messageData := rawCmd
+	if ns.crypto != nil {
+		encrypted, err := ns.crypto.Encrypt(rawCmd)
+		if err != nil {
+			cleanup()
+			return CommandResult{}, err
+		}
+		wrapper := map[string]interface{}{
+			"encrypted": true,
+			"data":      encrypted,
+			"timestamp": time.Now().UnixMilli(),
+		}
+		messageData, err = json.Marshal(wrapper)
+		if err != nil {
+			cleanup()
+			return CommandResult{}, err
+		}
+	}
+
+	// Serialize with other writers, then revalidate this exact session before
+	// writing. Replacement/expiry since the initial lookup means no dispatch.
+	ns.conn.mu.Lock()
+	s.mu.RLock()
+	current := s.nodes[nodeID] == ns && !nodeSessionExpired(ns)
+	s.mu.RUnlock()
+	if !current {
+		err = ErrNodeOffline
+	} else {
+		_ = ns.conn.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+		err = ns.conn.conn.WriteMessage(websocket.TextMessage, messageData)
+		_ = ns.conn.conn.SetWriteDeadline(time.Time{})
+	}
+	ns.conn.mu.Unlock()
+	if err != nil {
+		cleanup()
+		return CommandResult{}, err
+	}
+
+	select {
+	case <-ctx.Done():
+		cleanup()
+		return CommandResult{}, ctx.Err()
+	case result, ok := <-ch:
+		if !ok {
+			return CommandResult{}, errors.New("命令通道已关闭")
+		}
+		if !result.Success {
+			if strings.TrimSpace(result.Message) == "" {
+				result.Message = "命令执行失败"
+			}
+			if result.agentRejected {
+				return result, &CommandRejectedError{Message: result.Message}
+			}
+			return result, errors.New(result.Message)
+		}
+		return result, nil
+	case <-time.After(timeout):
+		cleanup()
+		return CommandResult{}, errors.New("等待节点响应超时")
+	}
+}
+
+func (s *Server) tryResolvePending(nodeID int64, message string) {
+	if s == nil || strings.TrimSpace(message) == "" {
+		return
+	}
+
+	// 快速短路：指标消息永远不含 requestId，跳过完整 JSON 解析
+	if !strings.Contains(message, "\"requestId\"") {
+		return
+	}
+
+	var resp commandResponse
+	if err := json.Unmarshal([]byte(message), &resp); err != nil {
+		return
+	}
+	if strings.TrimSpace(resp.RequestID) == "" {
+		return
+	}
+
+	result := CommandResult{agentRejected: !resp.Success, Type: resp.Type, Success: resp.Success, Message: resp.Message}
+	if len(resp.Data) > 0 {
+		_ = json.Unmarshal(resp.Data, &result.Data)
+	}
+	s.mu.Lock()
+	p, ok := s.pending[resp.RequestID]
+	// Check the authenticated node before consuming a global pending request.
+	if ok && p.nodeID != nodeID {
+		s.mu.Unlock()
+		return
+	}
+	if ok {
+		delete(s.pending, resp.RequestID)
+	}
+	hook := s.onNodeLateCommand
+	s.mu.Unlock()
+	if !ok {
+		if attempt, command, valid := nodeLifecycleAttempt(resp.RequestID, nodeID); valid && hook != nil && (resp.Type == command+"Response" || agentPreParseErrorTypes[resp.Type] || (!resp.Success && resp.Type == "UnknownCommandResponse")) {
+			hook(nodeID, attempt, command, result)
+		}
+		return
+	}
+
+	select {
+	case p.ch <- result:
+	default:
+	}
+	close(p.ch)
+}
+
+func (s *Server) failPendingForNode(nodeID int64, message string) {
+	if s == nil {
+		return
+	}
+
+	type pair struct {
+		id string
+		pr pendingRequest
+	}
+	items := make([]pair, 0)
+
+	s.mu.Lock()
+	for id, pr := range s.pending {
+		if pr.nodeID != nodeID {
+			continue
+		}
+		items = append(items, pair{id: id, pr: pr})
+		delete(s.pending, id)
+	}
+	s.mu.Unlock()
+
+	for _, item := range items {
+		select {
+		case item.pr.ch <- CommandResult{Success: false, Message: message}:
+		default:
+		}
+		close(item.pr.ch)
+	}
+}
+
+// failOldestPendingForNode 只结清该节点最早的一条在途命令
+// （F2-05）：agent 的解析前拒绝帧构造上不带 requestId（拒绝发
+// 生在解密之前，requestId 在未解密内层、不可得），无法精确认领
+// 是哪条命令被拒；命令按发送顺序被 agent 接收处理，最早在途者
+// 即最可能的被拒者。解密后的内层拒绝（MissingInnerTimestamp /
+// StaleTimestamp，R18-R2-D1-03）已带 requestId，走 tryResolvePending
+// 精确结清，不到这里。以真因结清它，等待方立即拿到点名原因，
+// 不再等满超时只见泛化文案；其余在途命令不受影响（它们已被
+// agent 正常解析）。requestId 形如 <nodeID>_<unixnano>，以纳秒
+// 后缀定序。
+func (s *Server) failOldestPendingForNode(nodeID int64, message string) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	var oldestID string
+	var oldest pendingRequest
+	var oldestSeq int64 = -1
+	for id, pr := range s.pending {
+		if pr.nodeID != nodeID {
+			continue
+		}
+		seq := int64(-1)
+		if idx := strings.LastIndex(id, "_"); idx >= 0 {
+			if n, err := strconv.ParseInt(id[idx+1:], 10, 64); err == nil {
+				seq = n
+			}
+		}
+		if oldestSeq == -1 || (seq >= 0 && seq < oldestSeq) {
+			oldestID, oldest, oldestSeq = id, pr, seq
+		}
+	}
+	if oldestSeq == -1 && oldestID == "" {
+		s.mu.Unlock()
+		return false
+	}
+	delete(s.pending, oldestID)
+	s.mu.Unlock()
+
+	select {
+	case oldest.ch <- CommandResult{Success: false, Message: message}:
+	default:
+	}
+	close(oldest.ch)
+	return true
+}
+
+// agentPreParseErrorCommandReason 把 agent 解析前错误六型映射
+// 为对等待方的点名结清文案（F2-05）：型别即真因（时钟偏差/
+// 解密失败等），附带 agent 自带 message 的安全化摘要。非六型
+// 返回 false。
+func agentPreParseErrorCommandReason(msgType, msg string) (string, bool) {
+	var base string
+	switch msgType {
+	case "StaleTimestamp":
+		base = "节点拒绝命令：面板与节点时钟偏差过大（StaleTimestamp），请校准节点与面板时间后重试"
+	case "DecryptError":
+		base = "节点拒绝命令：命令解密失败（DecryptError），节点密钥可能已轮换或与面板不一致"
+	case "NoDecryptor":
+		base = "节点拒绝命令：节点无可用解密器（NoDecryptor），节点密钥可能已轮换或与面板不一致"
+	case "DecompressError":
+		base = "节点拒绝命令：命令解压失败（DecompressError）"
+	case "ParseError":
+		base = "节点拒绝命令：命令帧解析失败（ParseError）"
+	case "MissingInnerTimestamp":
+		// R18-R2-D1-02：面板版本过旧（发不出内层时间戳）是本型
+		// 的首要成因，点名升级顺序；顺序门（upgrade.go）本应
+		// 在下发前拦住先升 agent，本分支是旧面板绕过门禁
+		// （如脚本直装新 agent）后的兜底诊断。
+		base = "节点拒绝命令：面板版本过旧（MissingInnerTimestamp），请先升级面板后重试"
+	default:
+		return "", false
+	}
+	if detail, ok := agentPreParseErrorReason(msgType, msg); ok && detail != "" {
+		return base + "：agent 原文：" + detail, true
+	}
+	return base, true
+}
+
+func (s *Server) broadcastStatus(nodeID int64, status int) {
+	payload := map[string]interface{}{
+		"id":   strconv.FormatInt(nodeID, 10),
+		"type": "status",
+		"data": status,
+	}
+	raw, _ := json.Marshal(payload)
+	s.broadcastToRealtime(string(raw))
+}
+
+func (s *Server) broadcastTyped(nodeID int64, msgType string, data string) {
+	payload := broadcastMessage{ID: nodeID, Type: msgType, Data: data}
+	raw, _ := json.Marshal(payload)
+	s.broadcastToRealtime(string(raw))
+}
+
+// broadcastToRealtime 把实时消息投递到各会话的发送队列（D2-04/D6-01）。
+// 旧实现在节点读循环内同步串行直写全部会话：一个慢消费者每次广播
+// 吃满 5s 写截止，队头阻塞该节点的全部后续消息。现改为非阻塞投递：
+// 队列满即丢弃该会话的本条消息（实时值为最新值语义），实际写由
+// runRealtimeWriter 完成，写失败在那里关连接逐出。R2-P1-F09 起每
+// 队列另有字节预算后盾（realtimeQueue.offer），丢弃计数并聚合上报。
+func (s *Server) broadcastToRealtime(message string) {
+	payload := []byte(message)
+	s.mu.RLock()
+	queues := make([]*realtimeQueue, 0, len(s.admins)+len(s.monitors))
+	for c := range s.admins {
+		if c != nil && c.queue != nil {
+			queues = append(queues, c.queue)
+		}
+	}
+	for c := range s.monitors {
+		if c != nil && c.queue != nil {
+			queues = append(queues, c.queue)
+		}
+	}
+	s.mu.RUnlock()
+
+	for _, q := range queues {
+		if !q.offer(payload) {
+			// 慢消费者：丢本条，不阻塞广播方与其他会话。
+			s.noteBroadcastDrop(int64(len(payload)))
+		}
+	}
+}
+
+// noteBroadcastDrop 汇总全服广播丢弃计数，并按窗口聚合打一条日志
+// （窗口内至多一条，不逐帧打）。聚合计数同时供测试与后续观测面读取。
+func (s *Server) noteBroadcastDrop(n int64) {
+	s.broadcastDropped.Add(1)
+	s.broadcastDroppedBytes.Add(n)
+	now := time.Now().UnixNano()
+	last := s.lastBroadcastDropLog.Load()
+	if now-last < int64(wsBroadcastDropLogWindow) {
+		return
+	}
+	if s.lastBroadcastDropLog.CompareAndSwap(last, now) {
+		log.Printf("ws realtime broadcast backpressure: dropped_frames=%d dropped_bytes=%d (per-session byte budget %d, queue depth %d)",
+			s.broadcastDropped.Load(), s.broadcastDroppedBytes.Load(), wsBroadcastQueueBytes, wsBroadcastQueueSize)
+	}
+}
+
+func decryptIfNeeded(payload []byte, crypto *security.AESCrypto, secret string) string {
+	text := string(payload)
+	var wrap encryptedMessage
+	if err := json.Unmarshal(payload, &wrap); err != nil || !wrap.Encrypted || strings.TrimSpace(wrap.Data) == "" {
+		return text
+	}
+
+	// 优先使用缓存的 crypto 实例
+	c := crypto
+	if c == nil && strings.TrimSpace(secret) != "" {
+		c, _ = security.NewAESCrypto(secret)
+	}
+	if c == nil {
+		return text
+	}
+	plain, err := c.Decrypt(wrap.Data)
+	if err != nil {
+		return text
+	}
+	return string(plain)
+}
+
+func parseIntDefault(v string, fallback int) int {
+	x, err := strconv.Atoi(v)
+	if err != nil {
+		return fallback
+	}
+	return x
+}
+
+func (s *Server) validateAdminSession(userID int64, claims auth.Claims) bool {
+	if s == nil {
+		return false
+	}
+	// R5-B2 A-005: 受限 token（M-05，默认口令登录签发）不得建立 WS 会话，
+	// 与 HTTP 侧中间件（middleware/auth.go:78）一致。
+	if claims.PwdChangeRequired {
+		return false
+	}
+	if claims.Exp <= time.Now().Unix() {
+		return false
+	}
+	if s.getUserAuthState == nil {
+		return true
+	}
+	state, err := s.getUserAuthState(userID)
+	if err != nil || state == nil || state.Status != 1 || state.RoleID != claims.RoleID || state.TokenStale(claims.IatMs) {
+		return false
+	}
+	return true
+}
+
+func (s *Server) validateMonitorSession(userID int64, claims auth.Claims) bool {
+	if s == nil {
+		return false
+	}
+	// R5-B2 A-005: 同上，受限 token 不得建立 WS 会话。
+	if claims.PwdChangeRequired {
+		return false
+	}
+	if claims.Exp <= time.Now().Unix() {
+		return false
+	}
+	if s.getUserAuthState != nil {
+		state, err := s.getUserAuthState(userID)
+		if err != nil || state == nil || state.Status != 1 || state.RoleID != claims.RoleID || state.TokenStale(claims.IatMs) {
+			return false
+		}
+	}
+	// 监控权限范围收窄（2026-11-01 用户拍板）：节点实时流（节点状态
+	// 与系统信息广播）只对管理员开放，监控权限不再准入 WS——普通
+	// 用户的隧道监控走 REST 并按其可达隧道过滤。校验通过后一律拒绝：
+	// 新连接在 ServeHTTP 准入处被拒，存量 monitor 会话在本函数的
+	// keepalive 复检（startKeepalive 调用点）时被关闭。
+	return false
+}
+
+func writeWSMessage(cw *connWrap, messageType int, payload []byte) error {
+	if cw == nil || cw.conn == nil {
+		return errors.New("websocket connection not initialized")
+	}
+	cw.mu.Lock()
+	defer cw.mu.Unlock()
+
+	_ = cw.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+	err := cw.conn.WriteMessage(messageType, payload)
+	_ = cw.conn.SetWriteDeadline(time.Time{})
+	return err
+}
+
+func startKeepalive(cw *connWrap, done <-chan struct{}, validate func() bool) {
+	if cw == nil || cw.conn == nil {
+		return
+	}
+	ticker := time.NewTicker(wsPingPeriod)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			if validate != nil && !validate() {
+				_ = cw.conn.Close()
+				return
+			}
+			err := writeWSMessage(cw, websocket.PingMessage, nil)
+			if err != nil {
+				_ = cw.conn.Close()
+				return
+			}
+		}
+	}
+}
+
+// BroadcastNodeOperation publishes a per-node receipt through the existing
+// visibility-filtered realtime channel (never broadcasts command payloads).
+func (s *Server) BroadcastNodeOperation(nodeID int64, receipt interface{}) {
+	raw, err := json.Marshal(receipt)
+	if err == nil {
+		s.broadcastTyped(nodeID, "node_operation", string(raw))
+	}
+}
+
+func asyncNodeLifecycleCommand(command string) bool {
+	return command == "UpgradeAgent" || command == "RollbackAgent" || command == "RestartAgent" || command == "UninstallAgent"
+}
+func nodeLifecycleAttempt(requestID string, nodeID int64) (int64, string, bool) {
+	parts := strings.Split(requestID, "_")
+	if (len(parts) != 3 && len(parts) != 4) || !asyncNodeLifecycleCommand(parts[1]) || (parts[1] == "UninstallAgent" && len(parts) != 4) || (parts[1] != "UninstallAgent" && len(parts) != 3) {
+		return 0, "", false
+	}
+	id, e := strconv.ParseInt(parts[0], 10, 64)
+	if e != nil || id != nodeID {
+		return 0, "", false
+	}
+	nanos, e := strconv.ParseInt(parts[2], 10, 64)
+	if e != nil || nanos <= 0 || nanos%int64(time.Millisecond) != 0 {
+		return 0, "", false
+	}
+	return nanos / int64(time.Millisecond), parts[1], true
+}

@@ -1,0 +1,486 @@
+import { useEffect, useRef, useState } from "react";
+import toast from "react-hot-toast";
+
+import { getNotifyHealth, testNotify } from "@/api";
+import type { NotifyHealth } from "@/api";
+import { Button } from "@/shadcn-bridge/heroui/button";
+import { Card, CardBody, CardHeader } from "@/shadcn-bridge/heroui/card";
+import { Checkbox } from "@/shadcn-bridge/heroui/checkbox";
+import { Divider } from "@/shadcn-bridge/heroui/divider";
+import { Input } from "@/shadcn-bridge/heroui/input";
+import { Switch } from "@/shadcn-bridge/heroui/switch";
+
+const NOTIFY_EVENTS = [
+  {
+    key: "node_offline",
+    label: "节点掉线 / 恢复",
+    description: "断开超过 90 秒才提醒，重启和升级不打扰",
+  },
+  {
+    key: "node_upgrade_failed",
+    label: "节点升级未落地",
+    description: "升级 / 回退下发后 5 分钟内未回连到目标版本时提醒一次",
+  },
+  {
+    key: "nft_collect_failed",
+    label: "节点 nft 采集失败 / 恢复",
+    description: "nft 流量采集连续失败 3 轮（约 90 秒）时提醒一次，恢复时再提醒一次",
+  },
+  {
+    key: "inbound_down",
+    label: "导入节点连不上 / 恢复",
+    description: "连续两次检测失败（约 6 分钟）才提醒",
+  },
+  {
+    key: "kernel_error",
+    label: "内核运行出错",
+    description: "Xray / sing-box 报错时提醒",
+  },
+  {
+    key: "node_expiry",
+    label: "节点即将到期",
+    description: "到期前 3 天提醒一次",
+  },
+  {
+    key: "latency_bad",
+    label: "延迟 / 丢包异常",
+    description:
+      "某测试点连续 3 次检测（约 9 分钟）丢包 ≥ 20% 或延迟超阈值才提醒，恢复时再提醒一次；阈值可在下方「延迟 / 丢包阈值」调整",
+  },
+  {
+    key: "route_change",
+    label: "回程线路变化",
+    description: "识别出的回程线路（如 CN2 GIA → 163）变化时提醒",
+  },
+  {
+    key: "user_quota",
+    label: "用户流量 / 到期",
+    description:
+      "转发用户流量用到 90%、用完或 3 天内到期；分享订阅流量用到 90%、用完或 3 天内到期",
+  },
+  {
+    key: "daily_report",
+    label: "每日汇总",
+    description: "每天定时发一条：节点在线、出错、流量、分享订阅",
+  },
+] as const;
+
+const ALL_EVENT_KEYS = NOTIFY_EVENTS.map((e) => e.key) as string[];
+
+// F3-NEW-01：三项资源告警的独立开关。它们不在上方 9 个事件复选框里，
+// 也不走 notify_events 列表——取消任一事件永不关闭资源告警。
+// 配置键缺席＝开（旧配置/新装默认开），显式 "false" 才关。
+const NOTIFY_RESOURCE_ALERTS = [
+  {
+    key: "notify_conntrack_high",
+    label: "连接跟踪表用量过高",
+    description: "节点 conntrack 表用量达 80% 时提醒，表满即全包丢弃，撞墙前预警",
+  },
+  {
+    key: "notify_disk_high",
+    label: "磁盘用量过高",
+    description: "节点或面板根盘用量达 80% 时提醒，盘满即服务崩溃，撞墙前预警",
+  },
+  {
+    key: "notify_agent_memory_high",
+    label: "agent 内存用量过高",
+    description: "节点 agent 进程内存用量达 80% 时提醒，撞墙前预警",
+  },
+] as const;
+
+interface NotifyCardProps {
+  configs: Record<string, string>;
+  originalConfigs: Record<string, string>;
+  onChange: (key: string, value: string) => void;
+}
+
+function Field({
+  label,
+  description,
+  children,
+}: {
+  label: string;
+  description?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="space-y-2">
+      <div className="flex flex-col gap-1">
+        <label className="text-sm font-medium text-foreground">{label}</label>
+        {description && (
+          <p className="text-xs font-semibold text-foreground">{description}</p>
+        )}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+/** Telegram / Webhook notification settings, saved with the page's other configs. */
+export function NotifyCard({
+  configs,
+  originalConfigs,
+  onChange,
+}: NotifyCardProps) {
+  const [testing, setTesting] = useState(false);
+  const testInFlightRef = useRef(false);
+  const enabled = configs.notify_enabled === "true";
+  // C-06：通知健康度（按已保存的配置检查）——凭据字段写-only，表单
+  // 永远看不到已保存值，前端算不出通道是否可用，须问后端。configs
+  // 变化时防抖重查（保存后父级重载 configs 即刷新警告）。
+  const [health, setHealth] = useState<NotifyHealth | null>(null);
+  const [healthFailed, setHealthFailed] = useState(false);
+  useEffect(() => {
+    let active = true;
+    const timer = setTimeout(() => {
+      getNotifyHealth()
+        .then((res) => {
+          if (!active) return;
+          if (res.code === 0 && res.data) {
+            setHealth(res.data);
+            setHealthFailed(false);
+          } else {
+            setHealthFailed(true);
+          }
+        })
+        .catch(() => {
+          if (active) setHealthFailed(true);
+        });
+    }, 300);
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  }, [configs]);
+  const rawEvents = (configs.notify_events ?? "").trim();
+  // Empty means every event, so new installs get all of them.
+  const selected = rawEvents
+    ? rawEvents
+        .split(",")
+        .map((e) => e.trim())
+        .filter(Boolean)
+    : ALL_EVENT_KEYS;
+
+  const changedClass = (key: string) =>
+    configs[key] !== originalConfigs[key]
+      ? "border-warning-300 data-[hover=true]:border-warning-400"
+      : "";
+
+  const toggleEvent = (key: string, on: boolean) => {
+    const next = on
+      ? [...new Set([...selected, key])]
+      : selected.filter((e) => e !== key);
+
+    onChange(
+      "notify_events",
+      next.length === ALL_EVENT_KEYS.length ? "" : next.join(",") || "none",
+    );
+  };
+
+  const runTest = async () => {
+    // F-L6-01 自复扫补遗：每次下发都真实发送一条外部通知，双发即重复
+    // 发送；此前只有 testing 渲染状态，补 ref 入口复核。
+    if (testInFlightRef.current) return;
+    testInFlightRef.current = true;
+    setTesting(true);
+    try {
+      const res = await testNotify({
+        telegramToken: configs.notify_telegram_bot_token ?? "",
+        telegramChatId: configs.notify_telegram_chat_id ?? "",
+        telegramApiBase: configs.notify_telegram_api_base ?? "",
+        webhookUrl: configs.notify_webhook_url ?? "",
+      });
+
+      if (res.code === 0) {
+        toast.success("测试通知已发送，请查收");
+      } else {
+        toast.error(res.msg || "发送失败");
+      }
+    } catch {
+      toast.error("发送失败");
+    } finally {
+      testInFlightRef.current = false;
+      setTesting(false);
+    }
+  };
+
+  const input = (key: string, placeholder: string, type = "text") => (
+    <Input
+      classNames={{ input: "text-sm", inputWrapper: changedClass(key) }}
+      placeholder={placeholder}
+      size="md"
+      type={type}
+      value={configs[key] ?? ""}
+      variant="bordered"
+      onChange={(e) => onChange(key, e.target.value.trim())}
+    />
+  );
+
+  // R7-L8-03 写-only 凭据字段：后端 config/get 对全角色 403、
+  // config/list 删除这三键，表单永不回填已保存值——configs 里
+  // 该键缺席＝未改动（留空保留）；输入非空＝
+  // 替换；键在场且为空＝已显式清除（或输入后删空），保存时以空
+  // 值下发删除已保存值（后端对三键按可清除键处理）。发送测试时
+  // 留空由后端回退到已保存值（notify/test 的 saved 回退口径）。
+  const credentialInput = (key: string, placeholder: string, type = "text") => {
+    const draft = configs[key];
+    const clearPending = key in configs && (draft ?? "") === "";
+
+    return (
+      <div className="space-y-1">
+        <Input
+          classNames={{ input: "text-sm", inputWrapper: changedClass(key) }}
+          placeholder={placeholder}
+          size="md"
+          type={type}
+          value={draft ?? ""}
+          variant="bordered"
+          onChange={(e) => onChange(key, e.target.value.trim())}
+        />
+        <p className="text-xs font-semibold text-foreground">
+          {clearPending ? (
+            "保存后将删除已保存的值"
+          ) : draft ? (
+            "保存后替换已保存的值，保存后不再回显"
+          ) : (
+            <>
+              已保存的值不会回显，留空表示保留 ·{" "}
+              <button
+                className="text-danger-700"
+                type="button"
+                onClick={() => onChange(key, "")}
+              >
+                清除已保存的值
+              </button>
+            </>
+          )}
+        </p>
+      </div>
+    );
+  };
+
+  return (
+    <Card className="mt-6 shadow-md">
+      <CardHeader className="pb-6">
+        <div>
+          <h2 className="text-xl font-semibold">通知</h2>
+          <p className="text-sm text-foreground">
+            节点掉线、导入节点连不上、内核出错、节点快到期时推送到 Telegram 或
+            Webhook
+          </p>
+        </div>
+      </CardHeader>
+      <Divider />
+      <CardBody className="space-y-6 pt-8">
+        <Field label="启用通知">
+          <div className="flex items-center gap-3">
+            <Switch
+              aria-label="启用通知"
+              isSelected={enabled}
+              size="sm"
+              onValueChange={(on) =>
+                onChange("notify_enabled", on ? "true" : "false")
+              }
+            />
+            <span className="text-sm text-foreground">
+              {enabled ? "已启用" : "已禁用"}
+            </span>
+          </div>
+        </Field>
+
+        {/* C-06：主开关已开但无可用通道时，事件会被静默丢弃——按已保存
+          的配置检查并在此警告（凭据字段写-only，表单看不到已保存值）。 */}
+        {enabled && health && !health.usable && (
+          <p className="rounded-xl bg-warning-50 px-3 py-2 text-xs font-semibold text-warning-700">
+            通知已开启但无法投递（按已保存的配置检查）：缺少
+            {health.missing
+              .map((m) =>
+                m === "telegramToken"
+                  ? "Telegram Bot Token"
+                  : m === "telegramChatId"
+                    ? "Telegram Chat ID"
+                    : m === "webhook"
+                      ? "Webhook 地址"
+                      : m === "events"
+                        ? "通知事件（当前全不选）"
+                        : m,
+              )
+              .join("、")}
+            ，事件将被静默丢弃。请补全后保存。
+          </p>
+        )}
+        {enabled && healthFailed && (
+          <p className="rounded-xl bg-warning-50 px-3 py-2 text-xs font-semibold text-warning-700">
+            通知健康度检查失败，无法确认通道是否可用。
+          </p>
+        )}
+
+        <Divider />
+        <Field
+          description="找 @BotFather 创建机器人拿到 Token；给机器人发一条消息后，用 @userinfobot 查自己的 Chat ID（群组 ID 以 -100 开头）"
+          label="Telegram Bot Token"
+        >
+          {credentialInput(
+            "notify_telegram_bot_token",
+            "留空保留已保存的 Token，输入新 Token 替换",
+            "password",
+          )}
+        </Field>
+        <Field label="Telegram Chat ID">
+          {input("notify_telegram_chat_id", "例如 123456789")}
+        </Field>
+        <Field
+          description="面板服务器连不上 Telegram 时，填一个反代地址；从未保存过或清除后使用官方地址"
+          label="Telegram API 地址（可选）"
+        >
+          {credentialInput(
+            "notify_telegram_api_base",
+            "留空保留已保存的地址，输入新地址替换",
+          )}
+        </Field>
+
+        <Divider />
+        <Field
+          description='以 POST JSON 发送：{"event","title","message","text","time","app"}，可对接企业微信、钉钉、Bark 等的转发服务'
+          label="Webhook 地址"
+        >
+          {credentialInput(
+            "notify_webhook_url",
+            "留空保留已保存的地址，输入新地址替换",
+          )}
+        </Field>
+
+        <Divider />
+        <Field label="通知哪些事件">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            {NOTIFY_EVENTS.map((e) => (
+              <Checkbox
+                key={e.key}
+                isSelected={selected.includes(e.key)}
+                onValueChange={(on) => toggleEvent(e.key, on)}
+              >
+                <div className="flex flex-col">
+                  <span className="text-sm">{e.label}</span>
+                  <span className="text-xs font-semibold text-foreground">
+                    {e.description}
+                  </span>
+                </div>
+              </Checkbox>
+            ))}
+          </div>
+        </Field>
+
+        <Divider />
+        <Field
+          description="独立开关，不受上方事件勾选影响——取消任一事件也不会关掉资源告警；缺省开启，建议保持开启"
+          label="资源告警"
+        >
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            {NOTIFY_RESOURCE_ALERTS.map((e) => (
+              <Checkbox
+                key={e.key}
+                isSelected={configs[e.key] !== "false"}
+                onValueChange={(on) =>
+                  onChange(e.key, on ? "true" : "false")
+                }
+              >
+                <div className="flex flex-col">
+                  <span className="text-sm">{e.label}</span>
+                  <span className="text-xs font-semibold text-foreground">
+                    {e.description}
+                  </span>
+                </div>
+              </Checkbox>
+            ))}
+          </div>
+        </Field>
+
+        {selected.includes("latency_bad") && (
+          <Field
+            description="连续 3 次检测（约 9 分钟）触发提醒；留空使用默认（丢包 20%、延迟不判断）"
+            label="延迟 / 丢包阈值"
+          >
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <div className="flex items-center gap-2">
+                <span className="shrink-0 text-sm text-foreground">丢包率 ≥</span>
+                <Input
+                  classNames={{
+                    input: "text-sm",
+                    inputWrapper: changedClass("notify_latency_loss_pct"),
+                  }}
+                  endContent="%"
+                  max={100}
+                  min={1}
+                  placeholder="20"
+                  size="md"
+                  type="number"
+                  value={configs.notify_latency_loss_pct ?? ""}
+                  variant="bordered"
+                  onChange={(e) =>
+                    onChange("notify_latency_loss_pct", e.target.value)
+                  }
+                />
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="shrink-0 text-sm text-foreground">延迟 ≥</span>
+                <Input
+                  classNames={{
+                    input: "text-sm",
+                    inputWrapper: changedClass("notify_latency_ms"),
+                  }}
+                  endContent="ms"
+                  min={0}
+                  placeholder="0"
+                  size="md"
+                  type="number"
+                  value={configs.notify_latency_ms ?? ""}
+                  variant="bordered"
+                  onChange={(e) =>
+                    onChange("notify_latency_ms", e.target.value)
+                  }
+                />
+              </div>
+            </div>
+          </Field>
+        )}
+
+        {selected.includes("daily_report") && (
+          <Field
+            description="按面板服务器的时区（安装脚本默认 Asia/Shanghai），0–23 点"
+            label="每日汇总发送时间"
+          >
+            <Input
+              classNames={{
+                input: "text-sm",
+                inputWrapper: changedClass("notify_daily_hour"),
+              }}
+              endContent="点"
+              max={23}
+              min={0}
+              placeholder="9"
+              size="md"
+              type="number"
+              value={configs.notify_daily_hour ?? ""}
+              variant="bordered"
+              onChange={(e) => onChange("notify_daily_hour", e.target.value)}
+            />
+          </Field>
+        )}
+
+        <div className="flex flex-wrap items-center justify-end gap-3 border-t border-divider/50 pt-6">
+          <span className="text-xs font-semibold text-foreground">
+            测试会用当前填写的内容（凭据留空则用已保存的值），不用先保存
+          </span>
+          <Button
+            color="primary"
+            isLoading={testing}
+            variant="flat"
+            onPress={runTest}
+          >
+            发送测试
+          </Button>
+        </div>
+      </CardBody>
+    </Card>
+  );
+}

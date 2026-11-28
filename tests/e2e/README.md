@@ -1,0 +1,194 @@
+# OVO E2E Tests
+
+End-to-end testing suite for OVO Panel using Playwright and pytest.
+
+## Structure
+
+```
+tests/e2e/
+├── conftest.py          # Pytest configuration and fixtures
+├── pyproject.toml       # Python project configuration
+├── with_server.py       # Server lifecycle manager
+├── pages/               # Page Object Models
+│   └── __init__.py
+├── fixtures/            # Test fixtures and helpers
+│   └── __init__.py
+├── utils/               # Utility modules
+│   ├── __init__.py
+│   └── api_client.py    # Backend API client
+├── test_auth.py         # Authentication tests
+├── test_api.py          # API endpoint tests
+├── test_dashboard.py    # Dashboard UI tests
+└── test_user_ui.py      # User management UI tests
+```
+
+## Prerequisites
+
+- Python 3.11+
+- Go 1.25 (for backend)
+- Node.js 18+ (for frontend)
+
+## Setup
+
+```bash
+# Create virtual environment
+cd tests/e2e
+python -m venv .venv
+source .venv/bin/activate  # or .venv\Scripts\activate on Windows
+
+# Install dependencies
+pip install -e ".[dev]"
+
+# Install Playwright browsers
+playwright install chromium
+```
+
+## Running Tests
+
+Notes (X02-002):
+
+- The seed admin user is `admin@user`. Since 2.0.0 the backend seeds a
+  random initial password unless one is injected, so the harness starts
+  the backend with the product env var `OVO_ADMIN_PASSWORD` set (CI job
+  and `with_server.py` both do, value `E2eSeed!2026x` by default) and the
+  fixtures read the same variable. Its first login returns a restricted
+  token, so `authenticated_api` changes the password once per session
+  (to `E2E_ADMIN_PASSWORD`) and restores the seed password at session
+  teardown.
+- Run against a fresh backend (as `with_server.py` and CI do). The backend
+  rate-limits logins per IP (10/min); back-to-back runs against a
+  long-lived server can hit that bucket.
+- If the servers are not running, tests fail hard. Set `E2E_SKIP_OK=1`
+  only when you explicitly want them skipped; the skip is then called
+  out in the run summary. CI runs the `-m api` subset on every push
+  (job `e2e-api` in `.github/workflows/ci-build.yml`) and the browser
+  subset `-m e2e` (job `e2e-browser`, which also starts the frontend
+  and installs Playwright Chromium).
+
+### Quick Start
+
+```bash
+# Run all tests (starts servers automatically)
+python with_server.py -- pytest -v
+
+# Run specific test file
+python with_server.py -- pytest test_auth.py -v
+
+# Run with markers
+python with_server.py -- pytest -m "auth" -v
+python with_server.py -- pytest -m "api" -v
+python with_server.py -- pytest -m "e2e" -v
+```
+
+### Manual Server Management
+
+If servers are already running:
+
+```bash
+# Set environment variables
+export E2E_BACKEND_PORT=6365
+export E2E_FRONTEND_PORT=3000
+
+# Run tests directly
+pytest -v
+```
+
+### Custom Server Configuration
+
+```bash
+# Custom ports
+python with_server.py --backend-port 8080 --frontend-port 5173 -- pytest -v
+
+# Custom server commands
+python with_server.py \
+  --server "make run" --port 6365 --cwd go-backend \
+  --server "pnpm run dev" --port 3000 --cwd vite-frontend \
+  -- pytest -v
+```
+
+## Test Markers
+
+| Marker    | Description                              |
+|-----------|------------------------------------------|
+| `@e2e`    | Full end-to-end test with browser        |
+| `@api`    | API-only test, no browser required       |
+| `@auth`   | Test requires authentication             |
+| `@slow`   | Slow running test (>5s)                  |
+
+## Writing Tests
+
+### API Tests
+
+```python
+import pytest
+from utils.api_client import APIClient
+
+@pytest.mark.api
+class TestMyAPI:
+    def test_something(self, authenticated_api: APIClient):
+        response = authenticated_api.post("/some/endpoint")
+        assert response["code"] == 0
+```
+
+### Browser Tests
+
+```python
+import pytest
+from playwright.sync_api import Page
+from pages import LoginPage
+
+@pytest.mark.e2e
+class TestMyFeature:
+    def test_something(self, page: Page, frontend_url: str):
+        login_page = LoginPage(page, frontend_url)
+        login_page.goto()
+        # ...
+```
+
+## Page Objects
+
+Located in `pages/__init__.py`:
+- `LoginPage` - Login form handling
+- `DashboardPage` - Dashboard interactions
+- `UserPage` - User management
+- `NodePage` - Node management
+- `TunnelPage` - Tunnel management
+- `ForwardPage` - Forward management
+- `ConfigPage` - Configuration
+
+## Fixtures
+
+Key fixtures in `conftest.py`:
+- `server_info` - Server configuration
+- `backend_url` / `frontend_url` - Base URLs
+- `page` - Fresh browser page
+- `api_client` - API client instance
+- `authenticated_api` - Authenticated API client
+- `auth_token` - JWT token string
+
+## Debugging
+
+```bash
+# Run with visible browser
+pytest -v --headed
+
+# Run specific test with debug output
+pytest test_auth.py::TestAuthentication::test_login_with_valid_credentials -v -s
+
+# Generate HTML report
+pytest -v --html=report.html --self-contained-html
+```
+
+## CI Integration
+
+CI runs both subsets on every push (`.github/workflows/ci-build.yml`):
+
+- job `e2e-api`: builds the real backend, starts it with a temporary
+  DB, then `python -m pytest -m api` (no browser).
+- job `e2e-browser`: same backend plus the frontend via
+  `with_server.py` and Playwright Chromium, then
+  `python -m pytest -m e2e`.
+
+Both jobs inject the seed password through `OVO_ADMIN_PASSWORD`
+(`E2eSeed!2026x`) and never set `E2E_SKIP_OK`, so a missing server
+fails the run instead of silently skipping.

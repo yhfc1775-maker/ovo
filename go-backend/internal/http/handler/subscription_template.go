@@ -1,0 +1,524 @@
+package handler
+
+import (
+	"context"
+	"encoding/json"
+	"log"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"go-backend/internal/http/response"
+	"go-backend/internal/kernel"
+	"go-backend/internal/store/model"
+)
+
+// Subscription templates (kernel/sub_template.go): the admin's own
+// Mihomo / sing-box / Surge profiles, pasted, built with the visual
+// builder, or downloaded from a URL once a day.
+
+const templateRefreshInterval = 24 * time.Hour
+
+type subTemplateView struct {
+	Builder     *kernel.TemplateBuilder `json:"builder,omitempty"`
+	ID          int64                   `json:"id"`
+	Name        string                  `json:"name"`
+	Kind        string                  `json:"kind"`
+	Content     string                  `json:"content"`
+	SourceURL   string                  `json:"sourceUrl"`
+	LastFetch   int64                   `json:"lastFetch"`
+	LastError   string                  `json:"lastError"`
+	UpdatedTime int64                   `json:"updatedTime"`
+	// UsedBy counts the subscriptions using it.
+	UsedBy     int `json:"usedBy"`
+	Groups     int `json:"groups"`
+	AutoGroups int `json:"autoGroups"`
+	Rules      int `json:"rules"`
+}
+
+// effectiveTemplate returns a template's saved content and, for visual
+// templates, the recipe the editor reopens. The content generated at
+// save time is what clients get, so a later change to the generator
+// only reaches a template when it is saved again.
+func effectiveTemplate(t *model.SubscriptionTemplate) (string, *kernel.TemplateBuilder) {
+	if t.BuilderConfig == "" || t.SourceURL != "" {
+		return t.Content, nil
+	}
+	var b kernel.TemplateBuilder
+	if json.Unmarshal([]byte(t.BuilderConfig), &b) != nil {
+		return t.Content, nil
+	}
+	if b.Groups == nil {
+		b.Groups = []kernel.TemplateBuilderGroup{}
+	}
+	if b.Rules == nil {
+		b.Rules = []kernel.TemplateBuilderRule{}
+	}
+	return t.Content, &b
+}
+
+func templateView(t *model.SubscriptionTemplate, usedBy int) subTemplateView {
+	v := subTemplateView{ID: t.ID, Name: t.Name, Kind: t.Kind, Content: t.Content, SourceURL: t.SourceURL,
+		LastFetch: t.LastFetch, LastError: t.LastError, UpdatedTime: t.UpdatedTime, UsedBy: usedBy}
+	v.Content, v.Builder = effectiveTemplate(t)
+	if s, err := kernel.CheckTemplate(t.Kind, v.Content, nil); err == nil {
+		v.Groups, v.AutoGroups, v.Rules = len(s.Groups), s.AutoGroups(), s.Rules
+	}
+	return v
+}
+
+func validTemplateKind(kind string) bool {
+	for _, k := range kernel.TemplateFormats {
+		if k == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// templateUsage counts, per template id, the subscriptions using it.
+func (h *Handler) templateUsage() (map[int64]int, error) {
+	out := map[int64]int{}
+	subs, err := h.repo.ListSubscriptions()
+	if err != nil {
+		return nil, err
+	}
+	for _, s := range subs {
+		for _, id := range parsePipeline(s.Options).Templates {
+			out[id]++
+		}
+	}
+	return out, nil
+}
+
+// subOptions is the pipeline's options with its templates loaded: the
+// render path resolves the picked template ids to their current saved
+// content, so editing a template takes effect without touching the
+// subscriptions using it.
+func (h *Handler) subOptions(p subPipeline, selectedSlot ...string) (kernel.SubOptions, error) {
+	opts := p.options()
+	for slot, id := range p.Templates {
+		// Only a template consumed by this client format can affect its output.
+		if len(selectedSlot) > 0 && slot != selectedSlot[0] {
+			continue
+		}
+		t, err := h.repo.GetSubscriptionTemplate(id)
+		if err != nil {
+			return opts, markRepoError(err)
+		}
+		if t == nil {
+			return opts, errText("所选模板不存在")
+		}
+		if t.Kind != kernel.TemplateKindOf(slot) {
+			return opts, errText("所选模板格式不匹配")
+		}
+		if opts.Templates == nil {
+			opts.Templates = map[string]string{}
+		}
+		opts.Templates[slot], _ = effectiveTemplate(t)
+	}
+	return opts, nil
+}
+
+// checkPipelineTemplates rejects templates that are missing or of
+// another kind than the client slot they are picked for (Stash and
+// Shadowrocket take Mihomo templates).
+func (h *Handler) checkPipelineTemplates(p subPipeline) error {
+	for slot, id := range p.Templates {
+		t, err := h.repo.GetSubscriptionTemplate(id)
+		if err != nil {
+			return markRepoError(err)
+		}
+		if t == nil {
+			return errText("所选模板不存在")
+		}
+		if t.Kind != kernel.TemplateKindOf(slot) {
+			return errText("模板「" + t.Name + "」的格式和所选客户端不符")
+		}
+	}
+	return nil
+}
+
+// fetchTemplate downloads a template's content through the same
+// SSRF-guarded fetch the remote subscription sources use.
+func (h *Handler) fetchTemplate(ctx context.Context, url string) (string, error) {
+	body, _, err := fetchSubscriptionInfo(ctx, url)
+	if err != nil {
+		return "", errText("下载模板失败：" + err.Error())
+	}
+	return body, nil
+}
+
+// refreshTemplate downloads a URL template again; a failure keeps the
+// last good content and records the error, so a broken source never
+// takes the subscriptions using it down.
+func (h *Handler) refreshTemplate(ctx context.Context, t *model.SubscriptionTemplate) error {
+	now := time.Now().UnixMilli()
+	body, err := h.fetchTemplate(ctx, t.SourceURL)
+	if err == nil {
+		_, err = kernel.CheckTemplate(t.Kind, body, nil)
+	}
+	if err != nil {
+		// R18-F3-01: a failed refresh must not advance LastFetch —
+		// only a success stamps "last fetched". Advancing it here
+		// silently postpones the next automatic retry by a whole
+		// interval, because refreshDueTemplates gates on LastFetch
+		// alone. The error is still recorded, and the last good
+		// content is kept.
+		t.LastError = truncate(err.Error(), 500)
+	} else {
+		t.Content, t.LastError, t.UpdatedTime, t.LastFetch = body, "", now, now
+	}
+	// R18-B6-02：删除与刷新竞态——模板在下载/校验期间被删时，
+	// Save() 的 upsert 会把已删模板复活。落库前复核仍在：已被删
+	// 则不写库、点名返回（手动刷新面原样回给用户；后台循环只记日志）。
+	if existing, err := h.repo.GetSubscriptionTemplate(t.ID); err != nil {
+		return markRepoError(err)
+	} else if existing == nil {
+		return errText("模板已被删除")
+	}
+	if saveErr := h.repo.SaveSubscriptionTemplate(t); saveErr != nil {
+		// RAW291：仓储直通错误标 repoError，调用点 guard 后
+		// 改走通用文案；fetch/校验失败为固定文案不经此标记。
+		return markRepoError(saveErr)
+	}
+	return err
+}
+
+func (h *Handler) refreshDueTemplates(ctx context.Context, now time.Time) {
+	templates, err := h.repo.ListSubscriptionTemplates()
+	if err != nil {
+		return
+	}
+	for i := range templates {
+		t := &templates[i]
+		if t.SourceURL == "" || now.Sub(time.UnixMilli(t.LastFetch)) < templateRefreshInterval {
+			continue
+		}
+		if err := h.refreshTemplate(ctx, t); err != nil {
+			log.Printf("subscription template %d refresh failed: %v", t.ID, err)
+		}
+	}
+}
+
+func (h *Handler) subscriptionTemplateList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+	templates, err := h.repo.ListSubscriptionTemplates()
+	if err != nil {
+		respondInternalError(w, "subscriptionTemplateList", err)
+		return
+	}
+	usage, err := h.templateUsage()
+	if err != nil {
+		respondInternalError(w, "subscriptionTemplateList", err)
+		return
+	}
+	out := make([]subTemplateView, 0, len(templates))
+	for i := range templates {
+		out = append(out, templateView(&templates[i], usage[templates[i].ID]))
+	}
+	response.WriteJSON(w, response.OK(out))
+}
+
+func (h *Handler) subscriptionTemplateCatalog(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+	response.WriteJSON(w, response.OK(kernel.TemplateRuleCategories()))
+}
+
+type subTemplateRequest struct {
+	Builder   *kernel.TemplateBuilder `json:"builder"`
+	ID        int64                   `json:"id"`
+	Name      string                  `json:"name"`
+	Kind      string                  `json:"kind"`
+	Content   string                  `json:"content"`
+	SourceURL string                  `json:"sourceUrl"`
+	// SubscriptionID previews the groups with that subscription's nodes
+	// (check only).
+	SubscriptionID int64 `json:"subscriptionId"`
+}
+
+// content returns the request's template text, generating it for a
+// builder recipe and downloading it for a URL template.
+func (req *subTemplateRequest) content(ctx context.Context, h *Handler) (string, error) {
+	req.SourceURL = strings.TrimSpace(req.SourceURL)
+	if req.Builder != nil {
+		if req.Builder.Groups == nil {
+			req.Builder.Groups = []kernel.TemplateBuilderGroup{}
+		}
+		if req.Builder.Rules == nil {
+			req.Builder.Rules = []kernel.TemplateBuilderRule{}
+		}
+		if req.SourceURL != "" {
+			return "", errText("选择规则与网址模板不能同时使用")
+		}
+		return kernel.BuildSubscriptionTemplate(req.Kind, *req.Builder)
+	}
+	if req.SourceURL == "" {
+		return strings.ReplaceAll(req.Content, "\r\n", "\n"), nil
+	}
+	if !isSubscriptionURL(req.SourceURL) {
+		return "", errText("请填写 http(s) 模板地址")
+	}
+	return h.fetchTemplate(ctx, req.SourceURL)
+}
+
+// subscriptionTemplateCheck parses a template and previews its groups
+// with a subscription's nodes (every node when none is given).
+func (h *Handler) subscriptionTemplateCheck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+	var req subTemplateRequest
+	if err := decodeJSON(r.Body, &req); err != nil || !validTemplateKind(req.Kind) {
+		response.WriteJSON(w, response.ErrDefault("请求参数错误"))
+		return
+	}
+	content, err := req.content(r.Context(), h)
+	if err != nil {
+		// RAW291 Type C：content() 只产 errText 固定校验文案
+		// （规则/网址互斥、URL 形态、下载失败提示），原样回。
+		response.WriteJSON(w, response.ErrDefault(err.Error()))
+		return
+	}
+	rows, err := h.repo.ListNodeInbounds()
+	if err != nil {
+		respondInternalError(w, "subscriptionTemplateCheck", err)
+		return
+	}
+	// Every node, unprocessed, unless a subscription is picked.
+	nodes := h.subEndpoints(&model.Subscription{SourceAll: 1}, rows)
+	var opts kernel.SubOptions
+	sample := "全部节点"
+	if req.SubscriptionID > 0 {
+		if s, err := h.repo.GetSubscription(req.SubscriptionID); err == nil && s != nil {
+			// 与订阅 preview 同口径取渲染集：订阅的渲染集就是它实
+			// 际下发的节点集，模板检查必须按同一集合预览。
+			nodes, opts, sample = h.subRenderEndpoints(s, rows), parsePipeline(s.Options).options(), s.Name
+		}
+	}
+	var names []string
+	for _, e := range kernel.ApplySubOptions(nodes, opts) {
+		names = append(names, e.Name)
+	}
+	summary, err := kernel.CheckTemplate(req.Kind, content, names)
+	if err != nil {
+		// RAW291 Type C：kernel.CheckTemplate 校验错误，文本源于
+		// 用户模板内容（纯函数、无仓储调用），原样回。
+		response.WriteJSON(w, response.ErrDefault(err.Error()))
+		return
+	}
+	services := []kernel.TemplateServiceGroup{}
+	if req.Builder != nil {
+		services = kernel.TemplateBuilderServiceGroups(req.Kind, *req.Builder)
+	}
+	response.WriteJSON(w, response.OK(map[string]interface{}{
+		"serviceGroups": services, "summary": summary, "autoGroups": summary.AutoGroups(), "sample": sample, "nodes": len(names), "content": content,
+	}))
+}
+
+func (h *Handler) subscriptionTemplateSave(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+	var req subTemplateRequest
+	if err := decodeJSON(r.Body, &req); err != nil {
+		response.WriteJSON(w, response.ErrDefault("请求参数错误"))
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	req.SourceURL = strings.TrimSpace(req.SourceURL)
+	if req.Name == "" || len([]rune(req.Name)) > 100 {
+		response.WriteJSON(w, response.ErrDefault("请填写名称（最多 100 个字）"))
+		return
+	}
+	if !validTemplateKind(req.Kind) {
+		response.WriteJSON(w, response.ErrDefault("请选择模板格式"))
+		return
+	}
+	// Unknown reference state must never be interpreted as unused. Resolve it
+	// before download or persistence, then reuse it for this response's count.
+	usage, usageErr := h.templateUsage()
+	if usageErr != nil {
+		respondInternalError(w, "subscriptionTemplateSave", usageErr)
+		return
+	}
+	now := time.Now().UnixMilli()
+	t := &model.SubscriptionTemplate{CreatedTime: now}
+	if req.ID > 0 {
+		var err error
+		t, err = h.repo.GetSubscriptionTemplate(req.ID)
+		if err != nil {
+			respondInternalError(w, "subscriptionTemplateSave", err)
+			return
+		}
+		if t == nil {
+			response.WriteJSON(w, response.ErrDefault("模板不存在"))
+			return
+		}
+		if t.Kind != req.Kind && usage[t.ID] > 0 {
+			response.WriteJSON(w, response.ErrDefault("有订阅在用这个模板，不能改格式"))
+			return
+		}
+	}
+	// R18-B6-04：同址更新只改元数据时不再重下载——上游挂了也能改
+	// 名，且不静默拉入远端内容变化；换址/新建仍下载；CheckTemplate
+	// 校验照常对（复用的）内容跑。LastFetch 只在真正下载时重打。
+	var content string
+	var err error
+	downloaded := false
+	if req.ID > 0 && req.Builder == nil && req.SourceURL != "" && req.SourceURL == t.SourceURL {
+		content = t.Content
+	} else {
+		content, err = req.content(r.Context(), h)
+		if err != nil {
+			// RAW291 Type C：同 subscriptionTemplateCheck 的 content()
+			// 口径，只产 errText 固定校验文案，原样回。
+			response.WriteJSON(w, response.ErrDefault(err.Error()))
+			return
+		}
+		downloaded = req.Builder == nil && req.SourceURL != ""
+	}
+	if _, err := kernel.CheckTemplate(req.Kind, content, nil); err != nil {
+		// RAW291 Type C：kernel.CheckTemplate 校验错误，文本源于
+		// 用户模板内容（纯函数、无仓储调用），原样回。
+		response.WriteJSON(w, response.ErrDefault(err.Error()))
+		return
+	}
+	// R10-06（I-C2-01）：新建分支接入 Idempotency-Key 机制（更新分支
+	// req.ID>0 不参与，更新本身按 ID 定位、无防重语义变化）。
+	if req.ID == 0 {
+		var finish func()
+		var replayed bool
+		w, finish, replayed = h.idemBegin(w, r, idemUserID(r), "subscription-template:create")
+		defer finish()
+		if replayed {
+			return
+		}
+	}
+	t.Name, t.Kind, t.Content, t.SourceURL, t.UpdatedTime = req.Name, req.Kind, content, req.SourceURL, now
+	t.BuilderConfig = ""
+	if req.Builder != nil {
+		raw, _ := json.Marshal(req.Builder)
+		t.BuilderConfig = string(raw)
+	}
+	t.LastError = ""
+	if downloaded {
+		t.LastFetch = now
+	}
+	// R18-R2-B6-01（R18-B6-02 保存腿）：与 refreshTemplate 同口径——
+	// 模板在下载/生成窗口内被删时，Save() 的 upsert 会把已删模板
+	// 复活（最长 20s 的下载窗口）。落库前复核仍在：已被删则拒
+	// 绝保存并点名；仓储读错则 fail-closed，不在未知状态下落库。
+	// 残留的复核→保存微秒级 TOCTOU 与刷新腿同口径接受（见复审
+	// R18-R2-B6-01 的未立案观察）。新建（req.ID == 0）无行可复核。
+	if req.ID > 0 {
+		if existing, err := h.repo.GetSubscriptionTemplate(req.ID); err != nil {
+			respondInternalError(w, "subscriptionTemplateSave", err)
+			return
+		} else if existing == nil {
+			response.WriteJSON(w, response.ErrDefault("模板已被删除"))
+			return
+		}
+	}
+	if err := h.repo.SaveSubscriptionTemplate(t); err != nil {
+		respondInternalError(w, "subscriptionTemplateSave", err)
+		return
+	}
+	response.WriteJSON(w, response.OK(templateView(t, usage[t.ID])))
+}
+
+func (h *Handler) subscriptionTemplateRefresh(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+	var req struct {
+		ID int64 `json:"id"`
+	}
+	if err := decodeJSON(r.Body, &req); err != nil {
+		response.WriteJSON(w, response.ErrDefault("请求参数错误"))
+		return
+	}
+	t, err := h.repo.GetSubscriptionTemplate(req.ID)
+	if err != nil {
+		respondInternalError(w, "subscriptionTemplateRefresh", err)
+		return
+	}
+	if t == nil || t.SourceURL == "" {
+		response.WriteJSON(w, response.ErrDefault("模板不存在或不是网址模板"))
+		return
+	}
+	usage, usageErr := h.templateUsage()
+	if usageErr != nil {
+		respondInternalError(w, "subscriptionTemplateRefresh", usageErr)
+		return
+	}
+	if err := h.refreshTemplate(r.Context(), t); err != nil {
+		// R18-B6-03：刷新失败分流——仓储错才走通用文案；上游下载/
+		// 校验失败回固定分类文案、原文记服务端日志（R2-F4-01 门：
+		// err 可能带仓储标记，ErrDefault(err.Error()) 原样回即红；
+		// 分类文案仍点名原因类别，不回通用 "Internal error"）。
+		if respondInternalIfRepoError(w, "subscriptionTemplateRefresh", err) {
+			return
+		}
+		log.Printf("subscription template %d refresh failed: %v", t.ID, err)
+		response.WriteJSON(w, response.ErrDefault(templateRefreshUserMessage(err)))
+		return
+	}
+	response.WriteJSON(w, response.OK(templateView(t, usage[t.ID])))
+}
+
+// templateRefreshUserMessage maps a refreshTemplate failure to a fixed
+// user-facing reason. Only fixed strings are returned: the raw error
+// may carry upstream detail (URL, dial/TLS text) and refreshTemplate
+// can also return repo-marked errors, so returning err.Error()
+// verbatim trips the R2-F4-01 admin raw-error gate. The download
+// prefix is kept so the B6-03/B6-04 assertions on "下载模板失败"
+// keep holding; the full error stays in the server log.
+func templateRefreshUserMessage(err error) string {
+	msg := err.Error()
+	if strings.HasPrefix(msg, "下载模板失败") {
+		return "下载模板失败，请检查模板地址与网络后重试"
+	}
+	if msg == "模板已被删除" {
+		return "模板已被删除"
+	}
+	return "模板校验失败，请检查模板内容后重试"
+}
+
+func (h *Handler) subscriptionTemplateDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+	var req struct {
+		ID int64 `json:"id"`
+	}
+	if err := decodeJSON(r.Body, &req); err != nil {
+		response.WriteJSON(w, response.ErrDefault("请求参数错误"))
+		return
+	}
+	usage, usageErr := h.templateUsage()
+	if usageErr != nil {
+		respondInternalError(w, "subscriptionTemplateDelete", usageErr)
+		return
+	}
+	if n := usage[req.ID]; n > 0 {
+		response.WriteJSON(w, response.ErrDefault("有 "+strconv.Itoa(n)+" 个订阅在用这个模板，先在订阅里换掉"))
+		return
+	}
+	if err := h.repo.DeleteSubscriptionTemplate(req.ID); err != nil {
+		respondInternalError(w, "subscriptionTemplateDelete", err)
+		return
+	}
+	response.WriteJSON(w, response.OKEmpty())
+}

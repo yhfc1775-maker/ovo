@@ -1,0 +1,479 @@
+package kernel
+
+import (
+	"encoding/json"
+	"fmt"
+	"net"
+	"sort"
+	"strconv"
+	"strings"
+)
+
+// Proxy is an imported node in the Mihomo (Clash Meta) proxy schema. Like
+// Sub-Store, every import format is parsed into this one shape and every
+// subscription format is produced from it, so no parameter is lost when a
+// node only passes through the panel.
+type Proxy map[string]interface{}
+
+// importTypes maps the supported Mihomo proxy types to the panel's protocol
+// names (used for display and the inbound's protocol column).
+var importTypes = map[string]string{
+	"ss":        ProtocolShadowsocks,
+	"vmess":     ProtocolVMess,
+	"vless":     ProtocolVLESS,
+	"trojan":    ProtocolTrojan,
+	"hysteria2": ProtocolHysteria2,
+	"tuic":      ProtocolTUIC,
+	"anytls":    ProtocolAnyTLS,
+	"snell":     ProtocolSnell,
+	"naive":     ProtocolNaive,
+	"socks5":    "socks5",
+	"http":      "http",
+}
+
+var proxyLabels = map[string]string{
+	"ss": "Shadowsocks", "vmess": "VMess", "vless": "VLESS", "trojan": "Trojan",
+	"hysteria2": "Hysteria2", "tuic": "TUIC", "anytls": "AnyTLS", "snell": "Snell",
+	"naive": "NaïveProxy", "socks5": "SOCKS5", "http": "HTTP",
+}
+
+// ImportedNode is a node the panel does not deploy; it only relays and
+// shares it.
+type ImportedNode struct {
+	Name  string
+	Host  string
+	Port  int
+	Proxy Proxy
+}
+
+func (p Proxy) str(k string) string {
+	switch v := p[k].(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case nil:
+		return ""
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	default:
+		return strings.TrimSpace(fmt.Sprint(v))
+	}
+}
+
+func (p Proxy) num(k string) int {
+	switch v := p[k].(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	case string:
+		n, _ := strconv.Atoi(strings.TrimSpace(v))
+		return n
+	}
+	return 0
+}
+
+// exactInt returns the integer stored under k when it is an exact integer:
+// a float with a fractional part (8388.9) or beyond float64's exact range
+// (1e20) is reported inexact instead of being silently truncated or
+// wrapped by num(). present=false means the key is absent.
+func (p Proxy) exactInt(k string) (n int, present, exact bool) {
+	v, present := p[k]
+	if !present {
+		return 0, false, false
+	}
+	switch t := v.(type) {
+	case int:
+		return t, true, true
+	case int64:
+		if t > 1<<53 || t < -(1<<53) {
+			return 0, true, false
+		}
+		return int(t), true, true
+	case float64:
+		if t == float64(int64(t)) && t <= 1<<53 && t >= -(1<<53) {
+			return int(t), true, true
+		}
+		return 0, true, false
+	case string:
+		if n, err := strconv.Atoi(strings.TrimSpace(t)); err == nil {
+			return n, true, true
+		}
+	}
+	return 0, true, false
+}
+
+func (p Proxy) flag(k string) bool {
+	switch v := p[k].(type) {
+	case bool:
+		return v
+	case string:
+		v = strings.ToLower(strings.TrimSpace(v))
+		return v == "true" || v == "1"
+	case int:
+		return v != 0
+	case float64:
+		return v != 0
+	}
+	return false
+}
+
+func (p Proxy) sub(k string) Proxy {
+	switch v := p[k].(type) {
+	case map[string]interface{}:
+		return Proxy(v)
+	case Proxy:
+		return v
+	}
+	return Proxy{}
+}
+
+func (p Proxy) strs(k string) []string {
+	var out []string
+	switch v := p[k].(type) {
+	case []interface{}:
+		for _, x := range v {
+			if s := strings.TrimSpace(fmt.Sprint(x)); s != "" {
+				out = append(out, s)
+			}
+		}
+	case []string:
+		for _, s := range v {
+			if s = strings.TrimSpace(s); s != "" {
+				out = append(out, s)
+			}
+		}
+	case string:
+		for _, s := range strings.Split(v, ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				out = append(out, s)
+			}
+		}
+	}
+	return out
+}
+
+// set stores v unless it is empty, keeping generated maps tidy.
+func (p Proxy) set(k string, v interface{}) {
+	switch t := v.(type) {
+	case string:
+		if t == "" {
+			return
+		}
+	case int:
+		if t == 0 {
+			return
+		}
+	case bool:
+		if !t {
+			return
+		}
+	case []string:
+		if len(t) == 0 {
+			return
+		}
+	case Proxy:
+		if len(t) == 0 {
+			return
+		}
+		v = map[string]interface{}(t)
+	case map[string]interface{}:
+		if len(t) == 0 {
+			return
+		}
+	}
+	p[k] = v
+}
+
+func (p Proxy) Type() string { return strings.ToLower(p.str("type")) }
+
+func (p Proxy) network() string {
+	n := strings.ToLower(p.str("network"))
+	if n == "" {
+		return "tcp"
+	}
+	return n
+}
+
+// serverName is the TLS server name, whichever key the type uses.
+func (p Proxy) serverName() string {
+	if s := p.str("servername"); s != "" {
+		return s
+	}
+	return p.str("sni")
+}
+
+func (p Proxy) usesTLS() bool {
+	switch p.Type() {
+	case "trojan", "hysteria2", "tuic", "anytls":
+		return true
+	}
+	return p.flag("tls") || len(p.sub("reality-opts")) > 0
+}
+
+// bandwidthMbps parses a Hysteria2 bandwidth value (the up / down keys)
+// into whole Mbps. Accepted shapes are the ones the import faces store:
+// a bare number (int / float / numeric string) or a number with an
+// Mbps unit suffix ("100Mbps", "100 Mbps", "100 mbps"). Anything else
+// (including Gbps forms, which no import face produces) reports false
+// so render faces omit the field instead of emitting a wrong limit.
+func (p Proxy) bandwidthMbps(key string) (int, bool) {
+	switch v := p[key].(type) {
+	case int:
+		return v, v > 0
+	case int64:
+		return int(v), v > 0
+	case float64:
+		return int(v), v > 0
+	case string:
+		s := strings.TrimSpace(strings.ToLower(v))
+		s = strings.TrimSpace(strings.TrimSuffix(s, "mbps"))
+		if n, err := strconv.Atoi(s); err == nil {
+			return n, n > 0
+		}
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			return int(f), f > 0
+		}
+	}
+	return 0, false
+}
+
+// IdentityShape is the non-credential identity descriptor of an
+// imported proxy: transport, security form, SNI and the Reality /
+// transport discriminators. Two entries at the same address with the
+// same credentials but different shapes are different nodes (a
+// VLESS+WS+Reality entry and a VLESS+TCP+TLS entry behind one
+// host:port do not substitute for each other), so the import dedupe
+// identity (handler.externalIdentityKey) mixes this descriptor in
+// (W3/I-004 — the key previously covered credentials only, and a
+// second import differing only in shape was rejected as a duplicate).
+func (p Proxy) IdentityShape() string {
+	security := "none"
+	if len(p.sub("reality-opts")) > 0 {
+		security = "reality"
+	} else if p.usesTLS() {
+		security = "tls"
+	}
+	parts := []string{"net:" + p.network(), "sec:" + security, "sni:" + strings.ToLower(p.serverName())}
+	if ro := p.sub("reality-opts"); len(ro) > 0 {
+		parts = append(parts, "pbk:"+ro.str("public-key"), "sid:"+ro.str("short-id"))
+	}
+	// Transport discriminators: the path / service name / host header
+	// that decide where the entry actually lands.
+	switch p.network() {
+	case "ws":
+		parts = append(parts, "path:"+p.sub("ws-opts").str("path"))
+	case "grpc":
+		parts = append(parts, "svc:"+p.sub("grpc-opts").str("grpc-service-name"))
+	case "xhttp":
+		parts = append(parts, "path:"+p.sub("xhttp-opts").str("path"))
+	case "h2":
+		parts = append(parts, "path:"+p.sub("h2-opts").str("path"))
+	}
+	return strings.Join(parts, "|")
+}
+
+func (p Proxy) clone() Proxy {
+	b, _ := json.Marshal(p)
+	out := Proxy{}
+	_ = json.Unmarshal(b, &out)
+	return out
+}
+
+// ProxyProtocol is the panel protocol name for an imported proxy.
+func ProxyProtocol(p Proxy) string { return importTypes[p.Type()] }
+
+// DescribeProxy summarises an imported proxy, e.g. "VLESS + WS + TLS".
+func DescribeProxy(p Proxy) string {
+	parts := []string{proxyLabels[p.Type()]}
+	if parts[0] == "" {
+		parts[0] = p.Type()
+	}
+	if n := p.network(); n != "tcp" && n != "" {
+		parts = append(parts, strings.ToUpper(n))
+	}
+	switch {
+	case len(p.sub("reality-opts")) > 0:
+		parts = append(parts, "Reality")
+	case p.flag("tls"):
+		parts = append(parts, "TLS")
+	}
+	if plugin := p.str("plugin"); plugin != "" {
+		parts = append(parts, plugin)
+	}
+	if p.str("obfs") != "" || len(p.sub("obfs-opts")) > 0 {
+		parts = append(parts, "obfs")
+	}
+	return strings.Join(parts, " + ")
+}
+
+// ProxyParams flattens an imported proxy for display, sorted by key.
+func ProxyParams(p Proxy) [][2]string {
+	var out [][2]string
+	var walk func(prefix string, m Proxy)
+	walk = func(prefix string, m Proxy) {
+		keys := make([]string, 0, len(m))
+		for k := range m {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			if prefix == "" && (k == "name" || k == "server" || k == "port") {
+				continue
+			}
+			switch v := m[k].(type) {
+			case map[string]interface{}:
+				walk(prefix+k+".", Proxy(v))
+			case []interface{}:
+				out = append(out, [2]string{prefix + k, strings.Join(Proxy{"x": v}.strs("x"), ", ")})
+			default:
+				out = append(out, [2]string{prefix + k, Proxy{"x": v}.str("x")})
+			}
+		}
+	}
+	walk("", p)
+	return out
+}
+
+// forEndpoint renders the proxy for one endpoint. Relays dial a different
+// address, so a domain the node was reached by is kept as the TLS server
+// name and WebSocket Host, and port hopping (one forwarded port) is dropped.
+func (p Proxy) forEndpoint(e Endpoint) Proxy {
+	out := p.clone()
+	orig := p.str("server")
+	out["name"] = e.Name
+	out["server"] = strings.Trim(e.Host, "[]")
+	out["port"] = e.Port
+	if out.Type() == "ss" {
+		// R4X-001（渲染自愈）：存量 cipher 大小写变体行在渲染克隆上
+		// 小写化——存量不迁移、拉取自愈（与下方密钥规范化同口径）。
+		// 变体名原样渲染会被 sing-box / mihomo 以 unknown method 拒
+		// 载整表、被 Loon / QX 的小写白名单静默丢弃；小写化后坏 key
+		// 变体也重新落入各面守卫（如 sing-box 的 ValidSS2022SingleKey
+		// 略过）。存储值不动。
+		if c := out.str("cipher"); c != "" {
+			out["cipher"] = strings.ToLower(c)
+		}
+		// GATE-F1（R3X-008 渲染侧）：forEndpoint 是导入节点的唯一渲染
+		// 收敛点——sing-box / Clash / Surge / ss 链接 / Loon / QX /
+		// Shadowrocket 与双链式出站全部经此克隆。在此把单段 SS2022
+		// 密钥规范化为带填充 Std 形态，一处收口全集；存量坏 key 与
+		// SIP023 多段按各面既有口径（helper 原样返回，见
+		// NormalizedSS2022Password）。存储值不动（导入期原样存口径
+		// 不变），仅渲染克隆归一。
+		if pw, ok := out["password"].(string); ok {
+			out["password"] = NormalizedSS2022Password(out.str("cipher"), pw)
+		}
+		// B-03（渲染自愈，同 cipher 口径）：存量 plugin 名大小写
+		// 变体行（进口愈合上线前落库）在渲染克隆上小写化——四面
+		// 渲染开关为精确匹配，变体名原样渲染即整节点丢弃；小写化
+		// 后未知插件名仍为未知名、仍被各面开关略过，接受集不扩大。
+		// 存储值不动。
+		if pl := out.str("plugin"); pl != "" {
+			out["plugin"] = strings.ToLower(pl)
+		}
+	}
+	// R9X-004（渲染自愈，同 SS cipher 口径）：其余四枚举字段的谓词
+	// 均大小写不敏感（credentials.go 各 Valid* 以 ToLower 判定），
+	// 但渲染产物在大小写敏感的本体面仍被拒——sing-box 对 vmess
+	// cipher / vless flow / hy2 obfs / tuic congestion-controller
+	// 大写变体整表/整单 FATAL、Xray 对 vless flow 大写 exit 23。
+	// 存量（进口愈合上线前落库）与旧备份逐字恢复来源在此克隆上
+	// 小写愈合，一处收口链式双面（chainTargetFromProxy /
+	// singboxOutbounds）与订阅面（proxySingbox / proxyClash /
+	// proxyURI 等共用本构造点）；垃圾值小写化后仍为垃圾值、仍被
+	// 各面谓词略过/拒绝，接受集不扩大。存储值不动。
+	switch out.Type() {
+	case "vmess":
+		if c := out.str("cipher"); c != "" {
+			out["cipher"] = strings.ToLower(c)
+		}
+	case "vless":
+		if f := out.str("flow"); f != "" {
+			out["flow"] = strings.ToLower(f)
+		}
+	case "hysteria2":
+		if o := out.str("obfs"); o != "" {
+			out["obfs"] = strings.ToLower(o)
+		}
+	case "tuic":
+		if cc := out.str("congestion-controller"); cc != "" {
+			out["congestion-controller"] = strings.ToLower(cc)
+		}
+	}
+	// R10X-001/002/003（渲染自愈，同 R9X-004 口径）：三个枚举字段的
+	// 谓词均大小写不敏感，但渲染产物在大小写敏感的本体面仍被拒。
+	// 存量克隆在此一处同口径小写愈合（存储不动）：client-fingerprint
+	// 与 xhttp-opts.mode 为横切字段（不绑协议）；SS plugin-opts.mode
+	// 仅 plugin=obfs 时——愈合后 Clash 透传面与 Surge 面同受益，
+	// ssPluginString 消费点另有同口径兜底。垃圾值小写化后仍被各面
+	// 谓词略过/拒绝，接受集不扩大。
+	if fp := out.str("client-fingerprint"); fp != "" {
+		out["client-fingerprint"] = strings.ToLower(fp)
+	}
+	if xo := out.sub("xhttp-opts"); xo.str("mode") != "" {
+		cp := xo.clone()
+		cp["mode"] = strings.ToLower(xo.str("mode"))
+		out["xhttp-opts"] = map[string]interface{}(cp)
+	}
+	if out.Type() == "ss" && strings.EqualFold(out.str("plugin"), "obfs") {
+		if po := out.sub("plugin-opts"); po.str("mode") != "" {
+			cp := po.clone()
+			cp["mode"] = strings.ToLower(po.str("mode"))
+			out["plugin-opts"] = map[string]interface{}(cp)
+		}
+	}
+	// R10X-009（D-04，渲染愈合上收）：Snell 两格此前只在 proxyClash
+	// 一面本地愈合、Surge 面原样下发，v6 顶层 mode 变体则在
+	// sing-box / Surge 两面被精确匹配静默丢弃。在此克隆上一处收口
+	// （与四字段同口径，存储不动）：
+	//   - obfs-opts.mode 经 CanonicalSnellObfsMode 规范化一次
+	//     （大小写小写化 + shadowtls 别名拼写），全面受益；
+	//     proxyClash 的本地愈合保留作冗余。
+	//   - 顶层 mode 凡 EqualFold(unshaped) 即愈合为规范值
+	//     SnellModeUnshaped，使 sing-box / Surge 的 v6 精确匹配
+	//     输出点命中而非丢弃；其余值原样（下游仍不输出，不扩大
+	//     接受集）。
+	if out.Type() == "snell" {
+		if oo := out.sub("obfs-opts"); oo.str("mode") != "" {
+			cp := make(Proxy, len(oo))
+			for k, v := range oo {
+				cp[k] = v
+			}
+			cp["mode"] = CanonicalSnellObfsMode(oo.str("mode"))
+			out["obfs-opts"] = map[string]interface{}(cp)
+		}
+		if strings.EqualFold(out.str("mode"), SnellModeUnshaped) {
+			out["mode"] = SnellModeUnshaped
+		}
+	}
+	if e.Direct {
+		return out
+	}
+	delete(out, "ports")
+	delete(out, "hop-interval")
+	if orig == "" || net.ParseIP(orig) != nil {
+		return out
+	}
+	if out.usesTLS() && out.serverName() == "" {
+		if t := out.Type(); t == "vmess" || t == "vless" {
+			out["servername"] = orig
+		} else {
+			out["sni"] = orig
+		}
+	}
+	if out.network() == "ws" {
+		ws := out.sub("ws-opts").clone()
+		headers := ws.sub("headers").clone()
+		// R5-D-02：全拼写判空——firstHeaderHostValue 覆盖全部拼写与
+		// 列表值，任一非空用户值在位即不注入，避免注入的规范键
+		// 在规范优先的读取下遮蔽用户非规范拼写键。
+		if firstHeaderHostValue(headers) == "" {
+			headers["Host"] = orig
+			ws["headers"] = map[string]interface{}(headers)
+			out["ws-opts"] = map[string]interface{}(ws)
+		}
+	}
+	return out
+}

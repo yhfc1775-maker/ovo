@@ -1,0 +1,1044 @@
+{
+  "baseline": "audit/20261124-full",
+  "countsBefore": {
+    "VerifyPassword": 11,
+    "GetSubscriptionByToken": 1,
+    "FinishPasskeyLogin": 1,
+    "UpdatePasskeyCredential": 1,
+    "DefaultSubscription": 4,
+    "ForwardRecordAdapter": 8,
+    "OnUpdate": 74,
+    "ParseChain": 6,
+    "ParseHop": 5,
+    "ParseService": 13,
+    "NewChain": 1,
+    "ParseNode": 1,
+    "NewHop": 1,
+    "NewTransport": 1
+  },
+  "countsAfter": {
+    "VerifyPassword": 11,
+    "UpdateUserNameAndPasswordIfCurrent": 1,
+    "CreatePasskeyIfCurrent": 1,
+    "FinishPasskeyLogin": 1,
+    "UpdatePasskeyCredential": 1,
+    "DeletePasskeyAndRevokeSessionsIfCurrent": 1,
+    "DefaultSubscription": 4,
+    "GetSubscriptionByToken": 1,
+    "ForwardRecordAdapter": 8,
+    "commitNamedConfig": 45,
+    "ParseChain": 6,
+    "OnUpdate": 15,
+    "ParseHop": 5,
+    "MutateServices": 10,
+    "ParseService": 5,
+    "NewChain": 1,
+    "ParseNode": 1,
+    "NewHop": 1,
+    "NewTransport": 1
+  },
+  "baselineIgnoredAPIOnUpdate": [
+    {
+      "file": "go-gost/x/api/config.go",
+      "function": "getConfig",
+      "line": 47,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_admission.go",
+      "function": "createAdmission",
+      "line": 60,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_admission.go",
+      "function": "updateAdmission",
+      "line": 120,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_admission.go",
+      "function": "deleteAdmission",
+      "line": 175,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_auther.go",
+      "function": "createAuther",
+      "line": 59,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_auther.go",
+      "function": "updateAuther",
+      "line": 118,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_auther.go",
+      "function": "deleteAuther",
+      "line": 173,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_bypass.go",
+      "function": "createBypass",
+      "line": 60,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_bypass.go",
+      "function": "updateBypass",
+      "line": 120,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_bypass.go",
+      "function": "deleteBypass",
+      "line": 175,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_chain.go",
+      "function": "createChain",
+      "line": 64,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_chain.go",
+      "function": "updateChain",
+      "line": 129,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_chain.go",
+      "function": "deleteChain",
+      "line": 184,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_conn_limiter.go",
+      "function": "createConnLimiter",
+      "line": 59,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_conn_limiter.go",
+      "function": "updateConnLimiter",
+      "line": 119,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_conn_limiter.go",
+      "function": "deleteConnLimiter",
+      "line": 174,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_hop.go",
+      "function": "createHop",
+      "line": 64,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_hop.go",
+      "function": "updateHop",
+      "line": 128,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_hop.go",
+      "function": "deleteHop",
+      "line": 183,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_hosts.go",
+      "function": "createHosts",
+      "line": 60,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_hosts.go",
+      "function": "updateHosts",
+      "line": 120,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_hosts.go",
+      "function": "deleteHosts",
+      "line": 175,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_ingress.go",
+      "function": "createIngress",
+      "line": 60,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_ingress.go",
+      "function": "updateIngress",
+      "line": 120,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_ingress.go",
+      "function": "deleteIngress",
+      "line": 175,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_limiter.go",
+      "function": "createLimiter",
+      "line": 60,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_limiter.go",
+      "function": "updateLimiter",
+      "line": 120,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_limiter.go",
+      "function": "deleteLimiter",
+      "line": 175,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_observer.go",
+      "function": "createObserver",
+      "line": 60,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_observer.go",
+      "function": "updateObserver",
+      "line": 120,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_observer.go",
+      "function": "deleteObserver",
+      "line": 175,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_rate_limiter.go",
+      "function": "createRateLimiter",
+      "line": 60,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_rate_limiter.go",
+      "function": "updateRateLimiter",
+      "line": 120,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_rate_limiter.go",
+      "function": "deleteRateLimiter",
+      "line": 175,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_recorder.go",
+      "function": "createRecorder",
+      "line": 59,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_recorder.go",
+      "function": "updateRecorder",
+      "line": 119,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_recorder.go",
+      "function": "deleteRecorder",
+      "line": 174,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_resolver.go",
+      "function": "createResolver",
+      "line": 64,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_resolver.go",
+      "function": "updateResolver",
+      "line": 128,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_resolver.go",
+      "function": "deleteResolver",
+      "line": 183,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_router.go",
+      "function": "createRouter",
+      "line": 60,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_router.go",
+      "function": "updateRouter",
+      "line": 120,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_router.go",
+      "function": "deleteRouter",
+      "line": 175,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_sd.go",
+      "function": "createSD",
+      "line": 60,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_sd.go",
+      "function": "updateSD",
+      "line": 120,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_sd.go",
+      "function": "deleteSD",
+      "line": 175,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_service.go",
+      "function": "createService",
+      "line": 85,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_service.go",
+      "function": "createServices",
+      "line": 172,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_service.go",
+      "function": "updateService",
+      "line": 258,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_service.go",
+      "function": "updateServices",
+      "line": 346,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_service.go",
+      "function": "deleteService",
+      "line": 418,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_service.go",
+      "function": "deleteServices",
+      "line": 493,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_service.go",
+      "function": "pauseService",
+      "line": 597,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_service.go",
+      "function": "resumeService",
+      "line": 714,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_service.go",
+      "function": "rollbackPausedServices",
+      "line": 836,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    },
+    {
+      "file": "go-gost/x/api/config_service.go",
+      "function": "rollbackResumedServices",
+      "line": 871,
+      "mechanism": "OnUpdate",
+      "unchecked": true
+    }
+  ],
+  "namedAPICommits": [
+    {
+      "file": "go-gost/x/api/config_admission.go",
+      "function": "createAdmission",
+      "line": 55,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_admission.go",
+      "function": "updateAdmission",
+      "line": 110,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_admission.go",
+      "function": "deleteAdmission",
+      "line": 167,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_auther.go",
+      "function": "createAuther",
+      "line": 55,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_auther.go",
+      "function": "updateAuther",
+      "line": 110,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_auther.go",
+      "function": "deleteAuther",
+      "line": 167,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_bypass.go",
+      "function": "createBypass",
+      "line": 55,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_bypass.go",
+      "function": "updateBypass",
+      "line": 110,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_bypass.go",
+      "function": "deleteBypass",
+      "line": 167,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_chain.go",
+      "function": "createChain",
+      "line": 59,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_chain.go",
+      "function": "updateChain",
+      "line": 119,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_chain.go",
+      "function": "deleteChain",
+      "line": 176,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_conn_limiter.go",
+      "function": "createConnLimiter",
+      "line": 55,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_conn_limiter.go",
+      "function": "updateConnLimiter",
+      "line": 110,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_conn_limiter.go",
+      "function": "deleteConnLimiter",
+      "line": 167,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_hop.go",
+      "function": "createHop",
+      "line": 59,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_hop.go",
+      "function": "updateHop",
+      "line": 118,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_hop.go",
+      "function": "deleteHop",
+      "line": 175,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_hosts.go",
+      "function": "createHosts",
+      "line": 55,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_hosts.go",
+      "function": "updateHosts",
+      "line": 110,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_hosts.go",
+      "function": "deleteHosts",
+      "line": 167,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_ingress.go",
+      "function": "createIngress",
+      "line": 55,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_ingress.go",
+      "function": "updateIngress",
+      "line": 110,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_ingress.go",
+      "function": "deleteIngress",
+      "line": 167,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_limiter.go",
+      "function": "createLimiter",
+      "line": 55,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_limiter.go",
+      "function": "updateLimiter",
+      "line": 110,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_limiter.go",
+      "function": "deleteLimiter",
+      "line": 167,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_observer.go",
+      "function": "createObserver",
+      "line": 55,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_observer.go",
+      "function": "updateObserver",
+      "line": 110,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_observer.go",
+      "function": "deleteObserver",
+      "line": 167,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_rate_limiter.go",
+      "function": "createRateLimiter",
+      "line": 55,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_rate_limiter.go",
+      "function": "updateRateLimiter",
+      "line": 110,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_rate_limiter.go",
+      "function": "deleteRateLimiter",
+      "line": 167,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_recorder.go",
+      "function": "createRecorder",
+      "line": 54,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_recorder.go",
+      "function": "updateRecorder",
+      "line": 109,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_recorder.go",
+      "function": "deleteRecorder",
+      "line": 166,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_resolver.go",
+      "function": "createResolver",
+      "line": 59,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_resolver.go",
+      "function": "updateResolver",
+      "line": 118,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_resolver.go",
+      "function": "deleteResolver",
+      "line": 175,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_router.go",
+      "function": "createRouter",
+      "line": 55,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_router.go",
+      "function": "updateRouter",
+      "line": 110,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_router.go",
+      "function": "deleteRouter",
+      "line": 167,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_sd.go",
+      "function": "createSD",
+      "line": 55,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_sd.go",
+      "function": "updateSD",
+      "line": 110,
+      "mechanism": "commitNamedConfig"
+    },
+    {
+      "file": "go-gost/x/api/config_sd.go",
+      "function": "deleteSD",
+      "line": 167,
+      "mechanism": "commitNamedConfig"
+    }
+  ],
+  "serviceAPIDelegation": [
+    {
+      "file": "go-gost/x/api/config_service.go",
+      "function": "createService",
+      "line": 46,
+      "mechanism": "MutateServices"
+    },
+    {
+      "file": "go-gost/x/api/config_service.go",
+      "function": "createServices",
+      "line": 60,
+      "mechanism": "MutateServices"
+    },
+    {
+      "file": "go-gost/x/api/config_service.go",
+      "function": "updateService",
+      "line": 112,
+      "mechanism": "MutateServices"
+    },
+    {
+      "file": "go-gost/x/api/config_service.go",
+      "function": "updateServices",
+      "line": 132,
+      "mechanism": "MutateServices"
+    },
+    {
+      "file": "go-gost/x/api/config_service.go",
+      "function": "deleteService",
+      "line": 177,
+      "mechanism": "MutateServices"
+    },
+    {
+      "file": "go-gost/x/api/config_service.go",
+      "function": "deleteServices",
+      "line": 197,
+      "mechanism": "MutateServices"
+    },
+    {
+      "file": "go-gost/x/api/config_service.go",
+      "function": "pauseService",
+      "line": 243,
+      "mechanism": "MutateServices"
+    },
+    {
+      "file": "go-gost/x/api/config_service.go",
+      "function": "resumeService",
+      "line": 263,
+      "mechanism": "MutateServices"
+    },
+    {
+      "file": "go-gost/x/api/config_service.go",
+      "function": "pauseServices",
+      "line": 381,
+      "mechanism": "MutateServices"
+    },
+    {
+      "file": "go-gost/x/api/config_service.go",
+      "function": "resumeServices",
+      "line": 395,
+      "mechanism": "MutateServices"
+    }
+  ],
+  "resourceConstructors": [
+    {
+      "file": "go-gost/x/api/config_chain.go",
+      "function": "createChain",
+      "line": 53,
+      "mechanism": "ParseChain"
+    },
+    {
+      "file": "go-gost/x/api/config_chain.go",
+      "function": "updateChain",
+      "line": 113,
+      "mechanism": "ParseChain"
+    },
+    {
+      "file": "go-gost/x/api/config_hop.go",
+      "function": "createHop",
+      "line": 53,
+      "mechanism": "ParseHop"
+    },
+    {
+      "file": "go-gost/x/api/config_hop.go",
+      "function": "updateHop",
+      "line": 112,
+      "mechanism": "ParseHop"
+    },
+    {
+      "file": "go-gost/x/config/loader/loader.go",
+      "function": "register",
+      "line": 339,
+      "mechanism": "ParseHop"
+    },
+    {
+      "file": "go-gost/x/config/loader/loader.go",
+      "function": "register",
+      "line": 359,
+      "mechanism": "ParseChain"
+    },
+    {
+      "file": "go-gost/x/config/loader/loader.go",
+      "function": "register",
+      "line": 381,
+      "mechanism": "ParseService"
+    },
+    {
+      "file": "go-gost/x/config/parsing/chain/parse.go",
+      "function": "ParseChain",
+      "line": 31,
+      "mechanism": "NewChain"
+    },
+    {
+      "file": "go-gost/x/config/parsing/chain/parse.go",
+      "function": "ParseChain",
+      "line": 51,
+      "mechanism": "ParseHop"
+    },
+    {
+      "file": "go-gost/x/config/parsing/hop/parse.go",
+      "function": "ParseHop",
+      "line": 111,
+      "mechanism": "ParseNode"
+    },
+    {
+      "file": "go-gost/x/config/parsing/hop/parse.go",
+      "function": "ParseHop",
+      "line": 155,
+      "mechanism": "NewHop"
+    },
+    {
+      "file": "go-gost/x/config/parsing/node/parse.go",
+      "function": "ParseNode",
+      "line": 167,
+      "mechanism": "NewTransport"
+    },
+    {
+      "file": "go-gost/x/config/parsing/service/parse.go",
+      "function": "parseForwarder",
+      "line": 558,
+      "mechanism": "ParseHop"
+    },
+    {
+      "file": "go-gost/x/socket/chain.go",
+      "function": "createChain",
+      "line": 26,
+      "mechanism": "ParseChain"
+    },
+    {
+      "file": "go-gost/x/socket/chain.go",
+      "function": "restoreChainRuntime",
+      "line": 101,
+      "mechanism": "ParseChain"
+    },
+    {
+      "file": "go-gost/x/socket/chain.go",
+      "function": "updateChain",
+      "line": 126,
+      "mechanism": "ParseChain"
+    },
+    {
+      "file": "go-gost/x/socket/service.go",
+      "function": "createServices",
+      "line": 67,
+      "mechanism": "ParseService"
+    },
+    {
+      "file": "go-gost/x/socket/service.go",
+      "function": "updateServices",
+      "line": 214,
+      "mechanism": "ParseService"
+    },
+    {
+      "file": "go-gost/x/socket/service.go",
+      "function": "restoreServiceRuntime",
+      "line": 302,
+      "mechanism": "ParseService"
+    },
+    {
+      "file": "go-gost/x/socket/service.go",
+      "function": "resumeServices",
+      "line": 508,
+      "mechanism": "ParseService"
+    }
+  ],
+  "forwardRecordAdapters": [
+    {
+      "file": "go-backend/internal/store/repo/repository_control.go",
+      "function": "ListForwardsByTunnelTx",
+      "line": 77,
+      "mechanism": "ForwardRecordAdapter"
+    },
+    {
+      "file": "go-backend/internal/store/repo/repository_flow.go",
+      "function": "ListActiveForwardsByUser",
+      "line": 162,
+      "mechanism": "ForwardRecordAdapter"
+    },
+    {
+      "file": "go-backend/internal/store/repo/repository_flow.go",
+      "function": "ListActiveForwardsByUserTunnel",
+      "line": 200,
+      "mechanism": "ForwardRecordAdapter"
+    },
+    {
+      "file": "go-backend/internal/store/repo/repository_flow.go",
+      "function": "ListForwardsByUser",
+      "line": 241,
+      "mechanism": "ForwardRecordAdapter"
+    },
+    {
+      "file": "go-backend/internal/store/repo/repository_flow.go",
+      "function": "ListForwardsByUserAndTunnel",
+      "line": 279,
+      "mechanism": "ForwardRecordAdapter"
+    },
+    {
+      "file": "go-backend/internal/store/repo/repository_flow.go",
+      "function": "GetForwardRecord",
+      "line": 318,
+      "mechanism": "ForwardRecordAdapter"
+    },
+    {
+      "file": "go-backend/internal/store/repo/repository_nftables.go",
+      "function": "listForwardsByNodeStatus",
+      "line": 274,
+      "mechanism": "ForwardRecordAdapter"
+    },
+    {
+      "file": "go-backend/internal/store/repo/repository_nftables.go",
+      "function": "ListRealmForwardsByNode",
+      "line": 322,
+      "mechanism": "ForwardRecordAdapter"
+    }
+  ],
+  "passwordProofCalls": [
+    {
+      "file": "go-backend/internal/http/handler/handler.go",
+      "function": "isStoredDefaultPassword",
+      "line": 635,
+      "mechanism": "VerifyPassword"
+    },
+    {
+      "file": "go-backend/internal/http/handler/handler.go",
+      "function": "isStoredDefaultPassword",
+      "line": 640,
+      "mechanism": "VerifyPassword"
+    },
+    {
+      "file": "go-backend/internal/http/handler/handler.go",
+      "function": "login",
+      "line": 817,
+      "mechanism": "VerifyPassword"
+    },
+    {
+      "file": "go-backend/internal/http/handler/handler.go",
+      "function": "login",
+      "line": 821,
+      "mechanism": "VerifyPassword"
+    },
+    {
+      "file": "go-backend/internal/http/handler/handler.go",
+      "function": "openAPISubStore",
+      "line": 1361,
+      "mechanism": "VerifyPassword"
+    },
+    {
+      "file": "go-backend/internal/http/handler/handler.go",
+      "function": "openAPISubStore",
+      "line": 1365,
+      "mechanism": "VerifyPassword"
+    },
+    {
+      "file": "go-backend/internal/http/handler/handler.go",
+      "function": "updatePassword",
+      "line": 2613,
+      "mechanism": "VerifyPassword"
+    },
+    {
+      "file": "go-backend/internal/http/handler/handler.go",
+      "function": "updatePassword",
+      "line": 2643,
+      "mechanism": "UpdateUserNameAndPasswordIfCurrent"
+    },
+    {
+      "file": "go-backend/internal/http/handler/passkey.go",
+      "function": "passkeyRegisterBegin",
+      "line": 195,
+      "mechanism": "VerifyPassword"
+    },
+    {
+      "file": "go-backend/internal/http/handler/passkey.go",
+      "function": "passkeyRegisterFinish",
+      "line": 274,
+      "mechanism": "CreatePasskeyIfCurrent"
+    },
+    {
+      "file": "go-backend/internal/http/handler/passkey.go",
+      "function": "passkeyLoginFinish",
+      "line": 360,
+      "mechanism": "FinishPasskeyLogin"
+    },
+    {
+      "file": "go-backend/internal/http/handler/passkey.go",
+      "function": "passkeyLoginFinish",
+      "line": 398,
+      "mechanism": "UpdatePasskeyCredential"
+    },
+    {
+      "file": "go-backend/internal/http/handler/passkey.go",
+      "function": "passkeyDelete",
+      "line": 482,
+      "mechanism": "VerifyPassword"
+    },
+    {
+      "file": "go-backend/internal/http/handler/passkey.go",
+      "function": "passkeyDelete",
+      "line": 486,
+      "mechanism": "DeletePasskeyAndRevokeSessionsIfCurrent"
+    },
+    {
+      "file": "go-backend/internal/store/repo/initial_admin.go",
+      "function": "probeInitialAdminPassword",
+      "line": 344,
+      "mechanism": "VerifyPassword"
+    },
+    {
+      "file": "go-backend/internal/store/repo/initial_admin.go",
+      "function": "probeInitialAdminPassword",
+      "line": 353,
+      "mechanism": "VerifyPassword"
+    }
+  ],
+  "difference": {
+    "namedAPIMissing": [],
+    "serviceAPIMissing": [],
+    "uncheckedOnUpdate": [],
+    "missingForwardRecordPolicy": []
+  }
+}

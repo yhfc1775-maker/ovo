@@ -1,0 +1,8379 @@
+package repo
+
+import (
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"math"
+	"math/bits"
+	"net"
+	"net/netip"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+	"unicode"
+
+	gsqlite "github.com/glebarez/sqlite"
+	"github.com/go-webauthn/webauthn/webauthn"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+	"gorm.io/gorm/logger"
+
+	"go-backend/internal/kernel"
+	"go-backend/internal/monitoring"
+	"go-backend/internal/netguard"
+	"go-backend/internal/security"
+	"go-backend/internal/store/model"
+)
+
+const (
+	defaultPostgresMaxOpenConns = 32
+	defaultPostgresMaxIdleConns = 8
+	defaultPostgresConnMaxIdle  = 5 * time.Minute
+	defaultPostgresConnMaxLife  = 30 * time.Minute
+)
+
+// ─── Type aliases for backward compatibility ─────────────────────────
+// Handlers still reference repo.User, repo.BackupData, etc.
+
+type User = model.User
+type ViteConfig = model.ViteConfig
+type UserTunnelDetail = model.UserTunnelDetail
+type UserForwardDetail = model.UserForwardDetail
+type StatisticsFlow = model.StatisticsFlow
+type Node = model.Node
+type BackupData = model.BackupData
+type UserBackup = model.UserBackup
+type NodeBackup = model.NodeBackup
+type TunnelBackup = model.TunnelBackup
+type ChainTunnelBackup = model.ChainTunnelBackup
+type ForwardBackup = model.ForwardBackup
+type ForwardPortBackup = model.ForwardPortBackup
+type UserTunnelBackup = model.UserTunnelBackup
+type SpeedLimitBackup = model.SpeedLimitBackup
+type TunnelGroupBackup = model.TunnelGroupBackup
+type UserGroupBackup = model.UserGroupBackup
+type PermissionBackup = model.PermissionBackup
+type PermissionGrantBackup = model.PermissionGrantBackup
+type ImportResult = model.ImportResult
+type NodeMetric = model.NodeMetric
+type TunnelMetric = model.TunnelMetric
+type ServiceMonitor = model.ServiceMonitor
+type ServiceMonitorResult = model.ServiceMonitorResult
+type TunnelQuality = model.TunnelQuality
+
+// ─── Repository ──────────────────────────────────────────────────────
+
+type Repository struct {
+	db     *gorm.DB
+	dbPath string
+}
+
+// FlowUploadCounterDelta R5X-013（verdicts §5.1 裁定）：delta 拆
+// raw/scaled 两组——InFlow/OutFlow 为 scaled 口径（乘流量倍率、单向
+// 过滤后），只落 user / user_tunnel 行（配额面，quotaUsage 亦由此
+// 派生）；RawInFlow/RawOutFlow 为原始字节口径，只落 forward 行
+// （「已用流量」如实统计面）。构建器（gost / nftables·realm）必须
+// 置 HasRaw=true 并填 raw 组；未置 HasRaw 的存量直接构造（旧测试与
+// 外部调用）按旧口径回退：forward 行落 scaled 值，行为不变。
+// 历史已落 scaled 值不回溯。
+type FlowUploadCounterDelta struct {
+	ForwardID    int64
+	UserID       int64
+	UserTunnelID int64
+	InFlow       int64
+	OutFlow      int64
+	RawInFlow    int64
+	RawOutFlow   int64
+	HasRaw       bool
+}
+
+func (r *Repository) DB() *gorm.DB {
+	if r == nil {
+		return nil
+	}
+	return r.db
+}
+
+func sortedFlowUploadTargetIDs(totals map[int64][2]int64) []int64 {
+	ids := make([]int64, 0, len(totals))
+	for id := range totals {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
+func (r *Repository) ApplyFlowUploadDeltasBatch(deltas []FlowUploadCounterDelta) error {
+	if r == nil || r.db == nil {
+		return errors.New("repository not initialized")
+	}
+	if len(deltas) == 0 {
+		return nil
+	}
+
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		return applyFlowUploadDeltasTx(tx, deltas)
+	})
+}
+
+// saturatingAddInt64 returns a+b clamped to the int64 range. Traffic
+// counters must never wrap: a wrapped Go sum would persist a negative
+// counter, and (at the SQL layer) an overflowing addition widens the
+// stored value out of int64 entirely — see saturatingCounterIncrExpr.
+func saturatingAddInt64(a, b int64) int64 {
+	if b > 0 && a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	if b < 0 && a < math.MinInt64-b {
+		return math.MinInt64
+	}
+	return a + b
+}
+
+// SaturatingAddInt64 is saturatingAddInt64 for the ingest-side batch
+// merges outside this package (handler tunnel-metric aggregation,
+// metrics node-traffic buffering): those merges sum report-driven
+// deltas before the values reach the SQL saturation guards, so they
+// must saturate by the same rule instead of wrapping first.
+func SaturatingAddInt64(a, b int64) int64 {
+	return saturatingAddInt64(a, b)
+}
+
+// mulDivSaturating computes floor(v*m/d) for byte counts without the
+// intermediate v*m overflowing int64 (R18-F2-01). The traffic charts
+// multiplied first: a single hour bucket over ~2.56TB (the 3.6e6 ms
+// overlap multiplier) wrapped the product, and the charts showed
+// negative or wildly wrong buckets while the stored counters stayed
+// correct. 128-bit multiply + saturating divide keeps the exact
+// floored share; a corrupt non-positive input yields 0, never a
+// negative share.
+func mulDivSaturating(v, m, d int64) int64 {
+	if v <= 0 || m <= 0 || d <= 0 {
+		return 0
+	}
+	hi, lo := bits.Mul64(uint64(v), uint64(m))
+	if hi >= uint64(d) {
+		// The quotient needs more than 64 bits: saturate.
+		return math.MaxInt64
+	}
+	q, _ := bits.Div64(hi, lo, uint64(d))
+	if q > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(q)
+}
+
+// MulDivSaturating is mulDivSaturating for the subscription traffic
+// chart in the handler package: it takes the same minute-share cuts
+// as NodeTrafficSince below, so both sides saturate by the same rule
+// instead of wrapping first.
+func MulDivSaturating(v, m, d int64) int64 {
+	return mulDivSaturating(v, m, d)
+}
+
+// saturatingCounterIncrExpr builds the SQL expression `column + delta`
+// with saturation at the int64 bounds, portable across SQLite and
+// PostgreSQL: the addition is only evaluated when the result stays in
+// range. B08-001: applyFlowUploadDeltasTx previously used a bare
+// `column + ?`, so a single report near MaxInt64 against a row with
+// any positive balance overflowed at the DB layer — on SQLite the
+// counter silently widened to REAL and poisoned the forward / user /
+// user_tunnel row (the owner's login and the forward list then failed
+// with scan errors until the row was repaired by hand); on PG the
+// whole accounting tx aborted on int8 overflow. This is the DB
+// accumulation face of the R7-F-01 family: scaleTrafficBytes guards
+// scaling and buildFlowUploadBatch guards in-batch merging, but
+// neither sees the stored balance, so the guard has to live here,
+// where the balance is.
+//
+// The saturation bounds (MaxInt64-delta / MinInt64-delta) are computed
+// in Go, never as `? - ?` inside the SQL. T2 real-machine lesson
+// (2026-10-30): pgx sends parameters without type annotations, and
+// PostgreSQL resolves an operator only when at least one operand has a
+// known type — `? - ?` has none, so EVERY flow-accounting write on PG
+// failed with "operator is not unique: unknown - unknown (SQLSTATE
+// 42725)", including ordinary small batches. SQLite's dynamic typing
+// had masked this in sandbox testing. Every placeholder below is
+// compared against (or added to) the typed column or an integer
+// literal, so PG always has a known type to infer the parameter from.
+// TestSaturatingCounterIncrExprNoParamParamArithmetic_C06PG locks this
+// shape.
+func saturatingCounterIncrExpr(column string, delta int64) clause.Expr {
+	// hi is the largest stored value that can still absorb delta
+	// without exceeding MaxInt64; lo is the mirror image at MinInt64.
+	// Each bound is only consulted in the branch gated on delta's sign,
+	// so the inert default for the other sign is never load-bearing.
+	hi := int64(math.MaxInt64)
+	if delta > 0 {
+		hi = math.MaxInt64 - delta
+	}
+	lo := int64(math.MinInt64)
+	if delta < 0 {
+		lo = math.MinInt64 - delta
+	}
+	return gorm.Expr(
+		"CASE WHEN ? > 0 AND "+column+" > ? THEN ? "+
+			"WHEN ? < 0 AND "+column+" < ? THEN ? "+
+			"ELSE "+column+" + ? END",
+		delta, hi, int64(math.MaxInt64),
+		delta, lo, int64(math.MinInt64),
+		delta)
+}
+
+// saturatingExcludedAddExpr is saturatingCounterIncrExpr's upsert
+// twin: it builds `table.column + excluded.column` under the same
+// saturation CASE, for ON CONFLICT DO UPDATE assignments where the
+// delta is the incoming row's value rather than a call-site int64, so
+// the bounds cannot be precomputed in Go. The bounds here are int64
+// literals — typed on both dialects, with no untyped placeholder
+// arithmetic, so the C06PG 42725 failure mode cannot recur — and
+// MinInt64 is spelled (-9223372036854775807 - 1) because the bare
+// literal 9223372036854775808 overflows int64 literal parsing.
+// The upsert bucket faces accumulate through this helper: subscription
+// hourly buckets, node_traffic hourly buckets and tunnel_metric
+// per-minute buckets. Every batch adds its delta onto the stored row,
+// so the stored value is a persistent accumulator with the same wrap
+// (SQLite) / abort (PG) exposure as the counters
+// saturatingCounterIncrExpr guards.
+func saturatingExcludedAddExpr(table, column string) clause.Expr {
+	delta := "excluded." + column
+	stored := table + "." + column
+	return gorm.Expr(
+		"CASE WHEN " + delta + " > 0 AND " + stored + " > 9223372036854775807 - " + delta + " THEN 9223372036854775807 " +
+			"WHEN " + delta + " < 0 AND " + stored + " < (-9223372036854775807 - 1) - " + delta + " THEN (-9223372036854775807 - 1) " +
+			"ELSE " + stored + " + " + delta + " END")
+}
+
+func applyFlowUploadDeltasTx(tx *gorm.DB, deltas []FlowUploadCounterDelta) error {
+	if tx == nil {
+		return errors.New("database unavailable")
+	}
+	if len(deltas) == 0 {
+		return nil
+	}
+
+	// B08-001：批内合并同样走饱和加——两条各自合法的增量相加可先在
+	// Go 层回绕为负，再以负增量落账绕过 DB 层守卫。
+	mergeDelta := func(totals map[int64][2]int64, id int64, kind string, in, out int64) {
+		current := totals[id]
+		nextIn := saturatingAddInt64(current[0], in)
+		nextOut := saturatingAddInt64(current[1], out)
+		if (in > 0 && nextIn == math.MaxInt64 && current[0] != math.MaxInt64) ||
+			(out > 0 && nextOut == math.MaxInt64 && current[1] != math.MaxInt64) {
+			log.Printf("flow accounting: %s id=%d batch merge saturates counter (in=%d out=%d)", kind, id, in, out)
+		}
+		totals[id] = [2]int64{nextIn, nextOut}
+	}
+
+	forwardTotals := make(map[int64][2]int64, len(deltas))
+	userTotals := make(map[int64][2]int64, len(deltas))
+	userTunnelTotals := make(map[int64][2]int64, len(deltas))
+	for _, delta := range deltas {
+		if delta.ForwardID > 0 {
+			// R5X-013：forward 行落 raw 组；无 raw 组的存量构造回退 scaled。
+			fwdIn, fwdOut := delta.InFlow, delta.OutFlow
+			if delta.HasRaw {
+				fwdIn, fwdOut = delta.RawInFlow, delta.RawOutFlow
+			}
+			mergeDelta(forwardTotals, delta.ForwardID, "forward", fwdIn, fwdOut)
+		}
+		if delta.UserID > 0 {
+			mergeDelta(userTotals, delta.UserID, "user", delta.InFlow, delta.OutFlow)
+		}
+		if delta.UserTunnelID > 0 {
+			mergeDelta(userTunnelTotals, delta.UserTunnelID, "user_tunnel", delta.InFlow, delta.OutFlow)
+		}
+	}
+
+	for _, forwardID := range sortedFlowUploadTargetIDs(forwardTotals) {
+		total := forwardTotals[forwardID]
+		if err := tx.Model(&model.Forward{}).Where("id = ?", forwardID).UpdateColumns(map[string]interface{}{
+			"in_flow":  saturatingCounterIncrExpr("in_flow", total[0]),
+			"out_flow": saturatingCounterIncrExpr("out_flow", total[1]),
+		}).Error; err != nil {
+			return err
+		}
+	}
+	for _, userID := range sortedFlowUploadTargetIDs(userTotals) {
+		total := userTotals[userID]
+		if err := tx.Model(&model.User{}).Where("id = ?", userID).UpdateColumns(map[string]interface{}{
+			"in_flow":  saturatingCounterIncrExpr("in_flow", total[0]),
+			"out_flow": saturatingCounterIncrExpr("out_flow", total[1]),
+		}).Error; err != nil {
+			return err
+		}
+	}
+	for _, userTunnelID := range sortedFlowUploadTargetIDs(userTunnelTotals) {
+		total := userTunnelTotals[userTunnelID]
+		if err := tx.Model(&model.UserTunnel{}).Where("id = ?", userTunnelID).UpdateColumns(map[string]interface{}{
+			"in_flow":  saturatingCounterIncrExpr("in_flow", total[0]),
+			"out_flow": saturatingCounterIncrExpr("out_flow", total[1]),
+		}).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ─── Open / Close ────────────────────────────────────────────────────
+
+func Open(path string) (*Repository, error) {
+	if err := ensureParentDir(path); err != nil {
+		return nil, err
+	}
+
+	// 包 K 的 auto_vacuum(INCREMENTAL) 不走 DSN _pragma：实测
+	// glebarez 驱动下 DSN 里的该 pragma 静默无效（文件头在
+	// pragma 生效前已落盘、读回恒 0），改在 Open 后显式落定，
+	// 见 ensureSQLiteIncrementalVacuum。
+	freshDB := false
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		freshDB = true
+	}
+
+	dsn := "file:" + path +
+		"?_pragma=busy_timeout(5000)" +
+		"&_pragma=journal_mode(WAL)" +
+		"&_pragma=synchronous(NORMAL)"
+
+	db, err := gorm.Open(gsqlite.Open(dsn), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	sqlDB, err := db.DB()
+	if err != nil {
+		return nil, err
+	}
+	sqlDB.SetMaxOpenConns(1)
+
+	if freshDB {
+		ensureSQLiteIncrementalVacuum(db)
+	}
+
+	if err := prepareSQLiteLegacyColumns(db); err != nil {
+		_ = sqlDB.Close()
+		return nil, fmt.Errorf("prepare sqlite legacy schema: %w", err)
+	}
+	if err := autoMigrateAll(db); err != nil {
+		_ = sqlDB.Close()
+		return nil, fmt.Errorf("auto migrate: %w", err)
+	}
+
+	// R1-12-01：初始管理员口令一次性文件落 SQLite 库同级目录。
+	// E-01 (AUDIT-R215)：path == ":memory:" 时 filepath.Dir 得 "."，
+	// 无条件置目录会把数据目录定为进程 CWD，播种随即把随机初始
+	// 口令写入 ./initial-admin-password.txt（测试包目录）。内存库
+	// 无同级目录可言：显式置空，沿用「直接调 seedData 的测试形态
+	// 文件面关闭、仅内存候选生效」既有语义（initial_admin.go:60-62）。
+	// 全仓 10 余处同型 Open(":memory:") 调用点同受益。
+	if path == ":memory:" {
+		setInitialAdminDataDir("")
+	} else {
+		setInitialAdminDataDir(filepath.Dir(path))
+	}
+	seedData(db)
+
+	if err := migrateSchema(db); err != nil {
+		_ = sqlDB.Close()
+		return nil, err
+	}
+	if err := migrateSubscriptions(db, unixMilliNow()); err != nil {
+		_ = sqlDB.Close()
+		return nil, fmt.Errorf("migrate subscriptions: %w", err)
+	}
+
+	return &Repository{db: db, dbPath: path}, nil
+}
+
+// DBPath 返回仓库打开时用的 SQLite 文件路径；Postgres 仓库返回 ""。
+// 供 handler 层按 <DBPath 同级> 惯例定位服务端状态文件
+// （如导入前自动备份快照），不暴露 DB 句柄。
+func (r *Repository) DBPath() string {
+	return r.dbPath
+}
+
+func OpenPostgres(dsn string) (*Repository, error) {
+	if strings.TrimSpace(dsn) == "" {
+		return nil, fmt.Errorf("empty postgres dsn")
+	}
+
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	sqlDB, err := db.DB()
+	if err != nil {
+		return nil, err
+	}
+	configurePostgresPool(sqlDB)
+	if err := sqlDB.Ping(); err != nil {
+		_ = sqlDB.Close()
+		return nil, err
+	}
+
+	if err := preparePostgresLegacySchema(db); err != nil {
+		_ = sqlDB.Close()
+		return nil, fmt.Errorf("prepare postgres legacy schema: %w", err)
+	}
+
+	if err := autoMigrateAll(db); err != nil {
+		_ = sqlDB.Close()
+		return nil, fmt.Errorf("auto migrate: %w", err)
+	}
+
+	// R1-12-01：PG 模式无本地库文件，一次性初始口令文件落
+	// DB_PATH 同级目录（两种模式下后端均挂载 /app/data）。
+	setInitialAdminDataDir(defaultInitialAdminDataDir())
+	seedData(db)
+
+	if err := migrateSchema(db); err != nil {
+		_ = sqlDB.Close()
+		return nil, err
+	}
+	if err := migrateSubscriptions(db, unixMilliNow()); err != nil {
+		_ = sqlDB.Close()
+		return nil, fmt.Errorf("migrate subscriptions: %w", err)
+	}
+
+	return &Repository{db: db}, nil
+}
+
+func configurePostgresPool(sqlDB *sql.DB) {
+	if sqlDB == nil {
+		return
+	}
+	sqlDB.SetMaxOpenConns(defaultPostgresMaxOpenConns)
+	sqlDB.SetMaxIdleConns(defaultPostgresMaxIdleConns)
+	sqlDB.SetConnMaxIdleTime(defaultPostgresConnMaxIdle)
+	sqlDB.SetConnMaxLifetime(defaultPostgresConnMaxLife)
+}
+
+func (r *Repository) Close() error {
+	if r == nil || r.db == nil {
+		return nil
+	}
+	sqlDB, err := r.db.DB()
+	if err != nil {
+		return err
+	}
+	return sqlDB.Close()
+}
+
+// finishInboundCounterNodeScope F2-02: completes the per-node keying
+// of node_inbound_counter baselines after AutoMigrate has run. GORM
+// AutoMigrate never drops indexes, so the pre-F2-02 global unique
+// index (idx_node_inbound_counter_key over inbound/protocol/direction
+// only) is removed explicitly — while it exists, a second node's
+// baseline row for the same inbound cannot be inserted at all. Rows
+// carrying node_id = 0 are pre-column legacy baselines with no owner;
+// they are cleared rather than attributed by guesswork, and the next
+// sample from the owning node re-establishes the baseline under the
+// standing "missing baseline counts delta = 0" semantics, so the
+// migration can neither double-count nor lose booked totals. Both
+// steps are idempotent and run on every startup (subsequent runs find
+// neither the old index nor ownerless rows).
+func finishInboundCounterNodeScope(db *gorm.DB) error {
+	if !db.Migrator().HasTable(&model.NodeInboundCounter{}) {
+		return nil
+	}
+	if db.Migrator().HasIndex(&model.NodeInboundCounter{}, "idx_node_inbound_counter_key") {
+		if err := db.Migrator().DropIndex(&model.NodeInboundCounter{}, "idx_node_inbound_counter_key"); err != nil {
+			return err
+		}
+	}
+	if db.Migrator().HasColumn(&model.NodeInboundCounter{}, "node_id") {
+		if err := db.Where("node_id = ?", 0).Delete(&model.NodeInboundCounter{}).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func autoMigrateAll(db *gorm.DB) error {
+	if db.Dialector.Name() == "sqlite" {
+		if err := prepareSQLiteNftablesColumns(db); err != nil {
+			return err
+		}
+	}
+
+	// Migrate user_inbound unique index from (user_id, inbound_id) to
+	// (user_id, inbound_id, relay_id) for per-relay subscription assignment.
+	// GORM AutoMigrate never drops indexes, so remove the old one explicitly.
+	if db.Migrator().HasTable(&model.UserInbound{}) {
+		if db.Migrator().HasIndex(&model.UserInbound{}, "idx_user_inbound_unique") {
+			if err := db.Migrator().DropIndex(&model.UserInbound{}, "idx_user_inbound_unique"); err != nil {
+				return err
+			}
+		}
+	}
+
+	models := []interface{}{
+		&model.User{},
+		&model.Passkey{},
+		&model.UserQuota{},
+		&model.Forward{},
+		&model.ForwardPort{},
+		&model.Node{},
+		&model.NodeUninstall{},
+		&model.NodePendingUninstall{},
+		&model.NodeUpgradeVerification{},
+		&model.NodeSSHConfig{},
+		&model.NftRuleBinding{},
+		&model.NftCounterState{},
+		&model.NftPendingDelete{},
+		&NodeSeq{},
+		&FlowLegacyBatchDedupe{},
+		&TrafficStreamCursor{},
+		&model.SpeedLimit{},
+		&model.StatisticsFlow{},
+		&model.Tunnel{},
+		&model.ChainTunnel{},
+		&model.UserTunnel{},
+		&model.MonitorPermission{},
+		&model.ViteConfig{},
+		&model.SchemaVersion{},
+		&model.NodeMetric{},
+		&model.NodeTraffic{},
+		&model.NodeLatencySample{},
+		&model.InboundConnLog{},
+		&model.ConnlogNodeDropped{},
+		&model.TrafficNodeDropped{},
+		&model.TunnelMetric{},
+		&model.ServiceMonitor{},
+		&model.ServiceMonitorResult{},
+		&model.TunnelQuality{},
+		&model.NodeTunnelTLS{},
+		&model.NodeKernel{},
+		&model.NodeInbound{},
+		&model.NodeInboundCounter{},
+		&model.NodeInboundRelay{},
+		&model.UserInbound{},
+		&model.UserSubscription{},
+		&model.SubUser{},
+		&model.Subscription{},
+		&model.SubscriptionCounter{},
+		&model.SubscriptionTraffic{},
+		&model.SubscriptionTemplate{},
+		&model.RemoteSource{},
+		&model.RemoteSourceShield{},
+	}
+
+	if db.Dialector.Name() != "sqlite" {
+		if err := db.AutoMigrate(models...); err != nil {
+			return err
+		}
+		if err := finishInboundCounterNodeScope(db); err != nil {
+			return err
+		}
+		// B4/F-009: PG 此前在此提前 return，R5-B4 版本化迁移从未在 PG 上
+		// 执行——四个唯一索引在 PG 永远建不上，migration_status 却按
+		// "下次启动会自动建"汇报。迁移函数本身是双言写的（索引存在性
+		// 检查有 pg_indexes 分支），在此与 SQLite 同口径执行。
+		if err := migrateV1PortUserUnique(db); err != nil {
+			return err
+		}
+		if err := migrateV2NodeInboundPartialUnique(db); err != nil {
+			return err
+		}
+		// R5-B4 v3（R18-C1-01）: chain_tunnel 唯一索引转部分索引
+		// （WHERE port > 0），存量全量索引显式 DROP + CREATE 转换。
+		if err := migrateV3ChainTunnelPartialUnique(db); err != nil {
+			return err
+		}
+		// C12 v4（X04）: 转发查询面普通索引（双后端同口径执行）。
+		if err := migrateC12V4ForwardLookupIndexes(db); err != nil {
+			return err
+		}
+		// K10 v5（B02-003）: 用户名大小写折叠唯一索引（双后端同口径）。
+		if err := migrateV5UsernameCasefoldUnique(db); err != nil {
+			return err
+		}
+		// DEV-RM-SNELL v1（2.1.0）: 存量 Snell 入站强制禁用、Snell
+		// 内核行清已装状态（双后端同口径）。
+		if err := migrateV1SnellInboundRemoved(db); err != nil {
+			return err
+		}
+		// RM-SHARE v6: 跨面板共享/联邦功能移除的一次性数据清理
+		// （删远端节点及其级联、删五张联邦表、删 node 远端列）。
+		// 原 FIX-132 的 share relay 凭据回填随联邦功能一并下线。
+		if err := migrateV6FederationRemoval(db); err != nil {
+			return err
+		}
+		// RM-ANN v1（2.1.13）: 公告功能整删的存量处置——删
+		// announcement 表（双后端同口径）。
+		if err := migrateV1AnnouncementTableRemoved(db); err != nil {
+			return err
+		}
+		// C-01 v1（流量审计）: 存量隧道 Flow=1 一次性翻为双向 2
+		// （新建缺省已改 2；双后端同口径执行）。
+		if err := migrateV1TunnelFlowBidiDefault(db); err != nil {
+			return err
+		}
+		// C-(6)③ v1（流量审计）: 用户配额限额整数 GB → 小数 GB
+		// （PostgreSQL 两列改 double precision；SQLite 仅记版本）。
+		if err := migrateV1QuotaDecimal(db); err != nil {
+			return err
+		}
+		// F03 v1：存量节点明文 secret 一次性哈希迁移（双后端同口径）。
+		if err := migrateNodeSecretHashes(db); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	m := db.Migrator()
+
+	for _, item := range models {
+		if err := db.AutoMigrate(item); err != nil {
+			return err
+		}
+	}
+
+	if err := finishInboundCounterNodeScope(db); err != nil {
+		return err
+	}
+
+	// 显式补列兜底：防止未来新增字段时 AutoMigrate 未生效（历史教训：latency_targets 事件）
+	// Node 表
+	if m.HasTable(&model.Node{}) {
+		if !m.HasColumn(&model.Node{}, "latency_targets") {
+			if err := m.AddColumn(&model.Node{}, "latency_targets"); err != nil {
+				return err
+			}
+		}
+	}
+
+	// R5-B4: 版本化迁移 v1（端口/用户名唯一索引）。
+	// 不在 model tag 上加 uniqueIndex，避免 AutoMigrate 在有重复数据时静默建索引失败导致启动崩溃。
+	// 本次执行于测试库；生产库需重跑 dry-run 并重新批准。
+	if err := migrateV1PortUserUnique(db); err != nil {
+		return err
+	}
+
+	// R5-B4 v2（B4/F-003）: node_inbound 唯一索引转部分索引
+	// （WHERE kernel_id > 0），存量全量索引显式 DROP + CREATE 转换。
+	if err := migrateV2NodeInboundPartialUnique(db); err != nil {
+		return err
+	}
+
+	// R5-B4 v3（R18-C1-01）: chain_tunnel 唯一索引转部分索引
+	// （WHERE port > 0），存量全量索引显式 DROP + CREATE 转换。
+	if err := migrateV3ChainTunnelPartialUnique(db); err != nil {
+		return err
+	}
+
+	// C12 v4（X04-001/X04-002）: 转发查询面普通索引——
+	// forward_port(forward_id)、forward(user_id)、forward(status, inx)。
+	if err := migrateC12V4ForwardLookupIndexes(db); err != nil {
+		return err
+	}
+
+	// K10 v5（B02-003）: 用户名大小写折叠唯一索引 (LOWER("user"))；
+	// 存量折叠重复时按 D23 跳过并逐组点名，不阻塞启动。
+	if err := migrateV5UsernameCasefoldUnique(db); err != nil {
+		return err
+	}
+
+	// DEV-RM-SNELL v1（2.1.0）: 存量 Snell 入站强制禁用、Snell
+	// 内核行清已装状态（数据行保留，处置口径见 migration_rmsnell_v1.go）。
+	if err := migrateV1SnellInboundRemoved(db); err != nil {
+		return err
+	}
+
+	// RM-SHARE v6: 跨面板共享/联邦功能移除的一次性数据清理
+	// （删远端节点及其级联、删五张联邦表、删 node 远端列）。
+	// 原 FIX-132 的 share relay 凭据回填随联邦功能一并下线。
+	if err := migrateV6FederationRemoval(db); err != nil {
+		return err
+	}
+
+	// RM-ANN v1（2.1.13）: 公告功能整删的存量处置——删
+	// announcement 表（新装库无表时直接记版本跳过）。
+	if err := migrateV1AnnouncementTableRemoved(db); err != nil {
+		return err
+	}
+
+	// C-01 v1（流量审计）: 存量隧道 Flow=1 一次性翻为双向 2
+	// （新建缺省已改 2；新装库无表时直接记版本跳过）。
+	if err := migrateV1TunnelFlowBidiDefault(db); err != nil {
+		return err
+	}
+
+	// C-(6)③ v1（流量审计）: 用户配额限额整数 GB → 小数 GB
+	// （PostgreSQL 两列改 double precision；SQLite 仅记版本）。
+	if err := migrateV1QuotaDecimal(db); err != nil {
+		return err
+	}
+
+	// F03 v1：存量节点明文 secret 一次性哈希迁移（双后端同口径）。
+	if err := migrateNodeSecretHashes(db); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// preparePostgresLegacySchema renames unique constraints that were created by
+// the old schema.sql (which used inline UNIQUE column syntax) to the names
+// expected by GORM's NamingStrategy ("uni_<table>_<column>"). Without this,
+// GORM's AutoMigrate emits "DROP CONSTRAINT uni_..." against constraints that
+// don't exist under that name, crashing startup on upgraded PostgreSQL installs.
+func preparePostgresLegacySchema(db *gorm.DB) error {
+	if db == nil || db.Dialector.Name() != "postgres" {
+		return nil
+	}
+
+	type rename struct{ table, oldName, newName string }
+	renames := []rename{
+		{"vite_config", "vite_config_name_key", "uni_vite_config_name"},
+	}
+
+	for _, r := range renames {
+		var count int64
+		if err := db.Raw(
+			`SELECT COUNT(*) FROM information_schema.table_constraints
+			 WHERE constraint_schema = current_schema()
+			   AND table_name = ?
+			   AND constraint_name = ?
+			   AND constraint_type = 'UNIQUE'`,
+			r.table, r.oldName,
+		).Scan(&count).Error; err != nil {
+			return fmt.Errorf("check constraint %s.%s: %w", r.table, r.oldName, err)
+		}
+		if count == 0 {
+			continue
+		}
+		if err := db.Exec(
+			fmt.Sprintf(`ALTER TABLE %q RENAME CONSTRAINT %q TO %q`, r.table, r.oldName, r.newName),
+		).Error; err != nil {
+			return fmt.Errorf("rename constraint %s.%s→%s: %w", r.table, r.oldName, r.newName, err)
+		}
+	}
+	return nil
+}
+
+func prepareSQLiteLegacyColumns(db *gorm.DB) error {
+	if db == nil || db.Dialector.Name() != "sqlite" {
+		return nil
+	}
+	m := db.Migrator()
+
+	if m.HasTable(&model.Node{}) {
+		for _, field := range []string{"ServerIPV4", "ServerIPV6", "ExtraIPs", "TCPListenAddr", "UDPListenAddr", "Inx", "Remark", "ExpiryTime", "RenewalCycle", "ExpiryReminderDismissed"} {
+			if m.HasColumn(&model.Node{}, field) {
+				continue
+			}
+			if err := m.AddColumn(&model.Node{}, field); err != nil {
+				return fmt.Errorf("add node.%s: %w", field, err)
+			}
+		}
+	}
+
+	if m.HasTable(&model.Tunnel{}) {
+		for _, field := range []string{"Inx", "IPPreference", "ProbeTargetHost", "ProbeTargetPort"} {
+			if m.HasColumn(&model.Tunnel{}, field) {
+				continue
+			}
+			if err := m.AddColumn(&model.Tunnel{}, field); err != nil {
+				return fmt.Errorf("add tunnel.%s: %w", field, err)
+			}
+		}
+	}
+
+	if m.HasTable(&model.Forward{}) {
+		for _, field := range []string{"MaxConn", "IPMaxConn", "IPSpeedID", "ProxyProtocol", "ProxyProtocolReceive", "ProxyProtocolSend"} {
+			if m.HasColumn(&model.Forward{}, field) {
+				continue
+			}
+			if err := m.AddColumn(&model.Forward{}, field); err != nil {
+				return fmt.Errorf("add forward.%s: %w", field, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+func prepareSQLiteNftablesColumns(db *gorm.DB) error {
+	if db == nil || db.Dialector.Name() != "sqlite" {
+		return nil
+	}
+	if !db.Migrator().HasTable(&model.Node{}) {
+		return nil
+	}
+	if !db.Migrator().HasColumn(&model.Node{}, "forward_mode") {
+		if err := db.Exec("ALTER TABLE node ADD COLUMN forward_mode varchar(20) NOT NULL DEFAULT 'agent'").Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// adminBootstrapRequired: id=1 缺失且 admin@user 被占用时为 true。
+// 面板无管理员账号，需人工处理（不得自动提权）。
+var adminBootstrapRequired = false
+
+// IsAdminBootstrapRequired 返回是否需要人工补建管理员。
+func IsAdminBootstrapRequired() bool {
+	return adminBootstrapRequired
+}
+
+func seedData(db *gorm.DB) {
+	var adminCount int64
+	// OPEN-16: a failed existence check used to silently skip
+	// seeding — no log, no adminBootstrapRequired — leaving a
+	// deployment with no admin and no visible trace. A check that
+	// cannot run is not "admin exists": fail closed to the
+	// human-intervention path instead of assuming the count was 0
+	// (which would attempt a seed) or non-zero (which would skip
+	// it silently).
+	adminCountErr := db.Model(&model.User{}).Where("id = ?", 1).Count(&adminCount).Error
+	if adminCountErr != nil {
+		adminBootstrapRequired = true
+		log.Printf("ERROR: seed skipped: cannot verify admin user (id=1 user count query failed: %v). "+
+			"面板管理员状态未知，需人工处理（不得自动提权）。", adminCountErr)
+	} else if adminCount == 0 {
+		// R5-B4C: 补建前检查用户名是否被占用（防改名后撞唯一约束）。
+		// B02-003/K10: 占用检查按折叠口径——存量有 Admin@User 变体时
+		// 同样视为占用（补建会撞 v1/v5 唯一索引），走人工处理路径。
+		nameCount, nameErr := usernameFoldCount(db, "admin@user", 0)
+		if nameErr != nil {
+			// OPEN-16: 同上——占用检查跑不起来时不得把 nameCount
+			// 的零值当成「未占用」去补建，同样走人工处理路径。
+			adminBootstrapRequired = true
+			log.Printf("ERROR: seed skipped: cannot verify admin username availability (username fold count failed: %v). "+
+				"面板管理员状态未知，需人工处理（不得自动提权）。", nameErr)
+		} else if nameCount > 0 {
+			// 修正 A：不得静默跳过。ERROR 日志 + API 状态可见。
+			adminBootstrapRequired = true
+			log.Printf("ERROR: seed skipped: id=1 missing and username admin@user already taken. " +
+				"面板缺少管理员账号，需人工处理（不得自动提权）。")
+		} else {
+			seedInitialAdmin(db)
+		}
+	}
+
+	// R1-12-01：管理员已存在时恢复初始口令候选登记（跨重启保持
+	// 强制改密）；刚播种完成时候选已登记，探针自动跳过。
+	probeInitialAdminPassword(db)
+
+	// INV-2：配置播种同口径可观测——FirstOrCreate 实际新建时打
+	// INFO 日志（存在性先查，与管理员补建的谓词形态一致）。
+	var appNameCount int64
+	appNameMissing := db.Model(&model.ViteConfig{}).Where("id = ?", 1).Count(&appNameCount).Error == nil && appNameCount == 0
+	appNameConfig := model.ViteConfig{ID: 1, Name: "app_name", Value: "OVO", Time: 1755147963000}
+	db.Where("id = ?", 1).FirstOrCreate(&appNameConfig)
+	if appNameMissing {
+		log.Printf("INFO: seeded initial config app_name (id=1): trigger predicate was vite_config count for id=1 == 0 in the opened database")
+	}
+	// "flux" was the seeded name, hidden behind the old commercial license
+	// (it could not be changed without one); show the product name instead.
+	// "FLVX"/"FLVX-MAX" were the seeded names before the OVO rename; same treatment.
+	db.Model(&model.ViteConfig{}).Where("name = ? AND value IN ?", "app_name", []string{"flux", "FLVX", "FLVX-MAX"}).Update("value", "OVO")
+	now := time.Now().UnixMilli()
+	for name, value := range map[string]string{
+		"hide_footer_brand": "false",
+	} {
+		var cfgCount int64
+		cfgMissing := db.Model(&model.ViteConfig{}).Where("name = ?", name).Count(&cfgCount).Error == nil && cfgCount == 0
+		cfg := model.ViteConfig{Name: name, Value: value, Time: now}
+		db.Where("name = ?", name).FirstOrCreate(&cfg)
+		if cfgMissing {
+			log.Printf("INFO: seeded initial config %s: trigger predicate was vite_config count for name=%s == 0 in the opened database", name, name)
+		}
+	}
+}
+
+// ─── User Queries ────────────────────────────────────────────────────
+
+func (r *Repository) GetUserByUsername(username string) (*model.User, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	var user model.User
+	err := r.db.Where(`"user" = ?`, username).First(&user).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &user, nil
+}
+
+func (r *Repository) GetUserByID(id int64) (*model.User, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	return getUserByID(r.db, id)
+}
+
+func (r *Repository) GetUserByIDTx(tx *gorm.DB, id int64) (*model.User, error) {
+	if tx == nil {
+		return nil, errors.New("database unavailable")
+	}
+	return getUserByID(tx, id)
+}
+
+func getUserByID(db *gorm.DB, id int64) (*model.User, error) {
+	var user model.User
+	err := db.Where("id = ?", id).First(&user).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &user, nil
+}
+
+// UsernameExists 用户名占用检查。B02-003：大小写不敏感（经
+// usernameFoldCount 统一口径）。
+func (r *Repository) UsernameExists(username string) (bool, error) {
+	count, err := usernameFoldCount(r.db, username, 0)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// UsernameExistsExceptID 同 UsernameExists，排除自身行（updatePassword
+// 改名预检）。
+func (r *Repository) UsernameExistsExceptID(username string, exceptID int64) (bool, error) {
+	if r == nil || r.db == nil {
+		return false, errors.New("repository not initialized")
+	}
+	count, err := usernameFoldCount(r.db, username, exceptID)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+func (r *Repository) UpdateUserNameAndPassword(userID int64, username, passwordMD5 string, now int64) error {
+	// R3 B02-002：与 UpdateUserWithPassword/WithoutPassword 同走
+	// updateUserWithRenameGuard——事务内折叠键咨询锁 + 折叠复检
+	// （排除自身），降级态（v5 索引缺席）下并发改名交错同样被拒，
+	// 不再只靠事务外预检 + 唯一冲突映射兜底；唯一冲突映射由封装内
+	// mapUniqueViolation 保留，DB 原文不回吐。
+	err := r.updateUserWithRenameGuard(userID, username, map[string]interface{}{
+		"user":                username,
+		"pwd":                 passwordMD5,
+		"password_changed_at": nextUserRevocationTime(now),
+		"updated_time":        now,
+	})
+	// R1-12-01：id=1 管理员真实改密成功 → 初始口令候选与一次性
+	// 文件就此失效（初始口令使命完成）。
+	if err == nil && userID == 1 {
+		clearInitialAdminPassword()
+	}
+	return err
+}
+
+// ─── Config Queries ──────────────────────────────────────────────────
+
+func (r *Repository) GetConfigByName(name string) (*model.ViteConfig, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	var cfg model.ViteConfig
+	err := r.db.Where("name = ?", name).First(&cfg).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+
+func (r *Repository) ListConfigs() (map[string]string, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	var configs []model.ViteConfig
+	if err := r.db.Find(&configs).Error; err != nil {
+		return nil, err
+	}
+	result := make(map[string]string)
+	for _, c := range configs {
+		result[c.Name] = c.Value
+	}
+	return result, nil
+}
+
+func (r *Repository) GetConfigsByNames(names []string) (map[string]string, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	if len(names) == 0 {
+		return map[string]string{}, nil
+	}
+	var configs []model.ViteConfig
+	if err := r.db.Select("name", "value").Where("name IN ?", names).Find(&configs).Error; err != nil {
+		return nil, err
+	}
+	result := make(map[string]string, len(configs))
+	for _, c := range configs {
+		result[c.Name] = c.Value
+	}
+	return result, nil
+}
+
+func (r *Repository) UpsertConfig(name, value string, now int64) error {
+	if r == nil || r.db == nil {
+		return errors.New("repository not initialized")
+	}
+	return upsertConfigTx(r.db, name, value, now)
+}
+
+func upsertConfigTx(db *gorm.DB, name, value string, now int64) error {
+	return db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "name"}},
+		DoUpdates: clause.AssignmentColumns([]string{"value", "time"}),
+	}).Create(&model.ViteConfig{Name: name, Value: value, Time: now}).Error
+}
+
+func (r *Repository) UpsertConfigs(values map[string]string, now int64) error {
+	if r == nil || r.db == nil {
+		return errors.New("repository not initialized")
+	}
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		for name, value := range values {
+			if err := upsertConfigTx(tx, name, value, now); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// DeleteConfig removes a config row so subsequent reads fall back to the
+// built-in default for the key. Deleting a key that is not stored is a
+// no-op, which makes "clear this setting" idempotent.
+func (r *Repository) DeleteConfig(name string) error {
+	if r == nil || r.db == nil {
+		return errors.New("repository not initialized")
+	}
+	return r.db.Where("name = ?", name).Delete(&model.ViteConfig{}).Error
+}
+
+// ApplyConfigBatch applies config upserts and clear-deletions in a single
+// transaction: a settings save either lands completely or not at all.
+func (r *Repository) ApplyConfigBatch(values map[string]string, deleteKeys []string, now int64) error {
+	if r == nil || r.db == nil {
+		return errors.New("repository not initialized")
+	}
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		for name, value := range values {
+			if err := upsertConfigTx(tx, name, value, now); err != nil {
+				return err
+			}
+		}
+		for _, name := range deleteKeys {
+			if err := tx.Where("name = ?", name).Delete(&model.ViteConfig{}).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// ─── User Package Queries ────────────────────────────────────────────
+
+func (r *Repository) GetUserPackageTunnels(userID int64) ([]model.UserTunnelDetail, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	var items []model.UserTunnelDetail
+	err := r.db.Model(&model.UserTunnel{}).
+		Select("user_tunnel.id, user_tunnel.user_id, user_tunnel.tunnel_id, tunnel.name AS tunnel_name, user_tunnel.status, tunnel.flow AS tunnel_flow, user_tunnel.flow, user_tunnel.flow_mib, user_tunnel.in_flow, user_tunnel.out_flow, user_tunnel.num, user_tunnel.flow_reset_time, user_tunnel.exp_time, user_tunnel.speed_id, speed_limit.name AS speed_limit, speed_limit.speed").
+		Joins("LEFT JOIN tunnel ON tunnel.id = user_tunnel.tunnel_id").
+		Joins("LEFT JOIN speed_limit ON speed_limit.id = user_tunnel.speed_id").
+		Where("user_tunnel.user_id = ?", userID).
+		Order("user_tunnel.id ASC").
+		Find(&items).Error
+	if err != nil {
+		return nil, err
+	}
+	if items == nil {
+		items = make([]model.UserTunnelDetail, 0)
+	}
+	return items, nil
+}
+
+func (r *Repository) GetUserPackageForwards(userID int64) ([]model.UserForwardDetail, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+
+	type fwdRow struct {
+		ID         int64
+		Name       string
+		TunnelID   int64
+		TunnelName string
+		RemoteAddr string
+		InFlow     int64
+		OutFlow    int64
+		Status     int
+		CreatedAt  int64
+	}
+
+	var rows []fwdRow
+	err := r.db.Model(&model.Forward{}).
+		Select("forward.id, forward.name, forward.tunnel_id, COALESCE(tunnel.name, '') AS tunnel_name, forward.remote_addr, forward.in_flow, forward.out_flow, forward.status, forward.created_time AS created_at").
+		Joins("LEFT JOIN tunnel ON tunnel.id = forward.tunnel_id").
+		Where("forward.user_id = ?", userID).
+		Order("forward.id ASC").
+		Find(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+
+	// X04-001：入口解析改批量预取（原逐条 resolveForwardIngress 为
+	// 每条 2 次查询、无 forward_id 索引时 forward_port 全表扫描）。
+	forwardIDs := make([]int64, 0, len(rows))
+	for _, row := range rows {
+		forwardIDs = append(forwardIDs, row.ID)
+	}
+	ingressByForward, err := resolveForwardIngressBatch(r.db, forwardIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	items := make([]model.UserForwardDetail, 0, len(rows))
+	for _, row := range rows {
+		ing := ingressByForward[row.ID]
+		inIP, inPort := ing.IP, ing.Port
+		items = append(items, model.UserForwardDetail{
+			ID: row.ID, Name: row.Name, TunnelID: row.TunnelID,
+			TunnelName: row.TunnelName, InIP: inIP, InPort: inPort,
+			RemoteAddr: row.RemoteAddr, InFlow: row.InFlow, OutFlow: row.OutFlow,
+			Status: row.Status, CreatedAt: row.CreatedAt,
+		})
+	}
+	return items, nil
+}
+
+// ─── Statistics Queries ──────────────────────────────────────────────
+
+func (r *Repository) GetStatisticsFlows(userID int64, limit int) ([]model.StatisticsFlow, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	var items []model.StatisticsFlow
+	err := r.db.Where("user_id = ?", userID).Order("id DESC").Limit(limit).Find(&items).Error
+	if err != nil {
+		return nil, err
+	}
+	if items == nil {
+		items = make([]model.StatisticsFlow, 0)
+	}
+	return items, nil
+}
+
+// ─── Node Queries ────────────────────────────────────────────────────
+
+func (r *Repository) NodeExistsBySecret(secret string) (bool, error) {
+	if r == nil || r.db == nil {
+		return false, errors.New("repository not initialized")
+	}
+	if secret == "" {
+		return false, nil
+	}
+	// F03：按存储哈希查（legacy 明文行亦须计入：回退面与
+	// GetNodeBySecret 同口径）。
+	var count int64
+	err := r.db.Model(&model.Node{}).Where("secret_hash = ?", security.HashNodeSecret(secret)).Count(&count).Error
+	if err != nil {
+		return false, err
+	}
+	if count > 0 {
+		return true, nil
+	}
+	err = r.db.Model(&model.Node{}).Where("secret = ? AND (secret_hash IS NULL OR secret_hash = '')", secret).Count(&count).Error
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// GetNodeBySecret 按出示的节点 secret 查节点（F03）：先按存储哈希
+// 等值查（secret_hash = HashNodeSecret(出示值)）；未命中时回退
+// legacy 明文行（secret 明文、secret_hash 为空——迁移未跑、或
+// 旧备份直接 SQL 恢复的行），命中即就地哈希迁移（明文清零）。
+// 明文原值绝不记日志；空值直接 miss（不查库）。
+func (r *Repository) GetNodeBySecret(secret string) (*model.Node, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	if secret == "" {
+		return nil, nil
+	}
+	hash := security.HashNodeSecret(secret)
+	var n model.Node
+	err := r.db.Where("secret_hash = ?", hash).First(&n).Error
+	if err == nil {
+		return &n, nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
+	}
+	var legacy model.Node
+	lerr := r.db.Where("secret = ? AND (secret_hash IS NULL OR secret_hash = '')", secret).First(&legacy).Error
+	if errors.Is(lerr, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if lerr != nil {
+		return nil, lerr
+	}
+	// 命中即迁移（best-effort：迁移失败不影响本次认证结果，
+	// 下次仍走回退面）。
+	_ = r.db.Model(&model.Node{}).Where("id = ?", legacy.ID).Updates(map[string]interface{}{
+		"secret":      "",
+		"secret_hash": hash,
+	}).Error
+	return &legacy, nil
+}
+
+func (r *Repository) GetNodeByID(id int64) (*model.Node, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	var n model.Node
+	err := r.db.Where("id = ?", id).First(&n).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &n, nil
+}
+
+// V-17（AUD-A4）：原 GetNodeAgentVersion 读口已删——其注释宣称供
+// 「FIX2-C #8 内置 bypass 版本门」按版本分版下发，但全仓无任何调用
+// 方、该版本门并不存在（bypass 为 agent 侧无条件内置，按名在解析期
+// 解析，见 go-gost/x/bypass/ovo_no_private.go）。节点版本串仍由
+// UpdateNodeOnline 落库、经 GetNodeByID 的 Node.Version 读取。
+
+func (r *Repository) UpdateNodeOnline(nodeID int64, status int, version string, httpVal, tlsVal, socksVal int) error {
+	if r == nil || r.db == nil {
+		return errors.New("repository not initialized")
+	}
+	return r.db.Model(&model.Node{}).Where("id = ?", nodeID).Updates(map[string]interface{}{
+		"status": status, "version": version, "http": httpVal, "tls": tlsVal,
+		"socks": socksVal, "updated_time": unixMilliNow(),
+	}).Error
+}
+
+// NodeOnlineReport 是节点握手自报的在场性载体（F2-04）：指针
+// 为 nil 表示该字段本次未自报，落库时不得覆写既有值。旧实现
+// 把缺参一律塌缩为 0/空串无条件覆写（UpdateNodeOnline），老
+// agent 或参数被代理剥离的握手会把真实版本与能力位清零。
+type NodeOnlineReport struct {
+	ConnectionID string
+	ConnectionIP string
+	ConnectedAt  int64
+	Status       int
+	Version      *string
+	HTTP         *int
+	TLS          *int
+	Socks        *int
+	// BinarySHA 是握手自报的运行中二进制 SHA-256（NU-07）：非 nil
+	// 时落库；nil 表示本次握手未自报，落库时清空——哈希是会话绑定
+	// 的，旧会话的残留值不得用来核验新一轮落地（与 version 等字段
+	// 的“缺参不覆写”不同，缺参不清零会把旧哈希留给下一次核验，
+	// 造成老 agent 回连时的假不命中）。
+	BinarySHA *string
+}
+
+// UpdateNodeOnlineReport 按在场性落库握手自报：status 恒更新，
+// version/http/tls/socks 仅在自报在场时覆写；binary_sha 仅在自报
+// 在场时写新值，未自报时清空（会话绑定，见 NodeOnlineReport）。
+func (r *Repository) UpdateNodeOnlineReport(nodeID int64, report NodeOnlineReport) error {
+	if r == nil || r.db == nil {
+		return errors.New("repository not initialized")
+	}
+	updates := map[string]interface{}{
+		"status": report.Status, "updated_time": unixMilliNow(),
+		"connection_id": report.ConnectionID, "connection_ip": report.ConnectionIP, "connected_at": report.ConnectedAt,
+		"connection_version": "",
+	}
+	if report.Version != nil {
+		updates["version"] = *report.Version
+		updates["connection_version"] = strings.TrimSpace(*report.Version)
+	}
+	if report.HTTP != nil {
+		updates["http"] = *report.HTTP
+	}
+	if report.TLS != nil {
+		updates["tls"] = *report.TLS
+	}
+	if report.Socks != nil {
+		updates["socks"] = *report.Socks
+	}
+	if report.BinarySHA != nil {
+		updates["binary_sha"] = *report.BinarySHA
+	} else {
+		updates["binary_sha"] = ""
+	}
+	return r.db.Model(&model.Node{}).Where("id = ?", nodeID).Updates(updates).Error
+}
+
+func (r *Repository) UpdateNodeStatus(nodeID int64, status int) error {
+	if r == nil || r.db == nil {
+		return errors.New("repository not initialized")
+	}
+	return r.db.Model(&model.Node{}).Where("id = ?", nodeID).Updates(map[string]interface{}{
+		"status": status, "updated_time": unixMilliNow(),
+	}).Error
+}
+
+// ResetLocalNodeStatusesAtStartup 在面板启动时批量复位本地节点的
+// 在线标记（R4B03-001）：进程重启后 WS 会话表为空，停机前残留的
+// status=1 全是僵尸值（断开 defer 在进程退出时不执行）；agent 重连
+// 会经 UpdateNodeOnline 立即置回 1，故复位不会误伤真实在线节点。
+// 范围与节点在线语义一致：仅非 nftables 模式——
+// nftables 节点创建即 status=1、无 agent 会话语义，不在复位面内。
+func (r *Repository) ResetLocalNodeStatusesAtStartup() (int64, error) {
+	if r == nil || r.db == nil {
+		return 0, errors.New("repository not initialized")
+	}
+	res := r.db.Model(&model.Node{}).
+		Where("status = ? AND forward_mode <> ?", 1, "nftables").
+		Updates(map[string]interface{}{
+			"status": 0, "updated_time": unixMilliNow(),
+		})
+	return res.RowsAffected, res.Error
+}
+
+// ListNodeIDs 返回全部节点 ID 集（L3-05 兜底清扫用：IngestionService
+// 的小时级 prune 按此集逐出已删节点的残留键）。
+func (r *Repository) ListNodeIDs() ([]int64, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	var ids []int64
+	err := r.db.Model(&model.Node{}).Order("id ASC").Pluck("id", &ids).Error
+	return ids, err
+}
+
+// ListOnlineLocalNodeIDs 返回当前 status=1 的本地（非
+// nftables）节点 ID 集，与 ResetLocalNodeStatusesAtStartup 的
+// 复位谓词完全同形——供启动路径在复位前留快照（F2-02）。
+func (r *Repository) ListOnlineLocalNodeIDs() ([]int64, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	var ids []int64
+	err := r.db.Model(&model.Node{}).
+		Where("status = ? AND forward_mode <> ?", 1, "nftables").
+		Pluck("id", &ids).Error
+	return ids, err
+}
+
+// ListOnlineLocalNodes 返回 DB 中仍标记在线的节点（
+// 且 status=1），供周期对账以 WS 实时会话为准复位僵尸在线
+// （R4B03-001）。forward_mode 的 nftables 判定由调用方经
+// defaultNodeForwardMode 归一化后做，与全仓口径一致。
+func (r *Repository) ListOnlineLocalNodes() ([]model.Node, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	var nodes []model.Node
+	if err := r.db.Where("status = ?", 1).Order("id ASC").Find(&nodes).Error; err != nil {
+		return nil, err
+	}
+	return nodes, nil
+}
+
+// ─── Flow ────────────────────────────────────────────────────────────
+
+func (r *Repository) AddFlow(forwardID, userID int64, userTunnelID int64, inFlow, outFlow int64) error {
+	if r == nil || r.db == nil {
+		return errors.New("repository not initialized")
+	}
+	// B08-001：与 applyFlowUploadDeltasTx 同口径走饱和守卫——同一组
+	// 计数器（forward/user/user_tunnel 的 in_flow/out_flow）的累加面
+	// 不得留裸 `+ ?`，否则极端增量同样溢出污染行。
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&model.Forward{}).Where("id = ?", forwardID).
+			UpdateColumns(map[string]interface{}{
+				"in_flow":  saturatingCounterIncrExpr("in_flow", inFlow),
+				"out_flow": saturatingCounterIncrExpr("out_flow", outFlow),
+			}).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&model.User{}).Where("id = ?", userID).
+			UpdateColumns(map[string]interface{}{
+				"in_flow":  saturatingCounterIncrExpr("in_flow", inFlow),
+				"out_flow": saturatingCounterIncrExpr("out_flow", outFlow),
+			}).Error; err != nil {
+			return err
+		}
+		if userTunnelID > 0 {
+			if err := tx.Model(&model.UserTunnel{}).Where("id = ?", userTunnelID).
+				UpdateColumns(map[string]interface{}{
+					"in_flow":  saturatingCounterIncrExpr("in_flow", inFlow),
+					"out_flow": saturatingCounterIncrExpr("out_flow", outFlow),
+				}).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// ─── List Methods (return map[string]interface{}) ────────────────────
+
+func (r *Repository) ListNodes() ([]map[string]interface{}, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	var nodes []model.Node
+	if err := r.db.Order("inx ASC, id ASC").Find(&nodes).Error; err != nil {
+		return nil, err
+	}
+	nodeIDs := make([]int64, 0, len(nodes))
+	for _, n := range nodes {
+		if defaultNodeForwardMode(n.ForwardMode) == "nftables" {
+			nodeIDs = append(nodeIDs, n.ID)
+		}
+	}
+	sshConfigByNodeID := make(map[int64]map[string]interface{}, len(nodeIDs))
+	// T2-NEW-01：nodeIDs 为整表节点集合，按块查避免 IN ? 变量越界
+	// （统一口径见 inListChunkSize）；结果进 map 与分块无关。
+	for _, chunk := range chunkInt64IDs(nodeIDs) {
+		var configs []model.NodeSSHConfig
+		if err := r.db.Where("node_id IN ?", chunk).Find(&configs).Error; err != nil {
+			return nil, err
+		}
+		for _, cfg := range configs {
+			sshConfigByNodeID[cfg.NodeID] = map[string]interface{}{
+				"host":               cfg.Host,
+				"port":               cfg.Port,
+				"username":           cfg.Username,
+				"authType":           cfg.AuthType,
+				"sudoMode":           cfg.SudoMode,
+				"hostKeyFingerprint": cfg.HostKeyFingerprint,
+			}
+		}
+	}
+	// A4-V-06：升级/回退落地核验状态随节点列表回读（pending /
+	// failed 才露面，landed 不占面）——用户在版本列旁即可看到
+	// 「已下发待核验 / 未落地（期望 X、实际 Y）」，不必靠人肉对
+	// 账。查询失败不拖垮整个列表：核验面缺失时该字段为 nil。
+	allNodeIDs := make([]int64, 0, len(nodes))
+	for _, n := range nodes {
+		allNodeIDs = append(allNodeIDs, n.ID)
+	}
+	upgradeVerifyByNodeID := map[int64]*model.NodeUpgradeVerification{}
+	if byID, verr := r.ListVisibleNodeUpgradeVerifications(allNodeIDs); verr == nil {
+		upgradeVerifyByNodeID = byID
+	}
+	items := make([]map[string]interface{}, 0, len(nodes))
+	for _, n := range nodes {
+		var upgradeVerification map[string]interface{}
+		if v := upgradeVerifyByNodeID[n.ID]; v != nil {
+			upgradeVerification = map[string]interface{}{
+				"kind":            v.Kind,
+				"dispatchStatus":  v.DispatchStatus,
+				"reason":          v.CloseReason,
+				"targetVersion":   v.TargetVersion,
+				"status":          v.Status,
+				"observedVersion": v.ObservedVersion,
+				"fromVersion":     v.FromVersion,
+				"dispatchedAt":    v.DispatchedAt,
+				"deadlineAt":      v.DeadlineAt,
+			}
+		}
+		items = append(items, map[string]interface{}{
+			"id": n.ID, "inx": n.Inx, "name": n.Name,
+			"remark":       nullableString(n.Remark),
+			"expiryTime":   nullableInt64(n.ExpiryTime),
+			"renewalCycle": nullableString(n.RenewalCycle),
+			"ip":           n.ServerIP, "serverIp": n.ServerIP,
+			"connectionIp": n.ConnectionIP, "connectedAt": n.ConnectedAt,
+			"serverIpV4":    nullableString(n.ServerIPV4),
+			"serverIpV6":    nullableString(n.ServerIPV6),
+			"extraIPs":      nullableString(n.ExtraIPs),
+			"port":          n.Port,
+			"tcpListenAddr": n.TCPListenAddr,
+			"udpListenAddr": n.UDPListenAddr,
+			"version":       nullableString(n.Version),
+			"http":          n.HTTP, "tls": n.TLS, "socks": n.Socks,
+			"status":                  n.Status,
+			"forwardMode":             defaultNodeForwardMode(n.ForwardMode),
+			"expiryReminderDismissed": n.ExpiryReminderDismissed,
+			// 展示分组标签（纯展示；空＝未分组）。
+			"displayGroup": n.DisplayGroup,
+			// 定时重启 agent 服务的面板权威设置（默认关）。
+			"restartEnabled":         n.RestartEnabled,
+			"restartTime":            n.RestartTime,
+			"restartJitterMinutes":   n.RestartJitterMinutes,
+			"restartMode":            n.RestartMode,
+			"restartIntervalMinutes": n.RestartIntervalMinutes,
+			// 定时重启下发结果（W8-R-C601 持久字段）：最近一次下
+			// 发尝试的状态／原因／时刻，刷新列表行可见。
+			"restartPushStatus": n.RestartPushStatus,
+			"restartPushError":  n.RestartPushError,
+			"restartPushedAt":   n.RestartPushedAt,
+			// 转发面会话无进展拆除阈值（秒，0＝关，默认关）。
+			"idleTimeoutSeconds": n.IdleTimeoutSeconds,
+			// 僵尸会话根治两档（秒）与兜底滴流上限（字节/秒，0＝关/默认）。
+			"edgeIdleTimeoutSeconds":     n.EdgeIdleTimeoutSeconds,
+			"backstopIdleTimeoutSeconds": n.BackstopIdleTimeoutSeconds,
+			"backstopTrickleBps":         n.BackstopTrickleBps,
+			// 节点级连接日志采集开关（0＝关，默认关）与节点级入站
+			// 白名单开关＋附加名单（0＝关，默认关）。
+			"connLogEnabled":   n.ConnLogEnabled,
+			"whitelistEnabled": n.WhitelistEnabled,
+			"whitelistExtra":   n.WhitelistExtra,
+			// nftables 状态（agent 上报的运行态）：""＝未知、installed
+			// ＝已安装、auto_installed＝已自动安装、failed＝自动安装
+			// 失败（原因见 nftablesError）、missing＝agent 已确认本
+			// 机无 nftables（仅 nftables 模式节点）。
+			"nftablesStatus": n.NftablesStatus,
+			"nftablesError":  n.NftablesError,
+			// nft 采集健康（A-中-2，面板周期 SSH 采集的失败态）：
+			// ""＝未采集过、"ok"＝最近一次采集成功、"failing"＝
+			// 连续失败已达阈值（原因见 nftCollectLastError）。
+			"nftCollectState":     n.NftCollectState,
+			"nftCollectFailCount": n.NftCollectFailCount,
+			"nftCollectLastError": n.NftCollectLastError,
+			"nftCollectLastOkAt":  n.NftCollectLastOKAt,
+			"interfaceName":       nullableString(n.InterfaceName),
+			"sshConfig":           sshConfigByNodeID[n.ID],
+			"upgradeVerification": upgradeVerification,
+		})
+	}
+	return items, nil
+}
+
+func (r *Repository) ListUsers() ([]map[string]interface{}, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	var users []model.User
+	if err := r.db.Where("role_id != ?", 0).Order("id DESC").Find(&users).Error; err != nil {
+		return nil, err
+	}
+	userIDs := make([]int64, 0, len(users))
+	for _, u := range users {
+		userIDs = append(userIDs, u.ID)
+	}
+	quotaMap, err := r.ListUserQuotaViewsByUserIDs(userIDs, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	items := make([]map[string]interface{}, 0, len(users))
+	for _, u := range users {
+		item := map[string]interface{}{
+			"id": u.ID, "user": u.User, "name": u.User,
+			"roleId": u.RoleID, "status": u.Status,
+			"flow": u.Flow, "flowMiB": u.FlowMiB, "num": u.Num, "expTime": u.ExpTime,
+			"flowResetTime": u.FlowResetTime, "createdTime": u.CreatedTime,
+			"updatedTime": nullableInt64(u.UpdatedTime),
+			"inFlow":      u.InFlow, "outFlow": u.OutFlow,
+			"maxConn": u.MaxConn,
+		}
+		if quota := quotaMap[u.ID]; quota != nil {
+			item["dailyQuotaGB"] = quota.DailyLimitGB
+			item["monthlyQuotaGB"] = quota.MonthlyLimitGB
+			item["dailyUsedBytes"] = quota.DailyUsedBytes
+			item["monthlyUsedBytes"] = quota.MonthlyUsedBytes
+			item["disabledByQuota"] = quota.DisabledByQuota
+			item["quotaDisabledAt"] = quota.DisabledAt
+		}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
+func (r *Repository) ListSpeedLimits() ([]map[string]interface{}, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	var limits []model.SpeedLimit
+	if err := r.db.Order("id DESC").Find(&limits).Error; err != nil {
+		return nil, err
+	}
+	items := make([]map[string]interface{}, 0, len(limits))
+	for _, sl := range limits {
+		item := map[string]interface{}{
+			"id": sl.ID, "name": sl.Name, "speed": sl.Speed,
+			"status": sl.Status, "createdTime": sl.CreatedTime,
+			"updatedTime": nullableInt64(sl.UpdatedTime),
+		}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
+func (r *Repository) ListForwards() ([]map[string]interface{}, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+
+	type fwdRow struct {
+		ID                   int64
+		UserID               int64
+		UserName             string
+		Name                 string
+		TunnelID             int64
+		TunnelName           string
+		TrafficRatio         float64
+		RemoteAddr           string
+		Strategy             string
+		InFlow               int64
+		OutFlow              int64
+		CreatedTime          int64
+		Status               int
+		Inx                  int
+		SpeedID              sql.NullInt64
+		MaxConn              int
+		IPMaxConn            int
+		IPSpeedID            sql.NullInt64
+		IPSpeedLimitName     string
+		ProxyProtocol        int
+		ProxyProtocolReceive int
+		ProxyProtocolSend    int
+	}
+
+	var rows []fwdRow
+	err := r.db.Model(&model.Forward{}).
+		Select("forward.id, forward.user_id, forward.user_name, forward.name, forward.tunnel_id, COALESCE(tunnel.name, '') AS tunnel_name, COALESCE(tunnel.traffic_ratio, 1.0) AS traffic_ratio, forward.remote_addr, COALESCE(forward.strategy, 'fifo') AS strategy, forward.in_flow, forward.out_flow, forward.created_time, forward.status, forward.inx, forward.speed_id, forward.max_conn, forward.ip_max_conn, forward.ip_speed_id, COALESCE(ip_speed_limit.name, '') AS ip_speed_limit_name, forward.proxy_protocol, forward.proxy_protocol_receive, forward.proxy_protocol_send").
+		Joins("LEFT JOIN tunnel ON tunnel.id = forward.tunnel_id").
+		Joins("LEFT JOIN speed_limit AS ip_speed_limit ON ip_speed_limit.id = forward.ip_speed_id").
+		// R5-B3 D1-001 矩阵 #1: pending-delete 行对用户/管理员列表隐藏。
+		Where("forward.status <> ?", model.ForwardStatusPendingDelete).
+		Order("forward.inx ASC, forward.id ASC").
+		Find(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+
+	// X04-001：入口解析改批量预取（原逐条 resolveForwardIngress 为
+	// 每条 2 次查询、无 forward_id 索引时 forward_port 全表扫描，
+	// 耗时随条数二次增长）。组装逻辑与单条版共用 assembleForwardIngress，
+	// 逐字段口径不变；C06 的 bindWarnings 批量透出在下方保持不变。
+	forwardIDs := make([]int64, 0, len(rows))
+	for _, row := range rows {
+		forwardIDs = append(forwardIDs, row.ID)
+	}
+	ingressByForward, err := resolveForwardIngressBatch(r.db, forwardIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	items := make([]map[string]interface{}, 0, len(rows))
+	for _, row := range rows {
+		proxyProtocolReceive, proxyProtocolSend := normalizeForwardProxyProtocol(row.ProxyProtocol, row.ProxyProtocolReceive, row.ProxyProtocolSend)
+		ing := ingressByForward[row.ID]
+		inIP, inPort := ing.IP, ing.Port
+		item := map[string]interface{}{
+			"id": row.ID, "userId": row.UserID, "userName": row.UserName,
+			"name": row.Name, "tunnelId": row.TunnelID, "tunnelName": row.TunnelName,
+			"tunnelTrafficRatio": row.TrafficRatio,
+			"inIp":               nullableForwardIngress(inIP), "inPort": nullableInt64(inPort),
+			"remoteAddr": row.RemoteAddr, "strategy": row.Strategy,
+			"inFlow": row.InFlow, "outFlow": row.OutFlow,
+			"createdTime": row.CreatedTime, "status": row.Status, "inx": int64(row.Inx),
+			"maxConn":              row.MaxConn,
+			"ipMaxConn":            row.IPMaxConn,
+			"proxyProtocol":        row.ProxyProtocol,
+			"proxyProtocolReceive": proxyProtocolReceive,
+			"proxyProtocolSend":    proxyProtocolSend,
+		}
+		if row.SpeedID.Valid {
+			item["speedId"] = row.SpeedID.Int64
+		}
+		if row.IPSpeedID.Valid {
+			item["ipSpeedId"] = row.IPSpeedID.Int64
+		}
+		if strings.TrimSpace(row.IPSpeedLimitName) != "" {
+			item["ipSpeedLimitName"] = row.IPSpeedLimitName
+		}
+		items = append(items, item)
+	}
+	// B08-005：把各转发端口持久化的绑定回退告警挂到列表项
+	// （bindWarnings），使回退事件不只抵达当次同步的调用方——节点
+	// 重连后的后台重推发生回退时，用户在列表上仍能看到。一次批量
+	// 查询，不新增逐行往返。
+	if len(rows) > 0 {
+		forwardIDs := make([]int64, 0, len(rows))
+		for _, row := range rows {
+			forwardIDs = append(forwardIDs, row.ID)
+		}
+		type bindWarningRow struct {
+			ForwardID   int64
+			BindWarning sql.NullString
+		}
+		var bwRows []bindWarningRow
+		bwOK := true
+		// T2-NEW-01：forwardIDs 为整表转发集合，按块查避免 IN ? 变量
+		// 越界。同一转发的端口行必落同一块（按 forward_id 分块）、块内
+		// 仍 id ASC 追加，每转发告警的相对顺序与单查一致；任一块失败
+		// 沿旧口径整体不挂告警（bwOK=false 时不进下方挂载段）。
+		for _, chunk := range chunkInt64IDs(forwardIDs) {
+			var chunkRows []bindWarningRow
+			if err := r.db.Model(&model.ForwardPort{}).
+				Select("forward_id, bind_warning").
+				Where("forward_id IN ? AND bind_warning IS NOT NULL AND bind_warning <> ''", chunk).
+				Order("id ASC").
+				Find(&chunkRows).Error; err != nil {
+				bwOK = false
+				break
+			}
+			bwRows = append(bwRows, chunkRows...)
+		}
+		if bwOK {
+			warningsByForward := make(map[int64][]string)
+			for _, bw := range bwRows {
+				if bw.BindWarning.Valid && strings.TrimSpace(bw.BindWarning.String) != "" {
+					warningsByForward[bw.ForwardID] = append(warningsByForward[bw.ForwardID], bw.BindWarning.String)
+				}
+			}
+			if len(warningsByForward) > 0 {
+				for _, item := range items {
+					if ws, ok := warningsByForward[asInt64Value(item["id"])]; ok {
+						item["bindWarnings"] = ws
+					}
+				}
+			}
+		}
+	}
+	return items, nil
+}
+
+// UpdateForwardPortBindWarning B08-005：把一次监听 IP 回退事件持久
+// 记录到转发端口行（与清空 in_ip 的 UpdateForwardPortBindIP 配对），
+// 使事件可经转发列表 bindWarnings 长期可见，而不只记日志/回当次调用方。
+func (r *Repository) UpdateForwardPortBindWarning(forwardID, nodeID int64, port int, warning string) error {
+	if r == nil || r.db == nil {
+		return errors.New("repository not initialized")
+	}
+	if forwardID <= 0 || nodeID <= 0 || port <= 0 {
+		return nil
+	}
+	return r.db.Model(&model.ForwardPort{}).
+		Where("forward_id = ? AND node_id = ? AND port = ?", forwardID, nodeID, port).
+		Update("bind_warning", sql.NullString{String: warning, Valid: strings.TrimSpace(warning) != ""}).Error
+}
+
+// ClearForwardPortBindWarning B08-005：显式监听 IP 再次同步成功后
+// 清除该端口的历史回退告警（best-effort 语义由调用方把握）。
+func (r *Repository) ClearForwardPortBindWarning(forwardID, nodeID int64, port int) error {
+	if r == nil || r.db == nil {
+		return errors.New("repository not initialized")
+	}
+	if forwardID <= 0 || nodeID <= 0 || port <= 0 {
+		return nil
+	}
+	return r.db.Model(&model.ForwardPort{}).
+		Where("forward_id = ? AND node_id = ? AND port = ?", forwardID, nodeID, port).
+		Update("bind_warning", sql.NullString{Valid: false}).Error
+}
+
+func asInt64Value(v interface{}) int64 {
+	switch n := v.(type) {
+	case int64:
+		return n
+	case int:
+		return int64(n)
+	case float64:
+		return int64(n)
+	default:
+		return 0
+	}
+}
+
+func (r *Repository) ListUserAccessibleTunnels(userID int64) ([]map[string]interface{}, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+
+	type row struct {
+		ID   int64
+		Name string
+	}
+	var rows []row
+	err := r.db.Model(&model.UserTunnel{}).
+		Select("tunnel.id, tunnel.name").
+		Joins("JOIN tunnel ON tunnel.id = user_tunnel.tunnel_id").
+		Where("user_tunnel.user_id = ? AND user_tunnel.status = 1 AND tunnel.status = 1", userID).
+		Order("tunnel.inx ASC, tunnel.id ASC").
+		Find(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+
+	tunnelIDs := make([]int64, 0, len(rows))
+	for _, rw := range rows {
+		tunnelIDs = append(tunnelIDs, rw.ID)
+	}
+	portRangeMap := r.getTunnelEntryPortRanges(tunnelIDs)
+
+	items := make([]map[string]interface{}, 0, len(rows))
+	for _, rw := range rows {
+		item := map[string]interface{}{"id": rw.ID, "name": rw.Name}
+		if pr, ok := portRangeMap[rw.ID]; ok {
+			item["portRangeMin"] = pr.min
+			item["portRangeMax"] = pr.max
+		}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
+func (r *Repository) ListEnabledTunnelSummaries() ([]map[string]interface{}, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+
+	type row struct {
+		ID   int64
+		Name string
+	}
+	var rows []row
+	err := r.db.Model(&model.Tunnel{}).Select("id, name").Where("status = 1").Order("inx ASC, id ASC").Find(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+
+	tunnelIDs := make([]int64, 0, len(rows))
+	for _, rw := range rows {
+		tunnelIDs = append(tunnelIDs, rw.ID)
+	}
+	portRangeMap := r.getTunnelEntryPortRanges(tunnelIDs)
+
+	items := make([]map[string]interface{}, 0, len(rows))
+	for _, rw := range rows {
+		item := map[string]interface{}{"id": rw.ID, "name": rw.Name}
+		if pr, ok := portRangeMap[rw.ID]; ok {
+			item["portRangeMin"] = pr.min
+			item["portRangeMax"] = pr.max
+		}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
+type tunnelPortRange struct {
+	min int
+	max int
+}
+
+func (r *Repository) getTunnelEntryPortRanges(tunnelIDs []int64) map[int64]tunnelPortRange {
+	result := make(map[int64]tunnelPortRange)
+	if len(tunnelIDs) == 0 {
+		return result
+	}
+
+	type entryNode struct {
+		TunnelID int64
+		NodeID   int64
+	}
+	var entries []entryNode
+	// T2-NEW-01：tunnelIDs 可为整表隧道集合（ListEnabledTunnelSummaries
+	// 传全量），按块查避免 IN ? 变量越界；结果按隧道聚合 min/max，
+	// 与分块无关。旧口径不查 Error，保持不变。
+	for _, chunk := range chunkInt64IDs(tunnelIDs) {
+		var chunkEntries []entryNode
+		r.db.Model(&model.ChainTunnel{}).
+			Select("tunnel_id, node_id").
+			Where("tunnel_id IN (?) AND chain_type = ?", chunk, "1").
+			Find(&chunkEntries)
+		entries = append(entries, chunkEntries...)
+	}
+
+	nodeIDs := make([]int64, 0, len(entries))
+	nodeSet := make(map[int64]struct{})
+	for _, e := range entries {
+		if _, exists := nodeSet[e.NodeID]; !exists {
+			nodeSet[e.NodeID] = struct{}{}
+			nodeIDs = append(nodeIDs, e.NodeID)
+		}
+	}
+
+	type nodePort struct {
+		ID   int64
+		Port string
+	}
+	var nodePorts []nodePort
+	// T2-NEW-01：nodeIDs 由上方 entries 派生（整表节点子集），同按块查。
+	for _, chunk := range chunkInt64IDs(nodeIDs) {
+		var chunkPorts []nodePort
+		r.db.Model(&model.Node{}).Select("id, port").Where("id IN (?)", chunk).Find(&chunkPorts)
+		nodePorts = append(nodePorts, chunkPorts...)
+	}
+
+	nodePortMap := make(map[int64]string)
+	for _, np := range nodePorts {
+		nodePortMap[np.ID] = np.Port
+	}
+
+	for _, e := range entries {
+		portSpec := nodePortMap[e.NodeID]
+		if portSpec == "" {
+			continue
+		}
+		minP, maxP := parsePortRangeMinMax(portSpec)
+		if minP <= 0 || maxP <= 0 {
+			continue
+		}
+		pr, exists := result[e.TunnelID]
+		if !exists {
+			result[e.TunnelID] = tunnelPortRange{min: minP, max: maxP}
+		} else {
+			if minP < pr.min {
+				pr.min = minP
+			}
+			if maxP > pr.max {
+				pr.max = maxP
+			}
+			result[e.TunnelID] = pr
+		}
+	}
+	return result
+}
+
+func parsePortRangeMinMax(input string) (int, int) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return 0, 0
+	}
+	minPort, maxPort := 0, 0
+	parts := strings.Split(input, ",")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if strings.Contains(part, "-") {
+			r := strings.SplitN(part, "-", 2)
+			if len(r) != 2 {
+				continue
+			}
+			start, end := parseIntPort(r[0]), parseIntPort(r[1])
+			if start <= 0 || end <= 0 {
+				continue
+			}
+			if end < start {
+				start, end = end, start
+			}
+			// 复扫 F-PORT-01：与 parsePortRangeSpec 同口径，上界钳到
+			// 65535（展示口径亦不许报出非法端口）。
+			if start > 65535 {
+				continue
+			}
+			if end > 65535 {
+				end = 65535
+			}
+			if minPort == 0 || start < minPort {
+				minPort = start
+			}
+			if maxPort == 0 || end > maxPort {
+				maxPort = end
+			}
+			continue
+		}
+		p := parseIntPort(part)
+		if p <= 0 || p > 65535 {
+			continue
+		}
+		if minPort == 0 || p < minPort {
+			minPort = p
+		}
+		if maxPort == 0 || p > maxPort {
+			maxPort = p
+		}
+	}
+	return minPort, maxPort
+}
+
+func parseIntPort(s string) int {
+	var p int
+	fmt.Sscanf(strings.TrimSpace(s), "%d", &p)
+	return p
+}
+
+func (r *Repository) ListTunnels() ([]map[string]interface{}, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+
+	var tunnels []model.Tunnel
+	if err := r.db.Order("inx ASC, id ASC").Find(&tunnels).Error; err != nil {
+		return nil, err
+	}
+
+	tunnelMap := make(map[int64]map[string]interface{})
+	orderedIDs := make([]int64, 0, len(tunnels))
+
+	for _, t := range tunnels {
+		tunnelMap[t.ID] = map[string]interface{}{
+			"id": t.ID, "inx": t.Inx, "name": t.Name,
+			"type": t.Type, "flow": t.Flow, "trafficRatio": t.TrafficRatio,
+			"status": t.Status, "createdTime": t.CreatedTime,
+			"engine":          t.Engine,
+			"inIp":            nullableInIPString(t.InIP),
+			"ipPreference":    t.IPPreference,
+			"probeTargetHost": t.ProbeTargetHost,
+			"probeTargetPort": t.ProbeTargetPort,
+			"inNodeId":        make([]map[string]interface{}, 0),
+			"outNodeId":       make([]map[string]interface{}, 0),
+			"chainNodes":      make([][]map[string]interface{}, 0),
+		}
+		orderedIDs = append(orderedIDs, t.ID)
+	}
+
+	// Build node IP map
+	nodeIPMap := map[int64]string{}
+	var nodeList []model.Node
+	// Only chain-referenced nodes can contribute an ingress address. Keep the
+	// ID set inside SQL, avoiding both an all-node scan and bind-variable growth.
+	if err := r.db.Select("id, server_ip").Where("id IN (?)", r.db.Model(&model.ChainTunnel{}).Select("node_id")).Find(&nodeList).Error; err == nil {
+		for _, n := range nodeList {
+			// R28-FIX-F01：inIp 回退展示值须为裸 host；含 :port 的
+			// ServerIP 原值会让前端 formatInAddress 把面板端口当
+			// 成入口端口展示。
+			nodeIPMap[n.ID] = stripIngressHostPort(n.ServerIP)
+		}
+	}
+
+	// Load chain tunnels
+	var chains []model.ChainTunnel
+	if err := r.db.Order("tunnel_id ASC, chain_type ASC, inx ASC, id ASC").Find(&chains).Error; err != nil {
+		return nil, err
+	}
+
+	chainBucket := map[int64]map[int][]map[string]interface{}{}
+	inNodeIPs := map[int64][]string{}
+
+	for _, c := range chains {
+		t, ok := tunnelMap[c.TunnelID]
+		if !ok {
+			continue
+		}
+
+		chainTypeInt := 0
+		fmt.Sscanf(c.ChainType, "%d", &chainTypeInt)
+
+		inx := int64(0)
+		if c.Inx.Valid {
+			inx = c.Inx.Int64
+		}
+
+		nodeObj := map[string]interface{}{
+			"nodeId":    c.NodeID,
+			"chainType": chainTypeInt,
+			"inx":       inx,
+		}
+		// P01-003：回吐链路行实际落库端口（链路段/出口段）。此前组装
+		// 丢弃 port，非入口段口在任何列表/详情面不可见——撞口/漂移
+		// 发生时用户只能看到下发失败、查不到各段拿了什么口。入口行
+		// port 恒 NULL 不带此字段；NULL（远端待预留）同样省略。
+		if c.Port.Valid && c.Port.Int64 > 0 {
+			nodeObj["port"] = int(c.Port.Int64)
+		}
+		if c.Protocol.Valid {
+			nodeObj["protocol"] = c.Protocol.String
+		}
+		if c.Strategy.Valid {
+			nodeObj["strategy"] = c.Strategy.String
+		}
+		if c.ConnectIP.Valid {
+			nodeObj["connectIp"] = c.ConnectIP.String
+		}
+
+		switch chainTypeInt {
+		case 1:
+			t["inNodeId"] = append(t["inNodeId"].([]map[string]interface{}), nodeObj)
+			if ip, ok := nodeIPMap[c.NodeID]; ok && ip != "" {
+				inNodeIPs[c.TunnelID] = append(inNodeIPs[c.TunnelID], ip)
+			}
+		case 2:
+			if _, ok := chainBucket[c.TunnelID]; !ok {
+				chainBucket[c.TunnelID] = map[int][]map[string]interface{}{}
+			}
+			chainBucket[c.TunnelID][int(inx)] = append(chainBucket[c.TunnelID][int(inx)], nodeObj)
+		case 3:
+			t["outNodeId"] = append(t["outNodeId"].([]map[string]interface{}), nodeObj)
+		}
+	}
+
+	for tunnelID, groups := range chainBucket {
+		t := tunnelMap[tunnelID]
+		if t == nil {
+			continue
+		}
+		keys := make([]int, 0, len(groups))
+		for k := range groups {
+			keys = append(keys, k)
+		}
+		sort.Ints(keys)
+		ordered := make([][]map[string]interface{}, 0, len(keys))
+		for _, k := range keys {
+			ordered = append(ordered, groups[k])
+		}
+		t["chainNodes"] = ordered
+
+		if s, ok := t["inIp"].(string); !ok || strings.TrimSpace(s) == "" {
+			if ips := inNodeIPs[tunnelID]; len(ips) > 0 {
+				t["inIp"] = strings.Join(ips, ",")
+			}
+		}
+	}
+
+	result := make([]map[string]interface{}, 0, len(orderedIDs))
+	for _, id := range orderedIDs {
+		if t, ok := tunnelMap[id]; ok {
+			result = append(result, t)
+		}
+	}
+	return result, nil
+}
+
+// ─── Export Methods ──────────────────────────────────────────────────
+
+// withContext 返回共享同一连接池、但 DB 会话绑定 ctx 的仓库克隆。
+// X-P3-21+X-P3-25（L-08-3＋L-10-1）：Export/Import 经克隆把请求
+// ctx 下传到每条查询（GORM WithContext），客户端断连后导出不再
+// 照跑到底；导入整单事务语义维持（有意），ctx 取消可中止等待。
+func (r *Repository) withContext(ctx context.Context) *Repository {
+	if r == nil || r.db == nil || ctx == nil {
+		return r
+	}
+	clone := *r
+	clone.db = r.db.WithContext(ctx)
+	return &clone
+}
+
+// withDB 返回绑定指定 gorm 句柄的浅克隆（withContext 的同型
+// 做法，供事务内复用全部段查询）。
+func (r *Repository) withDB(db *gorm.DB) *Repository {
+	if r == nil || db == nil {
+		return r
+	}
+	clone := *r
+	clone.db = db
+	return &clone
+}
+
+// runExportInSnapshot 在单个只读快照事务里执行 fn（C1-05）：
+// 此前 ExportAll/ExportPartial 的约 15 段查询逐段自动提交，并
+// 发编辑可让备份跨段不一致（forward 在、其 tunnel 已改名/已
+// 删，恢复时才爆）。PG 用 REPEATABLE READ 只读事务取真快照；
+// SQLite（WAL＋单连接）用缺省事务，第一条读起即钉住快照。段
+// 查询全部走克隆的 Repository 方法、句柄即事务本身，不改各段
+// 实现。
+func (r *Repository) runExportInSnapshot(fn func(txRepo *Repository) error) error {
+	if r.db.Dialector != nil && r.db.Dialector.Name() == "postgres" {
+		return r.db.Transaction(func(tx *gorm.DB) error {
+			return fn(r.withDB(tx))
+		}, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+	}
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		return fn(r.withDB(tx))
+	})
+}
+
+// ExportAllContext 同 ExportAll，但全部查询绑定 ctx。
+func (r *Repository) ExportAllContext(ctx context.Context) (*model.BackupData, error) {
+	return r.withContext(ctx).ExportAll()
+}
+
+// ExportPartialContext 同 ExportPartial，但全部查询绑定 ctx。
+func (r *Repository) ExportPartialContext(ctx context.Context, types []string) (*model.BackupData, error) {
+	return r.withContext(ctx).ExportPartial(types)
+}
+
+// ImportContext 同 Import（整单事务语义不变），但事务绑定 ctx：
+// 请求取消/断连可中止导入的连接等待，不再无限排队。
+func (r *Repository) ImportContext(ctx context.Context, backup *model.BackupData, types []string) (*model.ImportResult, error) {
+	return r.withContext(ctx).Import(backup, types)
+}
+
+func (r *Repository) ExportAll() (*model.BackupData, error) {
+	var backup *model.BackupData
+	err := r.runExportInSnapshot(func(txRepo *Repository) error {
+		b, err := txRepo.exportAll()
+		if err != nil {
+			return err
+		}
+		backup = b
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return backup, nil
+}
+
+func (r *Repository) exportAll() (*model.BackupData, error) {
+	backup := &model.BackupData{Version: "1.0", ExportedAt: unixMilliNow()}
+
+	users, err := r.exportUsers()
+	if err != nil {
+		return nil, fmt.Errorf("export users failed: %w", err)
+	}
+	backup.Users = users
+
+	nodes, err := r.exportNodes()
+	if err != nil {
+		return nil, fmt.Errorf("export nodes failed: %w", err)
+	}
+	backup.Nodes = nodes
+
+	// FIX132-C（A3-05）：SSH 配置随 nodes 段导出。
+	nodeSSHConfigs, err := r.exportNodeSSHConfigs()
+	if err != nil {
+		return nil, fmt.Errorf("export node ssh configs failed: %w", err)
+	}
+	backup.NodeSSHConfigs = nodeSSHConfigs
+
+	tunnels, err := r.exportTunnels()
+	if err != nil {
+		return nil, fmt.Errorf("export tunnels failed: %w", err)
+	}
+	backup.Tunnels = tunnels
+
+	forwards, err := r.exportForwards()
+	if err != nil {
+		return nil, fmt.Errorf("export forwards failed: %w", err)
+	}
+	backup.Forwards = forwards
+
+	userTunnels, err := r.exportUserTunnels()
+	if err != nil {
+		return nil, fmt.Errorf("export user tunnels failed: %w", err)
+	}
+	backup.UserTunnels = userTunnels
+
+	speedLimits, err := r.exportSpeedLimits()
+	if err != nil {
+		return nil, fmt.Errorf("export speed limits failed: %w", err)
+	}
+	backup.SpeedLimits = speedLimits
+
+	configs, err := r.ListConfigs()
+	if err != nil {
+		return nil, fmt.Errorf("export configs failed: %w", err)
+	}
+	backup.Configs = FilterBackupConfigs(configs)
+
+	inbounds, err := r.exportInbounds()
+	if err != nil {
+		return nil, fmt.Errorf("export inbounds failed: %w", err)
+	}
+	backup.Inbounds = inbounds
+
+	// O7-001：导出 user_inbound 表（订阅分配关系）
+	userInbounds, err := r.exportUserInbounds()
+	if err != nil {
+		return nil, fmt.Errorf("export user inbounds failed: %w", err)
+	}
+	backup.UserInbounds = userInbounds
+
+	// O7-008：导出 monitor_permission 整表（监控权限）
+	monitorPermissions, err := r.exportMonitorPermissions()
+	if err != nil {
+		return nil, fmt.Errorf("export monitor permissions failed: %w", err)
+	}
+	backup.MonitorPermissions = monitorPermissions
+
+	// R2-E3-F02：导出 passkey 整表（WebAuthn 公钥凭据）
+	passkeys, err := r.exportPasskeys()
+	if err != nil {
+		return nil, fmt.Errorf("export passkeys failed: %w", err)
+	}
+	backup.Passkeys = passkeys
+
+	// B4/F-004：导出 user_subscription 整表（订阅分配关系）
+	userSubscriptions, err := r.exportUserSubscriptions()
+	if err != nil {
+		return nil, fmt.Errorf("export user subscriptions failed: %w", err)
+	}
+	backup.UserSubscriptions = userSubscriptions
+
+	// B4/F-030：导出 service_monitor 整表（监控定义）
+	serviceMonitors, err := r.exportServiceMonitors()
+	if err != nil {
+		return nil, fmt.Errorf("export service monitors failed: %w", err)
+	}
+	backup.ServiceMonitors = serviceMonitors
+
+	return backup, nil
+}
+
+// validBackupTypes is the full set of top-level backup segment names
+// accepted by ExportPartial / Import (R13X-005). It must stay identical
+// to the frontend BACKUP_TYPE_VALUES list (vite-frontend config.tsx,
+// 13 values): any drift reopens the silent-ignore gap for API callers,
+// since the handler's non-empty check cannot catch an all-unknown list.
+// The group-trio segment names (tunnelGroups/userGroups/permissions)
+// were removed with the feature in 1.9.6: old backups carrying them
+// still decode (BackupData keeps the fields as shells) and Import
+// discloses the ignored rows by name in ImportWarnings.
+var validBackupTypes = map[string]bool{
+	"users": true, "nodes": true, "tunnels": true, "forwards": true,
+	"userTunnels": true, "speedLimits": true, "configs": true,
+	"inbounds": true, "userInbounds": true,
+	"monitorPermissions": true, "userSubscriptions": true,
+	"serviceMonitors": true, "passkeys": true,
+}
+
+// validateBackupTypes rejects unknown segment names, naming each one
+// (R13X-005): silently ignoring a misspelled type used to produce a
+// "successful but segment-missing" export, or a "successful but zero
+// rows restored" import. Duplicates and order are untouched.
+func validateBackupTypes(types []string) error {
+	var unknown []string
+	for _, t := range types {
+		if !validBackupTypes[t] {
+			unknown = append(unknown, fmt.Sprintf("%q", t))
+		}
+	}
+	if len(unknown) > 0 {
+		return fmt.Errorf("未知备份类型：%s", strings.Join(unknown, "、"))
+	}
+	return nil
+}
+
+func (r *Repository) ExportPartial(types []string) (*model.BackupData, error) {
+	if err := validateBackupTypes(types); err != nil {
+		return nil, err
+	}
+	var backup *model.BackupData
+	err := r.runExportInSnapshot(func(txRepo *Repository) error {
+		b, err := txRepo.exportPartial(types)
+		if err != nil {
+			return err
+		}
+		backup = b
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return backup, nil
+}
+
+func (r *Repository) exportPartial(types []string) (*model.BackupData, error) {
+	backup := &model.BackupData{Version: "1.0", ExportedAt: unixMilliNow()}
+	typeSet := make(map[string]bool)
+	for _, t := range types {
+		typeSet[t] = true
+	}
+
+	if typeSet["users"] {
+		v, err := r.exportUsers()
+		if err != nil {
+			return nil, fmt.Errorf("export users failed: %w", err)
+		}
+		backup.Users = v
+	}
+	if typeSet["nodes"] {
+		v, err := r.exportNodes()
+		if err != nil {
+			return nil, fmt.Errorf("export nodes failed: %w", err)
+		}
+		backup.Nodes = v
+		// A3-05：SSH 配置随 nodes 段。
+		sc, err := r.exportNodeSSHConfigs()
+		if err != nil {
+			return nil, fmt.Errorf("export node ssh configs failed: %w", err)
+		}
+		backup.NodeSSHConfigs = sc
+	}
+	if typeSet["tunnels"] {
+		v, err := r.exportTunnels()
+		if err != nil {
+			return nil, fmt.Errorf("export tunnels failed: %w", err)
+		}
+		backup.Tunnels = v
+	}
+	if typeSet["forwards"] {
+		v, err := r.exportForwards()
+		if err != nil {
+			return nil, fmt.Errorf("export forwards failed: %w", err)
+		}
+		backup.Forwards = v
+	}
+	if typeSet["userTunnels"] {
+		v, err := r.exportUserTunnels()
+		if err != nil {
+			return nil, fmt.Errorf("export user tunnels failed: %w", err)
+		}
+		backup.UserTunnels = v
+	}
+	if typeSet["speedLimits"] {
+		v, err := r.exportSpeedLimits()
+		if err != nil {
+			return nil, fmt.Errorf("export speed limits failed: %w", err)
+		}
+		backup.SpeedLimits = v
+	}
+	if typeSet["configs"] {
+		v, err := r.ListConfigs()
+		if err != nil {
+			return nil, fmt.Errorf("export configs failed: %w", err)
+		}
+		backup.Configs = FilterBackupConfigs(v)
+	}
+	if typeSet["inbounds"] {
+		v, err := r.exportInbounds()
+		if err != nil {
+			return nil, fmt.Errorf("export inbounds failed: %w", err)
+		}
+		backup.Inbounds = v
+	}
+	// O7-001/O7-008：补齐 user_inbound/monitor_permission 两表
+	// （O7-001 时 ExportPartial 遗漏，此处一并补上）
+	if typeSet["userInbounds"] {
+		v, err := r.exportUserInbounds()
+		if err != nil {
+			return nil, fmt.Errorf("export user inbounds failed: %w", err)
+		}
+		backup.UserInbounds = v
+	}
+	if typeSet["monitorPermissions"] {
+		v, err := r.exportMonitorPermissions()
+		if err != nil {
+			return nil, fmt.Errorf("export monitor permissions failed: %w", err)
+		}
+		backup.MonitorPermissions = v
+	}
+	// R2-E3-F02：passkey 整表随段导出。
+	if typeSet["passkeys"] {
+		v, err := r.exportPasskeys()
+		if err != nil {
+			return nil, fmt.Errorf("export passkeys failed: %w", err)
+		}
+		backup.Passkeys = v
+	}
+	// B4/F-004/F-030：补齐 user_subscription/service_monitor 两表
+	if typeSet["userSubscriptions"] {
+		v, err := r.exportUserSubscriptions()
+		if err != nil {
+			return nil, fmt.Errorf("export user subscriptions failed: %w", err)
+		}
+		backup.UserSubscriptions = v
+	}
+	if typeSet["serviceMonitors"] {
+		v, err := r.exportServiceMonitors()
+		if err != nil {
+			return nil, fmt.Errorf("export service monitors failed: %w", err)
+		}
+		backup.ServiceMonitors = v
+	}
+	return backup, nil
+}
+
+func (r *Repository) exportUsers() ([]model.UserBackup, error) {
+	var users []model.User
+	if err := r.db.Order("id ASC").Find(&users).Error; err != nil {
+		return nil, err
+	}
+	userIDs := make([]int64, 0, len(users))
+	for _, u := range users {
+		userIDs = append(userIDs, u.ID)
+	}
+	quotaMap, err := r.ListUserQuotaViewsByUserIDs(userIDs, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	out := make([]model.UserBackup, 0, len(users))
+	for _, u := range users {
+		b := model.UserBackup{
+			ID: u.ID, User: u.User, Pwd: u.Pwd, RoleID: u.RoleID,
+			ExpTime: u.ExpTime, Flow: u.Flow, FlowMiB: u.FlowMiB, InFlow: u.InFlow, OutFlow: u.OutFlow,
+			FlowResetTime: u.FlowResetTime, Num: u.Num,
+			CreatedTime: u.CreatedTime, Status: u.Status,
+			PasswordChangedAt: u.PasswordChangedAt, MaxConn: u.MaxConn,
+		}
+		if quota := quotaMap[u.ID]; quota != nil {
+			b.DailyQuotaGB = quota.DailyLimitGB
+			b.MonthlyQuotaGB = quota.MonthlyLimitGB
+			b.DisabledByQuota = quota.DisabledByQuota
+			b.QuotaDisabledAt = quota.DisabledAt
+			// D4-01：已用量、暂停清单与窗口键一并导出（视图已按当前
+			// 窗口归一，过期窗口的已用量在视图层即为 0）。
+			b.DailyUsedBytes = quota.DailyUsedBytes
+			b.MonthlyUsedBytes = quota.MonthlyUsedBytes
+			b.PausedForwardIDs = quota.PausedForwardIDs
+			b.QuotaDayKey = quota.DayKey
+			b.QuotaMonthKey = quota.MonthKey
+		}
+		if u.UpdatedTime.Valid {
+			b.UpdatedTime = u.UpdatedTime.Int64
+		}
+		out = append(out, b)
+	}
+	return out, nil
+}
+
+func (r *Repository) exportNodes() ([]model.NodeBackup, error) {
+	var nodes []model.Node
+	if err := r.db.Order("inx ASC, id ASC").Find(&nodes).Error; err != nil {
+		return nil, err
+	}
+	out := make([]model.NodeBackup, 0, len(nodes))
+	for _, n := range nodes {
+		// F03：备份导出不得再明文输出 secret——Secret 恒留空，
+		// 只出 SecretHash（恢复面凭哈希重建认证，见 importNodes）。
+		b := model.NodeBackup{
+			ID: n.ID, Name: n.Name, SecretHash: n.SecretHash, ServerIP: n.ServerIP,
+			Remark: n.Remark.String, RenewalCycle: n.RenewalCycle.String,
+			Port: n.Port, HTTP: n.HTTP, TLS: n.TLS, Socks: n.Socks,
+			CreatedTime: n.CreatedTime, Status: n.Status,
+			TCPListenAddr: n.TCPListenAddr, UDPListenAddr: n.UDPListenAddr,
+			Inx: n.Inx,
+		}
+		if n.ExpiryTime.Valid {
+			b.ExpiryTime = n.ExpiryTime.Int64
+		}
+		if n.UpdatedTime.Valid {
+			b.UpdatedTime = n.UpdatedTime.Int64
+		}
+		if n.ServerIPV4.Valid {
+			b.ServerIPv4 = n.ServerIPV4.String
+		}
+		if n.ServerIPV6.Valid {
+			b.ServerIPv6 = n.ServerIPV6.String
+		}
+		// B4/F-027：ExtraIPs 字段在 NodeBackup 中存在但导出曾漏写，
+		// 多 IP 节点恢复后附加 IP 全丢。
+		if n.ExtraIPs.Valid {
+			b.ExtraIPs = n.ExtraIPs.String
+		}
+		if n.InterfaceName.Valid {
+			b.InterfaceName = n.InterfaceName.String
+		}
+		if n.Version.Valid {
+			b.Version = n.Version.String
+		}
+		b.LatencyTargets = n.LatencyTargets
+		b.ForwardMode = n.ForwardMode
+		// 展示分组标签随备份导出（纯展示字段）。
+		b.DisplayGroup = n.DisplayGroup
+		// R2-E1-06：定时重启三字段随备份导出（此前 DTO 已补列、此处
+		// 赋值，缺一仍会静默回落默认）。
+		b.RestartEnabled = n.RestartEnabled
+		b.RestartTime = n.RestartTime
+		b.RestartJitterMinutes = n.RestartJitterMinutes
+		b.RestartMode = n.RestartMode
+		b.RestartIntervalMinutes = n.RestartIntervalMinutes
+		b.IdleTimeoutSeconds = n.IdleTimeoutSeconds
+		b.EdgeIdleTimeoutSeconds = n.EdgeIdleTimeoutSeconds
+		b.BackstopIdleTimeoutSeconds = n.BackstopIdleTimeoutSeconds
+		b.BackstopTrickleBps = n.BackstopTrickleBps
+		b.ConnLogEnabled = n.ConnLogEnabled
+		b.WhitelistEnabled = n.WhitelistEnabled
+		b.WhitelistExtra = n.WhitelistExtra
+		// O7-006：恢复后保留已忽略的到期提醒状态
+		b.ExpiryReminderDismissed = n.ExpiryReminderDismissed
+		out = append(out, b)
+	}
+	return out, nil
+}
+
+// exportNodeSSHConfigs 导出 node_ssh_config 全表（A3-05）。
+func (r *Repository) exportNodeSSHConfigs() ([]model.NodeSSHConfigBackup, error) {
+	var rows []model.NodeSSHConfig
+	if err := r.db.Order("node_id ASC").Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	out := make([]model.NodeSSHConfigBackup, 0, len(rows))
+	for _, c := range rows {
+		out = append(out, model.NodeSSHConfigBackup{
+			NodeID: c.NodeID, Host: c.Host, Port: c.Port, Username: c.Username,
+			AuthType: c.AuthType, Password: c.Password.String, PrivateKey: c.PrivateKey.String,
+			Passphrase: c.Passphrase.String, SudoMode: c.SudoMode, CreatedTime: c.CreatedTime,
+			// R2-E1-08：已钉入指纹随备份导出。
+			HostKeyFingerprint: c.HostKeyFingerprint,
+		})
+	}
+	return out, nil
+}
+
+func (r *Repository) exportTunnels() ([]model.TunnelBackup, error) {
+	var tunnels []model.Tunnel
+	if err := r.db.Order("inx ASC, id ASC").Find(&tunnels).Error; err != nil {
+		return nil, err
+	}
+	out := make([]model.TunnelBackup, 0, len(tunnels))
+	for _, t := range tunnels {
+		b := model.TunnelBackup{
+			ID: t.ID, Name: t.Name, TrafficRatio: t.TrafficRatio,
+			Type: t.Type, Protocol: t.Protocol, Flow: t.Flow,
+			CreatedTime: t.CreatedTime, UpdatedTime: t.UpdatedTime,
+			Status: t.Status, Inx: t.Inx, IPPreference: t.IPPreference,
+			ProbeTargetHost: t.ProbeTargetHost, ProbeTargetPort: t.ProbeTargetPort,
+			Engine: t.Engine,
+		}
+		if t.InIP.Valid {
+			b.InIP = t.InIP.String
+		}
+		chains, err := r.exportChainTunnels(t.ID)
+		if err != nil {
+			return nil, err
+		}
+		b.ChainTunnels = chains
+		out = append(out, b)
+	}
+	return out, nil
+}
+
+func (r *Repository) exportChainTunnels(tunnelID int64) ([]model.ChainTunnelBackup, error) {
+	var chains []model.ChainTunnel
+	if err := r.db.Where("tunnel_id = ?", tunnelID).Order("inx ASC, id ASC").Find(&chains).Error; err != nil {
+		return nil, err
+	}
+	out := make([]model.ChainTunnelBackup, 0, len(chains))
+	for _, c := range chains {
+		// BUG-A2-3：可空列仅在 Valid 时写指针，NULL 在备份中缺失，
+		// 与零值严格区分（旧实现把 NULL 与 0/'' 一并丢弃）。
+		b := model.ChainTunnelBackup{
+			ID: c.ID, TunnelID: c.TunnelID, ChainType: c.ChainType, NodeID: c.NodeID,
+			Port:      nullInt64Ptr(c.Port),
+			Strategy:  nullStringPtr(c.Strategy),
+			Inx:       nullInt64Ptr(c.Inx),
+			Protocol:  nullStringPtr(c.Protocol),
+			ConnectIP: nullStringPtr(c.ConnectIP),
+		}
+		out = append(out, b)
+	}
+	return out, nil
+}
+
+// nullInt64Ptr / nullStringPtr：导出侧把 sql.Null* 转为备份指针
+// （NULL → nil，备份 JSON 中缺失）。
+func nullInt64Ptr(v sql.NullInt64) *int {
+	if !v.Valid {
+		return nil
+	}
+	n := int(v.Int64)
+	return &n
+}
+
+func nullStringPtr(v sql.NullString) *string {
+	if !v.Valid {
+		return nil
+	}
+	s := v.String
+	return &s
+}
+
+// ptrToNullInt64 / ptrToNullString：导入侧把备份指针还原为
+// sql.Null*（nil → NULL），与导出严格互逆。
+func ptrToNullInt64(p *int) sql.NullInt64 {
+	if p == nil {
+		return sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: int64(*p), Valid: true}
+}
+
+func ptrToNullString(p *string) sql.NullString {
+	if p == nil {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: *p, Valid: true}
+}
+
+func (r *Repository) exportForwards() ([]model.ForwardBackup, error) {
+	var forwards []model.Forward
+	if err := r.db.Order("id ASC").Find(&forwards).Error; err != nil {
+		return nil, err
+	}
+	// X04-002：端口行改批量预取（原逐条 exportForwardPorts 为每条
+	// 转发一次查询、无 forward_id 索引时全表扫描）。
+	forwardIDs := make([]int64, 0, len(forwards))
+	for _, f := range forwards {
+		forwardIDs = append(forwardIDs, f.ID)
+	}
+	portsByForward, err := r.exportForwardPortsBatch(forwardIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]model.ForwardBackup, 0, len(forwards))
+	for _, f := range forwards {
+		b := model.ForwardBackup{
+			ID: f.ID, UserID: f.UserID, UserName: f.UserName, Name: f.Name,
+			TunnelID: f.TunnelID, RemoteAddr: f.RemoteAddr, TargetPolicy: f.TargetPolicy, Strategy: f.Strategy,
+			InFlow: f.InFlow, OutFlow: f.OutFlow, CreatedTime: f.CreatedTime,
+			UpdatedTime: f.UpdatedTime, Status: f.Status, Inx: f.Inx,
+			MaxConn:              f.MaxConn,
+			IPMaxConn:            f.IPMaxConn,
+			ProxyProtocol:        f.ProxyProtocol,
+			ProxyProtocolReceive: f.ProxyProtocolReceive,
+			ProxyProtocolSend:    f.ProxyProtocolSend,
+		}
+		if f.SpeedID.Valid {
+			v := f.SpeedID.Int64
+			b.SpeedID = &v
+		}
+		if f.IPSpeedID.Valid {
+			v := f.IPSpeedID.Int64
+			b.IPSpeedID = &v
+		}
+		ports := portsByForward[f.ID]
+		portsCopy := append([]model.ForwardPortBackup(nil), ports...)
+		b.ForwardPorts = &portsCopy
+		out = append(out, b)
+	}
+	return out, nil
+}
+
+func (r *Repository) exportForwardPorts(forwardID int64) ([]model.ForwardPortBackup, error) {
+	var fps []model.ForwardPort
+	if err := r.db.Where("forward_id = ?", forwardID).Order("id ASC").Find(&fps).Error; err != nil {
+		return nil, err
+	}
+	out := make([]model.ForwardPortBackup, 0, len(fps))
+	for _, fp := range fps {
+		b := model.ForwardPortBackup{NodeID: fp.NodeID, Port: fp.Port}
+		if fp.InIP.Valid {
+			b.InIP = fp.InIP.String
+		}
+		// R2-E1-14：绑定回退告警随备份导出。
+		if fp.BindWarning.Valid {
+			b.BindWarning = fp.BindWarning.String
+		}
+		out = append(out, b)
+	}
+	return out, nil
+}
+
+// exportForwardPortsBatch 是 exportForwardPorts 的批量版：按
+// forward_id 集合分块 IN 查询（ORDER BY id ASC 与单条版一致），内存
+// 分组。无端口的 forward 不出现在结果 map 中（调用方取 nil，与单条
+// 版经 append(nil, 空...) 后得到 nil 切片的 JSON null 口径一致）。
+func (r *Repository) exportForwardPortsBatch(forwardIDs []int64) (map[int64][]model.ForwardPortBackup, error) {
+	out := make(map[int64][]model.ForwardPortBackup, len(forwardIDs))
+	for start := 0; start < len(forwardIDs); start += forwardIngressBatchChunk {
+		end := start + forwardIngressBatchChunk
+		if end > len(forwardIDs) {
+			end = len(forwardIDs)
+		}
+		var fps []model.ForwardPort
+		if err := r.db.Where("forward_id IN ?", forwardIDs[start:end]).Order("id ASC").Find(&fps).Error; err != nil {
+			return nil, err
+		}
+		for _, fp := range fps {
+			b := model.ForwardPortBackup{NodeID: fp.NodeID, Port: fp.Port}
+			if fp.InIP.Valid {
+				b.InIP = fp.InIP.String
+			}
+			// R2-E1-14：同 exportForwardPorts，告警随备份导出。
+			if fp.BindWarning.Valid {
+				b.BindWarning = fp.BindWarning.String
+			}
+			out[fp.ForwardID] = append(out[fp.ForwardID], b)
+		}
+	}
+	return out, nil
+}
+
+func (r *Repository) exportUserTunnels() ([]model.UserTunnelBackup, error) {
+	var uts []model.UserTunnel
+	if err := r.db.Order("id ASC").Find(&uts).Error; err != nil {
+		return nil, err
+	}
+	out := make([]model.UserTunnelBackup, 0, len(uts))
+	for _, ut := range uts {
+		b := model.UserTunnelBackup{
+			ID: ut.ID, UserID: ut.UserID, TunnelID: ut.TunnelID,
+			Num: ut.Num, Flow: ut.Flow, FlowMiB: ut.FlowMiB, InFlow: ut.InFlow, OutFlow: ut.OutFlow,
+			FlowResetTime: ut.FlowResetTime, ExpTime: ut.ExpTime, Status: ut.Status,
+		}
+		if ut.SpeedID.Valid {
+			b.SpeedID = ut.SpeedID.Int64
+		}
+		out = append(out, b)
+	}
+	return out, nil
+}
+
+func (r *Repository) exportSpeedLimits() ([]model.SpeedLimitBackup, error) {
+	var sls []model.SpeedLimit
+	if err := r.db.Order("id ASC").Find(&sls).Error; err != nil {
+		return nil, err
+	}
+	out := make([]model.SpeedLimitBackup, 0, len(sls))
+	for _, sl := range sls {
+		b := model.SpeedLimitBackup{
+			ID: sl.ID, Name: sl.Name, Speed: int64(sl.Speed),
+			CreatedTime: sl.CreatedTime, Status: sl.Status,
+		}
+		// G2 审计补漏：TunnelID/TunnelName 字段在备份结构里早已存在，
+		// 但导出从不赋值、导入写死 NULL——绑定隧道的限速规则恢复后
+		// 会静默变成全局规则。与 BUG-A2-3 同属备份往返丢可空字段。
+		if sl.TunnelID.Valid {
+			v := sl.TunnelID.Int64
+			b.TunnelID = &v
+		}
+		if sl.TunnelName.Valid {
+			b.TunnelName = sl.TunnelName.String
+		}
+		if sl.UpdatedTime.Valid {
+			b.UpdatedTime = sl.UpdatedTime.Int64
+		}
+		out = append(out, b)
+	}
+	return out, nil
+}
+
+// O7-001：导出 user_inbound 表（用户订阅分配关系）
+func (r *Repository) exportUserInbounds() ([]model.UserInboundBackup, error) {
+	var rows []model.UserInbound
+	if err := r.db.Order("id ASC").Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	out := make([]model.UserInboundBackup, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, model.UserInboundBackup{
+			ID: row.ID, UserID: row.UserID, InboundID: row.InboundID, RelayID: row.RelayID,
+		})
+	}
+	return out, nil
+}
+
+// B4/F-004：导出 user_subscription 整表（订阅分配关系）
+func (r *Repository) exportUserSubscriptions() ([]model.UserSubscriptionBackup, error) {
+	var rows []model.UserSubscription
+	if err := r.db.Order("id ASC").Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	out := make([]model.UserSubscriptionBackup, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, model.UserSubscriptionBackup{
+			ID: row.ID, UserID: row.UserID, SubscriptionID: row.SubscriptionID, CreatedTime: row.CreatedTime,
+		})
+	}
+	return out, nil
+}
+
+// B4/F-030：导出 service_monitor 整表（监控定义）
+func (r *Repository) exportServiceMonitors() ([]model.ServiceMonitorBackup, error) {
+	var rows []model.ServiceMonitor
+	if err := r.db.Order("id ASC").Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	out := make([]model.ServiceMonitorBackup, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, model.ServiceMonitorBackup{
+			ID: row.ID, Name: row.Name, Type: row.Type, Target: row.Target,
+			IntervalSec: row.IntervalSec, TimeoutSec: row.TimeoutSec,
+			NodeID: row.NodeID, Enabled: row.Enabled,
+			CreatedTime: row.CreatedTime, UpdatedTime: row.UpdatedTime,
+		})
+	}
+	return out, nil
+}
+
+// O7-008：导出 monitor_permission 整表（监控权限备份）
+func (r *Repository) exportMonitorPermissions() ([]model.MonitorPermissionBackup, error) {
+	var rows []model.MonitorPermission
+	if err := r.db.Order("id ASC").Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	out := make([]model.MonitorPermissionBackup, 0, len(rows))
+	for _, mp := range rows {
+		out = append(out, model.MonitorPermissionBackup{
+			ID:          mp.ID,
+			UserID:      mp.UserID,
+			CreatedTime: mp.CreatedTime,
+		})
+	}
+	return out, nil
+}
+
+// exportPasskeys 导出 passkey 整表（R2-E3-F02）。CredentialJSON 只
+// 含公钥凭据材料（逐字段核验见 model.PasskeyBackup 注），随备份
+// 往返不引入私钥类数据。
+func (r *Repository) exportPasskeys() ([]model.PasskeyBackup, error) {
+	var rows []model.Passkey
+	if err := r.db.Order("id ASC").Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	out := make([]model.PasskeyBackup, 0, len(rows))
+	for _, p := range rows {
+		out = append(out, model.PasskeyBackup{
+			ID:             p.ID,
+			UserID:         p.UserID,
+			Name:           p.Name,
+			CredentialJSON: p.CredentialJSON,
+			CreatedAt:      p.CreatedAt,
+			LastUsedAt:     p.LastUsedAt,
+		})
+	}
+	return out, nil
+}
+
+// ─── Import Methods ──────────────────────────────────────────────────
+
+// importReport 收集一次 Import 的跳过与提示，最终落入 ImportResult
+// 回执（FIX132-C / D4-03：恢复不再静默写悬空行、静默顶替或整单回滚，
+// 无法落位的行跳过并如实计数、顶替与降级如实提示，对齐订阅段
+// BUG-A2-4 的标杆口径）。
+type importReport struct {
+	skipped            map[string]int
+	warnings           []string
+	restoredSSHNodeIDs []int64
+	// R3X-005 facet (a)：导入事务内撤销的用户隧道授权，最终经
+	// ImportResult.RevokedUserTunnels 回传 handler 清转发。
+	revoked []RevokedUserTunnelPair
+}
+
+// clampImportedCounter 是 F2-04 的恢复面计数器门：流量计数器在任
+// 何正常写面都只能由饱和累加产生（恒 ≥ 0），负值不在合法集内——
+// 恢复若原样落库，负基会让此后全部配额判定（used ≥ limit）在积
+// 累等量真实流量前恒假，形成持久静默绕过。故负值一律钳为 0 并经
+// rep.warnf 在回执中点名（段行、字段、原值），与本文件既有恢复门
+// 「逐行处置 + 回执点名」同形。正数（含合法的大额计数）不设上限
+// 钳制——超限处置由导入尾的配额重估负责，求和面另有饱和守卫。
+func clampImportedCounter(rep *importReport, label, field string, v int64) int64 {
+	if v >= 0 {
+		return v
+	}
+	rep.warnf("备份恢复：%s 的计数器 %s=%d 为负值，已按 0 恢复", label, field, v)
+	return 0
+}
+
+// clampImportedLimit 是 R18-B9-01 的恢复面限额门：流量上限
+// （flow/flowMiB）、转发数上限（num）、连接数上限（maxConn）在任何
+// 写面都不得为负（mutations.go O5-005/O5-006、parseTrafficLimit），
+// 负值在消费面 >0 门控下静默等价无限制。恢复面按转发段 B8-06 同形
+// 取钳 0 + warning（不丢整行）：0 在消费面同为无限制，与负值的实
+// 际生效形态等价，只把存储值拉回合法域；与写面拒收口径的差异在此
+// 注明（恢复面不因单个字段丢弃整行）。
+func clampImportedLimit(rep *importReport, label, field string, v int64) int64 {
+	if v >= 0 {
+		return v
+	}
+	rep.warnf("备份恢复：%s 的限额 %s=%d 含负值，已按 0（无限制）恢复", label, field, v)
+	return 0
+}
+
+// clampImportedQuotaGB 是 R18-B9-01 的恢复面配额门
+// （clampImportedLimit 的 float64 版，日/月配额以小数 GB 计）：
+// 负值钳 0 + warning。
+func clampImportedQuotaGB(rep *importReport, label, field string, v float64) float64 {
+	if v >= 0 {
+		return v
+	}
+	rep.warnf("备份恢复：%s 的配额 %s=%v 含负值，已按 0（无限制）恢复", label, field, v)
+	return 0
+}
+
+func (rep *importReport) addRevoked(pairs []RevokedUserTunnelPair) {
+	if rep == nil {
+		return
+	}
+	for _, p := range pairs {
+		dup := false
+		for _, q := range rep.revoked {
+			if q.UserID == p.UserID && q.TunnelID == p.TunnelID {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			rep.revoked = append(rep.revoked, p)
+		}
+	}
+}
+
+func newImportReport() *importReport {
+	return &importReport{skipped: make(map[string]int)}
+}
+
+func (rep *importReport) skip(segment string) {
+	if rep == nil {
+		return
+	}
+	rep.skipped[segment]++
+}
+
+func (rep *importReport) warnf(format string, args ...interface{}) {
+	if rep == nil {
+		return
+	}
+	rep.warnings = append(rep.warnings, fmt.Sprintf(format, args...))
+}
+
+// rowExistsTx 判断 id 行是否存在（引用存在性校验，D4-03）。
+func rowExistsTx(tx *gorm.DB, model interface{}, id int64) (bool, error) {
+	if id <= 0 {
+		return false, nil
+	}
+	var n int64
+	if err := tx.Model(model).Where("id = ?", id).Count(&n).Error; err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// noteRemovedGroupSegments discloses the group-trio backup segments
+// an old backup still carries (分组三件套已于 1.9.6 整套移除): the
+// BackupData fields survive only as decode shells, so the rows are
+// counted and named in the import warnings instead of being silently
+// dropped. Runs for every import that carries the segments, whatever
+// segment set the caller selected. Returns the per-segment row counts
+// so the caller can fill the receipt's *Ignored fields with the same
+// numbers the warnings disclose (RR-S2-01).
+func noteRemovedGroupSegments(backup *model.BackupData, rep *importReport) (tunnelGroups, userGroups, permissions int) {
+	if n := len(backup.TunnelGroups); n > 0 {
+		tunnelGroups = n
+		rep.warnf("备份恢复：隧道分组功能已移除，备份中的 tunnelGroups 段（%d 条）已忽略未恢复", n)
+	}
+	if n := len(backup.UserGroups); n > 0 {
+		userGroups = n
+		rep.warnf("备份恢复：用户分组功能已移除，备份中的 userGroups 段（%d 条）已忽略未恢复", n)
+	}
+	if n := len(backup.Permissions); n > 0 {
+		permissions = n
+		rep.warnf("备份恢复：分组权限功能已移除，备份中的 permissions 段（%d 条）已忽略未恢复", n)
+	}
+	return tunnelGroups, userGroups, permissions
+}
+
+// noteRemovedFeatureSegments discloses the 2.1.0-removed feature
+// segments an old backup still carries, in the same shape as
+// noteRemovedGroupSegments: counted, named in the import warnings,
+// and kept out of the database. Runs for every import carrying the
+// segments, whatever segment set the caller selected.
+//
+//   - peerShares: the federation/peer-share segment. BackupData
+//     keeps the field as a decode shell only; the rows never land.
+//   - themes: the theme-pack segment. Same shell treatment (the
+//     segment never shipped in panel backups — theme choice lived
+//     in browser localStorage — so this guards crafted/cross-
+//     version backups).
+//   - gist config keys: the Gist backup feature had no segment of
+//     its own; its footprint in a backup is the retiredConfigKeysList
+//     set inside the configs segment. Those keys used to be restored
+//     verbatim (silently resurrecting even the gist_token credential
+//     until the next boot's migration), so they are stripped from
+//     backup.Configs here — before the configs segment is imported
+//     later in the same transaction — and named by key (names only,
+//     never values, same discipline as B8-12).
+//
+// Returns the per-face counts so the caller can fill the receipt's
+// *Ignored fields with the same numbers the warnings disclose.
+func noteRemovedFeatureSegments(backup *model.BackupData, rep *importReport) (peerShares, gistKeys, themes int) {
+	if n := len(backup.PeerShares); n > 0 {
+		peerShares = n
+		rep.warnf("备份恢复：面板共享（联邦）功能已移除，备份中的 peerShares 段（%d 条）已忽略未恢复", n)
+	}
+	if n := len(backup.Themes); n > 0 {
+		themes = n
+		rep.warnf("备份恢复：主题功能已移除，备份中的 themes 段（%d 条）已忽略未恢复", n)
+	}
+	if len(backup.Configs) > 0 {
+		removed := make(map[string]bool, len(retiredConfigKeysList))
+		for _, k := range retiredConfigKeysList {
+			removed[k] = true
+		}
+		var present []string
+		for name := range backup.Configs {
+			if removed[normalizeConfigKey(name)] {
+				present = append(present, name)
+			}
+		}
+		if len(present) > 0 {
+			sort.Strings(present)
+			gistKeys = len(present)
+			for _, name := range present {
+				delete(backup.Configs, name)
+			}
+			rep.warnf("备份恢复：GitHub/Gist 备份功能已移除，备份中的 %d 个已随功能下线注销的 gist 配置键已忽略未恢复：%s", gistKeys, strings.Join(present, "、"))
+		}
+	}
+	return peerShares, gistKeys, themes
+}
+
+// ImportValidationError 标记备份导入中「由备份内容本身导致」的
+// 拒绝（R3-GEN-02①）：不支持的版本、未知段类型、预算超限、端口
+// 冲突、管理员不变式——文案均为面向操作者的自著文本，可由传输层
+// 原样回执（基线 backupImport 的「导入失败: %v」口径）；Import 的
+// 其余错误皆为仓储/事务故障，传输层必须泛化。本型只在校验点构造
+// （进事务前的各校验与事务内 validateImportAdminInvariant 的自著
+// 拒绝支），事务的存储错误包装（"import users failed: %w" 等）
+// 不得套用本型。
+type ImportValidationError struct {
+	msg string
+}
+
+func (e *ImportValidationError) Error() string { return e.msg }
+
+func newImportValidationError(format string, args ...interface{}) *ImportValidationError {
+	return &ImportValidationError{msg: fmt.Sprintf(format, args...)}
+}
+
+// wrapImportValidationError 把既有校验函数的自著错误定型为
+// ImportValidationError（文本逐字不变）。
+func wrapImportValidationError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &ImportValidationError{msg: err.Error()}
+}
+
+func (r *Repository) Import(backup *model.BackupData, types []string) (*model.ImportResult, error) {
+	// O7-009：版本兼容性检查（导出仅写 "1.0"），未知版本拒绝导入，
+	// 避免不兼容格式被错误恢复。
+	if backup == nil || backup.Version != "1.0" {
+		version := ""
+		if backup != nil {
+			version = backup.Version
+		}
+		return nil, newImportValidationError("不支持的备份版本 %q（仅支持 1.0）", version)
+	}
+	if err := validateBackupTypes(types); err != nil {
+		return nil, wrapImportValidationError(err)
+	}
+	result := &model.ImportResult{}
+	typeSet := make(map[string]bool)
+	for _, t := range types {
+		typeSet[t] = true
+	}
+
+	// R10-10：bcrypt 预算校验——进事务与端口预检之前整单拒绝
+	// （见 ValidateBackupImportUserHashBudget；两个 handler 入口
+	// 已在取单飞锁前先行同判，此处为 repo 层单一收口，覆盖全部
+	// Import 调用方）。
+	if err := ValidateBackupImportUserHashBudget(backup, types); err != nil {
+		return nil, wrapImportValidationError(err)
+	}
+
+	// B8-14：per-section 行数预算——与哈希预算同收口位（进事务
+	// 与端口预检之前整单拒绝，见 validateBackupSectionBudgets）。
+	if err := validateBackupSectionBudgets(backup, typeSet); err != nil {
+		return nil, wrapImportValidationError(err)
+	}
+
+	// B4/F-055: 端口预检 + per-node 锁（见 repository_backup_precheck.go）。
+	claims := backupClaims(backup, typeSet)
+	releasePortLocks := lockBackupPortNodes(claims)
+	defer releasePortLocks()
+	if err := r.precheckBackupPortConflicts(backup, typeSet, claims); err != nil {
+		return nil, err
+	}
+
+	rep := newImportReport()
+	err := r.db.Transaction(func(tx *gorm.DB) error {
+		now := unixMilliNow()
+		// 分组三件套段披露：旧备份的 tunnelGroups/userGroups/
+		// permissions 段随功能移除不再落库，在回执中点名计数，
+		// 不静默丢（inbounds 段内的 nodeGroups/groupIds 同口径在
+		// importInbounds 内披露）。计数同时写入回执的 *Ignored
+		// 结构化字段，与文本披露同数（RR-S2-01）。
+		result.TunnelGroupsIgnored, result.UserGroupsIgnored, result.PermissionsIgnored = noteRemovedGroupSegments(backup, rep)
+		// 2.1.0 四删除面中的顶层三面同口径披露：peerShares/themes
+		// 段只计数点名不落库；gist 面以 configs 段内的已删功能键
+		// 为载体，在此剥离并点名（configs 段在本事务后段才导入，
+		// 剥离生效）。Snell 面在 inbounds 段内由 importInbounds 处置。
+		result.PeerSharesIgnored, result.GistConfigsIgnored, result.ThemesIgnored = noteRemovedFeatureSegments(backup, rep)
+		// R4X-006：事务尾转发授权收口只裁定本次导入新落的行——先
+		// 快照 forwards 备份 id 在目标库的存量存在性，尾部清扫据此
+		// 区分「本次新落」与「存量行被刷新」（后者是目标库现行
+		// 数据，不在导入裁定范围内）。
+		preForwardIDs := make(map[int64]bool)
+		if typeSet["forwards"] && len(backup.Forwards) > 0 {
+			ids := make([]int64, 0, len(backup.Forwards))
+			for _, f := range backup.Forwards {
+				ids = append(ids, f.ID)
+			}
+			var existing []int64
+			// T2-NEW-01：同上，按块查跨块累加。
+			for _, chunk := range chunkInt64IDs(ids) {
+				var chunkExisting []int64
+				if err := tx.Model(&model.Forward{}).Where("id IN ?", chunk).Pluck("id", &chunkExisting).Error; err != nil {
+					return fmt.Errorf("import pre-snapshot forwards failed: %w", err)
+				}
+				existing = append(existing, chunkExisting...)
+			}
+			for _, id := range existing {
+				preForwardIDs[id] = true
+			}
+		}
+		// BUG-A2-4：订阅在 inbounds 段按 token 重建、可能换 id；
+		// subRemap 把备份订阅 id 映射到落库 id，供 userSubscriptions
+		// 段重写分配引用（inbounds 段在本事务中先于该段执行）。
+		subRemap := make(map[int64]int64)
+
+		if typeSet["users"] && len(backup.Users) > 0 {
+			// R1-06-L1：users 段导入后管理员不变式的前置快照（段后
+			// 校验见 validateImportAdminInvariant）：构造/异源备份的
+			// id=1 行 role_id≠0 或 status≠1（或全段无启用中管理员
+			// 行）经 upsert 可把现行管理员整行降权/停用覆盖，而 seedData 只在 id=1 行不
+			// 存在时补建——导入后无管理员可登录且永不自愈。故落库
+			// 前记下现行 id=1 管理员的存在性，段末整单裁定。
+			_, preAdminRow1, err := importAdminState(tx)
+			if err != nil {
+				return fmt.Errorf("import users admin precheck failed: %w", err)
+			}
+			count, err := importUsers(tx, backup.Users, now, rep)
+			if err != nil {
+				return fmt.Errorf("import users failed: %w", err)
+			}
+			if err := validateImportAdminInvariant(tx, preAdminRow1); err != nil {
+				return err
+			}
+			result.UsersImported = count
+		}
+		if typeSet["nodes"] && len(backup.Nodes) > 0 {
+			count, err := importNodes(tx, backup.Nodes, now, rep)
+			if err != nil {
+				return fmt.Errorf("import nodes failed: %w", err)
+			}
+			result.NodesImported = count
+		}
+		// FIX132-C（A3-05）：SSH 配置与面板共享定义随 nodes 段恢复。
+		if typeSet["nodes"] && len(backup.NodeSSHConfigs) > 0 {
+			count, err := importNodeSSHConfigs(tx, backup.NodeSSHConfigs, now, rep)
+			if err != nil {
+				return fmt.Errorf("import node ssh configs failed: %w", err)
+			}
+			result.NodeSSHConfigsImported = count
+		}
+		// B4-02 残面：转发端口替换集全集预判（见
+		// predictImportedForwardPortReplacements）——在 tunnels
+		// 段之前算定（链路面复检要用），供 tunnels/forwards 两段
+		// 的行内四源复检作转发排除集；成员资格与备份内声明顺序
+		// 无关。users 段已在本点之前落库，用户存在性是终态。
+		forwardReplaceIDs := map[int64]bool{}
+		if typeSet["forwards"] && len(backup.Forwards) > 0 {
+			var perr error
+			forwardReplaceIDs, perr = predictImportedForwardPortReplacements(tx, backup, typeSet)
+			if perr != nil {
+				return fmt.Errorf("import forwards replacement prediction failed: %w", perr)
+			}
+		}
+		if typeSet["tunnels"] && len(backup.Tunnels) > 0 {
+			count, err := r.importTunnels(tx, backup.Tunnels, now, rep, forwardReplaceIDs)
+			if err != nil {
+				return fmt.Errorf("import tunnels failed: %w", err)
+			}
+			result.TunnelsImported = count
+		}
+		if typeSet["forwards"] && len(backup.Forwards) > 0 {
+			count, err := r.importForwards(tx, backup.Forwards, now, rep, forwardReplaceIDs)
+			if err != nil {
+				return fmt.Errorf("import forwards failed: %w", err)
+			}
+			result.ForwardsImported = count
+		}
+		if typeSet["userTunnels"] && len(backup.UserTunnels) > 0 {
+			count, err := importUserTunnels(tx, backup.UserTunnels, now, rep)
+			if err != nil {
+				return fmt.Errorf("import user tunnels failed: %w", err)
+			}
+			result.UserTunnelsImported = count
+		}
+		if typeSet["speedLimits"] && len(backup.SpeedLimits) > 0 {
+			count, err := importSpeedLimits(tx, backup.SpeedLimits, now, rep)
+			if err != nil {
+				return fmt.Errorf("import speed limits failed: %w", err)
+			}
+			result.SpeedLimitsImported = count
+		}
+		if typeSet["configs"] && len(backup.Configs) > 0 {
+			count, err := importConfigs(tx, backup.Configs, now, rep)
+			if err != nil {
+				return fmt.Errorf("import configs failed: %w", err)
+			}
+			result.ConfigsImported = count
+		}
+		if typeSet["inbounds"] && backup.Inbounds != nil {
+			counts, err := r.importInbounds(tx, backup.Inbounds, now, subRemap, rep)
+			if err != nil {
+				return fmt.Errorf("import inbounds failed: %w", err)
+			}
+			result.InboundsImported = counts.inbounds
+			result.InboundKernelsImported = counts.kernels
+			result.InboundRelaysImported = counts.relays
+			result.InboundCountersImported = counts.counters
+			result.InboundSubscriptionsImported = counts.subscriptions
+			result.InboundSubscriptionCountersImported = counts.subscriptionCounter
+			result.InboundSourcesImported = counts.sources
+			result.InboundShieldsImported = counts.shields
+			result.InboundNodeGroupsIgnored = counts.groupsIgnored
+			result.InboundSnellKernelsDisabled = counts.snellKernelsDisabled
+			result.InboundSnellInboundsDisabled = counts.snellInboundsDisabled
+			result.InboundTemplatesImported = counts.templates
+			result.InboundLegacyUsersImported = counts.legacyUsers
+		}
+		// O7-001：导入 user_inbound 表（用户订阅分配关系）
+		if typeSet["userInbounds"] && len(backup.UserInbounds) > 0 {
+			count, err := importUserInbounds(tx, backup.UserInbounds, rep)
+			if err != nil {
+				return fmt.Errorf("import user inbounds failed: %w", err)
+			}
+			result.UserInboundsImported = count
+		}
+		// O7-008：导入 monitor_permission 表（监控权限）
+		if typeSet["monitorPermissions"] && len(backup.MonitorPermissions) > 0 {
+			count, err := importMonitorPermissions(tx, backup.MonitorPermissions, rep)
+			if err != nil {
+				return fmt.Errorf("import monitor permissions failed: %w", err)
+			}
+			result.MonitorPermissionsImported = count
+		}
+		// R2-E3-F02：导入 passkey 表（WebAuthn 公钥凭据，按 user
+		// 归属落库；用户不存在的行跳过并经 SkippedRows 点名计数）。
+		if typeSet["passkeys"] && len(backup.Passkeys) > 0 {
+			count, err := importPasskeys(tx, backup.Passkeys, rep)
+			if err != nil {
+				return fmt.Errorf("import passkeys failed: %w", err)
+			}
+			result.PasskeysImported = count
+		}
+		// B4/F-004：导入 user_subscription 表（订阅分配关系）。
+		// 旧备份无该字段时 len=0 自动跳过，不报错。
+		// BUG-A2-4：分配引用经 subRemap 重写到重建后的订阅 id；
+		// 无法落位的分配跳过并计入 UserSubscriptionsSkipped 如实回执。
+		if typeSet["userSubscriptions"] && len(backup.UserSubscriptions) > 0 {
+			count, skipped, err := importUserSubscriptions(tx, backup.UserSubscriptions, subRemap)
+			if err != nil {
+				return fmt.Errorf("import user subscriptions failed: %w", err)
+			}
+			result.UserSubscriptionsImported = count
+			result.UserSubscriptionsSkipped = skipped
+		}
+		// B4/F-030：导入 service_monitor 表（监控定义）
+		if typeSet["serviceMonitors"] && len(backup.ServiceMonitors) > 0 {
+			count, err := importServiceMonitors(tx, backup.ServiceMonitors, now, rep)
+			if err != nil {
+				return fmt.Errorf("import service monitors failed: %w", err)
+			}
+			result.ServiceMonitorsImported = count
+		}
+		// R4X-006：全部段落库后做一次转发授权收口（与 R2X-014
+		// speed 清扫同为事务尾落点）：段序 forwards 先于 userTunnels，
+		// 段内即时校验会误伤同批全量恢复，只有在事务尾以终态裁定
+		// 才不误杀同批补写的授权。用户隧道授权本身不再按分组状态
+		// 裁定（R5-FGRP：分组只限定分配范围，停用组对不撤销任何
+		// 授权），导入的授权行逐字落库。
+		var authForwards []model.ForwardBackup
+		if typeSet["forwards"] {
+			authForwards = backup.Forwards
+		}
+		if len(authForwards) > 0 {
+			fwdSkipped, err := sweepImportedAuthorizationTx(tx, authForwards, preForwardIDs, rep)
+			if err != nil {
+				return fmt.Errorf("import authorization sweep failed: %w", err)
+			}
+			result.ForwardsImported -= fwdSkipped
+		}
+		// R2X-014：全部段落库后做一次 speed 引用清扫（限速段在段序
+		// 末尾，逐行校验会误杀全量恢复的合法绑定——见
+		// sweepDanglingSpeedRefsTx 注释）。只清扫本轮勾选段的行。
+		var sweepForwards []model.ForwardBackup
+		if typeSet["forwards"] {
+			sweepForwards = backup.Forwards
+		}
+		var sweepUserTunnels []model.UserTunnelBackup
+		if typeSet["userTunnels"] {
+			sweepUserTunnels = backup.UserTunnels
+		}
+		if len(sweepForwards) > 0 || len(sweepUserTunnels) > 0 {
+			if err := sweepDanglingSpeedRefsTx(tx, sweepForwards, sweepUserTunnels, rep); err != nil {
+				return fmt.Errorf("import speed ref sweep failed: %w", err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(rep.skipped) > 0 {
+		result.SkippedRows = rep.skipped
+	}
+	result.ImportWarnings = rep.warnings
+	result.RestoredSSHNodeIDs = rep.restoredSSHNodeIDs
+	if len(rep.revoked) > 0 {
+		result.RevokedUserTunnels = make([]model.RevokedImportPair, 0, len(rep.revoked))
+		for _, p := range rep.revoked {
+			result.RevokedUserTunnels = append(result.RevokedUserTunnels, model.RevokedImportPair{UserID: p.UserID, TunnelID: p.TunnelID})
+		}
+	}
+	return result, nil
+}
+
+func importUsers(tx *gorm.DB, users []model.UserBackup, now int64, rep *importReport) (int, error) {
+	count := 0
+	for _, u := range users {
+		// B02-001（R3 K4）：用户名先 TrimSpace 归一再判重/落库，与
+		// create/update/updatePassword 写面同口径。此前原样落库：
+		// 带空格名只能以原名登录、带空格的大小写变体绕过 K10 折叠
+		// 判重构成逻辑同名、空名成永久不可登录的死账号、超长名在
+		// PG 使整单导入失败。归一后为空或 >100 rune 按 R5X-009
+		// 同形逐行 skip+warn（不整单失败）。
+		username := strings.TrimSpace(u.User)
+		if username == "" {
+			rep.skip("users")
+			rep.warnf("备份恢复：用户 #%d 的用户名 %q 归一（去首尾空格）后为空，已跳过该行未恢复", u.ID, u.User)
+			continue
+		}
+		if len([]rune(username)) > 100 {
+			rep.skip("users")
+			rep.warnf("备份恢复：用户 #%d 的用户名归一后长度 %d 超过 100 字符，已跳过该行未恢复", u.ID, len([]rune(username)))
+			continue
+		}
+		// R5X-009：status 合法域 {0,1} 枚举门（与运行时写入口同
+		// 口径）——非法值逐行跳过 + skipped/warning，不静默原样
+		// 落库（非法值会形成「登录发 token、其余全拒」的僵尸账号）。
+		if u.Status != 0 && u.Status != 1 {
+			rep.skip("users")
+			rep.warnf("备份恢复：用户 #%d（%q）的 status=%d 不在合法枚举 {0,1} 内，已跳过该行未恢复", u.ID, u.User, u.Status)
+			continue
+		}
+		// R18-B9-01：flowResetTime 合法域 0-31 门（与 importUserTunnels
+		// 的 R7-G-02 门及写面 O5-008 同口径）——越界值整行跳过 +
+		// 点名警告，不静默原样落库。越界值经 monthlyFlowDue/
+		// monthlyResetMoment 会把月重置日偷改为月末（>31）或使月
+		// 重置永不触发（<0）。与限额字段不同，重置日是排程而非数
+		// 量，无法安全地钳为某一合法日，故不钳制、直接跳行。
+		if u.FlowResetTime < 0 || u.FlowResetTime > 31 {
+			rep.skip("users")
+			rep.warnf("备份恢复：用户 #%d（%q）的 flowResetTime=%d 不在合法范围 0-31 内，已跳过该行未恢复", u.ID, u.User, u.FlowResetTime)
+			continue
+		}
+		pwdHash, status, err := normalizeImportedUserPassword(u.Pwd, u.Status)
+		if err != nil {
+			return count, err
+		}
+		// Preserve the password history for new rows; authentication revocation
+		// is independent and must advance on every restore, including bcrypt.
+		passwordChangedAt := u.PasswordChangedAt
+		if security.IsLegacyPasswordHash(u.Pwd) || u.Pwd == "" {
+			passwordChangedAt = now
+		}
+		userLabel := fmt.Sprintf("用户 #%d（%q）", u.ID, username)
+		// R18-B9-01：负值限额钳 0（见 clampImportedLimit 注释）。
+		flow := clampImportedLimit(rep, userLabel, "flow", u.Flow)
+		flowMiB := clampImportedLimit(rep, userLabel, "flowMiB", u.FlowMiB)
+		num := clampImportedLimit(rep, userLabel, "num", int64(u.Num))
+		maxConn := clampImportedLimit(rep, userLabel, "maxConn", int64(u.MaxConn))
+		item := model.User{
+			ID:            u.ID,
+			User:          username,
+			Pwd:           pwdHash,
+			RoleID:        u.RoleID,
+			ExpTime:       u.ExpTime,
+			Flow:          flow,
+			FlowMiB:       flowMiB,
+			InFlow:        clampImportedCounter(rep, userLabel, "inFlow", u.InFlow),
+			OutFlow:       clampImportedCounter(rep, userLabel, "outFlow", u.OutFlow),
+			FlowResetTime: u.FlowResetTime,
+			// R11X-005: restored counters count from the import
+			// moment (backup format carries no reset marker).
+			FlowLastResetTime:   now,
+			Num:                 int(num),
+			CreatedTime:         u.CreatedTime,
+			UpdatedTime:         sql.NullInt64{Int64: now, Valid: true},
+			Status:              status,
+			PasswordChangedAt:   passwordChangedAt,
+			TokensRevokedBefore: max(now, passwordChangedAt) + 1,
+			MaxConn:             int(maxConn),
+		}
+		// R5-B4C: 备份导入查重。重名时明确报错，不静默覆盖。
+		if err := ensureUsernameAvailable(tx, username, u.ID); err != nil {
+			return count, fmt.Errorf("import user %q: %w", username, err)
+		}
+		// R2-03-01: 管理员集合变化须按导入前状态判定——同 id 行
+		// 已存在且已是管理员时 upsert 不扩大集合；行不存在（新
+		// id）或既有行 role_id 非 0 时，落库为 role_id=0 即构成
+		// 新建/提权，须在下方落库成功后经 ImportWarnings 点名。
+		var existingUser model.User
+		existingUserErr := tx.Select("role_id").Where("id = ?", u.ID).First(&existingUser).Error
+		existingUserFound := existingUserErr == nil
+		if existingUserErr != nil && !errors.Is(existingUserErr, gorm.ErrRecordNotFound) {
+			return count, existingUserErr
+		}
+		updates := clause.AssignmentColumns([]string{
+			"user", "pwd", "role_id", "exp_time", "flow", "flow_mib", "in_flow", "out_flow",
+			"flow_reset_time", "flow_last_reset_time", "num", "updated_time", "status", "max_conn",
+		})
+		currentPasswordTime := clause.Column{Table: "user", Name: "password_changed_at"}
+		updates = append(updates,
+			clause.Assignment{Column: clause.Column{Name: "password_changed_at"}, Value: gorm.Expr("CASE WHEN ? > ? THEN ? ELSE ? END", currentPasswordTime, passwordChangedAt, currentPasswordTime, passwordChangedAt)},
+			clause.Assignment{Column: clause.Column{Name: "tokens_revoked_before"}, Value: nextUserRevocationTime(max(now, passwordChangedAt), "user")},
+		)
+		err = tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "id"}}, DoUpdates: updates,
+		}).Create(&item).Error
+		if err != nil {
+			// R5-B4C: 并发兜底，映射为友好错误。
+			return count, mapUniqueViolation(err, "username")
+		}
+		if err := syncForwardUsernameTx(tx, u.ID, username); err != nil {
+			return count, err
+		}
+		if u.RoleID == 0 {
+			if !existingUserFound {
+				rep.warnf("备份恢复：用户 #%d（%q）以新 id 导入并成为管理员（role_id=0），请确认该新增管理员为预期账户", u.ID, username)
+			} else if existingUser.RoleID != 0 {
+				rep.warnf("备份恢复：用户 #%d（%q）由非管理员提升为管理员（role_id=0），请确认该提权为预期操作", u.ID, username)
+			}
+		}
+		if u.DailyQuotaGB > 0 || u.MonthlyQuotaGB > 0 || u.DisabledByQuota != 0 || u.QuotaDisabledAt > 0 ||
+			u.PausedForwardIDs != "" || u.DailyUsedBytes != 0 || u.MonthlyUsedBytes != 0 {
+			// D4-01：新备份带窗口键时，已用量与暂停清单原样恢复
+			//（跨日恢复由配额视图的滚动归零兜底）；旧备份无这批
+			// 字段，沿用旧口径（导入日窗口 + 已用量清零）。
+			dayKey, monthKey := u.QuotaDayKey, u.QuotaMonthKey
+			dailyUsed, monthlyUsed := u.DailyUsedBytes, u.MonthlyUsedBytes
+			pausedForwardIDs := u.PausedForwardIDs
+			if dayKey <= 0 || monthKey <= 0 {
+				current := time.UnixMilli(now)
+				dayKey = int64(current.Year()*10000 + int(current.Month())*100 + current.Day())
+				monthKey = int64(current.Year()*100 + int(current.Month()))
+				dailyUsed, monthlyUsed, pausedForwardIDs = 0, 0, ""
+			}
+			// F2-04：带窗口键保真恢复的已用量同样过计数器门（负已
+			// 用量会让日/月配额判定在积累等量真实流量前恒假）。
+			dailyUsed = clampImportedCounter(rep, userLabel, "dailyUsedBytes", dailyUsed)
+			monthlyUsed = clampImportedCounter(rep, userLabel, "monthlyUsedBytes", monthlyUsed)
+			// R18-B9-01：日/月配额负值钳 0（与写面
+			// dailyQuotaGB/monthlyQuotaGB < 0 拒收同谓词；0 表无限制）。
+			dailyQuotaGB := clampImportedQuotaGB(rep, userLabel, "dailyQuotaGB", u.DailyQuotaGB)
+			monthlyQuotaGB := clampImportedQuotaGB(rep, userLabel, "monthlyQuotaGB", u.MonthlyQuotaGB)
+			quotaItem := model.UserQuota{
+				UserID:           u.ID,
+				DailyLimitGB:     dailyQuotaGB,
+				MonthlyLimitGB:   monthlyQuotaGB,
+				DailyUsedBytes:   dailyUsed,
+				MonthlyUsedBytes: monthlyUsed,
+				DayKey:           dayKey,
+				MonthKey:         monthKey,
+				DisabledByQuota:  u.DisabledByQuota,
+				DisabledAt:       u.QuotaDisabledAt,
+				PausedForwardIDs: pausedForwardIDs,
+				CreatedTime:      now,
+				UpdatedTime:      now,
+			}
+			err = tx.Clauses(clause.OnConflict{
+				Columns: []clause.Column{{Name: "user_id"}},
+				DoUpdates: clause.AssignmentColumns([]string{
+					"daily_limit_gb", "monthly_limit_gb", "daily_used_bytes", "monthly_used_bytes",
+					"day_key", "month_key", "disabled_by_quota", "disabled_at", "paused_forward_ids", "updated_time",
+				}),
+			}).Create(&quotaItem).Error
+			if err != nil {
+				return count, err
+			}
+		} else {
+			// FIX2-B（D4-11）：处置选择「保行」。备份无任何配额信号
+			// 只说明备份侧没有可恢复的配额数据（旧备份根本没有这批
+			// 字段），不构成「该用户应无配额」的断言；旧实现据此删
+			// 除目标库现存配额行，同实例重导入一份旧备份即静默剥
+			// 掉用户的日/月限额。导入其余段均为 upsert 语义（备份
+			// 里没有的行从不反删），此处与之对齐：无信号即不动。
+		}
+		count++
+	}
+	return count, nil
+}
+
+// importAdminState 返回导入后管理员不变式所需的两个计数：全库
+// 启用中管理员（role_id=0 AND status=1）行数、以及 id=1 行中启用
+// 中管理员的行数（0 或 1）。R2-08-01：计数必须带 status——登录与
+// 逐请求鉴权均以 Status!=1 拒绝，只数 role 的旧谓词对「管理员行
+// 还在、但已被停用」的备份全盲：构造备份把唯一管理员行置
+// status=0、或合法旧备份的管理员行携 legacy MD5/空口令被
+// normalizeImportedUserPassword 按策略强制置 status=0，两种形状
+// 都能让导入后启用中管理员归零而不触发任何一臂。
+func importAdminState(tx *gorm.DB) (admins int64, adminRow1 int64, err error) {
+	if err := tx.Model(&model.User{}).Where("role_id = ? AND status = ?", 0, 1).Count(&admins).Error; err != nil {
+		return 0, 0, err
+	}
+	if err := tx.Model(&model.User{}).Where("id = ? AND role_id = ? AND status = ?", 1, 0, 1).Count(&adminRow1).Error; err != nil {
+		return 0, 0, err
+	}
+	return admins, adminRow1, nil
+}
+
+// validateImportAdminInvariant 是 R1-06-L1 的导入后不变式：users 段
+// 落库后（仍在导入事务内）校验管理员面未被导入消灭，任一臂命中即
+// 返回点名错误、整单回滚——
+//
+//	臂① 导入后全库启用中管理员（role_id=0 AND status=1）计数为 0
+//	    （备份全段无启用中管理员行、且现行管理员行被其同 id 行降
+//	    权或停用覆盖，或目标库本就无启用中管理员）；
+//	臂② 导入前 id=1 为启用中管理员、导入后 id=1 不再是启用中管理
+//	    员（id=1 行被备份降权或停用覆盖，即便备份另带其他管理员
+//	    行亦拒绝：id=1 是 seedData 的播种锚点，静默换锚会让运维
+//	    以为管理员未变）。
+//
+// 不变式在落库后评估，看到的是归一化后的有效状态：
+// normalizeImportedUserPassword 对 legacy MD5/空口令行强制置
+// status=0 的结果已经落库、包含在计数内（R2-08-01 形状 b 无需在
+// 归一处特判；普通用户行的该策略不受本不变式影响）。
+//
+// 正常备份（自家导出恒含其 id=1 启用中管理员行）两臂均不命中。
+func validateImportAdminInvariant(tx *gorm.DB, preAdminRow1 int64) error {
+	admins, adminRow1, err := importAdminState(tx)
+	if err != nil {
+		return fmt.Errorf("import users admin invariant check failed: %w", err)
+	}
+	if admins == 0 {
+		return newImportValidationError("备份恢复被拒绝：该备份的用户段不含任何启用中管理员（role_id=0 且 status=1），导入后将没有任何管理员可登录，已整单取消")
+	}
+	if preAdminRow1 > 0 && adminRow1 == 0 {
+		return newImportValidationError("备份恢复被拒绝：该备份的 id=1 用户不是启用中管理员（role_id≠0 或 status≠1），导入会把现行 id=1 管理员降权或停用覆盖，已整单取消")
+	}
+	return nil
+}
+
+// importUserPasswordNeedsHash 报告备份用户行在导入时是否需要新
+// 做一次 bcrypt 哈希——normalizeImportedUserPassword 的分流谓词
+// 与 R10-10 预算统计的单一定义点：$2 前缀（bcrypt 家族）原样保
+// 留，其余（明文、legacy MD5、空串）一律走哈希路径。注意谓词
+// 在 TrimSpace 之后判定（与 normalizeImportedUserPassword 本体
+// 同序），预算统计对原始 Pwd 判定——带首尾空白的 $2 行在本体被
+// 剥空白后不哈希、预算侧从严计为需哈希，方向为高估、从严。
+func importUserPasswordNeedsHash(password string) bool {
+	return !strings.HasPrefix(password, "$2")
+}
+
+// MaxImportUserPasswordHashes 是单次备份导入允许触发新 bcrypt
+// 哈希的用户行数上限（R10-10/I-F2-03）。合法备份恒携 $2 哈希、
+// 永不触发；非哈希行逐行 cost-10 哈希（实测 300–900ms/行），此前
+// 无帽——约 2MB 的构造备份即可在单飞锁＋30 分钟 detached 事务内
+// 把整单预算烧满后回滚。超限在校验相位整单点名拒绝。
+const MaxImportUserPasswordHashes = 1000
+
+// ValidateBackupImportUserHashBudget 统计所选段为 users 时备份中
+// 需重新哈希口令的用户行数，超限返回错误。Repository.Import 在
+// 进事务前调用；本地导入的 handler 入口在取
+// backupImportMu 之前亦先行调用，使拒绝不占锁、不进事务、
+// 不烧任何哈希。计数只看口令形态（逐行是否最终被跳过由
+// importUsers 的行级校验另判，预算从严计全集）。
+func ValidateBackupImportUserHashBudget(backup *model.BackupData, types []string) error {
+	if backup == nil {
+		return nil
+	}
+	selected := false
+	for _, t := range types {
+		if t == "users" {
+			selected = true
+			break
+		}
+	}
+	if !selected {
+		return nil
+	}
+	need := 0
+	for _, u := range backup.Users {
+		if importUserPasswordNeedsHash(u.Pwd) {
+			need++
+		}
+	}
+	if need > MaxImportUserPasswordHashes {
+		return fmt.Errorf("备份中需重新哈希密码的用户行数 %d 超过单次上限 %d，请分批导入", need, MaxImportUserPasswordHashes)
+	}
+	return nil
+}
+
+func normalizeImportedUserPassword(password string, status int) (string, int, error) {
+	password = strings.TrimSpace(password)
+	if !importUserPasswordNeedsHash(password) {
+		return password, status, nil
+	}
+	if security.IsLegacyPasswordHash(password) || password == "" {
+		replacement, err := randomPasswordHash()
+		if err != nil {
+			return "", status, err
+		}
+		return replacement, 0, nil
+	}
+	hash, err := security.HashPassword(password)
+	if err != nil {
+		return "", status, err
+	}
+	return hash, status, nil
+}
+
+func randomPasswordHash() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return security.HashPassword(hex.EncodeToString(buf))
+}
+
+// importedNodeSecretCharset 是节点 secret 生成契约字符集的
+// repo 侧镜像（handler 的 nodeSecretCharset，B3-01）：
+// randomToken(16) 的 32 位小写 hex。生成面
+// validateNodeSecretForInstall 对集外存量 secret 点名拒绝生成
+// 安装命令；恢复面是该值此前的唯一无校验写入口，须同集收口。
+var importedNodeSecretCharset = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
+// importNodeSecretHash 取备份节点行的有效存储哈希（F03，不铸新）：
+// 新备份的 SecretHash（64 位 hex）直接取；legacy 明文 Secret
+// （合法 32-hex）哈希后取；两者皆无/皆非法即 ""（调用方现场重发）。
+func importNodeSecretHash(n model.NodeBackup) string {
+	if security.IsNodeSecretHash(n.SecretHash) {
+		return n.SecretHash
+	}
+	if n.Secret != "" && importedNodeSecretCharset.MatchString(n.Secret) {
+		return security.HashNodeSecret(n.Secret)
+	}
+	return ""
+}
+
+// normalizeImportedNodeRenewalCycle 镜像 handler 的
+// normalizeNodeRenewalCycle（repo 不可反向导入 handler，本地同
+// 集实现）：lower+trim 后 ∈ {month, quarter, year} 取归一值，
+// 否则 ""。
+func normalizeImportedNodeRenewalCycle(v string) string {
+	switch lv := strings.ToLower(strings.TrimSpace(v)); lv {
+	case "month", "quarter", "year":
+		return lv
+	default:
+		return ""
+	}
+}
+
+// defaultImportedNodeForwardMode 镜像 handler 的
+// defaultNodeForwardMode："nftables"（大小写/空白不敏感）取
+// "nftables"，其余（含空）归 "agent"。
+func defaultImportedNodeForwardMode(mode string) string {
+	if strings.TrimSpace(strings.ToLower(mode)) == "nftables" {
+		return "nftables"
+	}
+	return "agent"
+}
+
+func importNodes(tx *gorm.DB, nodes []model.NodeBackup, now int64, rep *importReport) (int, error) {
+	count := 0
+	for _, n := range nodes {
+		// R7-H-01：节点端口范围串（node.port）过恢复面端口门——
+		// 任一 token 不是 1-65535 的端口/有序区间即整行跳过 +
+		// warning（与入站行同处置）；空串为未设置形态，放行。
+		if !validRestoreNodePortSpec(n.Port) {
+			rep.skip("nodes")
+			rep.warnf("备份恢复：节点 #%d（%q）的端口范围 %q 不是合法的 1-65535 端口/有序区间，已跳过该行未恢复", n.ID, n.Name, n.Port)
+			continue
+		}
+		// D4-03：同 id 异源顶替不再静默——覆盖前比对既有行的身份
+		// 字段（名称/密钥），不同则在回执中如实提示（备份为准的
+		// 恢复语义不变，仅补披露，同订阅段 BUG-A2-4 的回执口径）。
+		var existing model.Node
+		existingRes := tx.Select("id", "name", "secret", "secret_hash").Where("id = ?", n.ID).Limit(1).Find(&existing)
+		if existingRes.Error != nil {
+			return count, existingRes.Error
+		}
+		// F03：比对按存储哈希（legacy 行现场哈希，同值），不再比明文。
+		if existingRes.RowsAffected > 0 && (existing.Name != n.Name || existing.EffectiveSecretHash() != importNodeSecretHash(n)) {
+			rep.warnf("节点 #%d 已被备份覆盖：目标库原记录（名称 %q）与备份（名称 %q）的名称/密钥不同，已按备份为准恢复", n.ID, existing.Name, n.Name)
+		}
+		// R3-E-01：节点地址含结构字符（@、#、逗号、空白/控制字符等，
+		// 与保存面 IsValidNodeAddress 同一字符集）时清空并披露——
+		// 该值是订阅 auto 模式与中转入口的地址源，坏值恢复落库即
+		// 改写订阅权威段。合法形态（主机名/IP 字面量/回环/
+		// RFC1918）逐字恢复，备份面不比保存面更严。
+		serverIP := n.ServerIP
+		if kernel.HostHasStructuralChars(serverIP) {
+			rep.warnf("备份恢复：节点地址（节点 #%d）含非法结构字符，已清空，恢复后请在节点设置中重新填写", n.ID)
+			serverIP = ""
+		}
+		// R30-FIX-F05（写侧归一化，用户 2026-10-26 拍板）：备份恢复
+		// 亦属节点入库语义，同口径剥离 :port 后再存。
+		serverIP = stripIngressHostPort(serverIP)
+		// PORT-CLOSURE F-07(ii)：单次剥离后追加与保存面
+		// IsValidNodeAddress 同口径的格式校验（R3-E-01 结构字符
+		// 集 + 双端口拒绝）；非法值清空 + 回执披露，不猜测修
+		// 正。双端口值剥离为 no-op，须经此门才闭合。
+		if !validImportNodeAddress(serverIP) {
+			rep.warnf("备份恢复：节点地址（节点 #%d）格式非法，已清空，恢复后请在节点设置中重新填写", n.ID)
+			serverIP = ""
+		}
+		serverIPv4 := stripIngressHostPort(n.ServerIPv4)
+		if !validImportNodeAddress(serverIPv4) {
+			rep.warnf("备份恢复：节点 IPv4 地址（节点 #%d）格式非法，已清空，恢复后请在节点设置中重新填写", n.ID)
+			serverIPv4 = ""
+		}
+		serverIPv6 := stripIngressHostPort(n.ServerIPv6)
+		if !validImportNodeAddress(serverIPv6) {
+			rep.warnf("备份恢复：节点 IPv6 地址（节点 #%d）格式非法，已清空，恢复后请在节点设置中重新填写", n.ID)
+			serverIPv6 = ""
+		}
+		// PORT-CLOSURE B-NEW-01（顺手收口，观察级）：ExtraIPs
+		// 逐项剥离 :port 后入库；双端口项剥离为 no-op，原值保
+		// 留（后端唯一消费 nodeAddresses 逐 token 剥离，无未
+		// 剥离消费点）。
+		extraIPs := stripIngressHostPortList(n.ExtraIPs)
+		// PORT-CLOSURE F-02：监听地址恢复侧收口。
+		// stripListenAddrPort 与 R32-FIX-F01 同口径（handler 侧
+		// 同名 helper 的 repo 镜像）：不修剪括号，默认 "[::]"
+		// 原样通过；单端口剥离。双端口值剥离为 no-op——ledger
+		// RED 实例即双端口——须经格式校验回落默认 "[::]" 并回
+		// 执披露，单次剥离本身闭合不了该实例。
+		tcpListenAddr := stripListenAddrPort(n.TCPListenAddr)
+		if !validImportListenAddr(tcpListenAddr) {
+			rep.warnf("备份恢复：节点 TCP 监听地址（节点 #%d）格式非法，已回落默认 [::]，恢复后请在节点设置中重新填写", n.ID)
+			tcpListenAddr = "[::]"
+		}
+		udpListenAddr := stripListenAddrPort(n.UDPListenAddr)
+		if !validImportListenAddr(udpListenAddr) {
+			rep.warnf("备份恢复：节点 UDP 监听地址（节点 #%d）格式非法，已回落默认 [::]，恢复后请在节点设置中重新填写", n.ID)
+			udpListenAddr = "[::]"
+		}
+		// B3-01（导入面）+ E-01-RES：节点 secret 字符集门，镜像生成面
+		// nodeSecretCharset（^[0-9a-f]{32}$，randomToken(16) 契
+		// 约）。安装命令构造把 secret 插值进以 root 执行的
+		// shell 命令，恢复面此前原样落库任意字符串——含空格/
+		// 引号/命令替换的 secret 即命令注入（生成面已以
+		// validateNodeSecretForInstall 点名拒收该值 + 构造器引
+		// 用纵深）。恢复面同口径拒收该值：不落库、warning 点名
+		// 节点与处置（绝不回显 secret 原文），节点行本身保留
+		// （整行跳过会连带误伤同批隧道/转发段，与本函数 ServerIP
+		// 清空先例同理）。E-01-RES：拒收／空 secret 不再清空落
+		// 库——空 secret 会使 UserMarkBaseForAgent 回落 v1 mark
+		// 派生（跨面板同 mark 碰撞，E-01），恢复时现场重发一枚
+		// 新 secret（randomToken，32 位小写十六进制），恢复后
+		// 的节点恒满足生成契约，安装／重装直接以新 secret 为
+		// 准，无需管理员重置。随机源失败 fail-closed：整单回滚，
+		// 绝不落全零／空 secret（X-P3-14 同口径）。
+		// F03：恢复面 secret 形态——优先新备份的 SecretHash（64 位
+		// hex，直接入库）；其次 legacy 明文 Secret（合法 32-hex 即哈
+		// 希入库）；非法／空则现场重发一枚新 secret（只存哈希，明文
+		// 随即丢弃，恢复后节点须经 nodeInstall 轮换取新命令重装）。
+		// 警告口径与旧版一致（点名节点与处置，绝不回显 secret 原
+		// 文），节点行本身保留。随机源失败 fail-closed：整单回滚，
+		// 绝不落全零／空 secret（X-P3-14 同口径）。
+		secretHash := importNodeSecretHash(n)
+		if secretHash == "" {
+			if n.SecretHash != "" {
+				rep.warnf("备份恢复：节点 #%d（%q）的 secretHash 不符合存储哈希格式（64 位小写十六进制），已作废并现场重发新 secret", n.ID, n.Name)
+			} else if n.Secret != "" {
+				rep.warnf("备份恢复：节点 #%d（%q）的 secret 不符合生成契约字符集（32 位小写十六进制），已作废并现场重发新 secret", n.ID, n.Name)
+			} else {
+				rep.warnf("备份恢复：节点 #%d（%q）的 secret 为空，已现场重发新 secret", n.ID, n.Name)
+			}
+			fresh, err := randomToken()
+			if err != nil {
+				return count, err
+			}
+			secretHash = security.HashNodeSecret(fresh)
+		}
+		// B8-11：RenewalCycle/ForwardMode 归一镜像写面——此前原
+		// 样落库：周期集外值使到期提醒计算落默认分支，转发模式
+		// 集外值与写面产出不同字面（消费面按字面分支）。归一后
+		// 与原值不同者在回执点名原值；空 ForwardMode 按写面默
+		// 认静默归 "agent"（写面保存时同此默认、无回执先例）。
+		// 写面产出的合法备份恒已归一，不触发回执。
+		renewalCycle := normalizeImportedNodeRenewalCycle(n.RenewalCycle)
+		if renewalCycle != n.RenewalCycle {
+			rep.warnf("备份恢复：节点 #%d（%q）的续费周期 %q 不在合法集 {month, quarter, year} 内，已按无周期恢复", n.ID, n.Name, n.RenewalCycle)
+		}
+		forwardMode := defaultImportedNodeForwardMode(n.ForwardMode)
+		if forwardMode != n.ForwardMode && n.ForwardMode != "" {
+			rep.warnf("备份恢复：节点 #%d（%q）的转发模式 %q 不在合法集 {agent, nftables} 内，已按保存面同口径归一为 %q", n.ID, n.Name, n.ForwardMode, forwardMode)
+		}
+		// R2-E1-06：定时重启三字段恢复面归一，镜像写面
+		// validateRestartSchedule（开关 {0,1}／时刻 HH:MM／抖动
+		// 0–720）。旧备份无此三字段（零值）时：开关 0 与合法集内值
+		// 无别、空时刻按模型默认 "04:00" 回落、抖动 0 在合法集内，
+		// 均静默（与存量未配置形态等价）；带值越界者逐项归一并回执
+		// 点名原值，与 B8-11 同口径。
+		restartEnabled := n.RestartEnabled
+		if restartEnabled != 0 && restartEnabled != 1 {
+			rep.warnf("备份恢复：节点 #%d（%q）的定时重启开关值 %d 无效，已按关闭恢复", n.ID, n.Name, n.RestartEnabled)
+			restartEnabled = 0
+		}
+		restartTime := n.RestartTime
+		if restartTime == "" {
+			restartTime = "04:00"
+		} else if !validImportRestartTime(restartTime) {
+			rep.warnf("备份恢复：节点 #%d（%q）的定时重启时刻 %q 不是合法的 HH:MM，已按默认 04:00 恢复", n.ID, n.Name, n.RestartTime)
+			restartTime = "04:00"
+		}
+		restartJitter := n.RestartJitterMinutes
+		if restartJitter < 0 || restartJitter > 720 {
+			rep.warnf("备份恢复：节点 #%d（%q）的定时重启抖动 %d 分钟超出 0–720，已按默认 30 恢复", n.ID, n.Name, n.RestartJitterMinutes)
+			restartJitter = 30
+		}
+		// 重启模式＋间隔恢复面归一，镜像写面（mode {daily,interval}／
+		// 间隔 15–10080 分钟）。旧备份无此两字段（空/零）时按
+		// daily/60 静默回落，与存量未配置形态等价；带值越界逐项归一
+		// 并回执点名原值。
+		restartMode := n.RestartMode
+		if restartMode == "" {
+			restartMode = "daily"
+		} else if restartMode != "daily" && restartMode != "interval" {
+			rep.warnf("备份恢复：节点 #%d（%q）的定时重启模式 %q 无效，已按每天定时（daily）恢复", n.ID, n.Name, n.RestartMode)
+			restartMode = "daily"
+		}
+		restartInterval := n.RestartIntervalMinutes
+		if restartInterval == 0 {
+			restartInterval = 60
+		} else if restartInterval < 15 || restartInterval > 10080 {
+			rep.warnf("备份恢复：节点 #%d（%q）的定时重启间隔 %d 分钟超出 15–10080，已按默认 60 恢复", n.ID, n.Name, n.RestartIntervalMinutes)
+			restartInterval = 60
+		}
+		// 无进展拆除阈值恢复面归一，镜像写面 validateNodeIdleTimeoutSeconds
+		//（0–86400 秒，0＝关）。旧备份无此字段（零值）即关闭，与存量
+		// 未配置形态等价、静默；带值越界按关闭归一并回执点名原值——
+		// 该保险丝宁可关错不可开错。
+		idleTimeoutSeconds := n.IdleTimeoutSeconds
+		if idleTimeoutSeconds < 0 || idleTimeoutSeconds > 86400 {
+			rep.warnf("备份恢复：节点 #%d（%q）的会话无进展拆除阈值 %d 秒超出 0–86400，已按关闭（0）恢复", n.ID, n.Name, n.IdleTimeoutSeconds)
+			idleTimeoutSeconds = 0
+		}
+		// 根治两档恢复面归一，镜像写面值域门（窗口：0＝关、非零
+		// 须 ≥60 秒；滴流上限：0＝agent 默认、1–1000000 字节/秒）。
+		// 旧备份无此三字段（零值）即关闭/默认，与存量未配置形态
+		// 等价、静默；带值越界按关闭归一并回执点名原值——保险丝
+		// 宁可关错不可开错。
+		edgeIdleTimeoutSeconds := n.EdgeIdleTimeoutSeconds
+		if edgeIdleTimeoutSeconds != 0 && edgeIdleTimeoutSeconds < 60 {
+			rep.warnf("备份恢复：节点 #%d（%q）的入口判死窗口 %d 秒无效（须为 0 或 ≥60），已按关闭（0）恢复", n.ID, n.Name, n.EdgeIdleTimeoutSeconds)
+			edgeIdleTimeoutSeconds = 0
+		}
+		backstopIdleTimeoutSeconds := n.BackstopIdleTimeoutSeconds
+		if backstopIdleTimeoutSeconds != 0 && backstopIdleTimeoutSeconds < 60 {
+			rep.warnf("备份恢复：节点 #%d（%q）的中途兜底窗口 %d 秒无效（须为 0 或 ≥60），已按关闭（0）恢复", n.ID, n.Name, n.BackstopIdleTimeoutSeconds)
+			backstopIdleTimeoutSeconds = 0
+		}
+		backstopTrickleBps := n.BackstopTrickleBps
+		if backstopTrickleBps < 0 || backstopTrickleBps > 1000000 {
+			rep.warnf("备份恢复：节点 #%d（%q）的兜底滴流上限 %d 字节/秒超出 0–1000000，已按默认（0）恢复", n.ID, n.Name, n.BackstopTrickleBps)
+			backstopTrickleBps = 0
+		}
+		// 节点级连接日志开关恢复面归一：只认 0/1，越界按关闭归一
+		// 并回执点名原值——采集开关宁可关错不可开错；旧备份无此
+		// 字段（零值）即关闭、静默。
+		connLogEnabled := n.ConnLogEnabled
+		if connLogEnabled != 0 && connLogEnabled != 1 {
+			rep.warnf("备份恢复：节点 #%d（%q）的连接日志开关 %d 无效（须为 0 或 1），已按关闭（0）恢复", n.ID, n.Name, n.ConnLogEnabled)
+			connLogEnabled = 0
+		}
+		// 节点级白名单恢复面归一：开关只认 0/1；名单须过
+		// ParseAllowList，非法条目即整组按关闭归一并回执点名原
+		// 值——白名单开关宁可关错不可开错（关即逐入站设置照旧），
+		// 且坏名单不得静默落成“开着空名单”。旧备份无此二字段
+		// （零值／空）即关闭、静默。
+		whitelistEnabled := n.WhitelistEnabled
+		whitelistExtra := n.WhitelistExtra
+		if whitelistEnabled != 0 && whitelistEnabled != 1 {
+			rep.warnf("备份恢复：节点 #%d（%q）的白名单开关 %d 无效（须为 0 或 1），已按关闭（0）恢复", n.ID, n.Name, n.WhitelistEnabled)
+			whitelistEnabled = 0
+		}
+		if whitelistEnabled == 1 {
+			if allow, err := kernel.ParseAllowList(whitelistExtra); err != nil {
+				rep.warnf("备份恢复：节点 #%d（%q）的白名单 %q 无效（%v），已按关闭恢复", n.ID, n.Name, n.WhitelistExtra, err)
+				whitelistEnabled = 0
+				whitelistExtra = ""
+			} else {
+				whitelistExtra = strings.Join(allow, ", ")
+			}
+		}
+		// 展示分组标签恢复面归一，镜像写面（trim＋列宽 100）：旧备
+		// 份无此字段为空＝未分组、静默；带值越界者截断并回执点名
+		// 原值，与 B8-11 同口径。
+		displayGroup := strings.TrimSpace(n.DisplayGroup)
+		if len([]rune(displayGroup)) > 100 {
+			rep.warnf("备份恢复：节点 #%d（%q）的展示分组标签 %q 超过 100 个字符，已截断恢复", n.ID, n.Name, n.DisplayGroup)
+			displayGroup = string([]rune(displayGroup)[:100])
+		}
+		item := model.Node{
+			ID:           n.ID,
+			Name:         n.Name,
+			Remark:       sql.NullString{String: n.Remark, Valid: n.Remark != ""},
+			ExpiryTime:   sql.NullInt64{Int64: n.ExpiryTime, Valid: n.ExpiryTime > 0},
+			RenewalCycle: sql.NullString{String: renewalCycle, Valid: renewalCycle != ""},
+			// F03：只存哈希，明文列恒空。
+			Secret:     "",
+			SecretHash: secretHash,
+			ServerIP:   serverIP,
+			ServerIPV4: sql.NullString{String: serverIPv4, Valid: serverIPv4 != ""},
+			ServerIPV6: sql.NullString{String: serverIPv6, Valid: serverIPv6 != ""},
+			// B4/F-027：导入侧同样补 ExtraIPs（此前导出/导入双漏）。
+			ExtraIPs:       sql.NullString{String: extraIPs, Valid: extraIPs != ""},
+			Port:           n.Port,
+			InterfaceName:  sql.NullString{String: n.InterfaceName, Valid: n.InterfaceName != ""},
+			Version:        sql.NullString{String: n.Version, Valid: n.Version != ""},
+			HTTP:           n.HTTP,
+			TLS:            n.TLS,
+			Socks:          n.Socks,
+			CreatedTime:    n.CreatedTime,
+			UpdatedTime:    sql.NullInt64{Int64: now, Valid: true},
+			Status:         n.Status,
+			TCPListenAddr:  tcpListenAddr,
+			UDPListenAddr:  udpListenAddr,
+			Inx:            n.Inx,
+			LatencyTargets: n.LatencyTargets,
+			ForwardMode:    forwardMode,
+			DisplayGroup:   displayGroup,
+			// R2-E1-06：归一后的定时重启三字段落库。
+			RestartEnabled:             restartEnabled,
+			RestartTime:                restartTime,
+			RestartJitterMinutes:       restartJitter,
+			RestartMode:                restartMode,
+			RestartIntervalMinutes:     restartInterval,
+			IdleTimeoutSeconds:         idleTimeoutSeconds,
+			EdgeIdleTimeoutSeconds:     edgeIdleTimeoutSeconds,
+			BackstopIdleTimeoutSeconds: backstopIdleTimeoutSeconds,
+			BackstopTrickleBps:         backstopTrickleBps,
+			ConnLogEnabled:             connLogEnabled,
+			WhitelistEnabled:           whitelistEnabled,
+			WhitelistExtra:             whitelistExtra,
+			// O7-006：恢复后保留已忽略的到期提醒状态
+			ExpiryReminderDismissed: n.ExpiryReminderDismissed,
+		}
+		err := tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "id"}},
+			DoUpdates: clause.AssignmentColumns([]string{
+				"name", "remark", "expiry_time", "renewal_cycle", "secret", "server_ip", "server_ip_v4", "server_ip_v6", "extra_ips", "port", "interface_name", "version",
+				"http", "tls", "socks", "updated_time", "status", "tcp_listen_addr", "udp_listen_addr",
+				"inx", "latency_targets", "forward_mode", "display_group", "restart_enabled", "restart_time", "restart_jitter_minutes", "restart_mode", "restart_interval_minutes", "idle_timeout_seconds", "edge_idle_timeout_seconds", "backstop_idle_timeout_seconds", "backstop_trickle_bps", "conn_log_enabled", "whitelist_enabled", "whitelist_extra", "expiry_reminder_dismissed",
+			}),
+		}).Create(&item).Error
+		if err != nil {
+			return count, err
+		}
+		count++
+	}
+	return count, nil
+}
+
+// importNodeSSHConfigs 恢复 node_ssh_config（A3-05）。以 node_id 为
+// 业务键 upsert；节点不存在的行跳过并计数（D4-03）。每个恢复成功的
+// 节点都登记进回执的「需重新下发」清单并附提示：SSH 配置回来了，
+// 但数据面（nft 规则绑定/内核状态）不随备份，须经启动 reconcile
+// 或下一次下发重新校验——不再静默降级。
+func importNodeSSHConfigs(tx *gorm.DB, rows []model.NodeSSHConfigBackup, now int64, rep *importReport) (int, error) {
+	count := 0
+	for _, c := range rows {
+		// R7-H-01：SSH 端口过恢复面端口门，且必须在落库之前判——
+		// port 列带 GORM default:22，先落库再判会把备份里的 0
+		// 静默改写成 22（连坏值都看不见）。域外整行跳过 + warning，
+		// 与入站行同处置（保存面 persistNodeSSHConfig 同口径拒收）。
+		if !validRestorePort(c.Port) {
+			rep.skip("nodeSSHConfigs")
+			rep.warnf("备份恢复：节点 #%d 的 SSH 配置端口 %d 不在 1-65535 之间，已跳过该行未恢复", c.NodeID, c.Port)
+			continue
+		}
+		nodeExists, err := rowExistsTx(tx, &model.Node{}, c.NodeID)
+		if err != nil {
+			return count, err
+		}
+		if !nodeExists {
+			rep.skip("nodeSSHConfigs")
+			continue
+		}
+		// 复扫 R-04：恢复面与写面同口径——空标签 SSH host 清空 +
+		// warning（与监控恢复面同型；其余字段保留，管理员可在节点
+		// 设置中重填）。
+		host := c.Host
+		if host != "" && addrHostHasEmptyLabel(host) {
+			rep.warnf("备份恢复：节点 #%d 的 SSH 配置主机 %q 含空标签主机名，已清空，恢复后请在节点设置中重新填写", c.NodeID, c.Host)
+			host = ""
+		}
+		// R2-E1-08：指纹列刻意不进下方 AssignmentColumns——旧备份
+		// 不携带指纹（空值）时不得把目标库已钉入的指纹冲掉。落值
+		// 分两路在 upsert 后显式处理（见后）。
+		existingPin := ""
+		if c.HostKeyFingerprint == "" {
+			var existing model.NodeSSHConfig
+			res := tx.Where("node_id = ?", c.NodeID).Limit(1).Find(&existing)
+			if res.Error != nil {
+				return count, res.Error
+			}
+			if res.RowsAffected > 0 {
+				existingPin = existing.HostKeyFingerprint
+			}
+		}
+		item := model.NodeSSHConfig{
+			NodeID:      c.NodeID,
+			Host:        host,
+			Port:        c.Port,
+			Username:    c.Username,
+			AuthType:    c.AuthType,
+			Password:    sql.NullString{String: c.Password, Valid: c.Password != ""},
+			PrivateKey:  sql.NullString{String: c.PrivateKey, Valid: c.PrivateKey != ""},
+			Passphrase:  sql.NullString{String: c.Passphrase, Valid: c.Passphrase != ""},
+			SudoMode:    c.SudoMode,
+			CreatedTime: c.CreatedTime,
+			UpdatedTime: now,
+			// 插入路径直接落备份指纹；冲突路径由下方显式 Update 落值。
+			HostKeyFingerprint: c.HostKeyFingerprint,
+		}
+		if item.CreatedTime == 0 {
+			item.CreatedTime = now
+		}
+		if err := tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "node_id"}},
+			DoUpdates: clause.AssignmentColumns([]string{
+				"host", "port", "username", "auth_type", "password", "private_key",
+				"passphrase", "sudo_mode", "updated_time",
+			}),
+		}).Create(&item).Error; err != nil {
+			return count, err
+		}
+		// R2-E1-08 落值/保留点名：备份携带指纹时显式写入（覆盖冲突
+		// 路径未更新该列的缺口）；未携带且目标库已有钉入值时，现值
+		// 已由「不进 AssignmentColumns」保留，回执点名披露。
+		if c.HostKeyFingerprint != "" {
+			if err := tx.Model(&model.NodeSSHConfig{}).Where("node_id = ?", c.NodeID).
+				Update("host_key_fingerprint", c.HostKeyFingerprint).Error; err != nil {
+				return count, err
+			}
+		} else if existingPin != "" {
+			rep.warnf("备份恢复：节点 #%d 的备份未携带 SSH 主机指纹（旧备份格式），面板现有钉入指纹已保留", c.NodeID)
+		}
+		rep.restoredSSHNodeIDs = append(rep.restoredSSHNodeIDs, c.NodeID)
+		count++
+	}
+	if count > 0 {
+		rep.warnf("已恢复 %d 个节点的 SSH 配置；这些节点的数据面（nftables 规则/计数基线）不随备份恢复，将在启动 reconcile 或下一次下发时重新校验（需重新下发），节点清单见 restoredSSHNodeIds", count)
+	}
+	return count, nil
+}
+
+// normalizeBackupTunnelEngine mirrors handler.normalizeTunnelEngine (the repo
+// layer cannot import the handler): "" or "gost" select the agent's
+// forwarder, "realm" selects realm; anything else is an error, never
+// silently dropped.
+func normalizeBackupTunnelEngine(raw string) (string, error) {
+	switch e := strings.ToLower(strings.TrimSpace(raw)); e {
+	case "", "gost":
+		return "", nil
+	case "realm":
+		return e, nil
+	default:
+		return "", fmt.Errorf("不支持的转发引擎 %s", raw)
+	}
+}
+
+// R13X-007：恢复面隧道两门，与保存面同合法集——Flow ∈ {1,2}、
+// TrafficRatio ∈ [0,100]（handler 包 validateTunnelFlow /
+// validateTunnelTrafficRatio 的合法集与文案口径）。字面函数复用
+// 不可行：handler 依赖 repo，repo 引用 handler 将成包循环，故此处
+// 以同集本地门镜像；两门任一漂移即视为本断言失效，须同步改动。
+func validateImportedTunnelFlow(flow int64) error {
+	if flow != 1 && flow != 2 {
+		return fmt.Errorf("计费方向超出范围 {1,2}: %d", flow)
+	}
+	return nil
+}
+
+func validateImportedTunnelTrafficRatio(ratio float64) error {
+	if math.IsNaN(ratio) || math.IsInf(ratio, 0) || ratio < 0 || ratio > 100 {
+		return fmt.Errorf("流量倍率超出范围 [0,100]: %v", ratio)
+	}
+	return nil
+}
+
+// B8-05：恢复面隧道 Type/Status 枚举门，基线镜像保存面合法集
+// ——Type ∈ {1,2}、Status ∈ {0,1}（handler 包 validateTunnelType /
+// validateTunnelStatus，B06-001）。此前 importTunnels 对 flow/
+// ratio/probe/名长都有门，唯独这两字段原样落库：备份 type=9、
+// status=7 可恢复出 UI 映射与未来闭集消费面都不认的行。镜像
+// 纪律同 validateImportedTunnelFlow（包循环故本地同集实现）。
+// GATE-FIX C 裁定（B8-05 过修一格）：恢复面 Type 合法集放宽为
+// {0,1,2}——type=0 是 B06-001 立门前写面自身的缺省落库值，
+// 在野存量全是此形态，且全部消费面对 0 有定义行为（==1/==2
+// 正向判定兜底，B06-001 注释自证）；它与 9/-1 等无语义垃圾
+// 值不同族。硬跳过 0 会让旧备份的隧道在恢复时整批静默丢失
+// （与恢复保真口径冲突），故 0 原样保真恢复、不归一不
+// warning；真正集外值仍逐行跳过 + warning。
+func validateImportedTunnelType(typeVal int) error {
+	if typeVal != 0 && typeVal != 1 && typeVal != 2 {
+		return fmt.Errorf("隧道类型超出范围 {0,1,2}: %d", typeVal)
+	}
+	return nil
+}
+
+func validateImportedTunnelStatus(status int) error {
+	if status != 0 && status != 1 {
+		return fmt.Errorf("隧道状态超出范围 {0,1}: %d", status)
+	}
+	return nil
+}
+
+// R7-H-01: the restore-face port gate. Before this batch the 1-65535
+// gate had exactly two restore landings (inbound rows and service
+// monitor targets); every other port carrier in a backup restored
+// out-of-range values verbatim with no skip and no warning, while the
+// save face rejects the same values for every carrier. The helpers
+// below are the single restore-side definition for the remaining
+// carriers (see the CLOSED-LIST section "restore port carrier full
+// set"): a value that is SET must be a port in 1-65535 (ranges: both
+// bounds in range and ordered). Carriers with a defined unset form
+// keep it: chain_tunnel.port NULL/0 ("undetermined"), an unconfigured
+// tunnel probe target (empty host + port 0, judged by the caller), and
+// an empty node.port spec.
+func validRestorePort(port int) bool {
+	return port >= 1 && port <= 65535
+}
+
+// validRestoreNodePortSpec judges a node.port range spec string: the
+// empty spec is the unset form; otherwise every comma-separated token
+// must be a single port in 1-65535 or an ordered range "a-b" with
+// 1 <= a <= b <= 65535. Unlike parsePortRangeSpec (the allocation
+// consumer, which silently drops/clamps/swaps bad tokens), the
+// restore gate is strict: one bad token invalidates the whole spec,
+// so no part of a restored spec can silently mean something else.
+func validRestoreNodePortSpec(spec string) bool {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return true
+	}
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return false
+		}
+		if strings.Contains(part, "-") {
+			if strings.Count(part, "-") != 1 {
+				return false
+			}
+			bounds := strings.SplitN(part, "-", 2)
+			start, err1 := strconv.Atoi(strings.TrimSpace(bounds[0]))
+			end, err2 := strconv.Atoi(strings.TrimSpace(bounds[1]))
+			if err1 != nil || err2 != nil {
+				return false
+			}
+			if !validRestorePort(start) || !validRestorePort(end) || start > end {
+				return false
+			}
+			continue
+		}
+		p, err := strconv.Atoi(part)
+		if err != nil || !validRestorePort(p) {
+			return false
+		}
+	}
+	return true
+}
+
+func (r *Repository) importTunnels(tx *gorm.DB, tunnels []model.TunnelBackup, now int64, rep *importReport, forwardReplaceIDs map[int64]bool) (int, error) {
+	// B4-02 残面：链路声明口的行内复检排除集（将被整表替换端口
+	// 行的转发 ID 全集，事务前段预判算定，与声明顺序无关）。
+	forwardExclIDs := make([]int64, 0, len(forwardReplaceIDs))
+	for id := range forwardReplaceIDs {
+		forwardExclIDs = append(forwardExclIDs, id)
+	}
+	// R13X-007：先过门、再预删——被跳过的行不得触发其存量链路
+	// 预删（预删在门后只覆盖通过门的行），跳过 + 逐行点名（与
+	// forwards status 门同形）；钳制 + warning 备选不采。
+	validTunnels := make([]model.TunnelBackup, 0, len(tunnels))
+	for _, t := range tunnels {
+		if err := validateImportedTunnelFlow(t.Flow); err != nil {
+			rep.skip("tunnels")
+			rep.warnf("备份恢复：隧道 #%d（%q）的 flow=%d 不在合法枚举 {1,2} 内，已跳过该行未恢复", t.ID, t.Name, t.Flow)
+			continue
+		}
+		if err := validateImportedTunnelTrafficRatio(t.TrafficRatio); err != nil {
+			rep.skip("tunnels")
+			rep.warnf("备份恢复：隧道 #%d（%q）的流量倍率=%v 不在合法范围 [0,100] 内，已跳过该行未恢复", t.ID, t.Name, t.TrafficRatio)
+			continue
+		}
+		// D-02（发版后审计）：恢复面与写面同口径——探测目标主机
+		// 含空标签时整行跳过 + warning（与 R-05/R-06/R-09 同型；
+		// 写面 C-26 isValidTunnelProbeTargetHost 明明拒收）。
+		// 恢复面不做 DNS，只判空标签语法。
+		if host := strings.TrimSpace(t.ProbeTargetHost); host != "" && kernel.HasEmptyLabel(host) {
+			rep.skip("tunnels")
+			rep.warnf("备份恢复：隧道 #%d（%q）的探测目标主机 %q 含空标签主机名，已跳过该行未恢复", t.ID, t.Name, t.ProbeTargetHost)
+			continue
+		}
+		// R7-H-01：探测目标端口过恢复面端口门——已设置的目标
+		// （host 非空，或端口本身域外）端口必须是 1-65535，整行
+		// 跳过 + warning（保存面 normalizeTunnelProbeTarget 同
+		// 口径拒收）；未设置形态（host 空 + port 0）放行，消费面
+		// 按默认目标处理。
+		if t.ProbeTargetPort < 0 || t.ProbeTargetPort > 65535 ||
+			(t.ProbeTargetPort == 0 && strings.TrimSpace(t.ProbeTargetHost) != "") {
+			rep.skip("tunnels")
+			rep.warnf("备份恢复：隧道 #%d（%q）的探测目标端口 %d 不在 1-65535 之间，已跳过该行未恢复", t.ID, t.Name, t.ProbeTargetPort)
+			continue
+		}
+		// 写面门×恢复面镜像普查（R1-03 修复批）：隧道名长门镜像
+		// 写面（create/update 同判 ≤100 rune，B03-001 同族口径）——
+		// 此前恢复面无此门，超长名在 SQLite 静默落库、PG 下可能
+		// 使整单导入失败（限速面 B09-001 同型故障）。
+		if len([]rune(t.Name)) > 100 {
+			rep.skip("tunnels")
+			rep.warnf("备份恢复：隧道 #%d 的名称长度超过 100 个字符，已跳过该行未恢复", t.ID)
+			continue
+		}
+		// B8-05：Type/Status 枚举门镜像写面（validateTunnelType/
+		// validateTunnelStatus，合法集 {1,2}/{0,1}）——此前两字段
+		// 原样落库，集外值恢复出的行与 UI 映射及闭集消费面脱节。
+		// 与 flow 门同形：集外逐行跳过 + warning。
+		if err := validateImportedTunnelType(t.Type); err != nil {
+			rep.skip("tunnels")
+			rep.warnf("备份恢复：隧道 #%d（%q）的 type=%d 不在合法枚举 {0,1,2} 内，已跳过该行未恢复", t.ID, t.Name, t.Type)
+			continue
+		}
+		if err := validateImportedTunnelStatus(t.Status); err != nil {
+			rep.skip("tunnels")
+			rep.warnf("备份恢复：隧道 #%d（%q）的 status=%d 不在合法枚举 {0,1} 内，已跳过该行未恢复", t.ID, t.Name, t.Status)
+			continue
+		}
+		validTunnels = append(validTunnels, t)
+	}
+	tunnels = validTunnels
+	// BUG-A2-3：chain 行先删后插。本批隧道在当前 DB 中的既有 chain 行
+	// 整体删除后再按备份重建——既避免恢复到已漂移状态时残留行与新行
+	// 在 (node_id, port) 唯一索引上互撞，也保证恢复结果与备份严格
+	// 一致（被删掉的链路行不会在恢复后残留）。
+	// R5X-017：预删行数先行计数——预删与存在性跳过组合时（部分导入
+	// 引用目标库外节点）存量链路会「两头落空」，重建后须补 warning
+	// 披露（删除时序不动）。
+	var preDeletedChains int64
+	chainSkippedBefore := 0
+	if rep != nil {
+		chainSkippedBefore = rep.skipped["chainTunnels"]
+	}
+	if len(tunnels) > 0 {
+		tunnelIDs := make([]int64, 0, len(tunnels))
+		for _, t := range tunnels {
+			tunnelIDs = append(tunnelIDs, t.ID)
+		}
+		// T2-NEW-01：tunnelIDs 为备份载荷全量，按块计数/删除避免
+		// IN ? 变量越界（计数跨块累加，与单查等价；同事务内逐块删
+		// 与整批删结果一致）。
+		for _, chunk := range chunkInt64IDs(tunnelIDs) {
+			var chunkCount int64
+			if err := tx.Model(&model.ChainTunnel{}).Where("tunnel_id IN ?", chunk).Count(&chunkCount).Error; err != nil {
+				return 0, err
+			}
+			preDeletedChains += chunkCount
+			if err := tx.Where("tunnel_id IN ?", chunk).Delete(&model.ChainTunnel{}).Error; err != nil {
+				return 0, err
+			}
+		}
+	}
+	count := 0
+	for _, t := range tunnels {
+		engine, err := normalizeBackupTunnelEngine(t.Engine)
+		if err != nil {
+			return count, err
+		}
+		// R2X-016：TrafficRatio 意图值在 Create 前捕获（Create 后
+		// GORM 会把 default:1.0 回填进 item，读 item 判不出意图）。
+		ratioIntent := t.TrafficRatio
+		// PORT-CLOSURE F-07(iii)：备份 in_ip 可能含 :port（单端口
+		// 逐项剥离，R32-L4-E02 同口径）；双端口项剥离为 no-op，
+		// 须经格式校验丢弃该项 + 回执披露（非法值清空，沿
+		// F-07(a)）。剥离后为空即 NULL（空即 NULL 既有口径）。
+		strippedInIP, droppedInIP := stripAndValidateImportInIPList(t.InIP)
+		if droppedInIP > 0 {
+			rep.warnf("备份恢复：隧道 #%d（%q）的 in_ip 含 %d 项格式非法地址，已丢弃该项，恢复后请检查隧道入口配置", t.ID, t.Name, droppedInIP)
+		}
+		item := model.Tunnel{
+			ID:           t.ID,
+			Name:         t.Name,
+			TrafficRatio: t.TrafficRatio,
+			Type:         t.Type,
+			Protocol:     t.Protocol,
+			Flow:         t.Flow,
+			CreatedTime:  t.CreatedTime,
+			UpdatedTime:  now,
+			Status:       t.Status,
+			// 导出仅在 Valid 时写 inIp，'' 不是合法 IP：空即 NULL，
+			// 与 ConnectIP 的既有口径一致（旧实现无条件 Valid:true
+			// 把 NULL 写成 ''，同 BUG-A2-3 的丢 NULL 类）。
+			InIP:            sql.NullString{String: strippedInIP, Valid: strippedInIP != ""},
+			Inx:             t.Inx,
+			IPPreference:    t.IPPreference,
+			ProbeTargetHost: t.ProbeTargetHost,
+			ProbeTargetPort: t.ProbeTargetPort,
+			Engine:          engine,
+		}
+		err = tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "id"}},
+			DoUpdates: clause.AssignmentColumns([]string{
+				"name", "traffic_ratio", "type", "protocol", "flow", "updated_time", "status", "in_ip", "inx", "ip_preference", "probe_target_host", "probe_target_port", "engine",
+			}),
+		}).Create(&item).Error
+		if err != nil {
+			return count, err
+		}
+		// R2X-016：default:1.0 吞掉的显式 0 倍率写回（插入/更新两
+		// 分支同病，见 restoreZeroValuedFloat）。
+		if err := restoreZeroValuedFloat(tx, &model.Tunnel{}, item.ID, "traffic_ratio", ratioIntent); err != nil {
+			return count, err
+		}
+		for _, ct := range t.ChainTunnels {
+			// D4-03：链路引用的节点不存在时跳过该行并计数，不写悬空行。
+			nodeExists, err := rowExistsTx(tx, &model.Node{}, ct.NodeID)
+			if err != nil {
+				return count, err
+			}
+			if !nodeExists {
+				rep.skip("chainTunnels")
+				continue
+			}
+			// D-01（发版后审计）：恢复面与写面同口径——链路连接
+			// 地址含空标签时该链路行跳过 + warning（与 R-05 同型；
+			// 写面 C-16 validateTunnelConnectIPConstraints 明明拒收）。
+			// addrHostHasEmptyLabel 覆盖裸主机与 host:port 两形态。
+			if ct.ConnectIP != nil && addrHostHasEmptyLabel(*ct.ConnectIP) {
+				rep.skip("chainTunnels")
+				rep.warnf("备份恢复：隧道 #%d（%q）的链路 #%d 的连接地址 %q 含空标签主机名，已跳过该链路行未恢复", t.ID, t.Name, ct.ID, *ct.ConnectIP)
+				continue
+			}
+			// 镜像普查续：ConnectIP 格式门补齐到恢复面节点地址
+			// 镜像口径（validImportNodeAddress，F-07(ii) 既定恢复
+			// 面标准）——写面 validateTunnelConnectIPConstraints
+			// 以 IsValidNodeAddress 全量判，此前恢复面只有上方的
+			// 空标签半判，结构非法值（如双端口、含空白）可逐字
+			// 落库、到消费面拨号期才暴露。
+			if ct.ConnectIP != nil && !validImportNodeAddress(*ct.ConnectIP) {
+				rep.skip("chainTunnels")
+				rep.warnf("备份恢复：隧道 #%d（%q）的链路 #%d 的连接地址格式非法，已跳过该链路行未恢复", t.ID, t.Name, ct.ID)
+				continue
+			}
+			// R1-03-M1：链路策略恢复面镜像写面合法集——合法集本
+			// 体是 kernel.ChainStrategyLegal 单点（分段口径与写面
+			// 同：跳行 {fifo,round,rand}、出口/入口行另含 best）。
+			// 集外值逐行跳过 + warning，不原文落库（落库后 agent
+			// 解析一律 default 轮询，声明与生效静默不一致；同函
+			// 数 forwards 段的 ForwardStrategyLegal 门同型）。空串
+			// 是备份的未设形态（读回按 round），不在门内；非空值
+			// 先 TrimSpace 再判、落库归一值（与写面同口径）。
+			chainStrategy := ""
+			if ct.Strategy != nil {
+				chainStrategy = strings.TrimSpace(*ct.Strategy)
+				if chainStrategy != "" {
+					chainTypeNum, convErr := strconv.Atoi(strings.TrimSpace(ct.ChainType))
+					if convErr != nil || !kernel.ChainStrategyLegal(chainTypeNum, chainStrategy) {
+						rep.skip("chainTunnels")
+						rep.warnf("备份恢复：隧道 #%d（%q）的链路 #%d 的负载策略 %q 不在该段合法集内，已跳过该链路行未恢复", t.ID, t.Name, ct.ID, *ct.Strategy)
+						continue
+					}
+				}
+			}
+			// R7-H-01：链路显式端口过恢复面端口门——NULL/0 是
+			// 既有「未定端口」语义（CLOSED-LIST R-02/A3-S1），
+			// 不在门内；负值与 >65535 无此语义，链路行跳过 +
+			// warning（保存面 validateExplicitPort 同口径拒收
+			// >65535，负值在运行时被当未定端口静默忽略）。
+			if ct.Port != nil && *ct.Port != 0 && !validRestorePort(*ct.Port) {
+				rep.skip("chainTunnels")
+				rep.warnf("备份恢复：隧道 #%d（%q）的链路 #%d 的端口 %d 不在 1-65535 之间，已跳过该链路行未恢复", t.ID, t.Name, ct.ID, *ct.Port)
+				continue
+			}
+			// B4-02 残面：链路声明口落库前四源占用复检（与转发面
+			// R1-03-M2 同型）——预检排除集按备份 ID 全集组装，
+			// 被行门跳过的转发其存量端口行在导入后存活，链路声明
+			// 与之同节点同口时预检放行、此前落库无门，可跨表双
+			// 落。此处以统一谓词复检：排除集只含预判将整表替换
+			// 端口行的转发（forwardExclIDs）；本批隧道的存量链路
+			// 行已在段首整批预删，不在占用集内；被跳隧道的存量
+			// 链路行与一切其他存量行照常计占用。冲突逐行跳过 +
+			// warning（与本函数既有跳过口径一致）。
+			if ct.Port != nil && *ct.Port > 0 {
+				source, occErr := r.NodePortOccupantTx(tx, ct.NodeID, *ct.Port, PortExclusions{ForwardIDs: forwardExclIDs})
+				if occErr != nil {
+					return count, occErr
+				}
+				if source != "" {
+					rep.skip("chainTunnels")
+					rep.warnf("备份恢复：隧道 #%d（%q）的链路 #%d 声明的端口 %d（节点 #%d）已被占用（来源：%s），已跳过该链路行未恢复", t.ID, t.Name, ct.ID, *ct.Port, ct.NodeID, backupPortSourceLabel(source))
+					continue
+				}
+			}
+			// BUG-A2-3：可空列按指针还原 NULL（旧实现一律 Valid:true，
+			// NULL port 被写成 0，两条同节点 NULL 链路即撞唯一索引
+			// 整单回滚）。chain 行已在上方整批删除，这里直接插入。
+			chainItem := model.ChainTunnel{
+				ID:        ct.ID,
+				TunnelID:  ct.TunnelID,
+				ChainType: ct.ChainType,
+				NodeID:    ct.NodeID,
+				Port:      ptrToNullInt64(ct.Port),
+				Strategy:  ptrToNullString(ct.Strategy),
+				Inx:       ptrToNullInt64(ct.Inx),
+				Protocol:  ptrToNullString(ct.Protocol),
+				ConnectIP: ptrToNullString(ct.ConnectIP),
+			}
+			// R1-03-M1：strategy 落库归一值（TrimSpace 后形态，
+			// 与写面同口径）；NULL 形态保持 NULL。
+			if ct.Strategy != nil {
+				chainItem.Strategy = ptrToNullString(&chainStrategy)
+			}
+			if err := tx.Clauses(clause.OnConflict{
+				Columns: []clause.Column{{Name: "id"}},
+				DoUpdates: clause.AssignmentColumns([]string{
+					"tunnel_id", "chain_type", "node_id", "port", "strategy", "inx", "protocol", "connect_ip",
+				}),
+			}).Create(&chainItem).Error; err != nil {
+				return count, err
+			}
+		}
+		count++
+	}
+	// R5X-017：预删>0 且本批 chain 跳过>0 时补 warning——存量链路
+	// 已被移除而备份链路未恢复，不得只剩一个无上下文的跳过数字。
+	if rep != nil && preDeletedChains > 0 {
+		if skipped := rep.skipped["chainTunnels"] - chainSkippedBefore; skipped > 0 {
+			rep.warnf("备份恢复：隧道链路（chainTunnels）重建时目标库原有 %d 条链路行已被移除，其中 %d 条备份链路行被跳过未恢复（引用节点不存在、连接地址含空标签主机名、链路端口超出 1-65535 范围或声明端口已被占用），请核对链路配置", preDeletedChains, skipped)
+		}
+	}
+	return count, nil
+}
+
+func nullableBackupInt64(v *int64) int64 {
+	if v == nil {
+		return 0
+	}
+	return *v
+}
+
+// restoreZeroValuedInt undoes GORM's default-tag swallowing after an
+// OnConflict Create during backup import: an int column tagged
+// `default:1` (Enabled / Managed) whose backup intent is 0 is dropped
+// from the INSERT, and the conflict-update assignments reuse the insert
+// values, so the row lands as 1 on BOTH branches (disabled inbounds,
+// kernels and monitors came back enabled; unmanaged
+// relays came back managed — W10 follow-up probe, both branches
+// reproduced). Reading the struct after Create cannot detect it —
+// GORM backfills the default into it — so the intent is captured by
+// the caller beforehand and written back explicitly here.
+// Same root as BUG-A4-1.
+func restoreZeroValuedInt(tx *gorm.DB, model interface{}, id int64, column string, intent int) error {
+	if intent != 0 {
+		return nil
+	}
+	return tx.Model(model).Where("id = ?", id).Update(column, 0).Error
+}
+
+// restoreZeroValuedFloat is the float twin of restoreZeroValuedInt
+// (R2X-016): Tunnel.TrafficRatio is the one float column with a
+// non-zero default (`default:1.0`), and 0 is a legal business value
+// (free tunnel, zero billing — see nftables_traffic.go). Without this
+// write-back a restored ratio=0 tunnel silently came back at 1.0 on
+// both the insert and the conflict-update branch.
+func restoreZeroValuedFloat(tx *gorm.DB, model interface{}, id int64, column string, intent float64) error {
+	if intent != 0 {
+		return nil
+	}
+	return tx.Model(model).Where("id = ?", id).Update(column, 0.0).Error
+}
+
+// importedUserRoleTx 查导入后目标库中用户的 role_id（恢复尾 sweep
+// 的授权判定以库内角色为准：备份用户的角色随用户段一并落库）。
+// 用户不在目标库时 found=false——孤儿转发按无授权处理（照旧被
+// sweep），不因缺行误判为管理员。
+func importedUserRoleTx(tx *gorm.DB, userID int64) (roleID int, found bool, err error) {
+	var user model.User
+	res := tx.Select("role_id").Where("id = ?", userID).Limit(1).Find(&user)
+	if res.Error != nil {
+		return 0, false, res.Error
+	}
+	if res.RowsAffected == 0 {
+		return 0, false, nil
+	}
+	return user.RoleID, true, nil
+}
+
+// sweepImportedAuthorizationTx 是导入段的事务尾转发授权收口：本次
+// 新落的转发若在终态下按运行时同一授权判定（tunnelUseAuthorizedTx，
+// 与 ensureTunnelPermission 判定同源）不获授权（无授权转发运行时
+// 本就不可用），删除该行（含其端口/中转附属行，与
+// DeleteForwardCascade 同口径）并计 skipped + ImportWarnings。同批
+// userTunnels 段后落的授权在事务尾已可见，段序不误伤。
+//
+// R3-D-01：判定同源含管理员豁免——所有者 role_id=0 的自有转发从
+// 不落授权行、运行时恒放行，恢复时必须同样存续；旧实现只查授权
+// 行存在性，会把管理员中转线（常态形态）在整库恢复时整批删除。
+// 回执除计数外逐条点名被删转发（名称＋所属隧道），不许只给计数。
+//
+// R5-FGRP：用户隧道授权本身不再有任何分组口径的裁定——分组只
+// 限定分配范围，停用/删除分组、撤销组权限从不删除任何授权（旧
+// R4X-006「停用对覆盖即删除新导入授权」与 R5X-015 无台账 warning
+// 随组语义改版一并删除），导入的授权行逐字落库。
+func sweepImportedAuthorizationTx(tx *gorm.DB, forwards []model.ForwardBackup, preForwardIDs map[int64]bool, rep *importReport) (fwdSkipped int, err error) {
+	var swept []struct{ name, tunnel string }
+	for _, fb := range forwards {
+		if preForwardIDs[fb.ID] {
+			continue
+		}
+		var row model.Forward
+		res := tx.Where("id = ?", fb.ID).Limit(1).Find(&row)
+		if res.Error != nil {
+			return fwdSkipped, res.Error
+		}
+		if res.RowsAffected == 0 {
+			continue
+		}
+		// 授权判定与运行时 ensureTunnelPermission 同源（共用
+		// tunnelUseAuthorizedTx）：角色以目标库用户段落库值为准；
+		// 用户不在目标库时按非管理员走授权行判定，孤儿转发照旧删。
+		roleID, roleFound, err := importedUserRoleTx(tx, row.UserID)
+		if err != nil {
+			return fwdSkipped, err
+		}
+		if !roleFound {
+			roleID = -1
+		}
+		authorized, err := tunnelUseAuthorizedTx(tx, roleID, row.UserID, row.TunnelID)
+		if err != nil {
+			return fwdSkipped, err
+		}
+		if authorized {
+			continue
+		}
+		// 回执点名用：先取所属隧道名（删除不触及隧道行，顺序无碍）。
+		var tun model.Tunnel
+		tunRes := tx.Select("name").Where("id = ?", row.TunnelID).Limit(1).Find(&tun)
+		if tunRes.Error != nil {
+			return fwdSkipped, tunRes.Error
+		}
+		tunnelName := fmt.Sprintf("隧道 #%d", row.TunnelID)
+		if tunRes.RowsAffected > 0 && tun.Name != "" {
+			tunnelName = tun.Name
+		}
+		// 与 DeleteForwardCascade 同口径清理附属行（刚落库的转发
+		// 通常只有 ForwardPort，其余为存量同 id 残留的兜底）。
+		if err := tx.Where("forward_id = ?", row.ID).Delete(&model.NftCounterState{}).Error; err != nil {
+			return fwdSkipped, err
+		}
+		if err := tx.Where("forward_id = ?", row.ID).Delete(&model.NftRuleBinding{}).Error; err != nil {
+			return fwdSkipped, err
+		}
+		if err := tx.Where("forward_id = ?", row.ID).Delete(&model.NftPendingDelete{}).Error; err != nil {
+			return fwdSkipped, err
+		}
+		if err := tx.Where("forward_id = ?", row.ID).Delete(&model.ForwardPort{}).Error; err != nil {
+			return fwdSkipped, err
+		}
+		relayIDs, err := pluckInboundRelayIDsTx(tx, "forward_id = ?", row.ID)
+		if err != nil {
+			return fwdSkipped, err
+		}
+		if err := deleteUserInboundGrantsByRelayIDsTx(tx, relayIDs); err != nil {
+			return fwdSkipped, err
+		}
+		if err := tx.Where("forward_id = ?", row.ID).Delete(&model.NodeInboundRelay{}).Error; err != nil {
+			return fwdSkipped, err
+		}
+		if err := tx.Where("id = ?", row.ID).Delete(&model.Forward{}).Error; err != nil {
+			return fwdSkipped, err
+		}
+		rep.skip("forwardsUnauthorized")
+		fwdSkipped++
+		swept = append(swept, struct{ name, tunnel string }{name: row.Name, tunnel: tunnelName})
+	}
+	if fwdSkipped > 0 {
+		rep.warnf("备份恢复：%d 条转发在目标库中无对应用户隧道授权，已跳过未恢复", fwdSkipped)
+		// R3-D-01：逐条点名（名称＋所属隧道），不许只给计数。
+		for _, s := range swept {
+			rep.warnf("备份恢复：转发「%s」（所属隧道「%s」）无对应用户隧道授权，已跳过未恢复", s.name, s.tunnel)
+		}
+	}
+	return fwdSkipped, nil
+}
+
+// sweepDanglingSpeedRefsTx 清扫本轮导入 forwards/userTunnels 的悬空
+// 限速引用（R2X-014）。必须在 Import 全部段落库之后执行：限速段在
+// 段序中位于 forwards/userTunnels 之后，逐行校验会在全量恢复时误杀
+// 合法绑定（H2-01 的段序陷阱）；后置清扫天然免疫段序。附属引用不
+// 存在时按 verdicts §2.7 剥离（置 NULL）+ 计 ImportWarnings，不跳
+// 整行——部分恢复（未勾 speedLimits）时整行跳过会连带丢转发。
+// 只处理备份清单内的行 id；被身份引用校验跳过的行在库中不存在，
+// Find 不命中自动略过，存量无关行不受影响。
+func sweepDanglingSpeedRefsTx(tx *gorm.DB, forwards []model.ForwardBackup, userTunnels []model.UserTunnelBackup, rep *importReport) error {
+	fwdSpeed, fwdIPSpeed, utSpeed := 0, 0, 0
+	for _, f := range forwards {
+		var row model.Forward
+		res := tx.Where("id = ?", f.ID).Limit(1).Find(&row)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			continue
+		}
+		if row.SpeedID.Valid {
+			exists, err := rowExistsTx(tx, &model.SpeedLimit{}, row.SpeedID.Int64)
+			if err != nil {
+				return err
+			}
+			if !exists {
+				if err := tx.Model(&model.Forward{}).Where("id = ?", f.ID).Update("speed_id", nil).Error; err != nil {
+					return err
+				}
+				fwdSpeed++
+			}
+		}
+		if row.IPSpeedID.Valid {
+			exists, err := rowExistsTx(tx, &model.SpeedLimit{}, row.IPSpeedID.Int64)
+			if err != nil {
+				return err
+			}
+			if !exists {
+				if err := tx.Model(&model.Forward{}).Where("id = ?", f.ID).Update("ip_speed_id", nil).Error; err != nil {
+					return err
+				}
+				fwdIPSpeed++
+			}
+		}
+	}
+	for _, ut := range userTunnels {
+		var row model.UserTunnel
+		res := tx.Where("id = ?", ut.ID).Limit(1).Find(&row)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			continue
+		}
+		if row.SpeedID.Valid {
+			exists, err := rowExistsTx(tx, &model.SpeedLimit{}, row.SpeedID.Int64)
+			if err != nil {
+				return err
+			}
+			if !exists {
+				if err := tx.Model(&model.UserTunnel{}).Where("id = ?", ut.ID).Update("speed_id", nil).Error; err != nil {
+					return err
+				}
+				utSpeed++
+			}
+		}
+	}
+	if total := fwdSpeed + fwdIPSpeed + utSpeed; total > 0 {
+		rep.warnf("备份恢复：%d 处限速引用指向不存在的限速规则，已剥离（置空）（转发 speed_id %d 处、转发 ip_speed_id %d 处、用户隧道 speed_id %d 处），转发/用户隧道行本身已照常恢复", total, fwdSpeed, fwdIPSpeed, utSpeed)
+	}
+	return nil
+}
+
+func (r *Repository) importForwards(tx *gorm.DB, forwards []model.ForwardBackup, now int64, rep *importReport, portReplaceIDs map[int64]bool) (int, error) {
+	count := 0
+	// R7X-002：本批恢复行在目标库取消掉的待删记账身份，循环后汇总
+	// 披露（见循环内侧表收口与循环后 warning）。
+	var cancelledPending []string
+	// R5X-017：ForwardPorts 先删后建——预删行数与本批跳过数先行
+	// 记账，重建后若「预删>0 且跳过>0」补 warning（见循环后）。
+	var preDeletedPorts int64
+	portsSkippedBefore := 0
+	if rep != nil {
+		portsSkippedBefore = rep.skipped["forwardPorts"]
+	}
+	// R4-F-01：端口行跳过分类计数——(a) 引用节点不存在、
+	// (b) InIP 格式非法、(c) 端口超出 1-65535（R7-H-01）、
+	// (d) 端口已被占用、(e) 端口不在节点允许范围（R1-03-M2）；
+	// 汇总 warning 按类披露条数与原因。各类仍共用
+	// rep.skipped["forwardPorts"] 合计数（回执 SkippedRows 口径
+	// 不变），分计数仅用于汇总文案归因。本函数内全部
+	// rep.skip("forwardPorts") 调用点都须同步累计对应分计数，
+	// 否则汇总条数与合计数对不上。
+	var portsSkippedMissingNode, portsSkippedBadInIP, portsSkippedBadPort int
+	// R1-03-M2：端口行落库前四源占用＋节点端口范围复检的状态。
+	// 恢复前预检（precheckBackupPortConflicts）按整单排除集判重，
+	// 存在盲区：被本单跳过的转发（策略/零目标等门）与 ForwardPorts
+	// 为 nil 的转发，其存量端口行被预检排除、却在导入后原样存
+	// 活——另一条转发的端口行可与之同节点同口并存落库。故在此
+	// 逐行复检；冲突行逐行跳过 + 分计数披露，不整单失败（与本
+	// 函数既有跳过口径一致）；本单内已落库的端口行另以 claimed
+	// 集防同批自撞。
+	//
+	// B4-02 残面：排除集的成员资格改由全集预判决定（参数
+	// portReplaceIDs，见 predictImportedForwardPortReplacements：
+	// 会通过全部行门落库且 ForwardPorts != nil、即存量端口行将
+	// 被整表替换的转发）。旧形态按「尚未处理」逐行收缩——被跳
+	// 转发的存量行只有在声明行排在其后时才计占用，声明行排在
+	// 前面时仍被排除、双落成立。现成员资格在处理开始前已算定，
+	// 处理到某行时将其移出（其新行已由 claimed 集与谓词的现存
+	// 行共同覆盖），复检结果与备份内声明顺序无关。
+	var portsSkippedOccupied, portsSkippedOutOfRange int
+	pendingForwardIDs := make(map[int64]bool, len(portReplaceIDs))
+	for id := range portReplaceIDs {
+		pendingForwardIDs[id] = true
+	}
+	claimedPorts := make(map[[2]int64]bool)
+	nodeByIDCache := make(map[int64]*model.Node)
+	nodeByID := func(nodeID int64) (*model.Node, error) {
+		if node, ok := nodeByIDCache[nodeID]; ok {
+			return node, nil
+		}
+		var node model.Node
+		if err := tx.Where("id = ?", nodeID).First(&node).Error; err != nil {
+			return nil, err
+		}
+		nodeByIDCache[nodeID] = &node
+		return &node, nil
+	}
+	// R4-F3-01：realm 策略门需要隧道引擎——隧道段先于转发段在同一
+	// 事务内恢复、目标库既有隧道同 tx 可见，按 ID 缓存查一次。
+	tunnelEngines := make(map[int64]string)
+	tunnelEngineOf := func(tunnelID int64) (string, error) {
+		if engine, ok := tunnelEngines[tunnelID]; ok {
+			return engine, nil
+		}
+		var tun model.Tunnel
+		if err := tx.Select("engine").Where("id = ?", tunnelID).First(&tun).Error; err != nil {
+			return "", err
+		}
+		tunnelEngines[tunnelID] = tun.Engine
+		return tun.Engine, nil
+	}
+	for _, f := range forwards {
+		// R1-03-M2：本行起进入处理——其存量端口行此后按最终形态
+		// （被替换或存活）参与后续行的占用复检，移出待处理排除集。
+		delete(pendingForwardIDs, f.ID)
+		// R6X-007：status 分格门。合法值域 {0,1,2} 之外逐行跳过 +
+		// warning（R5X-009 同型口径）；status=2（删除待处理）的重试
+		// 记账在 nft_pending_delete 侧表、不随备份迁移（BackupData
+		// 无该段），其失败节点/重试计数/24h 起点均无从恢复——按
+		// 批 3 裁定 (b) 归一为暂停（status=0）：行恢复后列表可见、
+		// 可经正常删除路径终删，不再产生「列表不可见 + 无重试面
+		// 可达」的僵尸行。归一逐行 warning 披露。
+		status := f.Status
+		switch f.Status {
+		case model.ForwardStatusPaused, model.ForwardStatusActive:
+		case model.ForwardStatusPendingDelete:
+			status = model.ForwardStatusPaused
+			rep.warnf("备份恢复：转发 #%d（%q）在备份时处于删除待处理（status=2）状态，其删除重试记账不随备份迁移，已恢复为暂停（status=0），可在转发列表中查看或删除", f.ID, f.Name)
+		default:
+			rep.skip("forwards")
+			rep.warnf("备份恢复：转发 #%d（%q）的 status=%d 不在合法枚举 {0,1,2} 内，已跳过该行未恢复", f.ID, f.Name, f.Status)
+			continue
+		}
+		// 复扫 R-05：恢复面与创建面同口径——空标签目标行跳过 + warning。
+		if addrsHaveEmptyLabel(f.RemoteAddr) {
+			rep.skip("forwards")
+			rep.warnf("备份恢复：转发 #%d（%q）的目标地址 %q 含空标签主机名，已跳过该行未恢复", f.ID, f.Name, f.RemoteAddr)
+			continue
+		}
+		// R8-07（H-F3-02）：恢复面补 R7-04 空段集谓词——零有效目标
+		// 与写面同口径逐行跳过 + warning，不整批中止。本地导入
+		// 共用本路径；修复前版本落库的零
+		// 目标行不得借备份迁移绕过新门重入（重入行占端口且在补正
+		// 目标前被更新面冻结）。R9-09 起零目标按归一后有效段集计
+		// （remoteAddrHasNoTargets 镜像写面新定义）："#"、纯 scheme、
+		// 纯格式符段构成的行同在此逐行跳过 + warning。
+		if remoteAddrHasNoTargets(f.RemoteAddr) {
+			rep.skip("forwards")
+			rep.warnf("备份恢复：转发 #%d（%q）的目标地址 %q 切分后无任何有效目标，已跳过该行未恢复", f.ID, f.Name, f.RemoteAddr)
+			continue
+		}
+		// 写面门×恢复面镜像普查（R1-03-L3）：补齐写面已有而恢复
+		// 面独缺的三门——转发名 ≤100 rune（create/update 同判，
+		// 超长名在 PG 下可使整单失败）、目标段数帽 100、目标端口
+		// 在场格式门。此前坏行可落库：消费侧逐段全量展开下发，
+		// 且经正常编辑面改目标时被合并值门冻结（与 R8-07 已修的
+		// 零目标冻结同族）。判定走 repo 镜像谓词（与写面双边对
+		// 齐口径，见 validateImportRemoteAddrPorts 等定义处）。
+		if len([]rune(f.Name)) > 100 {
+			rep.skip("forwards")
+			rep.warnf("备份恢复：转发 #%d 的名称长度超过 100 个字符，已跳过该行未恢复", f.ID)
+			continue
+		}
+		if n := importRemoteAddrSegmentCount(f.RemoteAddr); n > maxImportRemoteAddrSegments {
+			rep.skip("forwards")
+			rep.warnf("备份恢复：转发 #%d（%q）的目标地址段数 %d 超过上限 %d，已跳过该行未恢复", f.ID, f.Name, n, maxImportRemoteAddrSegments)
+			continue
+		}
+		if err := validateImportRemoteAddrPorts(f.RemoteAddr); err != nil {
+			rep.skip("forwards")
+			rep.warnf("备份恢复：转发 #%d（%q）：%s，已跳过该行未恢复", f.ID, f.Name, err)
+			continue
+		}
+		// D4-03：引用（用户/隧道）不存在时整行跳过并计数，不写悬空行。
+		userExists, err := rowExistsTx(tx, &model.User{}, f.UserID)
+		if err != nil {
+			return count, err
+		}
+		tunnelExists, err := rowExistsTx(tx, &model.Tunnel{}, f.TunnelID)
+		if err != nil {
+			return count, err
+		}
+		if !userExists || !tunnelExists {
+			rep.skip("forwards")
+			continue
+		}
+		// R4-F4-02：策略合法集与写面共用 kernel.ForwardStrategyLegal
+		// 单点判（不得在此另立字面集）。空串是备份的未设形态，按
+		// create 面缺省口径补 fifo 落库；非空集外值逐行跳过 +
+		// warning——原文落库后 agent 解析一律 roundrobin，声明与
+		// 生效静默不一致且无从察觉。
+		strategy := strings.TrimSpace(f.Strategy)
+		if strategy == "" {
+			strategy = "fifo"
+		}
+		if !kernel.ForwardStrategyLegal(strategy) {
+			rep.skip("forwards")
+			rep.warnf("备份恢复：转发 #%d（%q）的负载策略 %q 不在合法集 {fifo, round, rand, hash} 内，已跳过该行未恢复", f.ID, f.Name, f.Strategy)
+			continue
+		}
+		// R4-F3-01（F4-01）：realm 策略门镜像写面——realm 隧道＋多
+		// 目标非 {round, hash} 逐行跳过 + warning（R8-07 同口径，
+		// 不整批中止）；本地导入共用本路径。此前唯独本面无门，恢复落库后渲染层静默改写轮询、
+		// 且经正常编辑面又会被合并值判定拒绝（恢复得进、改不动、
+		// 跑不对）。
+		engine, err := tunnelEngineOf(f.TunnelID)
+		if err != nil {
+			return count, err
+		}
+		if err := validateImportedRealmForwardStrategy(engine, f.RemoteAddr, strategy); err != nil {
+			rep.skip("forwards")
+			rep.warnf("备份恢复：转发 #%d（%q）：%s，已跳过该行未恢复", f.ID, f.Name, err)
+			continue
+		}
+		// B8-06 残面：MaxConn/IPMaxConn 负值钳制——写面
+		// （B09-002）MaxConn 负值拒收、IPMaxConn 负值钳 0，恢复
+		// 面此前原样落库，负值在消费面 MaxConn>0 门控下静默等
+		// 价无限制。恢复面按自身逐行惯例取钳 0 + warning（不丢
+		// 整行）：0 在消费面同为无限制，与负值的实际生效形态
+		// 等价，只把存储值拉回合法域；与写面 MaxConn 拒收口径
+		// 的差异在此注明（恢复面不因单个字段丢弃整条转发）。
+		maxConn := f.MaxConn
+		ipMaxConn := f.IPMaxConn
+		if maxConn < 0 || ipMaxConn < 0 {
+			rep.warnf("备份恢复：转发 #%d（%q）的连接数限制 maxConn/ipMaxConn（%d/%d）含负值，已按 0（无限制）恢复", f.ID, f.Name, f.MaxConn, f.IPMaxConn)
+			if maxConn < 0 {
+				maxConn = 0
+			}
+			if ipMaxConn < 0 {
+				ipMaxConn = 0
+			}
+		}
+		currentUsername, err := currentForwardUsernameTx(tx, f.UserID, f.UserName)
+		if err != nil {
+			return count, err
+		}
+		item := model.Forward{
+			ID:         f.ID,
+			UserID:     f.UserID,
+			UserName:   currentUsername,
+			Name:       f.Name,
+			TunnelID:   f.TunnelID,
+			RemoteAddr: f.RemoteAddr, TargetPolicy: f.TargetPolicy,
+			Strategy:             strategy,
+			InFlow:               clampImportedCounter(rep, fmt.Sprintf("转发 #%d（%q）", f.ID, f.Name), "inFlow", f.InFlow),
+			OutFlow:              clampImportedCounter(rep, fmt.Sprintf("转发 #%d（%q）", f.ID, f.Name), "outFlow", f.OutFlow),
+			CreatedTime:          f.CreatedTime,
+			UpdatedTime:          now,
+			Status:               status,
+			Inx:                  f.Inx,
+			SpeedID:              sql.NullInt64{Int64: nullableBackupInt64(f.SpeedID), Valid: f.SpeedID != nil && *f.SpeedID > 0},
+			MaxConn:              maxConn,
+			IPMaxConn:            ipMaxConn,
+			IPSpeedID:            sql.NullInt64{Int64: nullableBackupInt64(f.IPSpeedID), Valid: f.IPSpeedID != nil && *f.IPSpeedID > 0},
+			ProxyProtocol:        f.ProxyProtocol,
+			ProxyProtocolReceive: f.ProxyProtocolReceive,
+			ProxyProtocolSend:    f.ProxyProtocolSend,
+		}
+		err = tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "id"}},
+			DoUpdates: clause.AssignmentColumns([]string{
+				"user_id", "user_name", "name", "tunnel_id", "remote_addr", "target_policy", "strategy",
+				"in_flow", "out_flow", "updated_time", "status", "inx", "speed_id", "max_conn", "ip_max_conn", "ip_speed_id", "proxy_protocol", "proxy_protocol_receive", "proxy_protocol_send",
+			}),
+		}).Create(&item).Error
+		if err != nil {
+			return count, err
+		}
+		// R7X-002：status=2 的第二表示收口——目标库同 id 的既有
+		// nft_pending_delete 侧表行是待删重试 job 的唯一驱动源，行
+		// status 已按上方分格落库（2 归一为 0、1/0 直通）而侧表不
+		// 收口时，恢复出的转发会在 ≤1 个重试周期内被 job 按侧表
+		// 无条件终删（与回执的恢复承诺正相反）。恢复即撤销该行在
+		// 目标库未完成的删除意图（备份是更新的真源）：落库成功后
+		// 删除同 id 侧表记账，取消身份收集后统一 warnf 披露；目标
+		// 库无侧表行时 RowsAffected=0、行为逐字不变（不新建记账）。
+		pendingRes := tx.Where("forward_id = ?", f.ID).Delete(&model.NftPendingDelete{})
+		if pendingRes.Error != nil {
+			return count, pendingRes.Error
+		}
+		if pendingRes.RowsAffected > 0 {
+			cancelledPending = append(cancelledPending, fmt.Sprintf("#%d（%q）", f.ID, f.Name))
+		}
+		if f.ForwardPorts != nil {
+			// R1-03-M2：本条转发的待处理排除集快照（处理期间不变）。
+			pendingForwardIDList := make([]int64, 0, len(pendingForwardIDs))
+			for id := range pendingForwardIDs {
+				pendingForwardIDList = append(pendingForwardIDList, id)
+			}
+			var existingPorts int64
+			if err := tx.Model(&model.ForwardPort{}).Where("forward_id = ?", f.ID).Count(&existingPorts).Error; err != nil {
+				return count, err
+			}
+			preDeletedPorts += existingPorts
+			if err := tx.Where("forward_id = ?", f.ID).Delete(&model.ForwardPort{}).Error; err != nil {
+				return count, err
+			}
+			for _, fp := range *f.ForwardPorts {
+				// D4-03：端口引用的节点不存在时跳过该端口行并计数。
+				portNodeExists, err := rowExistsTx(tx, &model.Node{}, fp.NodeID)
+				if err != nil {
+					return count, err
+				}
+				if !portNodeExists {
+					rep.skip("forwardPorts")
+					portsSkippedMissingNode++
+					continue
+				}
+				// R7-H-01：转发端口过恢复面端口门——转发端口恒为
+				// 已分配的合法监听端口、无未设置形态，0/负/>65535
+				// 一律跳过该端口行 + warning（保存面
+				// validateLocalNodePort/validateRemoteNodePort 与
+				// 端口占用校验同口径；处置与入站行、与本函数
+				// InIP 门同型：只跳端口行，转发本体照常恢复）。
+				if !validRestorePort(fp.Port) {
+					rep.skip("forwardPorts")
+					portsSkippedBadPort++
+					rep.warnf("备份恢复：转发 #%d（%q）的端口行（节点 #%d，端口 %d）端口不在 1-65535 之间，已跳过该端口行未恢复，请核对转发端口配置", f.ID, f.Name, fp.NodeID, fp.Port)
+					continue
+				}
+				// R3-H-01：恢复侧 ForwardPort.InIP 复用与保存侧 intake
+				// （stripAndValidateNodeAddress）及隧道 InIP（F-07(iii)）
+				// 同口径的剥离 + 校验：单端口剥离后入库；非法值（含空
+				// 标签主机名、双端口）丢弃该端口行 + warning 点名
+				// （warning 不含值原文，防大值膨胀回执；R2-H-02 同例）。
+				// 空即 NULL（与隧道 InIP 既有口径一致）。
+				inIP := strings.TrimSpace(fp.InIP)
+				if inIP != "" {
+					stripped := stripIngressHostPort(inIP)
+					if !validImportNodeAddress(stripped) {
+						rep.skip("forwardPorts")
+						portsSkippedBadInIP++
+						rep.warnf("备份恢复：转发 #%d（%q）的端口行（节点 #%d，端口 %d）的监听 IP 格式非法，已跳过该端口行未恢复，请核对转发端口配置", f.ID, f.Name, fp.NodeID, fp.Port)
+						continue
+					}
+					inIP = stripped
+				}
+				// R1-03-M2：落库前四源占用＋节点端口范围复检（预
+				// 检盲区收口，状态定义见函数前段）。占用走统一谓
+				// 词 NodePortOccupantTx、排除集仅含尚未处理的备
+				// 份转发；范围内判走节点 Port 规格集合语义（与写
+				// 面 validateLocalNodePort 同口径：规格空=不限；
+				// 远端节点的 Port 由分享段回填、同口径适用）。
+				claimKey := [2]int64{fp.NodeID, int64(fp.Port)}
+				if claimedPorts[claimKey] {
+					rep.skip("forwardPorts")
+					portsSkippedOccupied++
+					rep.warnf("备份恢复：转发 #%d（%q）的端口行（节点 #%d，端口 %d）与本批已恢复的端口行冲突，已跳过该端口行未恢复", f.ID, f.Name, fp.NodeID, fp.Port)
+					continue
+				}
+				source, occErr := r.NodePortOccupantTx(tx, fp.NodeID, fp.Port, PortExclusions{ForwardIDs: pendingForwardIDList})
+				if occErr != nil {
+					return count, occErr
+				}
+				if source != "" {
+					rep.skip("forwardPorts")
+					portsSkippedOccupied++
+					rep.warnf("备份恢复：转发 #%d（%q）的端口行（节点 #%d，端口 %d）已被占用（来源：%s），已跳过该端口行未恢复，请核对转发端口配置", f.ID, f.Name, fp.NodeID, fp.Port, backupPortSourceLabel(source))
+					continue
+				}
+				node, nodeErr := nodeByID(fp.NodeID)
+				if nodeErr != nil {
+					return count, nodeErr
+				}
+				if !importPortInNodeSpec(node, fp.Port) {
+					rep.skip("forwardPorts")
+					portsSkippedOutOfRange++
+					rep.warnf("备份恢复：转发 #%d（%q）的端口行（节点 #%d，端口 %d）不在节点允许端口范围 %q 内，已跳过该端口行未恢复，请核对转发端口配置", f.ID, f.Name, fp.NodeID, fp.Port, node.Port)
+					continue
+				}
+				// O7-005：恢复 ForwardPort 的 InIP（sql.NullString）
+				// R2-E1-14：BindWarning 同路恢复（空串＝无告警 NULL）。
+				if err := tx.Create(&model.ForwardPort{
+					ForwardID: f.ID, NodeID: fp.NodeID, Port: fp.Port,
+					InIP:        sql.NullString{String: inIP, Valid: inIP != ""},
+					BindWarning: sql.NullString{String: fp.BindWarning, Valid: fp.BindWarning != ""},
+				}).Error; err != nil {
+					return count, err
+				}
+				claimedPorts[claimKey] = true
+			}
+		}
+		count++
+	}
+	// R7X-002：取消待删记账的汇总披露（删除数 >0 才发）。
+	if len(cancelledPending) > 0 {
+		rep.warnf("备份恢复：恢复的转发在目标库存在删除待处理记账（nft_pending_delete），已随恢复取消 %d 条：转发 %s；这些转发不会再被待删重试流程删除", len(cancelledPending), strings.Join(cancelledPending, "、"))
+	}
+	// R5X-017：预删>0 且本批端口跳过>0 时补 warning（口径同
+	// importTunnels 的 chain 段）。R4-F-01：各类跳过分别披露——
+	// 引用节点不存在、监听 IP 格式非法与端口域外（R7-H-01）各写各的条数；旧文案把
+	// InIP 非法跳过误归因为节点不存在（该类行的节点检查已通过、
+	// 节点必然存在）。仅当某类跳过 >0 时才出现该类分句。
+	if rep != nil && preDeletedPorts > 0 {
+		if skipped := rep.skipped["forwardPorts"] - portsSkippedBefore; skipped > 0 {
+			var reasons []string
+			if portsSkippedMissingNode > 0 {
+				reasons = append(reasons, fmt.Sprintf("引用节点不存在 %d 条", portsSkippedMissingNode))
+			}
+			if portsSkippedBadInIP > 0 {
+				reasons = append(reasons, fmt.Sprintf("监听 IP 格式非法 %d 条", portsSkippedBadInIP))
+			}
+			if portsSkippedBadPort > 0 {
+				reasons = append(reasons, fmt.Sprintf("端口超出 1-65535 范围 %d 条", portsSkippedBadPort))
+			}
+			if portsSkippedOccupied > 0 {
+				reasons = append(reasons, fmt.Sprintf("端口已被占用 %d 条", portsSkippedOccupied))
+			}
+			if portsSkippedOutOfRange > 0 {
+				reasons = append(reasons, fmt.Sprintf("端口不在节点允许范围 %d 条", portsSkippedOutOfRange))
+			}
+			rep.warnf("备份恢复：转发端口（forwardPorts）重建时目标库原有 %d 条端口行已被移除，其中 %d 条备份端口行被跳过未恢复（%s），请核对转发端口配置", preDeletedPorts, skipped, strings.Join(reasons, "、"))
+		}
+	}
+	return count, nil
+}
+
+func importUserTunnels(tx *gorm.DB, userTunnels []model.UserTunnelBackup, now int64, rep *importReport) (int, error) {
+	count := 0
+	for _, ut := range userTunnels {
+		// D4-03：引用（用户/隧道）不存在时整行跳过并计数。
+		userExists, err := rowExistsTx(tx, &model.User{}, ut.UserID)
+		if err != nil {
+			return count, err
+		}
+		tunnelExists, err := rowExistsTx(tx, &model.Tunnel{}, ut.TunnelID)
+		if err != nil {
+			return count, err
+		}
+		if !userExists || !tunnelExists {
+			rep.skip("userTunnels")
+			continue
+		}
+		// R7-G-02：status / flowResetTime 合法集门（与 importUsers 的
+		// status 门 R5X-009 及运行时写入口同口径）——非法值整行跳过
+		// + 点名警告，不静默原样落库。
+		if ut.Status != 0 && ut.Status != 1 {
+			rep.skip("userTunnels")
+			rep.warnf("备份恢复：用户隧道授权 #%d 的 status=%d 不在合法枚举 {0,1} 内，已跳过该行未恢复", ut.ID, ut.Status)
+			continue
+		}
+		if ut.FlowResetTime < 0 || ut.FlowResetTime > 31 {
+			rep.skip("userTunnels")
+			rep.warnf("备份恢复：用户隧道授权 #%d 的 flowResetTime=%d 不在合法范围 0-31 内，已跳过该行未恢复", ut.ID, ut.FlowResetTime)
+			continue
+		}
+		// R18-B9-01：负值限额钳 0 + warning（与 importUsers 及转发段
+		// B8-06 同形，不丢整行；FlowResetTime 越界仍走上方 R7-G-02
+		// 整行跳过门，排程字段不钳制）。
+		utLabel := fmt.Sprintf("用户隧道授权 #%d", ut.ID)
+		utNum := clampImportedLimit(rep, utLabel, "num", int64(ut.Num))
+		utFlow := clampImportedLimit(rep, utLabel, "flow", ut.Flow)
+		utFlowMiB := clampImportedLimit(rep, utLabel, "flowMiB", ut.FlowMiB)
+		item := model.UserTunnel{
+			ID:            ut.ID,
+			UserID:        ut.UserID,
+			TunnelID:      ut.TunnelID,
+			SpeedID:       sql.NullInt64{Int64: ut.SpeedID, Valid: ut.SpeedID > 0},
+			Num:           int(utNum),
+			Flow:          utFlow,
+			FlowMiB:       utFlowMiB,
+			InFlow:        clampImportedCounter(rep, fmt.Sprintf("用户隧道授权 #%d", ut.ID), "inFlow", ut.InFlow),
+			OutFlow:       clampImportedCounter(rep, fmt.Sprintf("用户隧道授权 #%d", ut.ID), "outFlow", ut.OutFlow),
+			FlowResetTime: ut.FlowResetTime,
+			// R11X-005: see importUsers (marker = import moment).
+			FlowLastResetTime: now,
+			ExpTime:           ut.ExpTime,
+			Status:            ut.Status,
+		}
+		err = tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "id"}},
+			DoUpdates: clause.AssignmentColumns([]string{
+				"user_id", "tunnel_id", "speed_id", "num", "flow", "flow_mib", "in_flow", "out_flow",
+				"flow_reset_time", "flow_last_reset_time", "exp_time", "status",
+			}),
+		}).Create(&item).Error
+		if err != nil {
+			return count, err
+		}
+		count++
+	}
+	return count, nil
+}
+
+func importSpeedLimits(tx *gorm.DB, speedLimits []model.SpeedLimitBackup, now int64, rep *importReport) (int, error) {
+	count := 0
+	for _, sl := range speedLimits {
+		// B09-001：与 create/update 写侧同口径的合法集——speed<1 或
+		// status∉{0,1} 的行整行跳过并计数 + warning（D4-03 同形）。
+		// 这类规则下发面以 speed>0 门控静默丢弃，导入落库只会造出
+		// 「可引用但不存在」的假限速。
+		if sl.Speed < 1 || (sl.Status != 0 && sl.Status != 1) {
+			rep.skip("speedLimits")
+			rep.warnf("备份恢复：限速规则 #%d（%s）speed=%d status=%d 不在合法集（speed≥1、status∈{0,1}），已跳过该行未恢复", sl.ID, sl.Name, sl.Speed, sl.Status)
+			continue
+		}
+		// B09-001（R3 K4）：名称长度与新建/编辑两载体同口径
+		// （speed_limit.name 列宽 varchar(100)，R2 B09-004）——超长
+		// 名此前在 SQLite 静默落库、在 PG 使整单导入失败并透出
+		// 原始错误；现同形逐行跳过 + 点名。
+		if len([]rune(sl.Name)) > 100 {
+			rep.skip("speedLimits")
+			rep.warnf("备份恢复：限速规则 #%d 的名称长度 %d 超过 100 字符，已跳过该行未恢复", sl.ID, len([]rune(sl.Name)))
+			continue
+		}
+		// D4-03：绑定了隧道而隧道不存在时整行跳过并计数（未绑定
+		// 的全局限速不受影响）。
+		if sl.TunnelID != nil {
+			tunnelExists, err := rowExistsTx(tx, &model.Tunnel{}, *sl.TunnelID)
+			if err != nil {
+				return count, err
+			}
+			if !tunnelExists {
+				rep.skip("speedLimits")
+				continue
+			}
+		}
+		item := model.SpeedLimit{
+			ID:          sl.ID,
+			Name:        sl.Name,
+			Speed:       int(sl.Speed),
+			TunnelID:    sql.NullInt64{Int64: nullableBackupInt64(sl.TunnelID), Valid: sl.TunnelID != nil},
+			TunnelName:  sql.NullString{String: sl.TunnelName, Valid: sl.TunnelName != ""},
+			CreatedTime: sl.CreatedTime,
+			UpdatedTime: sql.NullInt64{Int64: now, Valid: true},
+			Status:      sl.Status,
+		}
+		err := tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "id"}},
+			DoUpdates: clause.AssignmentColumns([]string{
+				"name", "speed", "tunnel_id", "tunnel_name", "updated_time", "status",
+			}),
+		}).Create(&item).Error
+		if err != nil {
+			return count, err
+		}
+		count++
+	}
+	return count, nil
+}
+
+// O7-001：导入 user_inbound 表（用户订阅分配关系）
+//
+// FIX132-C（D4-03）：引用存在性校验对齐订阅段标杆——用户/入站
+// 不存在，或 relay 不存在/不属于该入站时，整行跳过并计入
+// SkippedRows["userInbounds"]，不写悬空行（旧实现原样落库且回执
+// 假报成功，D4 探针 C 坐实）。D4-02：(user_id, inbound_id, relay_id)
+// 复合唯一占位预处理，同键异 id 先删。
+func importUserInbounds(tx *gorm.DB, rows []model.UserInboundBackup, rep *importReport) (int, error) {
+	count := 0
+	for _, r := range rows {
+		userExists, err := rowExistsTx(tx, &model.User{}, r.UserID)
+		if err != nil {
+			return count, err
+		}
+		inboundExists, err := rowExistsTx(tx, &model.NodeInbound{}, r.InboundID)
+		if err != nil {
+			return count, err
+		}
+		// R6X-011：与保存面（setUserInbounds）同口径——计量伴生入站
+		// （CompanionOf>0）是系统管理的派生行、不可分配给用户。
+		// 导入段此前只验存在性，伴生分配可绕过该守卫落库（伴生行
+		// 会在用户的分配列表露出、且满足默认订阅的 legacy 放行
+		// 谓词）。整行跳过 + 计数 + warning，合法 origin 分配不变。
+		if inboundExists {
+			var inboundRow model.NodeInbound
+			res := tx.Where("id = ?", r.InboundID).Limit(1).Find(&inboundRow)
+			if res.Error != nil {
+				return count, res.Error
+			}
+			if res.RowsAffected > 0 && inboundRow.CompanionOf > 0 {
+				rep.skip("userInbounds")
+				rep.warnf("备份恢复：用户入站分配 #%d（用户 #%d → 入站 #%d）指向计量伴生入站，伴生入站不能分配给用户，已跳过该行未恢复", r.ID, r.UserID, r.InboundID)
+				continue
+			}
+		}
+		relayOK := true
+		if r.RelayID > 0 {
+			var relay model.NodeInboundRelay
+			res := tx.Where("id = ?", r.RelayID).Limit(1).Find(&relay)
+			if res.Error != nil {
+				return count, res.Error
+			}
+			relayOK = res.RowsAffected > 0 && relay.InboundID == r.InboundID
+		}
+		if !userExists || !inboundExists || !relayOK {
+			rep.skip("userInbounds")
+			continue
+		}
+		if err := tx.Where("user_id = ? AND inbound_id = ? AND relay_id = ? AND id <> ?", r.UserID, r.InboundID, r.RelayID, r.ID).
+			Delete(&model.UserInbound{}).Error; err != nil {
+			return count, err
+		}
+		item := model.UserInbound{
+			ID:        r.ID,
+			UserID:    r.UserID,
+			InboundID: r.InboundID,
+			RelayID:   r.RelayID,
+		}
+		err = tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "id"}},
+			DoUpdates: clause.AssignmentColumns([]string{
+				"user_id", "inbound_id", "relay_id",
+			}),
+		}).Create(&item).Error
+		if err != nil {
+			return count, err
+		}
+		count++
+	}
+	return count, nil
+}
+
+// B4/F-004：导入 user_subscription 表（订阅分配关系）
+//
+// BUG-A2-4：备份里的 subscription_id 是备份侧的订阅 id。订阅在
+// inbounds 段按 token 匹配重建，被删过的订阅会换新 id——分配必须
+// 先经 subRemap 重写再落库，否则全部悬空且回执假报成功。重写后仍
+// 不存在的订阅（备份不含该订阅、当前库也没有）无法落位：跳过该行
+// 并计入 skipped 由回执如实报告，不写悬空行、不报假成功。
+func importUserSubscriptions(tx *gorm.DB, rows []model.UserSubscriptionBackup, subRemap map[int64]int64) (imported int, skipped int, err error) {
+	for _, r := range rows {
+		subID := r.SubscriptionID
+		if mapped, ok := subRemap[subID]; ok {
+			subID = mapped
+		}
+		// R1 X-P2-7（H1-01，BC-08）：此前只校验订阅侧，用户不存在
+		// 时悬空分配照样落库且回执假报 imported。落库前补 user
+		// 存在性校验（与订阅侧同口径）：不存在 → skipped++ 不落库。
+		userExists, err := rowExistsTx(tx, &model.User{}, r.UserID)
+		if err != nil {
+			return imported, skipped, err
+		}
+		if !userExists {
+			skipped++
+			continue
+		}
+		var exists int64
+		if err := tx.Model(&model.Subscription{}).Where("id = ?", subID).Count(&exists).Error; err != nil {
+			return imported, skipped, err
+		}
+		if exists == 0 {
+			skipped++
+			continue
+		}
+		// (user_id, subscription_id) 唯一对若被另一行占用（例如恢复
+		// 期间管理员已把同一订阅手工分配给同一用户），先删占位行，
+		// 以备份为准——与 kernels/relays 导入的既有处理一致。
+		if err := tx.Where("user_id = ? AND subscription_id = ? AND id <> ?", r.UserID, subID, r.ID).
+			Delete(&model.UserSubscription{}).Error; err != nil {
+			return imported, skipped, err
+		}
+		item := model.UserSubscription{
+			ID:             r.ID,
+			UserID:         r.UserID,
+			SubscriptionID: subID,
+			CreatedTime:    r.CreatedTime,
+		}
+		err = tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "id"}},
+			DoUpdates: clause.AssignmentColumns([]string{
+				"user_id", "subscription_id", "created_time",
+			}),
+		}).Create(&item).Error
+		if err != nil {
+			return imported, skipped, err
+		}
+		imported++
+	}
+	return imported, skipped, nil
+}
+
+// B4/F-030：导入 service_monitor 表（监控定义）
+// importServiceMonitorLimits 读导入事务内的服务监控限值（7 个
+// service_monitor_* 配置键），归一口径与写面
+// handler.resolveServiceMonitorLimits 完全同源
+// （monitoring.ServiceMonitorLimitsFromConfigMap）。configs 段在
+// serviceMonitors 段之前已同事务落库，恢复进来的限值即时生效，
+// 与写面此刻读到的口径一致。
+func importServiceMonitorLimits(tx *gorm.DB) (monitoring.ServiceMonitorLimits, error) {
+	names := []string{
+		monitoring.ConfigServiceMonitorCheckerScanIntervalSec,
+		monitoring.ConfigServiceMonitorWorkerLimit,
+		monitoring.ConfigServiceMonitorMinIntervalSec,
+		monitoring.ConfigServiceMonitorDefaultIntervalSec,
+		monitoring.ConfigServiceMonitorMinTimeoutSec,
+		monitoring.ConfigServiceMonitorDefaultTimeoutSec,
+		monitoring.ConfigServiceMonitorMaxTimeoutSec,
+	}
+	var configs []model.ViteConfig
+	if err := tx.Select("name", "value").Where("name IN ?", names).Find(&configs).Error; err != nil {
+		return monitoring.ServiceMonitorLimits{}, err
+	}
+	cfg := make(map[string]string, len(configs))
+	for _, c := range configs {
+		cfg[c.Name] = c.Value
+	}
+	return monitoring.ServiceMonitorLimitsFromConfigMap(cfg), nil
+}
+
+func importServiceMonitors(tx *gorm.DB, rows []model.ServiceMonitorBackup, now int64, rep *importReport) (int, error) {
+	// B8-02：恢复面镜像写面（monitorServiceCreate，更新面同口径）
+	// 全套门。此前仅镜像了目标格式一门（F-08），type/名/间隔/
+	// 超时/enabled/负 NodeID/ICMP 无节点全部原样落库——写面已封
+	// 死的脏行经恢复面重入：调度按脏 interval/timeout 运行（热
+	// 循环或永不执行）、ICMP 无节点行在 checker 恒失败
+	// （「ICMP 监控必须指定执行节点」）、负 NodeID 被消费面按
+	// ≤0 当面板本地监控。处置与恢复面惯例一致：硬门逐行跳过 +
+	// warning（NodeID<0、名空/超长、type 集外、enabled 域外、
+	// ICMP 无节点、绑定节点不存在）；软门（interval/timeout）
+	// 按写面同源限值默认 + 钳制 + warning。SSRF 硬拒层
+	// （ValidateMonitorTCPTarget/ValidateNodeMonitorTarget 的
+	// DNS/netguard 判定）仍属创建/更新面，恢复侧不做 DNS 解析，
+	// 只镜格式层（与 F-08 既定口径一致）。
+	limits, err := importServiceMonitorLimits(tx)
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, r := range rows {
+		if r.NodeID < 0 {
+			rep.skip("serviceMonitors")
+			rep.warnf("备份恢复：监控 #%d（%q）的 nodeId=%d 为负值，已跳过该行未恢复", r.ID, r.Name, r.NodeID)
+			continue
+		}
+		name := strings.TrimSpace(r.Name)
+		if name == "" || len([]rune(name)) > 100 {
+			rep.skip("serviceMonitors")
+			rep.warnf("备份恢复：监控 #%d 的名称为空或超过 100 个字符，已跳过该行未恢复", r.ID)
+			continue
+		}
+		monitorType := strings.ToLower(strings.TrimSpace(r.Type))
+		if monitorType != "tcp" && monitorType != "icmp" && monitorType != "http" {
+			rep.skip("serviceMonitors")
+			rep.warnf("备份恢复：监控 #%d（%q）的类型 %q 不在合法集 {tcp, icmp} 内，已跳过该行未恢复", r.ID, name, r.Type)
+			continue
+		}
+		// GATE-FIX C 裁定（B8-02 过修一格）：http 是存量旧类型——
+		// 写面更新路径对它专门留了容忍口径（传 http 返回成功、不
+		// 改类型），checker 对它只是报「不支持的检查类型」、行本
+		// 身一直被系统携带；恢复面硬跳过等于恢复即删数据。故
+		// http 原样恢复 + warning 披露（target 格式按
+		// validImportMonitorTarget 的 default 口径保真），真正
+		// 集外类型仍逐行跳过。
+		if monitorType == "http" {
+			rep.warnf("备份恢复：监控 #%d（%q）的类型 \"http\" 是存量旧类型（写面已不新建、检查器不支持），已按原样恢复，恢复后请改建为 tcp/icmp 监控", r.ID, name)
+		}
+		if r.Enabled != 0 && r.Enabled != 1 {
+			rep.skip("serviceMonitors")
+			rep.warnf("备份恢复：监控 #%d（%q）的 enabled=%d 不在 {0, 1} 内，已跳过该行未恢复", r.ID, name, r.Enabled)
+			continue
+		}
+		if monitorType == "icmp" && r.NodeID <= 0 {
+			rep.skip("serviceMonitors")
+			rep.warnf("备份恢复：监控 #%d（%q）是 ICMP 监控但未绑定执行节点，已跳过该行未恢复（ICMP 监控必须选择执行节点）", r.ID, name)
+			continue
+		}
+		// D4-03：绑定了节点而节点不存在时整行跳过并计数＋点名
+		//（NodeID=0 的面板本地监控不受影响）。R2-08-02：此跳行
+		// 此前是本函数内唯一只计数不点名的跳行，恢复后无从定位
+		// 是哪条监控、缺哪个节点，现按其余跳行同形补 warnf。
+		if r.NodeID > 0 {
+			nodeExists, err := rowExistsTx(tx, &model.Node{}, r.NodeID)
+			if err != nil {
+				return count, err
+			}
+			if !nodeExists {
+				rep.skip("serviceMonitors")
+				rep.warnf("备份恢复：监控 #%d（%q）绑定的节点 #%d 不存在，已跳过该行未恢复", r.ID, name, r.NodeID)
+				continue
+			}
+		}
+		updated := r.UpdatedTime
+		if updated == 0 {
+			updated = now
+		}
+		// PORT-CLOSURE F-08：恢复面绕过创建/更新两门（A-31/A-33）。
+		// Target 复用两门格式口径（tcp 须为 host:port、双端口拒；
+		// icmp 同 PC-09 口径：含 ":" 且非合法 IP 字面量即拒），
+		// 非法值清空 + 回执披露。SSRF 硬拒层（LookupIP/netguard）
+		// 仍属创建/更新面，恢复侧不做 DNS 解析。
+		target := strings.TrimSpace(r.Target)
+		if target != "" && !validImportMonitorTarget(monitorType, target) {
+			rep.warnf("备份恢复：监控 #%d（%q）的目标地址 %q 格式非法，已清空，恢复后请在监控设置中重新填写", r.ID, name, r.Target)
+			target = ""
+		}
+		// 软门：interval/timeout 按写面同源限值默认 + 钳制
+		//（create 面同序：≤0 取默认、interval 下限钳、timeout
+		// 上下限钳），调整逐行 warning 披露调整前后值。
+		intervalSec := r.IntervalSec
+		if intervalSec <= 0 {
+			intervalSec = limits.DefaultIntervalSec
+		}
+		if intervalSec < limits.MinIntervalSec {
+			intervalSec = limits.MinIntervalSec
+		}
+		timeoutSec := r.TimeoutSec
+		if timeoutSec <= 0 {
+			timeoutSec = limits.DefaultTimeoutSec
+		}
+		if timeoutSec < limits.MinTimeoutSec {
+			timeoutSec = limits.MinTimeoutSec
+		}
+		if timeoutSec > limits.MaxTimeoutSec {
+			timeoutSec = limits.MaxTimeoutSec
+		}
+		if intervalSec != r.IntervalSec || timeoutSec != r.TimeoutSec {
+			rep.warnf("备份恢复：监控 #%d（%q）的检查间隔/超时 %d/%d 不在服务监控限值内，已调整为 %d/%d", r.ID, name, r.IntervalSec, r.TimeoutSec, intervalSec, timeoutSec)
+		}
+		item := model.ServiceMonitor{
+			ID:          r.ID,
+			Name:        name,
+			Type:        monitorType,
+			Target:      target,
+			IntervalSec: intervalSec,
+			TimeoutSec:  timeoutSec,
+			NodeID:      r.NodeID,
+			Enabled:     r.Enabled,
+			CreatedTime: r.CreatedTime,
+			UpdatedTime: updated,
+		}
+		err := tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "id"}},
+			DoUpdates: clause.AssignmentColumns([]string{
+				"name", "type", "target", "interval_sec", "timeout_sec",
+				"node_id", "enabled", "created_time", "updated_time",
+			}),
+		}).Create(&item).Error
+		if err != nil {
+			return count, err
+		}
+		if err := restoreZeroValuedInt(tx, &model.ServiceMonitor{}, r.ID, "enabled", r.Enabled); err != nil {
+			return count, err
+		}
+		count++
+	}
+	return count, nil
+}
+
+// O7-008：导入 monitor_permission 表（监控权限）
+//
+// FIX132-C（D4-02）：user_id 全局唯一——同用户异 id 的既有行先删
+// 占位，以备份为准（旧实现只有 OnConflict(id)，业务键冲突即整单
+// 回滚，D4 探针 B 坐实）。D4-03：用户不存在时跳过并计数。
+func importMonitorPermissions(tx *gorm.DB, rows []model.MonitorPermissionBackup, rep *importReport) (int, error) {
+	count := 0
+	for _, mp := range rows {
+		userExists, err := rowExistsTx(tx, &model.User{}, mp.UserID)
+		if err != nil {
+			return count, err
+		}
+		if !userExists {
+			rep.skip("monitorPermissions")
+			continue
+		}
+		if err := tx.Where("user_id = ? AND id <> ?", mp.UserID, mp.ID).Delete(&model.MonitorPermission{}).Error; err != nil {
+			return count, err
+		}
+		item := model.MonitorPermission{
+			ID:          mp.ID,
+			UserID:      mp.UserID,
+			CreatedTime: mp.CreatedTime,
+		}
+		err = tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "id"}},
+			DoUpdates: clause.AssignmentColumns([]string{
+				"user_id", "created_time",
+			}),
+		}).Create(&item).Error
+		if err != nil {
+			return count, err
+		}
+		count++
+	}
+	return count, nil
+}
+
+// validImportedCredential reports whether an unmarshalled backup
+// credential can ever be used at login (OPEN-17): WebAuthn needs
+// both the credential ID (to find it) and the public key (to verify
+// the assertion). A `{}` credential unmarshals cleanly with both
+// empty and would otherwise land as a dead row — and, via the
+// OnConflict on id, could overwrite a good row with the same id.
+func validImportedCredential(credential webauthn.Credential) bool {
+	return len(credential.ID) > 0 && len(credential.PublicKey) > 0
+}
+
+// importPasskeys 恢复 passkey 段（R2-E3-F02）：按 user 归属落库，
+// 同 id 行按备份内容更新（整表段「备份为准」的既有恢复语义）。
+// 用户不存在的行跳过并计入 SkippedRows["passkeys"]（回执点名计
+// 数，与 monitorPermissions 的跳过口径一致）；credential_json 无
+// 法解为 webauthn.Credential 的行同样跳过并逐行点名——坏凭据落
+// 库后在登录面也永不可用，不如在恢复面挡下并披露。
+func importPasskeys(tx *gorm.DB, rows []model.PasskeyBackup, rep *importReport) (int, error) {
+	count := 0
+	for _, p := range rows {
+		userExists, err := rowExistsTx(tx, &model.User{}, p.UserID)
+		if err != nil {
+			return count, err
+		}
+		if !userExists {
+			rep.skip("passkeys")
+			continue
+		}
+		var credential webauthn.Credential
+		if err := json.Unmarshal([]byte(p.CredentialJSON), &credential); err != nil {
+			rep.skip("passkeys")
+			rep.warnf("备份恢复：用户 #%d 的 passkey %q 凭据数据无法解析，已跳过未恢复", p.UserID, p.ID)
+			continue
+		}
+		if !validImportedCredential(credential) {
+			// OPEN-17: 凭据 ID 或公钥为空的凭据在登录面永不可用
+			// （空 ID 找不到、空公钥验不过），与无法解析的行同
+			// 口径跳过并逐行点名，不让死凭据落库或覆盖同 id 好行。
+			rep.skip("passkeys")
+			rep.warnf("备份恢复：用户 #%d 的 passkey %q 凭据 ID 或公钥为空，已跳过未恢复", p.UserID, p.ID)
+			continue
+		}
+		item := model.Passkey{
+			ID:             p.ID,
+			UserID:         p.UserID,
+			Name:           p.Name,
+			CredentialJSON: p.CredentialJSON,
+			CreatedAt:      p.CreatedAt,
+			LastUsedAt:     p.LastUsedAt,
+		}
+		err = tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "id"}},
+			DoUpdates: clause.AssignmentColumns([]string{
+				"user_id", "name", "credential_json", "created_at", "last_used_at",
+			}),
+		}).Create(&item).Error
+		if err != nil {
+			return count, err
+		}
+		count++
+	}
+	return count, nil
+}
+
+func normalizeImportedMonitoringConfigValue(name, value string) (string, error) {
+	switch name {
+	case "monitor_tunnel_quality_enabled":
+		normalized := strings.TrimSpace(strings.ToLower(value))
+		switch normalized {
+		case "true", "false":
+			return normalized, nil
+		default:
+			return "", fmt.Errorf("隧道质量检测开关配置值无效")
+		}
+	case monitoring.ConfigMonitorRetentionDays:
+		return monitoring.NormalizeMonitoringRetentionDays(value)
+	case monitoring.ConfigTunnelQualityProbeIntervalSec:
+		return monitoring.NormalizeTunnelQualityProbeIntervalSeconds(value)
+	case monitoring.ConfigServiceMonitorCheckerScanIntervalSec,
+		monitoring.ConfigServiceMonitorWorkerLimit,
+		monitoring.ConfigServiceMonitorMinIntervalSec,
+		monitoring.ConfigServiceMonitorDefaultIntervalSec,
+		monitoring.ConfigServiceMonitorMinTimeoutSec,
+		monitoring.ConfigServiceMonitorDefaultTimeoutSec,
+		monitoring.ConfigServiceMonitorMaxTimeoutSec:
+		// RR-F5-01：服务监控内部限值 7 键与保存面同源共用
+		// monitoring.NormalizeServiceMonitorLimitValue——旧备份里
+		// 经未校验写面落库的越界值（如 max_timeout>60）恢复时
+		// 同样跳过 + warning，不许从恢复面绕回。
+		return monitoring.NormalizeServiceMonitorLimitValue(name, value)
+	case NotifyDailyHourConfigKey:
+		return NormalizeNotifyDailyHour(value)
+	}
+	return value, nil
+}
+
+func importConfigs(tx *gorm.DB, configs map[string]string, now int64, rep *importReport) (int, error) {
+	// R2-E3-F03：已注销键（随功能下线）在过滤前单独点名——它们
+	// 不在凭据/系统托管/台账排除集里，处置理由是功能已删除：旧
+	// 备份恢复若落库即成无读者、无清理路径的复活残留（gist_token
+	// 更是凭据本体），过滤骨架恒排除，此处只报键名与条数、绝不
+	// 带值。与下方 B8-12 点名不重叠（注销键已退出全部策略表）。
+	if retired := restoreRetiredConfigKeys(configs); len(retired) > 0 {
+		rep.warnf("备份恢复：%d 个配置键已随功能下线注销，未随恢复落库：%s", len(retired), strings.Join(retired, "、"))
+	}
+	// B8-12：被导入面过滤剔除的键在过滤前先取名单进回执点名
+	// （只报键名与条数、绝不带值）——此前静默消失，管理员无从
+	// 知道备份中哪些设置未恢复。
+	if dropped := restoreDroppedConfigKeys(configs); len(dropped) > 0 {
+		rep.warnf("备份恢复：%d 个配置键属于凭据/系统托管/运行时排除集，未随恢复落库：%s", len(dropped), strings.Join(dropped, "、"))
+	}
+	// RB4-01：导入面走 filterRestoreConfigs（只排凭据/系统态/台账，
+	// 不叠加导出面的默认敏感口径），未知键按 R3 K5 口径原样恢复。
+	configs = filterRestoreConfigs(configs)
+	// R3 B14-001：落库前对每个键执行 NormalizeConfigKey 归一并按归一
+	// 键合并——导入面此前以原始键名直接落库，Round 2 B14-001 的影子
+	// 行缺陷（UI 两写面已修）在导入面复发：变体键落库成读不到的影子
+	// 行，且影子合并迁移被 schema 版本门控、永不自愈。归一口径与保存
+	// 面（updateConfigs/updateSingleConfig）同源：NormalizeConfigKey
+	// 归一、归一后为空或 >200 rune（varchar(200) 列宽，K1 写面口径）
+	// 的键跳过 + 点名。输入是 map 无出现序，按原始键字典序定序合并，
+	// 同归一键取序后者并 warn，保证结果确定。
+	rawNames := make([]string, 0, len(configs))
+	for name := range configs {
+		rawNames = append(rawNames, name)
+	}
+	sort.Strings(rawNames)
+	merged := make(map[string]string, len(configs))
+	mergedFrom := make(map[string]string, len(configs))
+	orderedNames := make([]string, 0, len(configs))
+	for _, rawName := range rawNames {
+		name := NormalizeConfigKey(rawName)
+		if name == "" || len([]rune(name)) > 200 {
+			rep.skip("configs")
+			rep.warnf("备份恢复：配置键 %q 归一后为空或长度超过 200 个字符，已跳过未恢复", rawName)
+			continue
+		}
+		if prevRaw, dup := mergedFrom[name]; dup {
+			rep.warnf("备份恢复：配置键 %q 与 %q 归一后同为 %q，已按后出现者 %q 的值恢复，前者被覆盖", prevRaw, rawName, name, rawName)
+		} else {
+			orderedNames = append(orderedNames, name)
+		}
+		merged[name] = configs[rawName]
+		mergedFrom[name] = rawName
+	}
+	count := 0
+	for _, name := range orderedNames {
+		value := merged[name]
+		// 复扫 R-09：恢复面与保存面同口径——主机名类配置键的空标签值
+		// 跳过 + warning。
+		if configValueHasEmptyLabelHost(name, value) {
+			rep.skip("configs")
+			rep.warnf("备份恢复：配置 %q 的值 %q 含空标签主机名，已跳过未恢复", name, value)
+			continue
+		}
+		// H-171-01：latency_targets 走保存面等价校验（见
+		// validateLatencyTargetsConfigValue），坏值跳过 + warning。
+		// 旧注释称“读取期 parseLatencyTargets 即拒，fail-safe”——该
+		// 论证只覆盖“不崩溃、不用坏数据”，不覆盖“解析失败即返空池、
+		// 全部延迟/回程测量静默停摆”：保存期拒收与读取期拒收的后果
+		// 并不等价，坏值留在库里、故障态随每次读取复现。
+		if strings.TrimSpace(name) == "latency_targets" {
+			if err := validateLatencyTargetsConfigValue(value); err != nil {
+				rep.skip("configs")
+				rep.warnf("备份恢复：配置 %q 的值 %q 无效（%v），已跳过未恢复", name, value, err)
+				continue
+			}
+		}
+		// R2-H-02：app_logo / app_favicon 走保存面同口径品牌图校验
+		// （见 validateBrandAssetConfigValue），坏值跳过 + warning。
+		if trimmed := strings.TrimSpace(name); trimmed == "app_logo" || trimmed == "app_favicon" {
+			if err := validateBrandAssetConfigValue(value); err != nil {
+				rep.skip("configs")
+				rep.warnf("备份恢复：配置 %q 的值无效（%v），已跳过未恢复", name, err)
+				continue
+			}
+		}
+		// R3 B14-002：监控三键（开关枚举/保留天数/探测间隔）走保存面
+		// 等价校验（normalizeImportedMonitoringConfigValue），坏值跳过
+		// + warning——此前差集 3 键无校验、坏值直接落库，与保存面分裂。
+		// RR-F5-01 起服务监控限值 7 键同经此面（见函数内注）。
+		normalizedValue, err := normalizeImportedMonitoringConfigValue(name, value)
+		if err != nil {
+			rep.skip("configs")
+			rep.warnf("备份恢复：配置 %q 的值 %q 无效（%v），已跳过未恢复", name, value, err)
+			continue
+		}
+		value = normalizedValue
+		// R4B09-001：subscription_front_urls（1.7.7 KU6）走与保存面
+		// 同一实现 NormalizeSubscriptionFrontURLs（单点在本包
+		// subscription_front.go，保存面经 handler 委托别名共用），
+		// 坏值跳过 + warning、合法值归一后落库——此前该键无恢复面
+		// 校验，非规范值（带路径/查询、异源 scheme、超上限、未归一
+		// 大小写）经导入原文落库，绕过保存面单点，前端读面又只防御
+		// JSON 解析失败、条目不校验，含 token 的订阅链接会被组装到
+		// 未预期来源。
+		if strings.TrimSpace(name) == SubscriptionFrontURLsConfigKey {
+			normalizedFrontURLs, ferr := NormalizeSubscriptionFrontURLs(value)
+			if ferr != nil {
+				rep.skip("configs")
+				rep.warnf("备份恢复：配置 %q 的值 %q 无效（%v），已跳过未恢复", name, value, ferr)
+				continue
+			}
+			value = normalizedFrontURLs
+		}
+		// C-F5-01（LEDGER3）：配置键 ip 走保存面等价地址语法门（见
+		// validatePanelInstallAddrForRestore）——此前恢复面只有上方
+		// 空标签谓词，含空格/下划线/双端口/分号等保存面必拒形态原
+		// 样落库，11 键双面差集恰此一键。坏值跳过 + warning，口径
+		// 与本循环其余值域键一致。
+		if strings.TrimSpace(name) == "ip" {
+			if err := validatePanelInstallAddrForRestore(value); err != nil {
+				rep.skip("configs")
+				rep.warnf("备份恢复：配置 %q 的值 %q 无效（%v），已跳过未恢复", name, value, err)
+				continue
+			}
+		}
+		err = tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "name"}},
+			DoUpdates: clause.AssignmentColumns([]string{"value", "time"}),
+		}).Create(&model.ViteConfig{Name: name, Value: value, Time: now}).Error
+		if err != nil {
+			return count, err
+		}
+		count++
+	}
+	return count, nil
+}
+
+// ─── Jobs Queries (background stats / expiry) ───────────────────────
+
+func (r *Repository) PurgeOldStatisticsFlows(cutoffMs int64) error {
+	if r == nil || r.db == nil {
+		return errors.New("repository not initialized")
+	}
+	return r.db.Where("created_time < ?", cutoffMs).Delete(&model.StatisticsFlow{}).Error
+}
+
+func (r *Repository) ListAllUserFlowSnapshots() ([]model.UserFlowSnapshot, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	var users []model.User
+	err := r.db.Order("id ASC").Find(&users).Error
+	if err != nil {
+		return nil, err
+	}
+	out := make([]model.UserFlowSnapshot, len(users))
+	for i, u := range users {
+		out[i] = model.UserFlowSnapshot{UserID: u.ID, InFlow: u.InFlow, OutFlow: u.OutFlow}
+	}
+	return out, nil
+}
+
+func (r *Repository) GetLastStatisticsFlowTotal(userID int64) (sql.NullInt64, error) {
+	if r == nil || r.db == nil {
+		return sql.NullInt64{}, errors.New("repository not initialized")
+	}
+	var sf model.StatisticsFlow
+	err := r.db.Where("user_id = ?", userID).Order("id DESC").First(&sf).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return sql.NullInt64{}, nil
+	}
+	if err != nil {
+		return sql.NullInt64{}, err
+	}
+	return sql.NullInt64{Int64: sf.TotalFlow, Valid: true}, nil
+}
+
+func (r *Repository) CreateStatisticsFlow(userID, flow, totalFlow int64, timeText string, createdTime int64) error {
+	if r == nil || r.db == nil {
+		return errors.New("repository not initialized")
+	}
+	return r.db.Create(&model.StatisticsFlow{
+		UserID: userID, Flow: flow, TotalFlow: totalFlow,
+		Time: timeText, CreatedTime: createdTime,
+	}).Error
+}
+
+// SumStatisticsFlowsSince returns the total hourly flow increment
+// recorded in statistics_flow since the given time. Rows are per-user
+// hourly increments written by the statistics job, so the sum is the
+// panel-wide traffic since fromMs.
+func (r *Repository) SumStatisticsFlowsSince(fromMs int64) (int64, error) {
+	if r == nil || r.db == nil {
+		return 0, errors.New("repository not initialized")
+	}
+	var total sql.NullInt64
+	if err := r.db.Model(&model.StatisticsFlow{}).Where("created_time >= ?", fromMs).Select("COALESCE(SUM(flow), 0)").Scan(&total).Error; err != nil {
+		return 0, err
+	}
+	return total.Int64, nil
+}
+
+// monthlyResetMoment is the most recent monthly reset moment at or
+// before now for reset day d (local time), clamped to the month's
+// length. This is the same algorithm (and clamping rule) as the
+// subscription side's lastResetAt used by handler.subDueReset —
+// R11X-005: the user/UT reset must align with that due判定形态 and
+// must not grow a second reset semantics.
+func monthlyResetMoment(d int, now time.Time) time.Time {
+	at := func(y int, m time.Month) time.Time {
+		last := time.Date(y, m+1, 0, 0, 0, 0, 0, now.Location()).Day()
+		day := d
+		if day > last {
+			day = last
+		}
+		return time.Date(y, m, day, 0, 0, 0, 0, now.Location())
+	}
+	t := at(now.Year(), now.Month())
+	if t.After(now) {
+		t = at(now.Year(), now.Month()-1)
+	}
+	return t
+}
+
+// monthlyFlowDue reports whether a monthly flow reset is due, in the
+// same判定形态 as handler.subDueReset: due iff the last recorded
+// reset is before the most recent reset moment at or before now.
+// Consequences: a missed reset day is caught up by the next run
+// (补跑), and after a (catch-up) reset the recorded marker is at or
+// after that moment, so re-runs within the same period are not due
+// again (恰一次) until the next period's moment passes.
+//
+// Stock-row baseline (marker == 0): rows that predate the
+// flow_last_reset_time column (and rows inserted without it) carry 0,
+// meaning "no reset recorded". Their effective baseline is the last
+// instant before the current month began (startOfMonth(now) - 1ms):
+// such a row is due exactly when the current month's reset moment has
+// already passed — it gets at most one catch-up reset in the upgrade
+// month, is never reset early for a reset day still ahead this month,
+// and from then on carries a real marker like any other row. Product
+// creation paths stamp the marker with the creation time instead, so
+// new rows never take this fallback.
+func monthlyFlowDue(resetDay int64, lastResetMs int64, now time.Time) bool {
+	if resetDay <= 0 {
+		return false
+	}
+	effective := lastResetMs
+	if effective == 0 {
+		effective = time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).UnixMilli() - 1
+	}
+	return effective < monthlyResetMoment(int(resetDay), now).UnixMilli()
+}
+
+// ResetUserMonthlyFlow zeroes the flow counters of every user whose
+// monthly reset is due at now (see monthlyFlowDue) and stamps
+// flow_last_reset_time with now, so each period is reset exactly once
+// even if the reset day itself was missed (R11X-005 due-type catch-up,
+// replacing the old same-day equality predicate flow_reset_time = day
+// whose month-end clamp case is subsumed by monthlyResetMoment).
+func (r *Repository) ResetUserMonthlyFlow(now time.Time) error {
+	if r == nil || r.db == nil {
+		return errors.New("repository not initialized")
+	}
+	var rows []model.User
+	if err := r.db.Select("id", "flow_reset_time", "flow_last_reset_time").
+		Where("flow_reset_time != 0").Find(&rows).Error; err != nil {
+		return err
+	}
+	var firstErr error
+	for _, row := range rows {
+		if !monthlyFlowDue(row.FlowResetTime, row.FlowLastResetTime, now) {
+			continue
+		}
+		// Conditional on the marker just read: a concurrent run that
+		// already reset this period has moved the marker, so this
+		// update then touches no row (exactly-once under overlap).
+		err := r.db.Model(&model.User{}).
+			Where("id = ? AND flow_last_reset_time = ?", row.ID, row.FlowLastResetTime).
+			Updates(map[string]interface{}{
+				"in_flow": 0, "out_flow": 0, "flow_last_reset_time": now.UnixMilli(),
+			}).Error
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// ResetUserTunnelMonthlyFlow is ResetUserMonthlyFlow for user_tunnel
+// rows (same due semantics, same exactly-once marker).
+func (r *Repository) ResetUserTunnelMonthlyFlow(now time.Time) error {
+	if r == nil || r.db == nil {
+		return errors.New("repository not initialized")
+	}
+	var rows []model.UserTunnel
+	if err := r.db.Select("id", "flow_reset_time", "flow_last_reset_time").
+		Where("flow_reset_time != 0").Find(&rows).Error; err != nil {
+		return err
+	}
+	var firstErr error
+	for _, row := range rows {
+		if !monthlyFlowDue(row.FlowResetTime, row.FlowLastResetTime, now) {
+			continue
+		}
+		err := r.db.Model(&model.UserTunnel{}).
+			Where("id = ? AND flow_last_reset_time = ?", row.ID, row.FlowLastResetTime).
+			Updates(map[string]interface{}{
+				"in_flow": 0, "out_flow": 0, "flow_last_reset_time": now.UnixMilli(),
+			}).Error
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func (r *Repository) ListExpiredActiveUserIDs(nowMs int64) ([]int64, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	var ids []int64
+	err := r.db.Model(&model.User{}).
+		Where("role_id != 0 AND status = 1 AND exp_time > 0 AND exp_time < ?", nowMs).
+		Pluck("id", &ids).Error
+	if err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+func (r *Repository) DisableUser(userID int64, nowMs int64) error {
+	if r == nil || r.db == nil {
+		return errors.New("repository not initialized")
+	}
+	// R-02：后台过期禁用与会话吊销共用同一 UPDATE（与 8e96342 的
+	// 管理员面同口径）。只写 status=0 会让重启用后旧 token 复活。
+	return r.db.Model(&model.User{}).Where("id = ?", userID).Updates(map[string]interface{}{
+		"status":              0,
+		"password_changed_at": nextUserRevocationTime(nowMs),
+		"updated_time":        sql.NullInt64{Int64: nowMs, Valid: true},
+	}).Error
+}
+
+func (r *Repository) ListExpiredActiveUserTunnels(nowMs int64) ([]model.ExpiredUserTunnel, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	var uts []model.UserTunnel
+	err := r.db.Where("status = 1 AND exp_time > 0 AND exp_time < ?", nowMs).Find(&uts).Error
+	if err != nil {
+		return nil, err
+	}
+	out := make([]model.ExpiredUserTunnel, len(uts))
+	for i, ut := range uts {
+		out[i] = model.ExpiredUserTunnel{ID: ut.ID, UserID: ut.UserID, TunnelID: ut.TunnelID}
+	}
+	return out, nil
+}
+
+func (r *Repository) DisableUserTunnel(id int64) error {
+	if r == nil || r.db == nil {
+		return errors.New("repository not initialized")
+	}
+	return r.db.Model(&model.UserTunnel{}).Where("id = ?", id).Update("status", 0).Error
+}
+
+func (r *Repository) GetUserTunnelByID(id int64) (*model.UserTunnel, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	return getUserTunnelByID(r.db, id)
+}
+
+func (r *Repository) GetUserTunnelByIDTx(tx *gorm.DB, id int64) (*model.UserTunnel, error) {
+	if tx == nil {
+		return nil, errors.New("database unavailable")
+	}
+	return getUserTunnelByID(tx, id)
+}
+
+func getUserTunnelByID(db *gorm.DB, id int64) (*model.UserTunnel, error) {
+	var ut model.UserTunnel
+	err := db.Where("id = ?", id).First(&ut).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &ut, nil
+}
+
+// ─── Migration ───────────────────────────────────────────────────────
+
+const currentSchemaVersion = 8
+
+var ensurePostgresIDDefaultsFn = ensurePostgresIDDefaults
+var migrateViteConfigValueColumnTypeFn = migrateViteConfigValueColumnType
+var migrateSpeedLimitTunnelBindingFn = migrateSpeedLimitTunnelBinding
+var migratePostgresTrafficInt64ColumnsFn = migratePostgresTrafficInt64Columns
+var migrateTunnelMetricBucketUniqueIndexFn = migrateTunnelMetricBucketUniqueIndex
+var migrateConfigKeyCaseShadowsFn = migrateConfigKeyCaseShadows
+var migrateRemoveGistConfigKeysFn = migrateRemoveGistConfigKeys
+
+// getSchemaVersion 读取 schema_version 当前版本。仅「表在但无行」
+// （ErrRecordNotFound）走建行回 0 的新库分支；其余读错误一律上抛
+// （X01-002：旧实现对任何错误都吞掉并伪装成版本 0，读失败会被当成
+// 空表触发全量迁移重跑、写失败会被当成已推进，migrateSchema 还
+// 无条件报完成，迁移状态彻底不可见）。建行本身失败同样上抛。
+func getSchemaVersion(db *gorm.DB) (int, error) {
+	var v model.SchemaVersion
+	if err := db.First(&v).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			if err := db.Create(&model.SchemaVersion{Version: 0}).Error; err != nil {
+				return 0, fmt.Errorf("create schema_version row: %w", err)
+			}
+			return 0, nil
+		}
+		return 0, fmt.Errorf("read schema_version: %w", err)
+	}
+	return v.Version, nil
+}
+
+// setSchemaVersion 推进 schema_version。写错误与 0 行更新（行不存在
+// ——调用方 migrateSchema 的不变量是 getSchemaVersion 已保证行存在）
+// 均上抛（X01-002），不得静默当作已推进。
+func setSchemaVersion(db *gorm.DB, ver int) error {
+	res := db.Model(&model.SchemaVersion{}).Where("1=1").Update("version", ver)
+	if res.Error != nil {
+		return fmt.Errorf("update schema_version: %w", res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return errors.New("update schema_version: no row updated")
+	}
+	return nil
+}
+
+func migrateSchema(db *gorm.DB) error {
+	if db == nil {
+		return errors.New("nil db")
+	}
+
+	if err := ensurePostgresIDDefaultsFn(db); err != nil {
+		return err
+	}
+
+	ver, err := getSchemaVersion(db)
+	if err != nil {
+		return err
+	}
+	if ver >= currentSchemaVersion {
+		return nil
+	}
+
+	// Normalize strategy columns
+	normalizeStrategy := func(modelRef interface{}, table, defaultValue string) error {
+		result := db.Model(modelRef).Where("strategy IS NULL").Update("strategy", defaultValue)
+		if result.Error != nil {
+			msg := strings.ToLower(result.Error.Error())
+			if strings.Contains(msg, "no such table") || (strings.Contains(msg, "relation") && strings.Contains(msg, "does not exist")) {
+				return nil
+			}
+			return fmt.Errorf("normalize %s.strategy: %w", table, result.Error)
+		}
+		return nil
+	}
+
+	if err := normalizeStrategy(&model.Forward{}, "forward", "fifo"); err != nil {
+		return err
+	}
+	if err := normalizeStrategy(&model.ChainTunnel{}, "chain_tunnel", "round"); err != nil {
+		return err
+	}
+
+	if ver < 3 {
+		if err := migrateViteConfigValueColumnTypeFn(db); err != nil {
+			return err
+		}
+	}
+
+	if ver < 4 {
+		if err := migrateSpeedLimitTunnelBindingFn(db); err != nil {
+			return err
+		}
+	}
+
+	if ver < 5 {
+		if err := migratePostgresTrafficInt64ColumnsFn(db); err != nil {
+			return err
+		}
+	}
+
+	if ver < 6 {
+		if err := migrateTunnelMetricBucketUniqueIndexFn(db); err != nil {
+			return err
+		}
+	}
+
+	if ver < 7 {
+		if err := migrateConfigKeyCaseShadowsFn(db); err != nil {
+			return err
+		}
+	}
+
+	if ver < 8 {
+		if err := migrateRemoveGistConfigKeysFn(db); err != nil {
+			return err
+		}
+	}
+
+	// X01-002：版本推进失败必须让 migrateSchema 报错、启动显式失败，
+	// 与本函数其余迁移步骤（及 autoMigrateAll / migrateSubscriptions
+	// 在 Open/OpenPostgres 的处置）同口径——迁移已执行而版本未落库
+	// 时静默成功，下次启动会把整批迁移当作未执行重跑且无人知晓。
+	if err := setSchemaVersion(db, currentSchemaVersion); err != nil {
+		return err
+	}
+	return nil
+}
+
+// migrateRemoveGistConfigKeys 删除 2.1.0 随 Gist 备份功能下线而失活
+// 的配置行：8 个 gist_* 键（设置与运行态）与 Gist 失败通知台账两键。
+// 功能代码删除后这些行无人读写，留置即残留（且其中 gist_token 是
+// GitHub 凭据本体），按「删除不留残留」口径在 schema v8 迁移里删净；
+// 幂等，键不存在时无副作用。本地备份/恢复与自动快照的键不在此列。
+// 键清单与备份过滤的已注销键集同源单点（retiredConfigKeysList，
+// config_policy.go）：本迁移是版本门控的一次性步进、到 v8 后永不
+// 重跑，恢复面（filterRestoreConfigs 恒排除＋noteRemovedFeatureSegments
+// 剥离点名）靠同一清单恒排除，两面才不会一删一复活（R2-E3-F03）。
+func migrateRemoveGistConfigKeys(db *gorm.DB) error {
+	if db == nil {
+		return errors.New("nil db")
+	}
+	keys := retiredConfigKeysList
+	if err := db.Where("name IN ?", keys).Delete(&model.ViteConfig{}).Error; err != nil {
+		msg := strings.ToLower(err.Error())
+		if strings.Contains(msg, "no such table") || (strings.Contains(msg, "relation") && strings.Contains(msg, "does not exist")) {
+			return nil
+		}
+		return fmt.Errorf("remove gist config keys: %w", err)
+	}
+	return nil
+}
+
+// migrateConfigKeyCaseShadows 合并 R2 B14-001 的存量影子行：写入口
+// 归一上线前，管理员以大写/混合大小写变体写入的配置行（name 与读路径
+// 的 normalizeConfigKey 口径不一致）永远读不到。按归一键分组——组内
+// 已有规范行（name == 归一键）时删全部变体行（读路径恒命中规范行，
+// 变体值从未生效）；只有变体行时保留最近一行（time 最大、id 最大
+// 兜底）改名为规范键、删其余变体。全程单事务。
+func migrateConfigKeyCaseShadows(db *gorm.DB) error {
+	if db == nil {
+		return errors.New("nil db")
+	}
+	if !db.Migrator().HasTable(&model.ViteConfig{}) {
+		return nil
+	}
+	return db.Transaction(func(tx *gorm.DB) error {
+		var rows []model.ViteConfig
+		if err := tx.Find(&rows).Error; err != nil {
+			return fmt.Errorf("load vite_config for case-shadow merge: %w", err)
+		}
+		groups := make(map[string][]model.ViteConfig)
+		for _, row := range rows {
+			key := normalizeConfigKey(row.Name)
+			groups[key] = append(groups[key], row)
+		}
+		for key, group := range groups {
+			var canonical *model.ViteConfig
+			var variants []model.ViteConfig
+			for i := range group {
+				if group[i].Name == key {
+					canonical = &group[i]
+				} else {
+					variants = append(variants, group[i])
+				}
+			}
+			if len(variants) == 0 {
+				continue
+			}
+			if canonical == nil {
+				// 仅变体行：最近写入的一行改名为规范键，其余删除。
+				keep := variants[0]
+				for _, v := range variants[1:] {
+					if v.Time > keep.Time || (v.Time == keep.Time && v.ID > keep.ID) {
+						keep = v
+					}
+				}
+				if err := tx.Model(&model.ViteConfig{}).Where("id = ?", keep.ID).Update("name", key).Error; err != nil {
+					return fmt.Errorf("rename config shadow row %q: %w", keep.Name, err)
+				}
+				for _, v := range variants {
+					if v.ID == keep.ID {
+						continue
+					}
+					if err := tx.Delete(&model.ViteConfig{}, v.ID).Error; err != nil {
+						return fmt.Errorf("delete config shadow row %q: %w", v.Name, err)
+					}
+				}
+				continue
+			}
+			for _, v := range variants {
+				if err := tx.Delete(&model.ViteConfig{}, v.ID).Error; err != nil {
+					return fmt.Errorf("delete config shadow row %q: %w", v.Name, err)
+				}
+			}
+		}
+		return nil
+	})
+}
+
+func migrateViteConfigValueColumnType(db *gorm.DB) error {
+	if db == nil {
+		return errors.New("nil db")
+	}
+
+	if !db.Migrator().HasTable(&model.ViteConfig{}) {
+		return nil
+	}
+
+	if db.Dialector.Name() != "postgres" {
+		return nil
+	}
+
+	type columnRow struct {
+		DataType string `gorm:"column:data_type"`
+	}
+
+	var row columnRow
+	if err := db.Raw(
+		`SELECT data_type FROM information_schema.columns
+		 WHERE table_schema = current_schema()
+		   AND table_name = ?
+		   AND column_name = ?`,
+		"vite_config", "value",
+	).Scan(&row).Error; err != nil {
+		return fmt.Errorf("inspect vite_config.value type: %w", err)
+	}
+
+	if strings.EqualFold(row.DataType, "text") {
+		return nil
+	}
+
+	if err := db.Exec(`ALTER TABLE "vite_config" ALTER COLUMN "value" TYPE TEXT`).Error; err != nil {
+		return fmt.Errorf("alter vite_config.value to text: %w", err)
+	}
+
+	return nil
+}
+
+func migrateSpeedLimitTunnelBinding(db *gorm.DB) error {
+	if db == nil {
+		return errors.New("nil db")
+	}
+
+	if !db.Migrator().HasTable(&model.SpeedLimit{}) {
+		return nil
+	}
+
+	if err := db.Model(&model.SpeedLimit{}).
+		Where("tunnel_id IS NOT NULL OR tunnel_name IS NOT NULL").
+		UpdateColumns(map[string]interface{}{
+			"tunnel_id":   nil,
+			"tunnel_name": nil,
+		}).Error; err != nil {
+		return fmt.Errorf("clear speed_limit tunnel binding: %w", err)
+	}
+
+	return nil
+}
+
+func migratePostgresTrafficInt64Columns(db *gorm.DB) error {
+	if db == nil {
+		return errors.New("nil db")
+	}
+
+	if db.Dialector.Name() != "postgres" {
+		return nil
+	}
+
+	type trafficColumn struct {
+		TableName  string
+		ColumnName string
+	}
+
+	columns := []trafficColumn{
+		{TableName: "user", ColumnName: "flow"},
+		{TableName: "user", ColumnName: "in_flow"},
+		{TableName: "user", ColumnName: "out_flow"},
+		{TableName: "forward", ColumnName: "in_flow"},
+		{TableName: "forward", ColumnName: "out_flow"},
+		{TableName: "statistics_flow", ColumnName: "flow"},
+		{TableName: "statistics_flow", ColumnName: "total_flow"},
+		{TableName: "tunnel", ColumnName: "flow"},
+		{TableName: "user_tunnel", ColumnName: "flow"},
+		{TableName: "user_tunnel", ColumnName: "in_flow"},
+		{TableName: "user_tunnel", ColumnName: "out_flow"},
+	}
+
+	for _, column := range columns {
+		if err := alterPostgresColumnToBigIntIfNeeded(db, column.TableName, column.ColumnName); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func migrateTunnelMetricBucketUniqueIndex(db *gorm.DB) error {
+	if db == nil {
+		return errors.New("nil db")
+	}
+
+	if !db.Migrator().HasTable(&model.TunnelMetric{}) {
+		return nil
+	}
+
+	return db.Transaction(func(tx *gorm.DB) error {
+		// Only do the heavier dedupe work when needed.
+		var dupGroups int64
+		q := `
+			SELECT COUNT(1) AS cnt
+			FROM (
+				SELECT 1
+				FROM tunnel_metric
+				GROUP BY tunnel_id, node_id, timestamp
+				HAVING COUNT(*) > 1
+			) t
+		`
+		if err := tx.Raw(q).Scan(&dupGroups).Error; err != nil {
+			return fmt.Errorf("inspect tunnel_metric duplicates: %w", err)
+		}
+
+		if dupGroups > 0 {
+			switch tx.Dialector.Name() {
+			case "postgres":
+				sql := `
+					WITH agg AS (
+						SELECT MIN(id) AS keep_id,
+						       tunnel_id,
+						       node_id,
+						       timestamp,
+						       SUM(bytes_in) AS bytes_in,
+						       SUM(bytes_out) AS bytes_out,
+						       SUM(connections) AS connections,
+						       SUM(errors) AS errors,
+						       AVG(avg_latency_ms) AS avg_latency_ms
+						FROM tunnel_metric
+						GROUP BY tunnel_id, node_id, timestamp
+						HAVING COUNT(*) > 1
+					), updated AS (
+						UPDATE tunnel_metric tm
+						SET bytes_in = agg.bytes_in,
+						    bytes_out = agg.bytes_out,
+						    connections = agg.connections,
+						    errors = agg.errors,
+						    avg_latency_ms = agg.avg_latency_ms
+						FROM agg
+						WHERE tm.id = agg.keep_id
+						RETURNING tm.id
+					)
+					DELETE FROM tunnel_metric tm
+					USING agg
+					WHERE tm.tunnel_id = agg.tunnel_id
+					  AND tm.node_id = agg.node_id
+					  AND tm.timestamp = agg.timestamp
+					  AND tm.id <> agg.keep_id
+				`
+				if err := tx.Exec(sql).Error; err != nil {
+					return fmt.Errorf("dedupe tunnel_metric buckets: %w", err)
+				}
+			default:
+				// SQLite (and other) path.
+				if err := tx.Exec(`DROP TABLE IF EXISTS tunnel_metric_dedupe`).Error; err != nil {
+					return fmt.Errorf("prepare tunnel_metric dedupe table: %w", err)
+				}
+				if err := tx.Exec(`
+					CREATE TEMP TABLE tunnel_metric_dedupe AS
+					SELECT MIN(id) AS keep_id,
+					       tunnel_id,
+					       node_id,
+					       timestamp,
+					       SUM(bytes_in) AS bytes_in,
+					       SUM(bytes_out) AS bytes_out,
+					       SUM(connections) AS connections,
+					       SUM(errors) AS errors,
+					       AVG(avg_latency_ms) AS avg_latency_ms
+					FROM tunnel_metric
+					GROUP BY tunnel_id, node_id, timestamp
+					HAVING COUNT(*) > 1
+				`).Error; err != nil {
+					return fmt.Errorf("build tunnel_metric dedupe table: %w", err)
+				}
+				if err := tx.Exec(`
+					UPDATE tunnel_metric
+					SET bytes_in = (SELECT bytes_in FROM tunnel_metric_dedupe d WHERE d.keep_id = tunnel_metric.id),
+					    bytes_out = (SELECT bytes_out FROM tunnel_metric_dedupe d WHERE d.keep_id = tunnel_metric.id),
+					    connections = (SELECT connections FROM tunnel_metric_dedupe d WHERE d.keep_id = tunnel_metric.id),
+					    errors = (SELECT errors FROM tunnel_metric_dedupe d WHERE d.keep_id = tunnel_metric.id),
+					    avg_latency_ms = (SELECT avg_latency_ms FROM tunnel_metric_dedupe d WHERE d.keep_id = tunnel_metric.id)
+					WHERE id IN (SELECT keep_id FROM tunnel_metric_dedupe)
+				`).Error; err != nil {
+					return fmt.Errorf("update tunnel_metric deduped rows: %w", err)
+				}
+				if err := tx.Exec(`
+					DELETE FROM tunnel_metric
+					WHERE id IN (
+						SELECT tm.id
+						FROM tunnel_metric tm
+						JOIN tunnel_metric_dedupe d
+						  ON tm.tunnel_id = d.tunnel_id
+						 AND tm.node_id = d.node_id
+						 AND tm.timestamp = d.timestamp
+						WHERE tm.id <> d.keep_id
+					)
+				`).Error; err != nil {
+					return fmt.Errorf("delete tunnel_metric duplicates: %w", err)
+				}
+				_ = tx.Exec(`DROP TABLE IF EXISTS tunnel_metric_dedupe`).Error
+			}
+		}
+
+		// Uniqueness is required for safe upsert on (tunnel_id, node_id, timestamp).
+		if err := tx.Exec(
+			`CREATE UNIQUE INDEX IF NOT EXISTS uidx_tunnel_metric_bucket ON tunnel_metric(tunnel_id, node_id, timestamp)`,
+		).Error; err != nil {
+			return fmt.Errorf("create tunnel_metric unique index: %w", err)
+		}
+		return nil
+	})
+}
+
+func alterPostgresColumnToBigIntIfNeeded(db *gorm.DB, tableName, columnName string) error {
+	if db == nil {
+		return errors.New("nil db")
+	}
+
+	if tableName == "" || columnName == "" {
+		return errors.New("empty table or column name")
+	}
+
+	type columnRow struct {
+		DataType string `gorm:"column:data_type"`
+	}
+
+	var row columnRow
+	if err := db.Raw(
+		`SELECT data_type FROM information_schema.columns
+		 WHERE table_schema = current_schema()
+		   AND table_name = ?
+		   AND column_name = ?`,
+		tableName, columnName,
+	).Scan(&row).Error; err != nil {
+		return fmt.Errorf("inspect %s.%s type: %w", tableName, columnName, err)
+	}
+
+	if row.DataType == "" || strings.EqualFold(row.DataType, "bigint") {
+		return nil
+	}
+	if !strings.EqualFold(row.DataType, "integer") {
+		return nil
+	}
+
+	if err := db.Exec(fmt.Sprintf(
+		"ALTER TABLE %s ALTER COLUMN %s TYPE BIGINT",
+		quoteSQLIdentifier(tableName),
+		quoteSQLIdentifier(columnName),
+	)).Error; err != nil {
+		return fmt.Errorf("alter %s.%s to bigint: %w", tableName, columnName, err)
+	}
+
+	return nil
+}
+
+func ensurePostgresIDDefaults(db *gorm.DB) error {
+	if db.Dialector.Name() != "postgres" {
+		return nil
+	}
+	type idRow struct {
+		TableSchema string
+		TableName   string
+	}
+	var rows []idRow
+	err := db.Table("information_schema.table_constraints AS tc").
+		Select("c.table_schema, c.table_name").
+		Joins("JOIN information_schema.key_column_usage AS kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema").
+		Joins("JOIN information_schema.columns AS c ON c.table_schema = kcu.table_schema AND c.table_name = kcu.table_name AND c.column_name = kcu.column_name").
+		Where("tc.constraint_type = ?", "PRIMARY KEY").
+		Where("kcu.column_name = ?", "id").
+		Where("c.data_type IN ?", []string{"integer", "bigint"}).
+		Where("c.is_identity = ?", "NO").
+		Where("c.table_schema = current_schema()").
+		Order("c.table_name ASC").
+		Scan(&rows).Error
+	if err != nil {
+		return fmt.Errorf("discover postgres id columns: %w", err)
+	}
+
+	for _, r := range rows {
+		if err := ensurePostgresTableIDDefault(db, r.TableSchema, r.TableName); err != nil {
+			return fmt.Errorf("repair %s.%s id default: %w", r.TableSchema, r.TableName, err)
+		}
+	}
+	return nil
+}
+
+func ensurePostgresTableIDDefault(db *gorm.DB, schemaName, tableName string) error {
+	type defaultRow struct {
+		ColumnDefault sql.NullString `gorm:"column:column_default"`
+	}
+	var row defaultRow
+	err := db.Table("information_schema.columns").
+		Select("column_default").
+		Where("table_schema = ? AND table_name = ? AND column_name = 'id'", schemaName, tableName).
+		Limit(1).
+		Scan(&row).Error
+	if err != nil {
+		return err
+	}
+	defaultExpr := row.ColumnDefault
+
+	hasNextvalDefault := defaultExpr.Valid && strings.Contains(strings.ToLower(defaultExpr.String), "nextval(")
+	seqRef := ""
+	if hasNextvalDefault {
+		seqRef = extractNextvalRegclass(defaultExpr.String)
+	}
+
+	if !hasNextvalDefault || seqRef == "" {
+		seqName := tableName + "_id_seq"
+		if err := db.Exec(fmt.Sprintf("CREATE SEQUENCE IF NOT EXISTS %s.%s", quoteSQLIdentifier(schemaName), quoteSQLIdentifier(seqName))).Error; err != nil {
+			return err
+		}
+		seqRef = schemaName + "." + seqName
+		if err := db.Exec(fmt.Sprintf(
+			"ALTER TABLE %s.%s ALTER COLUMN id SET DEFAULT nextval(%s::regclass)",
+			quoteSQLIdentifier(schemaName), quoteSQLIdentifier(tableName), quoteSQLLiteral(seqRef),
+		)).Error; err != nil {
+			return err
+		}
+		if err := db.Exec(fmt.Sprintf(
+			"ALTER SEQUENCE %s.%s OWNED BY %s.%s.id",
+			quoteSQLIdentifier(schemaName), quoteSQLIdentifier(seqName),
+			quoteSQLIdentifier(schemaName), quoteSQLIdentifier(tableName),
+		)).Error; err != nil {
+			return err
+		}
+	}
+
+	return syncPostgresTableIDSequence(db, schemaName, tableName, seqRef)
+}
+
+func syncPostgresTableIDSequence(db *gorm.DB, schemaName, tableName, seqRef string) error {
+	type maxRow struct {
+		MaxID int64 `gorm:"column:max_id"`
+	}
+	var row maxRow
+	qualifiedTable := fmt.Sprintf("%s.%s", quoteSQLIdentifier(schemaName), quoteSQLIdentifier(tableName))
+	err := db.Table(qualifiedTable).
+		Select("COALESCE(MAX(id), 0) AS max_id").
+		Scan(&row).Error
+	if err != nil {
+		return err
+	}
+	maxID := row.MaxID
+
+	setVal := maxID
+	isCalled := true
+	if maxID <= 0 {
+		setVal = 1
+		isCalled = false
+	}
+
+	return db.Exec(`SELECT setval(?::regclass, ?, ?)`, seqRef, setVal, isCalled).Error
+}
+
+func extractNextvalRegclass(defaultExpr string) string {
+	nextvalIdx := strings.Index(strings.ToLower(defaultExpr), "nextval(")
+	if nextvalIdx < 0 {
+		return ""
+	}
+	expr := defaultExpr[nextvalIdx:]
+	firstQuote := strings.Index(expr, "'")
+	if firstQuote < 0 {
+		return ""
+	}
+	expr = expr[firstQuote+1:]
+	secondQuote := strings.Index(expr, "'")
+	if secondQuote < 0 {
+		return ""
+	}
+	return strings.TrimSpace(expr[:secondQuote])
+}
+
+func quoteSQLIdentifier(ident string) string {
+	return `"` + strings.ReplaceAll(ident, `"`, `""`) + `"`
+}
+
+func quoteSQLLiteral(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+}
+
+// ─── Helper Functions ────────────────────────────────────────────────
+
+// forwardIngressPortRow 是入口解析的原始行（forward_port LEFT JOIN
+// node）。单条版 resolveForwardIngress 与批量版
+// resolveForwardIngressBatch 共用同一组装逻辑 assembleForwardIngress，
+// 保证两条路径逐字段同口径（X04-001 批量化改造）。
+type forwardIngressPortRow struct {
+	ForwardID int64
+	Port      sql.NullInt64
+	ServerIP  sql.NullString
+	InIP      sql.NullString
+}
+
+// assembleForwardIngress 把一个转发的端口行（已按 forward_port.id ASC
+// 排序）组装为 (inIp 串, 首端口)。逻辑与原 resolveForwardIngress 内联
+// 实现逐行一致，包括 port<=0 时 formatForwardIngressAddress 返回空串
+// 仍作为条目参与 Join 的既有边沿行为，不得在此「顺手修正」。
+func assembleForwardIngress(fpRows []forwardIngressPortRow) (string, sql.NullInt64) {
+	ports := make([]int64, 0)
+	entries := make([]string, 0)
+	seenPorts := make(map[int64]struct{})
+	seenPairs := make(map[string]struct{})
+
+	for _, row := range fpRows {
+		if !row.Port.Valid {
+			continue
+		}
+		if _, ok := seenPorts[row.Port.Int64]; !ok {
+			seenPorts[row.Port.Int64] = struct{}{}
+			ports = append(ports, row.Port.Int64)
+		}
+
+		var ip string
+		if row.InIP.Valid && strings.TrimSpace(row.InIP.String) != "" {
+			ip = strings.TrimSpace(row.InIP.String)
+		} else if row.ServerIP.Valid && strings.TrimSpace(row.ServerIP.String) != "" {
+			ip = strings.TrimSpace(row.ServerIP.String)
+		}
+
+		if ip != "" {
+			pair := formatForwardIngressAddress(ip, row.Port.Int64)
+			if _, ok := seenPairs[pair]; !ok {
+				seenPairs[pair] = struct{}{}
+				entries = append(entries, pair)
+			}
+		}
+	}
+
+	if len(ports) == 0 {
+		return "", sql.NullInt64{}
+	}
+
+	inPort := sql.NullInt64{Int64: ports[0], Valid: true}
+
+	return strings.Join(entries, ","), inPort
+}
+
+func resolveForwardIngress(db *gorm.DB, forwardID int64, tunnelID int64) (string, sql.NullInt64, error) {
+	var tunnelInIP sql.NullString
+	db.Model(&model.Tunnel{}).Select("in_ip").Where("id = ?", tunnelID).Limit(1).Scan(&tunnelInIP)
+
+	var fpRows []forwardIngressPortRow
+	err := db.Model(&model.ForwardPort{}).
+		Select("forward_port.forward_id, forward_port.port, node.server_ip, forward_port.in_ip").
+		Joins("LEFT JOIN node ON node.id = forward_port.node_id").
+		Where("forward_port.forward_id = ?", forwardID).
+		Order("forward_port.id ASC").
+		Find(&fpRows).Error
+	if err != nil {
+		return "", sql.NullInt64{}, err
+	}
+
+	inIP, inPort := assembleForwardIngress(fpRows)
+	return inIP, inPort, nil
+}
+
+// forwardIngress 是批量解析的结果（与 resolveForwardIngress 的
+// (inIp, inPort) 返回对齐）。
+type forwardIngress struct {
+	IP   string
+	Port sql.NullInt64
+}
+
+// forwardIngressBatchChunk 是批量 IN 查询的分块大小：远低于 SQLite
+// 历史变量上限（999），同时使查询次数随条数亚线性（每 500 条一条）。
+const forwardIngressBatchChunk = 500
+
+// resolveForwardIngressBatch 一次（按块）查出全部 forward 的端口行后
+// 在内存组装，替代列表路径逐条调用 resolveForwardIngress 的 2N 次
+// 查询（X04-001）。无端口行的 forward 不出现在结果 map 中，调用方取
+// 零值（"", 无效端口）与单条版返回一致。
+func resolveForwardIngressBatch(db *gorm.DB, forwardIDs []int64) (map[int64]forwardIngress, error) {
+	out := make(map[int64]forwardIngress, len(forwardIDs))
+	seen := make(map[int64]struct{}, len(forwardIDs))
+	uniq := make([]int64, 0, len(forwardIDs))
+	for _, id := range forwardIDs {
+		if _, ok := seen[id]; !ok {
+			seen[id] = struct{}{}
+			uniq = append(uniq, id)
+		}
+	}
+	for start := 0; start < len(uniq); start += forwardIngressBatchChunk {
+		end := start + forwardIngressBatchChunk
+		if end > len(uniq) {
+			end = len(uniq)
+		}
+		var rows []forwardIngressPortRow
+		err := db.Model(&model.ForwardPort{}).
+			Select("forward_port.forward_id, forward_port.port, node.server_ip, forward_port.in_ip").
+			Joins("LEFT JOIN node ON node.id = forward_port.node_id").
+			Where("forward_port.forward_id IN ?", uniq[start:end]).
+			Order("forward_port.id ASC").
+			Find(&rows).Error
+		if err != nil {
+			return nil, err
+		}
+		grouped := make(map[int64][]forwardIngressPortRow)
+		for _, row := range rows {
+			grouped[row.ForwardID] = append(grouped[row.ForwardID], row)
+		}
+		for fid, grows := range grouped {
+			ip, port := assembleForwardIngress(grows)
+			out[fid] = forwardIngress{IP: ip, Port: port}
+		}
+	}
+	return out, nil
+}
+
+func formatForwardIngressAddress(host string, port int64) string {
+	// R28-FIX-F01：入口 host 可源自含 :port 的 ServerIP（或 InIP）；
+	// 此处剥离是三处调用面（forward 列表/详情 inIp 面与
+	// ForwardEntries）的唯一汇合点，同口径一次修全。口径与 handler
+	// 层 stripShareHostPort 一致：SplitHostPort 成功取 host，失败
+	// 原样去括号；repo 层不能 import handler 包，故本地同等实现。
+	host = stripIngressHostPort(host)
+	if host == "" || port <= 0 {
+		return ""
+	}
+	return net.JoinHostPort(host, strconv.FormatInt(port, 10))
+}
+
+// stripIngressHostPort strips a trailing :port from a stored node
+// address (R28-FIX-F01). See formatForwardIngressAddress.
+func stripIngressHostPort(value string) string {
+	value = strings.TrimSpace(value)
+	if host, _, err := net.SplitHostPort(value); err == nil {
+		return host
+	}
+	return strings.Trim(value, "[]")
+}
+
+// stripIngressHostPortList strips a trailing :port from each
+// comma-separated item of a multi-value host list (R32-L4-E02).
+// Same per-item semantics as handler stripShareHostPortList
+// (R31-L1-E01); repo cannot import handler, so local mirror —
+// stripIngressHostPort on the whole string is a no-op because
+// net.SplitHostPort fails on the comma. Empty items are preserved
+// as-is so the item count/shape of the input is unchanged.
+func stripIngressHostPortList(value string) string {
+	parts := strings.Split(value, ",")
+	for i, part := range parts {
+		parts[i] = stripIngressHostPort(part)
+	}
+	return strings.Join(parts, ",")
+}
+
+// nullableInIPString renders a stored tunnel in_ip for ListTunnels
+// (R32-L4-E02): legacy residue restored from ≤1.5.1 backups may still
+// carry a trailing :port; render strips it per item so the list shows
+// the bare host. Stored value is untouched（存量不改写）— the import
+// side strips on the way in, so fresh restores never leave residue.
+func nullableInIPString(v sql.NullString) interface{} {
+	if !v.Valid {
+		return nil
+	}
+	return stripIngressHostPortList(v.String)
+}
+
+// stripListenAddrPort strips a trailing :port from a node listen
+// address (PORT-CLOSURE F-02): repo-side mirror of handler
+// stripListenAddrPort (R32-FIX-F01), same semantics — repo cannot
+// import handler. Unlike stripIngressHostPort this never trims
+// brackets: the stored default "[::]" must pass through unchanged
+// (stripIngressHostPort would return "::" and rewrite the
+// default's shape), and a bracketed IPv6 with port
+// ("[2001:db8::1]:9999") strips to its bare host. A value that is
+// not a host:port pair (bare host/IP, bare IPv6, "[::]") passes
+// through unchanged.
+func stripListenAddrPort(value string) string {
+	value = strings.TrimSpace(value)
+	if host, _, err := net.SplitHostPort(value); err == nil {
+		return host
+	}
+	return value
+}
+
+// validImportNodeAddress is the repo-side mirror of handler
+// IsValidNodeAddress (PORT-CLOSURE F-07(ii)); repo cannot import
+// handler. Same gate: the R3-E-01 structural character set
+// (@ # , / ? whitespace/control, via kernel.HostHasStructuralChars)
+// plus the double-port refusal — a bare IPv6 literal passes via
+// netip.ParseAddr, a plain hostname passes via the SplitHostPort
+// "missing port" allowance, and anything else SplitHostPort rejects
+// (e.g. "too many colons") fails. L1-F-04: plus the empty-label
+// refusal, same as the handler predicate. Empty counts as valid (empty
+// means NULL/unset; callers handle it per field).
+func validImportNodeAddress(addr string) bool {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return true
+	}
+	if kernel.HostHasStructuralChars(addr) {
+		return false
+	}
+	if _, err := netip.ParseAddr(addr); err == nil {
+		return true
+	}
+	host := addr
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		host = h
+	} else if !strings.Contains(err.Error(), "missing port in address") {
+		return false
+	}
+	return !kernel.HasEmptyLabel(host)
+}
+
+// validImportListenAddr validates a stripped node listen address
+// (PORT-CLOSURE F-02): a bare IP/hostname, a bare or bracketed IPv6
+// literal, or empty (pass-through, no rewrite). A value still
+// carrying ":" that is not a valid IP literal — e.g. a double-port
+// value the single strip could not remove — is invalid.
+func validImportListenAddr(addr string) bool {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return true
+	}
+	if kernel.HostHasStructuralChars(addr) {
+		return false
+	}
+	if strings.HasPrefix(addr, "[") && strings.HasSuffix(addr, "]") {
+		return net.ParseIP(strings.Trim(addr, "[]")) != nil
+	}
+	if _, err := netip.ParseAddr(addr); err == nil {
+		return true
+	}
+	if strings.Contains(addr, ":") {
+		return false
+	}
+	// L1-F-04: 裸主机名补空标签判（与 IsValidNodeAddress 同口径）。
+	return !kernel.HasEmptyLabel(addr)
+}
+
+// validImportRestartTime mirrors the write face's HH:MM rule for
+// node restart times (handler restartTimePattern
+// ^([01][0-9]|2[0-3]):[0-5][0-9]$; the repo layer cannot import the
+// handler, same precedent as normalizeBackupTunnelEngine). Digit
+// checks are explicit so signed or spaced forms the regexp would
+// reject cannot slip through strconv parsing.
+func validImportRestartTime(s string) bool {
+	if len(s) != 5 || s[2] != ':' {
+		return false
+	}
+	for _, i := range []int{0, 1, 3, 4} {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	hh := int(s[0]-'0')*10 + int(s[1]-'0')
+	mm := int(s[3]-'0')*10 + int(s[4]-'0')
+	return hh <= 23 && mm <= 59
+}
+
+// stripAndValidateImportInIPList strips :port per item of a tunnel
+// in_ip list and drops items that are still not valid node addresses
+// after stripping (PORT-CLOSURE F-07(iii)): a double-port item is a
+// no-op for a single strip and must not land in the DB. Returns the
+// cleaned list and the number of dropped items. Empty items are
+// preserved as-is (R32-L4-E02 shape rule).
+func stripAndValidateImportInIPList(value string) (string, int) {
+	parts := strings.Split(value, ",")
+	kept := parts[:0]
+	dropped := 0
+	for _, part := range parts {
+		stripped := stripIngressHostPort(part)
+		if stripped != "" && !validImportNodeAddress(stripped) {
+			dropped++
+			continue
+		}
+		kept = append(kept, stripped)
+	}
+	return strings.Join(kept, ","), dropped
+}
+
+// validImportMonitorTarget is the format layer of the create/update
+// monitor Target gates (PORT-CLOSURE F-08), mirrored repo-side:
+// tcp must be exactly one host:port (double-port / portless
+// rejected, port 1-65535); icmp must be a bare host — a value
+// containing ":" that is not a valid IP literal is rejected (the
+// PC-09 gate: bracketed IPv6 and bare IPv6 literals pass). L1-F-05:
+// both forms additionally reject empty-label hostnames at the format
+// layer. Unknown types get no new gate. The SSRF hard-deny layer (LookupIP /
+// netguard) stays on the create/update surface; restore does no DNS
+// resolution.
+func validImportMonitorTarget(typ, target string) bool {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(typ)) {
+	case "tcp":
+		host, port, err := net.SplitHostPort(target)
+		if err != nil || strings.TrimSpace(host) == "" {
+			return false
+		}
+		// L1-F-05: 空标签在任何 DNS 下都不可解析，格式层即拒；
+		// 恢复面不做 DNS 解析的口径不变。
+		if kernel.HasEmptyLabel(host) {
+			return false
+		}
+		p, err := strconv.Atoi(port)
+		return err == nil && p >= 1 && p <= 65535
+	case "icmp":
+		host := target
+		if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+			host = host[1 : len(host)-1]
+		}
+		if net.ParseIP(host) != nil {
+			return true
+		}
+		// L1-F-05: 同 tcp 面，空标签格式层即拒。
+		if kernel.HasEmptyLabel(host) {
+			return false
+		}
+		return !strings.Contains(host, ":")
+	default:
+		return true
+	}
+}
+
+// ─── 复扫空标签 helper（fix/final-resweep）─────────────────────────
+// repo 层不能 import handler，故此处镜像 handler 侧的空标签谓词
+// （validateNoEmptyLabelAddr / validateNoEmptyLabelURLHost），只做
+// 语法层 HasEmptyLabel 判定、不做 DNS 解析。恢复面专用。
+
+// addrHostHasEmptyLabel 报告单个地址（裸主机或 host:port）的 host 段
+// 是否含空标签；IP 字面量无空标签。
+func addrHostHasEmptyLabel(addr string) bool {
+	addr = strings.TrimSpace(addr)
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		addr = h
+	}
+	return kernel.HasEmptyLabel(addr)
+}
+
+// addrsHaveEmptyLabel 报告逗号/换行分隔的多目标地址中是否有任一 host
+// 含空标签（转发 RemoteAddr 形态）。
+func addrsHaveEmptyLabel(addr string) bool {
+	for _, part := range strings.FieldsFunc(addr, func(r rune) bool {
+		return r == ',' || r == '\n' || r == '\r'
+	}) {
+		if addrHostHasEmptyLabel(strings.TrimSpace(part)) {
+			return true
+		}
+	}
+	return false
+}
+
+// remoteAddrHasNoTargets 镜像 handler 侧零有效目标判
+// （validateRemoteAddrHasTargets）。R8-07（H-F3-02）：恢复面此前
+// 只有空标签判，修复前版本落库的零目标行（如 ",,,"）可随备份迁
+// 移绕过写面新门逐字重入——importForwards 以本判与写面同口径逐
+// 行跳过 + warning。R9-09（I-F3-01）起与写面同为「归一后有效段
+// 集」口径：逐段按下方的镜像归一（剥 scheme、首个 /?# 截断）折
+// 算，归一后无实质内容的段不计；全部段均无效才判零目标。纯
+// Unicode 格式符（Cf）段不计入有效段，与写面 I-F3-03 裁定同字
+// 落定（见 repoRemotePartHasEffectiveTarget）。
+func remoteAddrHasNoTargets(addr string) bool {
+	for _, part := range strings.FieldsFunc(addr, func(r rune) bool {
+		return r == ',' || r == '\n' || r == '\r'
+	}) {
+		if repoRemotePartHasEffectiveTarget(part) {
+			return false
+		}
+	}
+	return true
+}
+
+// repoRemotePartHasEffectiveTarget 镜像 handler 侧
+// remotePartHasEffectiveTarget / remoteNormalizedTargetEffective
+// （security_utils.go，R9-09 单一定义点）：归一后的值须含至少一
+// 个既非空白、亦非 Unicode 格式符（Cf）的字符。纯 Cf 段不计入
+// 有效段系 I-F3-03 的同批裁定，与 R8-01 主题值轴先例同口径（纯
+// 格式符内容不构成有效内容）；repo 包不反向依赖 handler 包，故
+// 在此逐行镜像，双边钉格表对齐。
+func repoRemotePartHasEffectiveTarget(part string) bool {
+	normalized := repoNormalizeRemoteAddrInput(part)
+	for _, r := range normalized {
+		if unicode.Is(unicode.Cf, r) || unicode.IsSpace(r) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// validateImportedRealmForwardStrategy 镜像 handler 侧 realm 策略
+// 门（validateRealmForwardStrategy，A4-004/BC-26）：realm 隧道＋
+// 有效目标 ≥2＋策略 ∉ {round, hash} 时该行不得落库——realm 渲染对
+// 非 hash 多目标一律 roundrobin，落库即 BC-26 明禁的静默改写。
+// repo 不能 import handler，故以同谓词本地镜像：有效目标计数走
+// repoRemotePartHasEffectiveTarget（与写面 remotePartHasEffective-
+// Target 双边钉格对齐，见 remoteAddrHasNoTargets 注）；错误文案与
+// 写面逐字一致。空标签半句不在此重复：importForwards 已对全部行
+// 以 addrsHaveEmptyLabel 先行逐行跳过（覆盖面严于写面仅 realm 判）。
+// 策略合法集本身不镜像——写面与恢复面共用 kernel.ForwardStrategyLegal
+// 单点判。
+func validateImportedRealmForwardStrategy(engine, remoteAddr, strategy string) error {
+	if engine != kernel.TypeRealm {
+		return nil
+	}
+	switch strings.TrimSpace(strategy) {
+	case "", "round", "hash":
+		return nil
+	}
+	effectiveTargets := 0
+	for _, part := range strings.FieldsFunc(remoteAddr, func(r rune) bool {
+		return r == ',' || r == '\n' || r == '\r'
+	}) {
+		if repoRemotePartHasEffectiveTarget(part) {
+			effectiveTargets++
+		}
+	}
+	if effectiveTargets < 2 {
+		return nil
+	}
+	return fmt.Errorf("realm 引擎仅支持轮询（round）与 IP 哈希（hash）负载策略，多目标转发不能使用 %s 策略", strings.TrimSpace(strategy))
+}
+
+// ─── 写面门×恢复面镜像普查补门（R1-03-M2/L3）────────────────
+// repo 不能 import handler，段数帽/目标端口格式/节点规格三判在此
+// 以镜像谓词与写面双边对齐（同 remoteAddrHasNoTargets 的镜像
+// 纪律）：判定口径逐格同写面，错误文案同形。
+
+// maxImportRemoteAddrSegments 镜像 handler 侧段数帽
+// maxRemoteAddrSegments（security_utils.go）：切分＋去空段后计数。
+const maxImportRemoteAddrSegments = 100
+
+// importRemoteAddrSegmentCount 镜像 handler splitRemoteParts 的
+// 计数口径：逗号/换行切分、TrimSpace、去空段。
+func importRemoteAddrSegmentCount(addr string) int {
+	n := 0
+	for _, part := range strings.FieldsFunc(addr, func(r rune) bool {
+		return r == ',' || r == '\n' || r == '\r'
+	}) {
+		if strings.TrimSpace(part) != "" {
+			n++
+		}
+	}
+	return n
+}
+
+// validateImportRemoteAddrPorts 逐行镜像 handler 侧
+// validateRemoteAddrPorts（F2-F1-02）：逐段按 repoNormalize-
+// RemoteAddrInput 归一后取 SplitHostPort 端口段，在场时须为
+// 1-65535 的数字端口；裸主机与不可切分形态不在此判（与写面同
+// 职责边界）。
+func validateImportRemoteAddrPorts(addr string) error {
+	for _, part := range strings.FieldsFunc(addr, func(r rune) bool {
+		return r == ',' || r == '\n' || r == '\r'
+	}) {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		normalized := repoNormalizeRemoteAddrInput(part)
+		if normalized == "" {
+			continue
+		}
+		_, port, err := net.SplitHostPort(normalized)
+		if err != nil {
+			continue
+		}
+		if !importIsDecimalPort(port) {
+			return fmt.Errorf("目标地址 %q 的端口 %q 无效（须为 1-65535 的数字端口）", part, port)
+		}
+	}
+	return nil
+}
+
+// importIsDecimalPort 镜像 handler 侧 isDecimalPort：纯数字且
+// 1-65535。
+func importIsDecimalPort(s string) bool {
+	if s == "" || len(s) > 5 {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	n, err := strconv.Atoi(s)
+	return err == nil && n >= 1 && n <= 65535
+}
+
+// importPortInNodeSpec 是恢复面的节点端口范围判（R1-03-M2）：
+// 与写面 validateLocalNodePort 同口径——按 node.Port 规格的集合
+// 语义（逗号多段、段间空隙不放行；规格空=不限；规格不可解析时
+// 宽松放行；可解析但钳制后为空集且含数字时全拒，E-01 口径）。
+// 不做全量展开、逐段区间成员判。
+func importPortInNodeSpec(node *model.Node, port int) bool {
+	if node == nil || port <= 0 {
+		return true
+	}
+	spec := strings.TrimSpace(node.Port)
+	if spec == "" {
+		return true
+	}
+	contains, malformed := importPortSpecContains(spec, port)
+	if malformed {
+		return true
+	}
+	return contains
+}
+
+// importPortSpecContains 是 node.Port 规格的成员判（不展开）：
+// 解析口径与 handler parsePorts 逐格一致（段格式非法→
+// malformed；越界段丢弃、区间钳到 1-65535）。钳制后无任何有效
+// 段时：含数字按 E-01 口径全拒（contains=false）、无数字的垃
+// 圾规格宽松放行（contains=true）。
+func importPortSpecContains(spec string, port int) (contains bool, malformed bool) {
+	anyValid := false
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if strings.Contains(part, "-") {
+			rangeParts := strings.Split(part, "-")
+			if len(rangeParts) != 2 {
+				return false, true
+			}
+			start, err1 := strconv.Atoi(strings.TrimSpace(rangeParts[0]))
+			end, err2 := strconv.Atoi(strings.TrimSpace(rangeParts[1]))
+			if err1 != nil || err2 != nil || start > end {
+				return false, true
+			}
+			if start > 65535 || end < 1 {
+				continue
+			}
+			if start < 1 {
+				start = 1
+			}
+			if end > 65535 {
+				end = 65535
+			}
+			anyValid = true
+			if port >= start && port <= end {
+				contains = true
+			}
+			continue
+		}
+		p, err := strconv.Atoi(part)
+		if err != nil {
+			return false, true
+		}
+		if p < 1 || p > 65535 {
+			continue
+		}
+		anyValid = true
+		if p == port {
+			contains = true
+		}
+	}
+	if !anyValid {
+		return !strings.ContainsAny(spec, "0123456789"), false
+	}
+	return contains, false
+}
+
+// repoNormalizeRemoteAddrInput 逐行镜像 handler 侧
+// normalizeServerAddressInput（control_plane.go）：TrimSpace 后，
+// 含 "://" 时优先取 URL 的 Host（无 Host 则截去 scheme 前缀），
+// 再在首个 /、?、# 处截断。
+func repoNormalizeRemoteAddrInput(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return s
+	}
+	if idx := strings.Index(s, "://"); idx > 0 {
+		if parsed, err := url.Parse(s); err == nil {
+			if host := strings.TrimSpace(parsed.Host); host != "" {
+				return host
+			}
+		}
+		s = s[idx+3:]
+	}
+	if idx := strings.IndexAny(s, "/?#"); idx >= 0 {
+		s = s[:idx]
+	}
+	return strings.TrimSpace(s)
+}
+
+// urlHostHasEmptyLabel 报告 URL 的 host 段是否含空标签；解析失败或
+// 无 host 时返回 false（不在此判，由调用面已有的结构校验处理）。
+func urlHostHasEmptyLabel(rawURL string) bool {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return false
+	}
+	return kernel.HasEmptyLabel(u.Hostname())
+}
+
+// configValueHasEmptyLabelHost 报告主机名类配置键的值是否含空标签
+// （恢复面与保存面 normalizeAndValidateConfigValue 同口径）。
+func configValueHasEmptyLabelHost(name, value string) bool {
+	switch strings.TrimSpace(name) {
+	case "panel_domain":
+		return kernel.HasEmptyLabel(strings.TrimSpace(value))
+	case "ip":
+		return addrsHaveEmptyLabel(strings.TrimSpace(value))
+	case "github_proxy_url", "notify_webhook_url", "notify_telegram_api_base":
+		// X-04 镜像同步：保存面新增 notify_telegram_api_base 后恢复面
+		// 同口径补齐。当前该键在 sensitiveConfigKeys 中、FilterBackupConfigs
+		// 在 importConfigs 之前已滤除，故恢复面本就触不到此 case；补齐只
+		// 为守住“恢复面与保存面同口径”的不变量，防过滤口径日后变化重开缺口。
+		return urlHostHasEmptyLabel(value)
+	default:
+		return false
+	}
+}
+
+// latencyTargetBackup mirrors the save-side latencyTarget shape
+// (handler/node_latency.go) for restore-side validation only.
+type latencyTargetBackup struct {
+	Name    string `json:"name"`
+	Host    string `json:"host"`
+	Port    int    `json:"port"`
+	Enabled bool   `json:"enabled"`
+	Pinned  bool   `json:"pinned,omitempty"`
+}
+
+// validateLatencyTargetsConfigValue mirrors the format layer of the
+// save-side handler.normalizeLatencyTargetsConfig / parseLatencyTargets
+// (node_latency.go) for restore: JSON shape, name rules, count/pinned
+// caps, host grammar and port range. Restore does no DNS resolution
+// (same rule as validImportMonitorTarget above); literal IPs get the
+// full deterministic policy verdict via validLatencyTargetHost
+// (netguard PolicyHardDenyOrLoopback, same as the save side — R2-H-01
+// closed the gap where only loopback/unspecified literals were
+// rejected). A value failing here must be skipped with a warning by
+// importConfigs, not stored: latencyPool fails to parse a bad stored
+// value and returns an empty pool, silently stopping all node
+// latency/route measurements (H-171-01). The two copies are locked
+// to the same verdicts by TestR171B5ValidateLatencyTargets-
+// ConfigValue (repo) and TestR171B5LatencyTargetsSaveSideCorpus
+// (handler) over a shared corpus.
+func validateLatencyTargetsConfigValue(raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var targets []latencyTargetBackup
+	if err := json.Unmarshal([]byte(raw), &targets); err != nil {
+		return errors.New("测试点格式无效")
+	}
+	// Caps mirror handler.maxLatencyTargets / maxPinnedLatencyTargets /
+	// maxLatencyTargetName (30 / 3 / 20).
+	if len(targets) > 30 {
+		return fmt.Errorf("测试点最多 %d 个", 30)
+	}
+	names := make(map[string]bool, len(targets))
+	pinned := 0
+	for i := range targets {
+		t := &targets[i]
+		t.Name = strings.TrimSpace(t.Name)
+		if t.Name == "" || len([]rune(t.Name)) > 20 {
+			return fmt.Errorf("测试点名称不能为空且不超过 %d 字", 20)
+		}
+		if names[t.Name] {
+			return fmt.Errorf("测试点名称重复：%s", t.Name)
+		}
+		names[t.Name] = true
+		if err := validateLatencyTargetHostPort(t.Host, t.Port); err != nil {
+			return fmt.Errorf("测试点 %s：地址无效", t.Name)
+		}
+		if t.Pinned {
+			pinned++
+		}
+	}
+	if pinned > 3 {
+		return fmt.Errorf("卡片最多固定显示 %d 个测试点", 3)
+	}
+	return nil
+}
+
+// brandAssetDataURLPrefix / maxBrandAssetDataURLBytes mirror the
+// save-side handler.normalizeAndValidateConfigValue app_logo /
+// app_favicon branch (handler.go): PNG data URL prefix + 1MiB cap.
+// R2-H-02: restore must reuse the same rule — an oversize or
+// non-PNG value must be skipped with a warning by importConfigs,
+// not stored (a 2MiB illegal value previously landed with zero
+// warning and the brand image silently fell back to the default
+// icon). Empty values pass through unchanged (same as the save side
+// returning "" for empty, which the handler then treats as clear).
+const (
+	brandAssetDataURLPrefix   = "data:image/png;base64,"
+	maxBrandAssetDataURLBytes = 1024 * 1024
+)
+
+// validateBrandAssetConfigValue mirrors the save-side brand-asset
+// rule for restore: non-empty values must be a PNG data URL within
+// 1MiB with valid base64 payload.
+func validateBrandAssetConfigValue(raw string) error {
+	normalized := strings.TrimSpace(raw)
+	if normalized == "" {
+		return nil
+	}
+	if !strings.HasPrefix(normalized, brandAssetDataURLPrefix) {
+		return errors.New("品牌图片必须通过上传生成 PNG 数据")
+	}
+	if len(normalized) > maxBrandAssetDataURLBytes {
+		return errors.New("品牌图片过大，请上传更小图片")
+	}
+	payload := strings.TrimSpace(strings.TrimPrefix(normalized, brandAssetDataURLPrefix))
+	if payload == "" {
+		return errors.New("品牌图片数据不能为空")
+	}
+	if _, err := base64.StdEncoding.DecodeString(payload); err != nil {
+		return errors.New("品牌图片数据格式无效")
+	}
+	return nil
+}
+
+// ─── C-F5-01（LEDGER3）：配置键 ip 的恢复面地址语法门 ──────────
+// repo 层不能 import handler，故此处镜像保存面 ip 分支的第二段谓词
+// handler.validatePanelInstallAddr → handler.IsValidNodeAddress
+// （第一段空标签判已由 configValueHasEmptyLabelHost 镜像覆盖）。
+// 此前恢复面只有空标签谓词：含空格/下划线/双端口/分号等保存面必拒
+// 形态经备份导入原样落库，违 B14-002「恢复面与保存面同口径」。
+// 两份实现以同源语料锁定：handler 侧 TestF3DConfigIPSaveSideCorpus
+// 与本包 TestF3DValidatePanelInstallAddrRestoreCorpus 逐条同 verdict。
+
+// validatePanelInstallAddrForRestore mirrors handler.
+// validatePanelInstallAddr: trim, empty passes (clearable), one
+// optional scheme prefix is stripped, the remainder must be a valid
+// bare host/IP or single host:port.
+func validatePanelInstallAddrForRestore(panelAddr string) error {
+	raw := strings.TrimSpace(panelAddr)
+	if raw == "" {
+		return nil
+	}
+	if idx := strings.Index(raw, "://"); idx > 0 {
+		raw = raw[idx+3:]
+	}
+	return isValidNodeAddressForRestore(raw)
+}
+
+// isValidNodeAddressForRestore mirrors handler.IsValidNodeAddress
+// step for step: no scheme/path/query, no structural characters
+// (kernel.HostHasStructuralChars, already shared), address charset
+// (letters, digits, hyphen, dot, colon, brackets, % zone id), IP
+// literals pass via netip, host:port port must be numeric 1-65535,
+// hostname must not carry an empty label, and an all-numeric dotted
+// host must parse as IPv4. Like the save side it does no DNS
+// resolution and no IP policy: loopback/RFC1918 storable-ness is
+// unchanged.
+func isValidNodeAddressForRestore(addr string) error {
+	addr = strings.TrimSpace(addr)
+	if strings.Contains(addr, "://") {
+		return fmt.Errorf("address must not contain scheme (e.g. http://)")
+	}
+	if strings.ContainsAny(addr, "/?") {
+		return fmt.Errorf("address must not contain path or query parameters")
+	}
+	if kernel.HostHasStructuralChars(addr) {
+		return fmt.Errorf("address must not contain @, #, commas, whitespace or control characters")
+	}
+	if !isNodeAddressCharset(addr) {
+		return fmt.Errorf("address must contain only letters, digits, hyphens, dots, colons, brackets or %% (IPv6 zone id)")
+	}
+	if _, err := netip.ParseAddr(addr); err == nil {
+		return nil
+	}
+	host := addr
+	port := ""
+	hasPort := false
+	if h, p, err := net.SplitHostPort(addr); err == nil {
+		host, port, hasPort = h, p, true
+	} else if !strings.Contains(err.Error(), "missing port in address") {
+		return fmt.Errorf("invalid address format")
+	}
+	if hasPort {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return fmt.Errorf("address port must be a number between 1 and 65535")
+		}
+	}
+	if kernel.HasEmptyLabel(host) {
+		return fmt.Errorf("address contains an empty DNS label (e.g. \"a..b\")")
+	}
+	if isAllNumericDottedHost(host) {
+		if _, err := netip.ParseAddr(host); err != nil {
+			return fmt.Errorf("invalid IPv4 address")
+		}
+	}
+	return nil
+}
+
+// isNodeAddressCharset mirrors handler.isAddressCharset (R3 B04-001).
+func isNodeAddressCharset(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '-' || c == '.' || c == ':' || c == '[' || c == ']' || c == '%':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// isAllNumericDottedHost mirrors handler.isAllNumericDottedHost.
+func isAllNumericDottedHost(host string) bool {
+	if !strings.Contains(host, ".") {
+		return false
+	}
+	for _, r := range host {
+		if (r < '0' || r > '9') && r != '.' {
+			return false
+		}
+	}
+	return true
+}
+
+// validateLatencyTargetHostPort mirrors the format layer of
+// handler.normalizeTunnelProbeTarget: empty host, port range, and the
+// host grammar of normalizeTunnelProbeTargetHost.
+func validateLatencyTargetHostPort(host string, port int) error {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return errors.New("测试目标 Host 不能为空")
+	}
+	if port <= 0 || port > 65535 {
+		return errors.New("测试目标端口必须是 1-65535")
+	}
+	if strings.Contains(host, "://") || strings.ContainsAny(host, "/?#") || strings.ContainsAny(host, " \t\r\n") || isLatencyTargetSchemeLikeHost(host) {
+		return errors.New("测试目标 Host 不能包含协议或路径")
+	}
+	if !validLatencyTargetHost(host) {
+		return errors.New("测试目标 Host 格式无效")
+	}
+	return nil
+}
+
+// validLatencyTargetHost mirrors handler.normalizeTunnelProbeTargetHost
+// + isValidTunnelProbeTargetHost, plus the deterministic part of the
+// save-side host policy (netguard PolicyHardDenyOrLoopback on literal
+// IPs: hard-deny metadata set, loopback, unspecified, reserved,
+// multicast and link-local — the same verdict the save side gives via
+// validateTunnelProbeTargetHostPolicy). Restore does no DNS resolution
+// (same rule as validImportMonitorTarget above), so hostname verdicts
+// stay format-only; only literal IPs get the policy verdict, which
+// needs no lookup. R2-H-01: the previous version only rejected
+// loopback/unspecified literals, so 13 policy-denied literals
+// (169.254.169.254, 100.100.100.200, fe80::1, 224.0.0.1, 198.18/15,
+// 240/4, 0.0.0.0/8, 4-in-6 metadata, fd00:ec2::254, 64:ff9b:1::/48)
+// landed in the store and poisoned the whole pool at read time.
+func validLatencyTargetHost(host string) bool {
+	if strings.HasPrefix(host, "[") || strings.HasSuffix(host, "]") {
+		if !strings.HasPrefix(host, "[") || !strings.HasSuffix(host, "]") {
+			return false
+		}
+		inner := host[1 : len(host)-1]
+		addr, err := netip.ParseAddr(inner)
+		if err != nil || !addr.Is6() {
+			return false
+		}
+		return netguard.JudgeAddr(addr, netguard.PolicyHardDenyOrLoopback, false).Allowed
+	}
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return netguard.JudgeAddr(addr, netguard.PolicyHardDenyOrLoopback, false).Allowed
+	}
+	if strings.Contains(host, ":") || isLatencyTargetIPv4Like(host) {
+		return false
+	}
+	if lower := strings.ToLower(strings.TrimSuffix(host, ".")); lower == "localhost" || strings.HasSuffix(lower, ".localhost") ||
+		lower == "ip6-localhost" || lower == "ip6-loopback" || lower == "localhost.localdomain" {
+		return false
+	}
+	return isValidLatencyTargetHostname(host)
+}
+
+// isValidLatencyTargetHostname mirrors handler.isValidTunnelProbeTargetHost.
+func isValidLatencyTargetHostname(host string) bool {
+	if host == "" || len(host) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, r := range label {
+			if !latencyTargetIsASCIILetter(r) && !latencyTargetIsASCIIDigit(r) && r != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// isLatencyTargetIPv4Like mirrors handler.isTunnelProbeTargetIPv4Like.
+func isLatencyTargetIPv4Like(host string) bool {
+	if host == "" {
+		return false
+	}
+	for _, r := range host {
+		if !latencyTargetIsASCIIDigit(r) && r != '.' {
+			return false
+		}
+	}
+	return strings.Contains(host, ".")
+}
+
+// isLatencyTargetSchemeLikeHost mirrors handler.isTunnelProbeTargetSchemeLikeHost.
+func isLatencyTargetSchemeLikeHost(host string) bool {
+	if _, err := netip.ParseAddr(host); err == nil {
+		return false
+	}
+	colon := strings.IndexByte(host, ':')
+	if colon <= 0 {
+		return false
+	}
+	for i, r := range host[:colon] {
+		if i == 0 {
+			if !latencyTargetIsASCIILetter(r) {
+				return false
+			}
+			continue
+		}
+		if !latencyTargetIsASCIILetter(r) && !latencyTargetIsASCIIDigit(r) && r != '+' && r != '-' && r != '.' {
+			return false
+		}
+	}
+	return true
+}
+
+func latencyTargetIsASCIILetter(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
+}
+
+func latencyTargetIsASCIIDigit(r rune) bool {
+	return r >= '0' && r <= '9'
+}
+
+// parseImportedIPLiteral 镜像 handler.parseIPLiteral：trim 空白与
+// 引号后 net.ParseIP，失败再按 host:port 拆主机段，命中后统一
+// normalizeImportedIPAddress 规范形。
+func parseImportedIPLiteral(raw string) net.IP {
+	value := strings.Trim(strings.TrimSpace(raw), "\"")
+	if value == "" {
+		return nil
+	}
+	if ip := net.ParseIP(value); ip != nil {
+		return normalizeImportedIPAddress(ip)
+	}
+	host, _, err := net.SplitHostPort(value)
+	if err != nil {
+		return nil
+	}
+	host = strings.Trim(strings.TrimSpace(host), "[]")
+	if host == "" {
+		return nil
+	}
+	return normalizeImportedIPAddress(net.ParseIP(host))
+}
+
+func normalizeImportedIPAddress(ip net.IP) net.IP {
+	if ip == nil {
+		return nil
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return v4
+	}
+	return ip.To16()
+}
+
+func nullableString(v sql.NullString) interface{} {
+	if v.Valid {
+		return v.String
+	}
+	return nil
+}
+
+func nullableForwardIngress(v string) interface{} {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return nil
+	}
+	return v
+}
+
+func nullableInt64(v sql.NullInt64) interface{} {
+	if v.Valid {
+		return v.Int64
+	}
+	return nil
+}
+
+func unixMilliNow() int64 {
+	return time.Now().UnixMilli()
+}
+
+func ensureParentDir(dbPath string) error {
+	if dbPath == "" {
+		return fmt.Errorf("empty db path")
+	}
+	dir := filepath.Dir(dbPath)
+	if dir == "" || dir == "." {
+		return nil
+	}
+	return osMkdirAll(dir)
+}
+
+var osMkdirAll = func(path string) error {
+	return os.MkdirAll(path, 0o755)
+}
+
+// Suppress unused import warning for log
+var _ = log.Printf
+
+func (r *Repository) InsertNodeMetric(m *model.NodeMetric) error {
+	if r == nil || r.db == nil {
+		return nil
+	}
+	return r.db.Create(m).Error
+}
+
+func (r *Repository) InsertNodeMetricBatch(metrics []*model.NodeMetric) error {
+	if r == nil || r.db == nil || len(metrics) == 0 {
+		return nil
+	}
+	return r.db.CreateInBatches(metrics, 100).Error
+}
+
+func (r *Repository) GetNodeMetrics(nodeID int64, startMs, endMs int64) ([]model.NodeMetric, error) {
+	if r == nil || r.db == nil {
+		return nil, nil
+	}
+
+	rangeMs := endMs - startMs
+	const maxRawRangeMs = int64(60 * 60 * 1000) // 1 hour — return raw data for short ranges
+	const targetPoints = 500                    // target number of chart points for downsampled data
+
+	// For short ranges, return raw data (full resolution).
+	if rangeMs <= maxRawRangeMs {
+		var metrics []model.NodeMetric
+		err := r.db.Where("node_id = ? AND timestamp >= ? AND timestamp <= ?", nodeID, startMs, endMs).
+			Order("timestamp ASC").
+			Limit(5000).
+			Find(&metrics).Error
+		return metrics, err
+	}
+
+	// For longer ranges, downsample via SQL aggregation to keep the response small and fast.
+	bucketMs := rangeMs / targetPoints
+	if bucketMs < 1000 {
+		bucketMs = 1000 // minimum 1-second buckets
+	}
+
+	bucketExpr := fmt.Sprintf("(timestamp / %d * %d)", bucketMs, bucketMs)
+	groupExpr := fmt.Sprintf("timestamp / %d", bucketMs)
+
+	var metrics []model.NodeMetric
+	err := r.db.Model(&model.NodeMetric{}).
+		Select(
+			fmt.Sprintf(
+				"%d AS node_id, "+
+					"CAST(%s AS BIGINT) AS timestamp, "+
+					"AVG(cpu_usage) AS cpu_usage, "+
+					"AVG(mem_usage) AS mem_usage, "+
+					"AVG(disk_usage) AS disk_usage, "+
+					"CAST(AVG(net_in_bytes) AS BIGINT) AS net_in_bytes, "+
+					"CAST(AVG(net_out_bytes) AS BIGINT) AS net_out_bytes, "+
+					"CAST(AVG(net_in_speed) AS BIGINT) AS net_in_speed, "+
+					"CAST(AVG(net_out_speed) AS BIGINT) AS net_out_speed, "+
+					"AVG(load1) AS load1, "+
+					"AVG(load5) AS load5, "+
+					"AVG(load15) AS load15, "+
+					"CAST(AVG(tcp_conns) AS BIGINT) AS tcp_conns, "+
+					"CAST(AVG(udp_conns) AS BIGINT) AS udp_conns, "+
+					"CAST(MAX(uptime) AS BIGINT) AS uptime",
+				nodeID, bucketExpr,
+			),
+		).
+		Where("node_id = ? AND timestamp >= ? AND timestamp <= ?", nodeID, startMs, endMs).
+		Group(groupExpr).
+		Order("timestamp ASC").
+		Limit(targetPoints + 100). // safety margin
+		Scan(&metrics).Error
+
+	if metrics == nil {
+		metrics = make([]model.NodeMetric, 0)
+	}
+	return metrics, err
+}
+
+func (r *Repository) GetLatestNodeMetric(nodeID int64) (*model.NodeMetric, error) {
+	if r == nil || r.db == nil {
+		return nil, nil
+	}
+	var m model.NodeMetric
+	err := r.db.Where("node_id = ?", nodeID).Order("timestamp DESC").First(&m).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &m, nil
+}
+
+// LatestNodeMetricTimes returns each given node's latest NodeMetric
+// timestamp (UnixMilli) in one query; nodes without any metric row
+// are absent from the map (A-低-6: a missing key means "never
+// reported", which is stale by definition, not "zero traffic").
+func (r *Repository) LatestNodeMetricTimes(nodeIDs []int64) (map[int64]int64, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	out := make(map[int64]int64, len(nodeIDs))
+	if len(nodeIDs) == 0 {
+		return out, nil
+	}
+	type row struct {
+		NodeID int64 `gorm:"column:node_id"`
+		Latest int64 `gorm:"column:latest"`
+	}
+	var rows []row
+	for _, chunk := range chunkInt64IDs(nodeIDs) {
+		var part []row
+		if err := r.db.Table("node_metric").
+			Select("node_id, MAX(timestamp) AS latest").
+			Where("node_id IN ?", chunk).
+			Group("node_id").Scan(&part).Error; err != nil {
+			return nil, err
+		}
+		rows = append(rows, part...)
+	}
+	for _, row := range rows {
+		out[row.NodeID] = row.Latest
+	}
+	return out, nil
+}
+
+// pruneDeleteChunk 是指标类 prune 的单批删除行数（L3-03，
+// SWEEP-CPU）：与连接日志 prune 的 connlogDeleteChunk=1000 同口
+// 径。单条 DELETE 在停机追赶时一次可删百万行、长持 SQLite 写
+// 锁（MaxOpenConns(1)，全写串行）；分批删、每批一事务提交，
+// 中途崩溃后下次 prune 从剩余行续删，不丢不重。
+const pruneDeleteChunk = 1000
+
+// deleteRowsInBatches 按 whereClause 分批删表：每批最多
+// pruneDeleteChunk 行、各自提交；删满一批继续、不足一批即
+// 删净返回。table 与 whereClause 只取调用方传入的模型表名与
+// 内部常量条件，不含任何外部输入。
+func (r *Repository) deleteRowsInBatches(table, whereClause string, args ...interface{}) error {
+	for {
+		res := r.db.Exec(
+			"DELETE FROM "+table+" WHERE id IN (SELECT id FROM "+table+" WHERE "+whereClause+" LIMIT ?)",
+			append(args, pruneDeleteChunk)...)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected < pruneDeleteChunk {
+			return nil
+		}
+	}
+}
+
+func (r *Repository) PruneNodeMetrics(olderThanMs int64) error {
+	if r == nil || r.db == nil {
+		return nil
+	}
+	return r.deleteRowsInBatches((&model.NodeMetric{}).TableName(), "timestamp < ?", olderThanMs)
+}
+
+// AddNodeTraffic adds hourly node NIC traffic deltas to the rows,
+// creating the (node_id, hour) bucket on first write.
+func (r *Repository) AddNodeTraffic(rows []model.NodeTraffic) error {
+	if r == nil || r.db == nil || len(rows) == 0 {
+		return nil
+	}
+	return r.db.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "node_id"}, {Name: "hour"}},
+		DoUpdates: clause.Assignments(map[string]interface{}{
+			"in_bytes":  saturatingExcludedAddExpr("node_traffic", "in_bytes"),
+			"out_bytes": saturatingExcludedAddExpr("node_traffic", "out_bytes"),
+		}),
+	}).Create(&rows).Error
+}
+
+// NodeTrafficSince sums each node's NIC traffic from fromMs on.
+// Values are [in, out] whole-machine NIC bytes — not tunnel billing.
+//
+// Buckets are UTC-hour aligned, so a fromMs in a non-whole-hour viewer
+// zone falls inside the first bucket: that bucket contributes only its
+// post-fromMs share, prorated by minutes the way the subscription side
+// splits straddling buckets (BC-12) — the counted segment is the row's
+// last segment and takes the remainder after the excluded share is
+// floored. Whole-hour zones align exactly and are summed as before.
+func (r *Repository) NodeTrafficSince(fromMs int64) (map[int64][2]int64, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	const hourMs = int64(time.Hour / time.Millisecond)
+	bucketStart := fromMs - ((fromMs%hourMs)+hourMs)%hourMs
+	fullFrom := bucketStart
+	if fromMs > bucketStart {
+		fullFrom = bucketStart + hourMs
+	}
+	// SQL SUM can overflow before its result reaches Go. Stream the
+	// retained hours and saturate per node, matching ingest and charts.
+	rows, err := r.db.Model(&model.NodeTraffic{}).Select("node_id", "in_bytes", "out_bytes").
+		Where("hour >= ?", fullFrom).Rows()
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[int64][2]int64)
+	for rows.Next() {
+		var nodeID, inBytes, outBytes int64
+		if err := rows.Scan(&nodeID, &inBytes, &outBytes); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		cur := out[nodeID]
+		cur[0] = saturatingAddInt64(cur[0], inBytes)
+		cur[1] = saturatingAddInt64(cur[1], outBytes)
+		out[nodeID] = cur
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	// Release SQLite's sole connection before reading the boundary hour.
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if fromMs > bucketStart {
+		var boundary []model.NodeTraffic
+		if err := r.db.Where("hour = ?", bucketStart).Find(&boundary).Error; err != nil {
+			return nil, err
+		}
+		pre := fromMs - bucketStart
+		for _, b := range boundary {
+			cur := out[b.NodeID]
+			cur[0] = saturatingAddInt64(cur[0], b.InBytes-mulDivSaturating(b.InBytes, pre, hourMs))
+			cur[1] = saturatingAddInt64(cur[1], b.OutBytes-mulDivSaturating(b.OutBytes, pre, hourMs))
+			out[b.NodeID] = cur
+		}
+	}
+	return out, nil
+}
+
+// NodeTrafficLastHour returns, per node id, the newest hourly bucket
+// (ms) present in node_traffic — the freshness source for the node
+// month-traffic numbers (D-06). node_traffic has no updated_time
+// column, so the newest bucket hour is the closest available signal;
+// a node whose newest bucket is hours old is reporting stale data.
+func (r *Repository) NodeTrafficLastHour() (map[int64]int64, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	var rows []struct {
+		NodeID   int64
+		LastHour int64
+	}
+	if err := r.db.Model(&model.NodeTraffic{}).
+		Select("node_id, MAX(hour) AS last_hour").
+		Group("node_id").Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	out := make(map[int64]int64, len(rows))
+	for _, row := range rows {
+		out[row.NodeID] = row.LastHour
+	}
+	return out, nil
+}
+
+// PruneNodeTraffic drops the hourly buckets before beforeMs.
+func (r *Repository) PruneNodeTraffic(beforeMs int64) error {
+	if r == nil || r.db == nil {
+		return nil
+	}
+	return r.deleteRowsInBatches((&model.NodeTraffic{}).TableName(), "hour < ?", beforeMs)
+}
+
+func (r *Repository) InsertTunnelMetric(m *model.TunnelMetric) error {
+	if r == nil || r.db == nil {
+		return nil
+	}
+	return r.db.Create(m).Error
+}
+
+func (r *Repository) InsertTunnelMetricBatch(metrics []*model.TunnelMetric) error {
+	if r == nil || r.db == nil || len(metrics) == 0 {
+		return nil
+	}
+	return r.db.CreateInBatches(metrics, 100).Error
+}
+
+// UpsertTunnelMetricBuckets adds the provided metric deltas into per-minute buckets.
+// Requires a unique index on (tunnel_id, node_id, timestamp) for safe upserts.
+func (r *Repository) UpsertTunnelMetricBuckets(metrics []*model.TunnelMetric) error {
+	if r == nil || r.db == nil || len(metrics) == 0 {
+		return nil
+	}
+
+	// Postgres rejects a single INSERT ... ON CONFLICT when the input contains
+	// duplicate conflict keys. Pre-aggregate within this batch to keep inserts safe.
+	type bucketKey struct {
+		tunnelID  int64
+		nodeID    int64
+		timestamp int64
+	}
+
+	agg := make(map[bucketKey]*model.TunnelMetric, len(metrics))
+	for _, m := range metrics {
+		if m == nil {
+			continue
+		}
+		if m.TunnelID <= 0 || m.NodeID <= 0 || m.Timestamp <= 0 {
+			continue
+		}
+		if m.BytesIn == 0 && m.BytesOut == 0 && m.Connections == 0 && m.Errors == 0 {
+			continue
+		}
+
+		k := bucketKey{tunnelID: m.TunnelID, nodeID: m.NodeID, timestamp: m.Timestamp}
+		if existing, ok := agg[k]; ok {
+			existing.BytesIn = saturatingAddInt64(existing.BytesIn, m.BytesIn)
+			existing.BytesOut = saturatingAddInt64(existing.BytesOut, m.BytesOut)
+			existing.Connections = saturatingAddInt64(existing.Connections, m.Connections)
+			existing.Errors = saturatingAddInt64(existing.Errors, m.Errors)
+			if existing.AvgLatencyMs == 0 && m.AvgLatencyMs != 0 {
+				existing.AvgLatencyMs = m.AvgLatencyMs
+			}
+			continue
+		}
+		cp := *m
+		agg[k] = &cp
+	}
+	if len(agg) == 0 {
+		return nil
+	}
+
+	rows := make([]*model.TunnelMetric, 0, len(agg))
+	for _, v := range agg {
+		rows = append(rows, v)
+	}
+
+	return r.db.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "tunnel_id"}, {Name: "node_id"}, {Name: "timestamp"}},
+		DoUpdates: clause.Assignments(map[string]interface{}{
+			"bytes_in":    saturatingExcludedAddExpr("tunnel_metric", "bytes_in"),
+			"bytes_out":   saturatingExcludedAddExpr("tunnel_metric", "bytes_out"),
+			"connections": saturatingExcludedAddExpr("tunnel_metric", "connections"),
+			"errors":      saturatingExcludedAddExpr("tunnel_metric", "errors"),
+			// avg_latency_ms is not additive; keep the existing bucket value.
+		}),
+	}).CreateInBatches(rows, 100).Error
+}
+
+func (r *Repository) GetTunnelMetrics(tunnelID int64, startMs, endMs int64) ([]model.TunnelMetric, error) {
+	if r == nil || r.db == nil {
+		return nil, nil
+	}
+	var metrics []model.TunnelMetric
+	err := r.db.Where("tunnel_id = ? AND timestamp >= ? AND timestamp <= ?", tunnelID, startMs, endMs).
+		Order("timestamp DESC").
+		Limit(5000).
+		Find(&metrics).Error
+	if len(metrics) > 1 {
+		for i, j := 0, len(metrics)-1; i < j; i, j = i+1, j-1 {
+			metrics[i], metrics[j] = metrics[j], metrics[i]
+		}
+	}
+	return metrics, err
+}
+
+// GetTunnelMetricsAggregated returns tunnel-level aggregated series (one point per timestamp).
+// Storage remains per (tunnel_id, node_id, timestamp) for future drill-down.
+func (r *Repository) GetTunnelMetricsAggregated(tunnelID int64, startMs, endMs int64) ([]model.TunnelMetric, error) {
+	if r == nil || r.db == nil {
+		return nil, nil
+	}
+
+	var metrics []model.TunnelMetric
+	err := r.db.Model(&model.TunnelMetric{}).
+		Select(
+			"tunnel_id, 0 AS node_id, timestamp, "+
+				"SUM(bytes_in) AS bytes_in, "+
+				"SUM(bytes_out) AS bytes_out, "+
+				"SUM(connections) AS connections, "+
+				"SUM(errors) AS errors, "+
+				"AVG(avg_latency_ms) AS avg_latency_ms",
+		).
+		Where("tunnel_id = ? AND timestamp >= ? AND timestamp <= ?", tunnelID, startMs, endMs).
+		Group("tunnel_id, timestamp").
+		Order("timestamp ASC").
+		Limit(5000).
+		Scan(&metrics).Error
+	if metrics == nil {
+		metrics = make([]model.TunnelMetric, 0)
+	}
+	return metrics, err
+}
+
+func (r *Repository) PruneTunnelMetrics(olderThanMs int64) error {
+	if r == nil || r.db == nil {
+		return nil
+	}
+	return r.deleteRowsInBatches((&model.TunnelMetric{}).TableName(), "timestamp < ?", olderThanMs)
+}
+
+func (r *Repository) ListServiceMonitors() ([]model.ServiceMonitor, error) {
+	if r == nil || r.db == nil {
+		return nil, nil
+	}
+	var monitors []model.ServiceMonitor
+	err := r.db.Order("id ASC").Find(&monitors).Error
+	return monitors, err
+}
+
+func (r *Repository) ListEnabledServiceMonitors() ([]model.ServiceMonitor, error) {
+	if r == nil || r.db == nil {
+		return nil, nil
+	}
+	var monitors []model.ServiceMonitor
+	err := r.db.Where("enabled = 1 AND type IN (?)", []string{"tcp", "icmp"}).Order("id ASC").Find(&monitors).Error
+	return monitors, err
+}
+
+func (r *Repository) GetServiceMonitor(id int64) (*model.ServiceMonitor, error) {
+	if r == nil || r.db == nil {
+		return nil, nil
+	}
+	var m model.ServiceMonitor
+	err := r.db.First(&m, id).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &m, nil
+}
+
+func (r *Repository) CreateServiceMonitor(m *model.ServiceMonitor) error {
+	if r == nil || r.db == nil {
+		return nil
+	}
+	// A2-03（零值家族）：ServiceMonitor.Enabled 带 `default:1`，以停用
+	// 状态创建的监控会被 Create 吞掉 0、落库为 1 并立即开始探测。
+	// 仿 CreateNodeInbound（BUG-A4-1）留意图、创建后写回。
+	wantEnabled := m.Enabled
+	if err := r.db.Create(m).Error; err != nil {
+		return err
+	}
+	if wantEnabled == 0 {
+		if err := r.db.Model(&model.ServiceMonitor{}).Where("id = ?", m.ID).Update("enabled", 0).Error; err != nil {
+			return err
+		}
+		m.Enabled = 0
+	}
+	return nil
+}
+
+func (r *Repository) UpdateServiceMonitor(m *model.ServiceMonitor) error {
+	if r == nil || r.db == nil {
+		return nil
+	}
+	return r.db.Save(m).Error
+}
+
+func (r *Repository) DeleteServiceMonitor(id int64) error {
+	if r == nil || r.db == nil {
+		return nil
+	}
+	if id <= 0 {
+		return nil
+	}
+
+	// Keep API/UI semantics simple: deleting a monitor also deletes its history.
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("monitor_id = ?", id).Delete(&model.ServiceMonitorResult{}).Error; err != nil {
+			return err
+		}
+		return tx.Delete(&model.ServiceMonitor{}, id).Error
+	})
+}
+
+func (r *Repository) InsertServiceMonitorResult(result *model.ServiceMonitorResult) error {
+	if r == nil || r.db == nil {
+		return nil
+	}
+	return r.db.Create(result).Error
+}
+
+func (r *Repository) GetServiceMonitorResults(monitorID int64, limit int) ([]model.ServiceMonitorResult, error) {
+	if r == nil || r.db == nil {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	var results []model.ServiceMonitorResult
+	err := r.db.Where("monitor_id = ?", monitorID).
+		Order("timestamp DESC").
+		Limit(limit).
+		Find(&results).Error
+	return results, err
+}
+
+// GetServiceMonitorResultsByTimeRange returns results for a monitor within [startMs, endMs].
+// Mirrors GetNodeMetrics / GetTunnelMetrics pattern for time-range based charting.
+func (r *Repository) GetServiceMonitorResultsByTimeRange(monitorID int64, startMs, endMs int64) ([]model.ServiceMonitorResult, error) {
+	if r == nil || r.db == nil {
+		return nil, nil
+	}
+	var results []model.ServiceMonitorResult
+	err := r.db.Where("monitor_id = ? AND timestamp >= ? AND timestamp <= ?", monitorID, startMs, endMs).
+		Order("timestamp DESC").
+		Limit(5000).
+		Find(&results).Error
+	if len(results) > 1 {
+		for i, j := 0, len(results)-1; i < j; i, j = i+1, j-1 {
+			results[i], results[j] = results[j], results[i]
+		}
+	}
+	return results, err
+}
+
+// GetLatestServiceMonitorResults returns the newest result per monitor_id.
+// This is intended for list rendering (avoid N+1 queries).
+func (r *Repository) GetLatestServiceMonitorResults() ([]model.ServiceMonitorResult, error) {
+	if r == nil || r.db == nil {
+		return nil, nil
+	}
+
+	var results []model.ServiceMonitorResult
+
+	// Prefer a window-function query (works on modern SQLite + Postgres).
+	q1 := `
+		SELECT id, monitor_id, node_id, timestamp, success, latency_ms, error_message
+		FROM (
+			SELECT *, ROW_NUMBER() OVER (PARTITION BY monitor_id ORDER BY timestamp DESC, id DESC) AS rn
+			FROM service_monitor_result
+		) t
+		WHERE rn = 1
+		ORDER BY monitor_id ASC
+	`
+	if err := r.db.Raw(q1).Scan(&results).Error; err == nil {
+		return results, nil
+	}
+
+	// Fallback: just return newest rows (best-effort). This avoids hard failure on older SQLite builds.
+	// Note: This may not include all monitors if the table is extremely large and skewed.
+	results = nil
+	q2 := `
+		SELECT id, monitor_id, node_id, timestamp, success, latency_ms, error_message
+		FROM service_monitor_result
+		ORDER BY timestamp DESC, id DESC
+		LIMIT 5000
+	`
+	err := r.db.Raw(q2).Scan(&results).Error
+	if err != nil {
+		return nil, err
+	}
+
+	seen := make(map[int64]struct{}, len(results))
+	out := make([]model.ServiceMonitorResult, 0, len(results))
+	for _, row := range results {
+		if row.MonitorID <= 0 {
+			continue
+		}
+		if _, ok := seen[row.MonitorID]; ok {
+			continue
+		}
+		seen[row.MonitorID] = struct{}{}
+		out = append(out, row)
+	}
+	// Keep response stable for the frontend.
+	sort.Slice(out, func(i, j int) bool { return out[i].MonitorID < out[j].MonitorID })
+	return out, nil
+}
+
+func (r *Repository) PruneServiceMonitorResults(olderThanMs int64) error {
+	if r == nil || r.db == nil {
+		return nil
+	}
+	return r.deleteRowsInBatches((&model.ServiceMonitorResult{}).TableName(), "timestamp < ?", olderThanMs)
+}
+
+// inxAllocMu 与 inxAllocLast 是 NextIndex 的进程内发放台账
+// （B04-001）：按 *gorm.DB 实例 + 表记录上次发放的 inx。
+//
+// 旧实现是「SELECT MIN(inx) → handler 再 Create」的读-写分离：并发
+// 建节点/隧道/转发时多个请求读到同一最小值、拿到相同 inx，排序
+// 序号撞车（12 路并发实测重复）。改为发放时持锁并取
+// min(DB 当前最小值-1, 上次发放值-1)：发放值在本进程内单调递减、
+// 绝不重复，落库先后不影响唯一性；每次仍重读 DB 最小值，导入或
+// 手动排序把 inx 压到更低时自动跟随。面板为单进程部署，进程内
+// 原子即足够；不走 inx 唯一索引路线——存量库可能已有撞车数据，
+// 建唯一索引会在迁移期失败。
+var (
+	inxAllocMu   sync.Mutex
+	inxAllocLast = map[*gorm.DB]map[string]int{}
+)
+
+func (r *Repository) NextIndex(table string) int {
+	if r == nil || r.db == nil {
+		return 0
+	}
+	var modelRef interface{}
+	switch table {
+	case "node":
+		modelRef = &model.Node{}
+	case "tunnel":
+		modelRef = &model.Tunnel{}
+	case "forward":
+		modelRef = &model.Forward{}
+	default:
+		return 0
+	}
+
+	inxAllocMu.Lock()
+	defer inxAllocMu.Unlock()
+
+	// DB 当前口径下的下一个值（与旧实现一致：空表 0，否则最小值-1）。
+	dbNext := 0
+	dbKnown := true
+	type inxRow struct {
+		Inx int
+	}
+	var row inxRow
+	err := r.db.Model(modelRef).
+		Select("inx").
+		Order("inx ASC, id ASC").
+		Limit(1).
+		Take(&row).Error
+	switch {
+	case err == nil:
+		dbNext = row.Inx - 1
+	case errors.Is(err, gorm.ErrRecordNotFound):
+		dbNext = 0
+	default:
+		// 查询失败：有台账时靠台账继续保唯一；无台账才回旧兜底 0。
+		dbKnown = false
+	}
+
+	byTable, ok := inxAllocLast[r.db]
+	if !ok {
+		byTable = map[string]int{}
+		inxAllocLast[r.db] = byTable
+	}
+	next := dbNext
+	if last, handed := byTable[table]; handed && last-1 < next {
+		next = last - 1
+	} else if !dbKnown && !handed {
+		return 0
+	}
+	byTable[table] = next
+	return next
+}

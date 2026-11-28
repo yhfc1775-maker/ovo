@@ -1,0 +1,40 @@
+{
+  "name": "@ovo/skill-api",
+  "version": "2.1.34",
+  "description": "Skill for AI assistants to operate OVO panel via REST API. Supports OpenCode, OpenClaw, Claude Code.",
+  "keywords": [
+    "opencode",
+    "openclaw",
+    "claude-code",
+    "skill",
+    "ovo",
+    "api",
+    "traffic-forwarding",
+    "gost"
+  ],
+  "license": "MIT",
+  "author": "OVO Team",
+  "files": [
+    "SKILL.md",
+    "references/**/*"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yhfc1775-maker/ovo.git",
+    "directory": "skills/ovo-api"
+  },
+  "bugs": {
+    "url": "https://github.com/yhfc1775-maker/ovo/issues"
+  },
+  "homepage": "https://github.com/yhfc1775-maker/ovo/tree/main/skills/ovo-api#readme",
+  "opencode": {
+    "skill": true,
+    "installTo": "~/.agents/skills/ovo-api"
+  },
+  "scripts": {
+    "postinstall": "node -e \"const fs=require('fs');const path=require('path');const target=path.join(process.env.HOME,'.agents','skills','ovo-api');const src=process.cwd();try{fs.mkdirSync(path.dirname(target),{recursive:true});try{fs.unlinkSync(target)}catch(_){}fs.symlinkSync(src,target);console.log('✓ Installed to',target)}catch(e){console.error('Manual install: ln -s',src,target)}\"",
+    "preuninstall": "node -e \"const target=require('path').join(process.env.HOME,'.agents','skills','ovo-api');try{require('fs').unlinkSync(target);console.log('✓ Removed',target)}catch(e){}\"",
+    "link": "node -e \"const fs=require('fs');const path=require('path');const target=path.join(process.env.HOME,'.agents','skills','ovo-api');const src=process.cwd();try{fs.mkdirSync(path.dirname(target),{recursive:true});try{fs.unlinkSync(target)}catch(_){}fs.symlinkSync(src,target);console.log('✓ Linked to',target)}catch(e){console.error(e)}\"",
+    "unlink": "node -e \"const target=require('path').join(process.env.HOME,'.agents','skills','ovo-api');try{require('fs').unlinkSync(target);console.log('✓ Unlinked',target)}catch(e){}\""
+  }
+}

@@ -1,0 +1,1220 @@
+package handler
+
+import (
+	"log"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"go-backend/internal/health"
+	"go-backend/internal/http/response"
+	"go-backend/internal/monitoring"
+	"go-backend/internal/store/model"
+)
+
+const (
+	defaultMetricsRangeMs = int64(60 * 60 * 1000)      // 1h
+	maxMetricsRangeMs     = int64(24 * 60 * 60 * 1000) // 24h
+)
+
+// parseMetricsRange 解析监控指标面共用的 start/end 毫秒查询参数
+// （节点指标、隧道指标、隧道质量、服务监控结果四处统一调用）。
+//
+// 口径：
+//   - 两界均未提供时用默认窗口 [now-1h, now]；
+//   - 任一界非空即生效：未提供的一界取默认值（start=now-1h、end=now）；
+//   - 任一界非空但不可解析、非正、或 end<start，一律返回「无效的时间范围」，
+//     不得静默回退默认窗口或全量结果；
+//   - 窗口跨度超过 24h 返回「时间范围过大」。
+//
+// 返回 errMsg 非空时调用方应以 ErrDefault(errMsg) 回执并中止。
+func parseMetricsRange(r *http.Request) (startMs, endMs int64, errMsg string) {
+	now := time.Now().UnixMilli()
+	startMs = now - defaultMetricsRangeMs
+	endMs = now
+
+	if s := r.URL.Query().Get("start"); s != "" {
+		v, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return 0, 0, "无效的时间范围"
+		}
+		startMs = v
+	}
+	if e := r.URL.Query().Get("end"); e != "" {
+		v, err := strconv.ParseInt(e, 10, 64)
+		if err != nil {
+			return 0, 0, "无效的时间范围"
+		}
+		endMs = v
+	}
+	if startMs <= 0 || endMs <= 0 || endMs < startMs {
+		return 0, 0, "无效的时间范围"
+	}
+	if endMs-startMs > maxMetricsRangeMs {
+		return 0, 0, "时间范围过大"
+	}
+	return startMs, endMs, ""
+}
+
+func (h *Handler) resolveServiceMonitorLimits() monitoring.ServiceMonitorLimits {
+	defaults := monitoring.DefaultServiceMonitorLimits()
+	if h == nil || h.repo == nil {
+		return defaults
+	}
+	cfg, err := h.repo.GetConfigsByNames([]string{
+		monitoring.ConfigServiceMonitorCheckerScanIntervalSec,
+		monitoring.ConfigServiceMonitorWorkerLimit,
+		monitoring.ConfigServiceMonitorMinIntervalSec,
+		monitoring.ConfigServiceMonitorDefaultIntervalSec,
+		monitoring.ConfigServiceMonitorMinTimeoutSec,
+		monitoring.ConfigServiceMonitorDefaultTimeoutSec,
+		monitoring.ConfigServiceMonitorMaxTimeoutSec,
+	})
+	if err != nil {
+		return defaults
+	}
+	return monitoring.ServiceMonitorLimitsFromConfigMap(cfg)
+}
+
+func (h *Handler) monitorNodeMetricsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+	// 监控权限范围收窄（2026-11-01 用户拍板）：节点面仅管理员，
+	// 监控权限只覆盖本人隧道的监控数据。
+	if !h.ensureAdminAccess(w, r) {
+		return
+	}
+
+	path := r.URL.Path
+	prefix := "/api/v1/monitor/nodes/"
+	if !strings.HasPrefix(path, prefix) {
+		response.WriteJSON(w, response.ErrDefault("无效的路径"))
+		return
+	}
+
+	rest := strings.TrimPrefix(path, prefix)
+	if strings.HasSuffix(rest, "/metrics/latest") {
+		h.handleNodeMetricsLatest(w, r, strings.TrimSuffix(rest, "/metrics/latest"))
+		return
+	}
+	if strings.HasSuffix(rest, "/metrics") {
+		h.handleNodeMetrics(w, r, strings.TrimSuffix(rest, "/metrics"))
+		return
+	}
+
+	response.WriteJSON(w, response.ErrDefault("无效的路径"))
+}
+
+type monitorNodeListItem struct {
+	ID          int64  `json:"id"`
+	Inx         int    `json:"inx"`
+	Name        string `json:"name"`
+	Status      int    `json:"status"`
+	Version     string `json:"version"`
+	UpdatedTime int64  `json:"updatedTime"`
+}
+
+func (h *Handler) monitorNodeListHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+	// 监控权限范围收窄：节点面仅管理员（同 monitorNodeMetricsHandler）。
+	if !h.ensureAdminAccess(w, r) {
+		return
+	}
+
+	// R1-09-L3：本文件管理员面（节点/服务/权限各面）与 node_traffic
+	// 的仓储错误同走 respondInternalError——RR4-C1-01 当年只收口了
+	// 用户可达面，管理员面仍原文直出仓储错误（可含表名/SQL 片段），
+	// 与 :175 一带自陈的「本文件同族各面同口径」不符，现全集收口
+	// （monitoring.go + node_traffic.go 的 Err(-2, err.Error()) 差集 ∅）。
+	nodes, err := h.repo.ListMonitorNodes()
+	if err != nil {
+		respondInternalError(w, "monitorNodeListHandler: ListMonitorNodes failed", err)
+		return
+	}
+
+	items := make([]monitorNodeListItem, 0, len(nodes))
+	for _, n := range nodes {
+		updated := int64(0)
+		if n.UpdatedTime.Valid {
+			updated = n.UpdatedTime.Int64
+		}
+		items = append(items, monitorNodeListItem{
+			ID:          n.ID,
+			Inx:         n.Inx,
+			Name:        n.Name,
+			Status:      n.Status,
+			Version:     n.Version.String,
+			UpdatedTime: updated,
+		})
+	}
+
+	response.WriteJSON(w, response.OK(items))
+}
+
+type monitorTunnelListItem struct {
+	ID          int64  `json:"id"`
+	Inx         int    `json:"inx"`
+	Name        string `json:"name"`
+	Status      int    `json:"status"`
+	UpdatedTime int64  `json:"updatedTime"`
+}
+
+func (h *Handler) monitorTunnelListHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+	if !h.ensureMonitoringAccess(w, r) {
+		return
+	}
+
+	tunnels, err := h.repo.ListMonitorTunnels()
+	if err != nil {
+		// RR4-C1-01：监控用户面（管理员或已授监控权限的普通用户
+		// 可达）仓储错误不得原文直出，本文件同族各面同口径收口。
+		respondInternalError(w, "monitorTunnels: ListMonitorTunnels failed", err)
+		return
+	}
+
+	// 监控权限范围收窄：非管理员只见自己可达的隧道（口径见
+	// monitorTunnelScope），管理员全量不变。
+	scope, isAdmin, ok := h.monitorTunnelScope(w, r)
+	if !ok {
+		return
+	}
+	if !isAdmin {
+		visible := make([]model.Tunnel, 0, len(tunnels))
+		for _, t := range tunnels {
+			if scope[t.ID] {
+				visible = append(visible, t)
+			}
+		}
+		tunnels = visible
+	}
+
+	items := make([]monitorTunnelListItem, 0, len(tunnels))
+	for _, t := range tunnels {
+		items = append(items, monitorTunnelListItem{
+			ID:          t.ID,
+			Inx:         t.Inx,
+			Name:        t.Name,
+			Status:      t.Status,
+			UpdatedTime: t.UpdatedTime,
+		})
+	}
+
+	response.WriteJSON(w, response.OK(items))
+}
+
+func (h *Handler) handleNodeMetrics(w http.ResponseWriter, r *http.Request, nodeIDStr string) {
+	nodeID, err := strconv.ParseInt(nodeIDStr, 10, 64)
+	if err != nil || nodeID <= 0 {
+		response.WriteJSON(w, response.ErrDefault("无效的节点ID"))
+		return
+	}
+
+	startMs, endMs, rangeErr := parseMetricsRange(r)
+	if rangeErr != "" {
+		response.WriteJSON(w, response.ErrDefault(rangeErr))
+		return
+	}
+
+	metrics, err := h.repo.GetNodeMetrics(nodeID, startMs, endMs)
+	if err != nil {
+		respondInternalError(w, "handleNodeMetrics: GetNodeMetrics failed", err)
+		return
+	}
+
+	response.WriteJSON(w, response.OK(metrics))
+}
+
+func (h *Handler) handleNodeMetricsLatest(w http.ResponseWriter, _ *http.Request, nodeIDStr string) {
+	nodeID, err := strconv.ParseInt(nodeIDStr, 10, 64)
+	if err != nil || nodeID <= 0 {
+		response.WriteJSON(w, response.ErrDefault("无效的节点ID"))
+		return
+	}
+
+	metric, err := h.repo.GetLatestNodeMetric(nodeID)
+	if err != nil {
+		respondInternalError(w, "handleNodeMetricsLatest: GetLatestNodeMetric failed", err)
+		return
+	}
+	if metric == nil {
+		response.WriteJSON(w, response.OK(nil))
+		return
+	}
+
+	response.WriteJSON(w, response.OK(metric))
+}
+
+func (h *Handler) monitorTunnelQualityHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+	if !h.ensureMonitoringAccess(w, r) {
+		return
+	}
+
+	// F-084 读取侧过滤（与 probeAll 每轮淘汰双保险）：已删除/停用的
+	// 隧道不得出现。enabled 集合查询失败时不过滤（保持原行为）。
+	var enabledSet map[int64]bool
+	if ids, lerr := h.repo.ListEnabledTunnelIDs(); lerr == nil {
+		enabledSet = make(map[int64]bool, len(ids))
+		for _, id := range ids {
+			enabledSet[id] = true
+		}
+	}
+	// 监控权限范围收窄：在 F-084 之上再交集调用者的可达隧道集合
+	// （授权边界不 fail-open：集合查询失败已在 monitorTunnelScope
+	// 内回执中止）。管理员 scope 为 nil，不收窄。
+	scope, isAdmin, ok := h.monitorTunnelScope(w, r)
+	if !ok {
+		return
+	}
+	qualityVisible := func(tunnelID int64) bool {
+		if enabledSet != nil && !enabledSet[tunnelID] {
+			return false
+		}
+		return isAdmin || scope[tunnelID]
+	}
+
+	// Try in-memory cache first
+	if h.qualityProber != nil {
+		items := h.qualityProber.GetAll()
+		if len(items) > 0 {
+			filtered := make([]tunnelQualitySnapshot, 0, len(items))
+			for _, s := range items {
+				if qualityVisible(s.TunnelID) {
+					filtered = append(filtered, s)
+				}
+			}
+			if len(filtered) > 0 {
+				response.WriteJSON(w, response.OK(filtered))
+				return
+			}
+		}
+	}
+
+	// Fallback to database (latest per tunnel)
+	qualities, err := h.repo.GetLatestTunnelQualities()
+	if err != nil {
+		respondInternalError(w, "monitorTunnelQuality: GetLatestTunnelQualities failed", err)
+		return
+	}
+
+	targetsByTunnelID := map[int64]tunnelProbeTarget{}
+	if tunnels, listErr := h.repo.ListTunnels(); listErr == nil {
+		for _, item := range tunnels {
+			id := asInt64(item["id"], 0)
+			if id > 0 {
+				targetsByTunnelID[id] = effectiveTunnelProbeTargetValues(asString(item["probeTargetHost"]), asInt(item["probeTargetPort"], 0))
+			}
+		}
+	}
+
+	snapshots := make([]tunnelQualitySnapshot, 0, len(qualities))
+	for _, q := range qualities {
+		if !qualityVisible(q.TunnelID) {
+			continue
+		}
+		target := targetsByTunnelID[q.TunnelID]
+		if target.Host == "" {
+			target = defaultTunnelProbeTarget()
+		}
+		snapshots = append(snapshots, tunnelQualitySnapshot{
+			TunnelID:           q.TunnelID,
+			EntryToExitLatency: q.EntryToExitLatency,
+			ExitToBingLatency:  q.ExitToBingLatency,
+			EntryToExitLoss:    q.EntryToExitLoss,
+			ExitToBingLoss:     q.ExitToBingLoss,
+			// R8-024：部分未测标记随落库列回读，快照面与写入时同口径。
+			EntryToExitPartialUntested: q.EntryToExitPartial != 0,
+			Success:                    q.Success == 1,
+			ErrorMessage:               q.ErrorMessage,
+			Timestamp:                  q.Timestamp,
+			ChainDetails:               q.ChainDetails,
+			ProbeTargetHost:            target.Host,
+			ProbeTargetPort:            target.Port,
+		})
+	}
+	response.WriteJSON(w, response.OK(snapshots))
+}
+
+// monitorTunnelQualityHistory returns quality probe history for charting.
+// GET /api/v1/monitor/tunnels/{id}/quality?start=...&end=...
+// Mirrors monitorTunnelMetrics / monitorServiceResultsHandler pattern.
+func (h *Handler) monitorTunnelQualityHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+	if !h.ensureMonitoringAccess(w, r) {
+		return
+	}
+
+	tunnelIDStr := extractPathParam(r.URL.Path, "/api/v1/monitor/tunnels/", "/quality")
+	tunnelID, err := strconv.ParseInt(tunnelIDStr, 10, 64)
+	if err != nil || tunnelID <= 0 {
+		response.WriteJSON(w, response.ErrDefault("无效的隧道ID"))
+		return
+	}
+	// 监控权限范围收窄：非管理员按 ID 只能看自己隧道的质量历史。
+	if !h.ensureMonitorTunnelVisible(w, r, tunnelID) {
+		return
+	}
+
+	startMs, endMs, rangeErr := parseMetricsRange(r)
+	if rangeErr != "" {
+		response.WriteJSON(w, response.ErrDefault(rangeErr))
+		return
+	}
+
+	results, err := h.repo.GetTunnelQualityHistory(tunnelID, startMs, endMs)
+	if err != nil {
+		respondInternalError(w, "monitorTunnelQualityHistory: GetTunnelQualityHistory failed", err)
+		return
+	}
+
+	response.WriteJSON(w, response.OK(results))
+}
+
+func (h *Handler) monitorTunnelMetrics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+	if !h.ensureMonitoringAccess(w, r) {
+		return
+	}
+
+	path := r.URL.Path
+	prefix := "/api/v1/monitor/tunnels/"
+	if !strings.HasPrefix(path, prefix) {
+		response.WriteJSON(w, response.ErrDefault("无效的路径"))
+		return
+	}
+
+	rest := strings.TrimPrefix(path, prefix)
+
+	// Route: /api/v1/monitor/tunnels/{id}/quality
+	if strings.HasSuffix(rest, "/quality") {
+		h.monitorTunnelQualityHistory(w, r)
+		return
+	}
+
+	// Route: /api/v1/monitor/tunnels/{id}/metrics (original)
+	tunnelIDStr := extractPathParam(path, prefix, "/metrics")
+	tunnelID, err := strconv.ParseInt(tunnelIDStr, 10, 64)
+	if err != nil || tunnelID <= 0 {
+		response.WriteJSON(w, response.ErrDefault("无效的隧道ID"))
+		return
+	}
+	// 监控权限范围收窄：非管理员按 ID 只能看自己隧道的指标。
+	if !h.ensureMonitorTunnelVisible(w, r, tunnelID) {
+		return
+	}
+
+	startMs, endMs, rangeErr := parseMetricsRange(r)
+	if rangeErr != "" {
+		response.WriteJSON(w, response.ErrDefault(rangeErr))
+		return
+	}
+
+	metrics, err := h.repo.GetTunnelMetricsAggregated(tunnelID, startMs, endMs)
+	if err != nil {
+		respondInternalError(w, "monitorTunnelMetrics: GetTunnelMetricsAggregated failed", err)
+		return
+	}
+
+	response.WriteJSON(w, response.OK(metrics))
+}
+
+func (h *Handler) monitorServiceListHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+	// 监控权限范围收窄：服务监控不挂任何用户隧道，仅管理员。
+	if !h.ensureAdminAccess(w, r) {
+		return
+	}
+
+	monitors, err := h.repo.ListServiceMonitors()
+	if err != nil {
+		respondInternalError(w, "monitorServiceListHandler: ListServiceMonitors failed", err)
+		return
+	}
+
+	response.WriteJSON(w, response.OK(monitors))
+}
+
+type createServiceMonitorRequest struct {
+	Name        string `json:"name"`
+	Type        string `json:"type"`
+	Target      string `json:"target"`
+	IntervalSec int    `json:"intervalSec"`
+	TimeoutSec  int    `json:"timeoutSec"`
+	NodeID      int64  `json:"nodeId"`
+	Enabled     *int   `json:"enabled"`
+}
+
+func (h *Handler) monitorServiceCreate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+	if !h.ensureAdminAccess(w, r) {
+		return
+	}
+
+	var req createServiceMonitorRequest
+	if err := decodeJSON(r.Body, &req); err != nil {
+		response.WriteJSON(w, response.ErrDefault("请求参数错误"))
+		return
+	}
+	// R2X-004：创建面接入 Idempotency-Key（机制见 idempotency.go；
+	// 管理员校验在 begin 之前，只读用户带键也不得回放绕过 403）。
+	{
+		var finish func()
+		var replayed bool
+		w, finish, replayed = h.idemBegin(w, r, idemUserID(r), "monitor-service:create")
+		defer finish()
+		if replayed {
+			return
+		}
+	}
+
+	// B12-002（R3 K4）：nodeId 负值在归一化之前拒绝（0=面板本机、
+	// >0 须存在、<0 非法）；此前负值直落库并传播进结果行，且被
+	// Checker 当作面板本机执行、与提交意图脱钩。
+	if req.NodeID < 0 {
+		response.WriteJSON(w, response.ErrDefault("无效的节点ID"))
+		return
+	}
+
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		response.WriteJSON(w, response.ErrDefault("名称不能为空"))
+		return
+	}
+	// R2 K1 枚举复扫（B03-001 同族）：名称按列宽 varchar(100) 校验。
+	if len([]rune(name)) > 100 {
+		response.WriteJSON(w, response.ErrDefault("名称长度不能超过100个字符"))
+		return
+	}
+
+	monitorType := strings.ToLower(strings.TrimSpace(req.Type))
+	if monitorType != "tcp" && monitorType != "icmp" {
+		response.WriteJSON(w, response.ErrDefault("类型必须是 tcp 或 icmp"))
+		return
+	}
+
+	target := strings.TrimSpace(req.Target)
+	if target == "" {
+		response.WriteJSON(w, response.ErrDefault("目标地址不能为空"))
+		return
+	}
+	// AUDIT-R2 (F1X-001): 面板本机执行的 TCP 探测由面板进程直接拨号，
+	// 目标须过 SSRF 校验。
+	if monitorType == "tcp" && req.NodeID <= 0 {
+		if err := health.ValidateMonitorTCPTarget(target); err != nil {
+			response.WriteJSON(w, response.Err(-3, err.Error()))
+			return
+		}
+	}
+	// R4X-008：nodeId>0 走节点侧执行时补硬拒子集底线（原注释「信任
+	// 边界不同，不限制」整体豁免连硬拒层一并豁免，与全仓「一切出站
+	// 至少过硬拒层」不变量冲突）。只判硬拒层：私网/回环/CGNAT 仍
+	// 不限——节点监控其所在 LAN 服务是正当用途。ICMP 恒为节点执行
+	//（下方强制 NodeID>0），同过本校验。
+	if req.NodeID > 0 {
+		if err := health.ValidateNodeMonitorTarget(monitorType, target); err != nil {
+			response.WriteJSON(w, response.Err(-3, err.Error()))
+			return
+		}
+	}
+
+	limits := h.resolveServiceMonitorLimits()
+
+	intervalSec := req.IntervalSec
+	if intervalSec <= 0 {
+		intervalSec = limits.DefaultIntervalSec
+	}
+	if intervalSec < limits.MinIntervalSec {
+		intervalSec = limits.MinIntervalSec
+	}
+
+	timeoutSec := req.TimeoutSec
+	if timeoutSec <= 0 {
+		timeoutSec = limits.DefaultTimeoutSec
+	}
+	if timeoutSec < limits.MinTimeoutSec {
+		timeoutSec = limits.MinTimeoutSec
+	}
+	if timeoutSec > limits.MaxTimeoutSec {
+		timeoutSec = limits.MaxTimeoutSec
+	}
+
+	enabled := 1
+	if req.Enabled != nil {
+		// B12-001（R3 K4）：与更新面 R2 B12-002 同口径——域外值
+		// 点名报错拒绝，不再静默回落为启用落库。
+		if *req.Enabled != 0 && *req.Enabled != 1 {
+			response.WriteJSON(w, response.ErrDefault("启用状态只能为 0 或 1"))
+			return
+		}
+		enabled = *req.Enabled
+	}
+
+	now := time.Now().UnixMilli()
+	if req.NodeID > 0 {
+		n, err := h.repo.GetNodeByID(req.NodeID)
+		if err != nil {
+			respondInternalError(w, "monitorServiceCreate: GetNodeByID failed", err)
+			return
+		}
+		if n == nil {
+			response.WriteJSON(w, response.ErrDefault("节点不存在"))
+			return
+		}
+	}
+	m := &model.ServiceMonitor{
+		Name:        name,
+		Type:        monitorType,
+		Target:      target,
+		IntervalSec: intervalSec,
+		TimeoutSec:  timeoutSec,
+		NodeID:      req.NodeID,
+		Enabled:     enabled,
+		CreatedTime: now,
+		UpdatedTime: now,
+	}
+	if m.Type == "icmp" && m.NodeID <= 0 {
+		response.WriteJSON(w, response.ErrDefault("ICMP 监控必须选择执行节点"))
+		return
+	}
+	// enabled is already normalized above.
+
+	if err := h.repo.CreateServiceMonitor(m); err != nil {
+		respondInternalError(w, "monitorServiceCreate: CreateServiceMonitor failed", err)
+		return
+	}
+
+	response.WriteJSON(w, response.OK(m))
+}
+
+type updateServiceMonitorRequest struct {
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	Type        string `json:"type"`
+	Target      string `json:"target"`
+	IntervalSec int    `json:"intervalSec"`
+	TimeoutSec  int    `json:"timeoutSec"`
+	NodeID      *int64 `json:"nodeId"`
+	Enabled     *int   `json:"enabled"`
+}
+
+func (h *Handler) monitorServiceUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+	if !h.ensureAdminAccess(w, r) {
+		return
+	}
+
+	var req updateServiceMonitorRequest
+	if err := decodeJSON(r.Body, &req); err != nil {
+		response.WriteJSON(w, response.ErrDefault("请求参数错误"))
+		return
+	}
+
+	if req.ID <= 0 {
+		response.WriteJSON(w, response.ErrDefault("无效的监控ID"))
+		return
+	}
+
+	existing, err := h.repo.GetServiceMonitor(req.ID)
+	if err != nil {
+		respondInternalError(w, "monitorServiceUpdate: GetServiceMonitor failed", err)
+		return
+	}
+	if existing == nil {
+		response.WriteJSON(w, response.ErrDefault("监控不存在"))
+		return
+	}
+
+	name := strings.TrimSpace(req.Name)
+	// R2 K1 枚举复扫（B03-001 同族）：显式提交的改名按列宽 100 校验。
+	if name != "" && len([]rune(name)) > 100 {
+		response.WriteJSON(w, response.ErrDefault("名称长度不能超过100个字符"))
+		return
+	}
+	if name != "" {
+		existing.Name = name
+	}
+
+	monitorType := strings.ToLower(strings.TrimSpace(req.Type))
+	// R2 B12-002：非空但非法的 type 与 create 同口径点名报错——旧实现
+	// 仅在等于 tcp/icmp 时赋值，传 "http" 返回成功却静默不改，管理员
+	// 误以为已切换类型。空值仍是「不改类型」的部分更新语义。
+	if monitorType != "" && monitorType != "tcp" && monitorType != "icmp" {
+		response.WriteJSON(w, response.ErrDefault("类型必须是 tcp 或 icmp"))
+		return
+	}
+	if monitorType == "tcp" || monitorType == "icmp" {
+		existing.Type = monitorType
+	}
+
+	target := strings.TrimSpace(req.Target)
+	if target != "" {
+		existing.Target = target
+	}
+
+	limits := h.resolveServiceMonitorLimits()
+
+	if req.IntervalSec > 0 {
+		intervalSec := req.IntervalSec
+		if intervalSec < limits.MinIntervalSec {
+			intervalSec = limits.MinIntervalSec
+		}
+		existing.IntervalSec = intervalSec
+	}
+	if req.TimeoutSec > 0 {
+		timeoutSec := req.TimeoutSec
+		if timeoutSec < limits.MinTimeoutSec {
+			timeoutSec = limits.MinTimeoutSec
+		}
+		if timeoutSec > limits.MaxTimeoutSec {
+			timeoutSec = limits.MaxTimeoutSec
+		}
+		existing.TimeoutSec = timeoutSec
+	}
+
+	if req.NodeID != nil {
+		// B12-002（R3 K4）：负值与创建面同口径拒绝（此前直落库）。
+		if *req.NodeID < 0 {
+			response.WriteJSON(w, response.ErrDefault("无效的节点ID"))
+			return
+		}
+		existing.NodeID = *req.NodeID
+	}
+	if req.Enabled != nil {
+		// R2 B12-002：域外值（如 5）同 type 口径点名报错，不再静默忽略
+		// 后回成功。
+		if *req.Enabled != 0 && *req.Enabled != 1 {
+			response.WriteJSON(w, response.ErrDefault("启用状态只能为 0 或 1"))
+			return
+		}
+		existing.Enabled = *req.Enabled
+	}
+
+	// AUDIT-R2 (F1X-001): 终态为面板本机 tcp 且目标/类型/执行位置被改动时做 SSRF 校验。
+	if (target != "" || req.NodeID != nil || monitorType == "tcp" || monitorType == "icmp") &&
+		existing.Type == "tcp" && existing.NodeID <= 0 {
+		if err := health.ValidateMonitorTCPTarget(existing.Target); err != nil {
+			response.WriteJSON(w, response.Err(-3, err.Error()))
+			return
+		}
+	}
+	// R4X-008：终态为节点执行（tcp/icmp 均含）且目标/类型/执行位置
+	// 被改动时，补硬拒子集校验（口径同创建面）。
+	if (target != "" || req.NodeID != nil || monitorType == "tcp" || monitorType == "icmp") &&
+		existing.NodeID > 0 {
+		if err := health.ValidateNodeMonitorTarget(existing.Type, existing.Target); err != nil {
+			response.WriteJSON(w, response.Err(-3, err.Error()))
+			return
+		}
+	}
+
+	existing.UpdatedTime = time.Now().UnixMilli()
+	if existing.Type == "icmp" && existing.NodeID <= 0 {
+		response.WriteJSON(w, response.ErrDefault("ICMP 监控必须选择执行节点"))
+		return
+	}
+	if existing.NodeID > 0 {
+		n, err := h.repo.GetNodeByID(existing.NodeID)
+		if err != nil {
+			respondInternalError(w, "monitorServiceUpdate: GetNodeByID failed", err)
+			return
+		}
+		if n == nil {
+			response.WriteJSON(w, response.ErrDefault("节点不存在"))
+			return
+		}
+	}
+
+	if err := h.repo.UpdateServiceMonitor(existing); err != nil {
+		respondInternalError(w, "monitorServiceUpdate: UpdateServiceMonitor failed", err)
+		return
+	}
+
+	response.WriteJSON(w, response.OK(existing))
+}
+
+type deleteServiceMonitorRequest struct {
+	ID int64 `json:"id"`
+}
+
+func (h *Handler) monitorServiceDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+	if !h.ensureAdminAccess(w, r) {
+		return
+	}
+
+	var req deleteServiceMonitorRequest
+	if err := decodeJSON(r.Body, &req); err != nil {
+		response.WriteJSON(w, response.ErrDefault("请求参数错误"))
+		return
+	}
+
+	if req.ID <= 0 {
+		response.WriteJSON(w, response.ErrDefault("无效的监控ID"))
+		return
+	}
+
+	if err := h.repo.DeleteServiceMonitor(req.ID); err != nil {
+		respondInternalError(w, "monitorServiceDelete: DeleteServiceMonitor failed", err)
+		return
+	}
+
+	response.WriteJSON(w, response.OKEmpty())
+}
+
+func (h *Handler) monitorServiceRun(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+	if !h.ensureAdminAccess(w, r) {
+		return
+	}
+	if h.healthCheck == nil {
+		response.WriteJSON(w, response.ErrDefault("监控服务不可用"))
+		return
+	}
+
+	var req deleteServiceMonitorRequest
+	if err := decodeJSON(r.Body, &req); err != nil {
+		response.WriteJSON(w, response.ErrDefault("请求参数错误"))
+		return
+	}
+	if req.ID <= 0 {
+		response.WriteJSON(w, response.ErrDefault("无效的监控ID"))
+		return
+	}
+
+	m, err := h.repo.GetServiceMonitor(req.ID)
+	if err != nil {
+		respondInternalError(w, "monitorServiceRun: GetServiceMonitor failed", err)
+		return
+	}
+	if m == nil {
+		response.WriteJSON(w, response.ErrDefault("监控不存在"))
+		return
+	}
+
+	res, err := h.healthCheck.RunOnceContext(r.Context(), m)
+	if err != nil {
+		respondInternalError(w, "monitorServiceRun: RunOnce failed", err)
+		return
+	}
+	if err := h.repo.InsertServiceMonitorResult(res); err != nil {
+		log.Printf("monitoring write failed op=service_monitor_result.manual_insert monitor_id=%d err=%v", res.MonitorID, err)
+	}
+	response.WriteJSON(w, response.OK(res))
+}
+
+func (h *Handler) monitorServiceResultsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+	// 监控权限范围收窄：服务监控结果仅管理员（同 monitorServiceListHandler）。
+	if !h.ensureAdminAccess(w, r) {
+		return
+	}
+
+	monitorIDStr := extractPathParam(r.URL.Path, "/api/v1/monitor/services/", "/results")
+	monitorID, err := strconv.ParseInt(monitorIDStr, 10, 64)
+	if err != nil || monitorID <= 0 {
+		response.WriteJSON(w, response.ErrDefault("无效的监控ID"))
+		return
+	}
+
+	// If either start or end is provided, use the time-range query with the
+	// shared parseMetricsRange semantics (a single provided bound takes
+	// effect; the other bound falls back to the default window edge).
+	// Only when neither is provided do we use the count-based limit query.
+	startStr := r.URL.Query().Get("start")
+	endStr := r.URL.Query().Get("end")
+	if startStr != "" || endStr != "" {
+		startMs, endMs, rangeErr := parseMetricsRange(r)
+		if rangeErr != "" {
+			response.WriteJSON(w, response.ErrDefault(rangeErr))
+			return
+		}
+		results, err := h.repo.GetServiceMonitorResultsByTimeRange(monitorID, startMs, endMs)
+		if err != nil {
+			respondInternalError(w, "monitorServiceResultsHandler: GetServiceMonitorResultsByTimeRange failed", err)
+			return
+		}
+		response.WriteJSON(w, response.OK(results))
+		return
+	}
+
+	// Fallback: count-based limit query (backward compat).
+	limit := 100
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if v, err := strconv.Atoi(l); err == nil && v > 0 && v <= 1000 {
+			limit = v
+		}
+	}
+
+	results, err := h.repo.GetServiceMonitorResults(monitorID, limit)
+	if err != nil {
+		respondInternalError(w, "monitorServiceResultsHandler: GetServiceMonitorResults failed", err)
+		return
+	}
+
+	response.WriteJSON(w, response.OK(results))
+}
+
+func (h *Handler) monitorServiceLatestResultsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+	// 监控权限范围收窄：服务监控最新结果仅管理员。
+	if !h.ensureAdminAccess(w, r) {
+		return
+	}
+
+	// F-084 读取侧过滤（与 Checker 每轮淘汰双保险）：已删除/停用的
+	// 监控不得出现。enabled 集合查询失败时不过滤（保持原行为）。
+	var enabledSet map[int64]bool
+	if monitors, lerr := h.repo.ListEnabledServiceMonitors(); lerr == nil {
+		enabledSet = make(map[int64]bool, len(monitors))
+		for _, m := range monitors {
+			enabledSet[m.ID] = true
+		}
+	}
+	resultVisible := func(monitorID int64) bool {
+		return enabledSet == nil || enabledSet[monitorID]
+	}
+
+	// RR4-F5-01：内存缓存只含「本进程已跑过」的监控——面板重启后
+	// 长间隔的启用监控长时间只有 DB 里有最新结果，旧实现只要缓存
+	// 非空就整体短路、这些项在总览里消失。改为：缓存覆盖全部启用
+	// 项时才纯走缓存（保持原性能意图）；有缺项时并入 DB 最新结果
+	// 按 monitorId 合并，同项取 Timestamp 更新者（同刻缓存优先）。
+	var cached []*model.ServiceMonitorResult
+	if h.healthCheck != nil {
+		for _, res := range h.healthCheck.GetLatestCached() {
+			if res != nil && resultVisible(res.MonitorID) {
+				cached = append(cached, res)
+			}
+		}
+	}
+	if len(cached) > 0 && enabledSet != nil {
+		seen := make(map[int64]bool, len(cached))
+		for _, res := range cached {
+			seen[res.MonitorID] = true
+		}
+		complete := true
+		for id := range enabledSet {
+			if !seen[id] {
+				complete = false
+				break
+			}
+		}
+		if complete {
+			response.WriteJSON(w, response.OK(cached))
+			return
+		}
+	}
+
+	// Fallback to database（缓存为空、或缓存有缺项时补齐）
+	results, err := h.repo.GetLatestServiceMonitorResults()
+	if err != nil {
+		if len(cached) > 0 {
+			response.WriteJSON(w, response.OK(cached))
+			return
+		}
+		respondInternalError(w, "monitorServiceLatestResultsHandler: GetLatestServiceMonitorResults failed", err)
+		return
+	}
+	if len(cached) == 0 {
+		filteredResults := make([]model.ServiceMonitorResult, 0, len(results))
+		for _, res := range results {
+			if resultVisible(res.MonitorID) {
+				filteredResults = append(filteredResults, res)
+			}
+		}
+		response.WriteJSON(w, response.OK(filteredResults))
+		return
+	}
+	merged := make(map[int64]*model.ServiceMonitorResult, len(cached))
+	for _, res := range cached {
+		merged[res.MonitorID] = res
+	}
+	for i := range results {
+		res := results[i]
+		if !resultVisible(res.MonitorID) {
+			continue
+		}
+		if cur, ok := merged[res.MonitorID]; !ok || res.Timestamp > cur.Timestamp {
+			merged[res.MonitorID] = &res
+		}
+	}
+	out := make([]*model.ServiceMonitorResult, 0, len(merged))
+	for _, res := range merged {
+		out = append(out, res)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].MonitorID < out[j].MonitorID })
+	response.WriteJSON(w, response.OK(out))
+}
+
+func (h *Handler) monitorServiceLimitsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+	// 监控权限范围收窄：limits 只在服务监控 UI 内使用，随服务面收管理员。
+	if !h.ensureAdminAccess(w, r) {
+		return
+	}
+	response.WriteJSON(w, response.OK(h.resolveServiceMonitorLimits()))
+}
+
+func extractPathParam(path, prefix, suffix string) string {
+	if !strings.HasPrefix(path, prefix) {
+		return ""
+	}
+	rest := strings.TrimPrefix(path, prefix)
+	if suffix != "" {
+		rest = strings.TrimSuffix(rest, suffix)
+	}
+	return rest
+}
+
+type monitorAccessData struct {
+	Allowed bool `json:"allowed"`
+	// Admin 标记管理员（roleID==0），供前端只读用户隐藏写入口
+	// （R2X-038：只读时不渲染写入口与 Modal，而非点击后撞 403）。
+	Admin  bool   `json:"admin"`
+	Reason string `json:"reason,omitempty"`
+}
+
+// monitorAccessHandler is a lightweight capability check for frontend navigation.
+// It does NOT replace authorization on the actual monitoring endpoints.
+func (h *Handler) monitorAccessHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+
+	userID, roleID, err := userRoleFromRequest(r)
+	if err != nil {
+		response.WriteJSON(w, response.Err(401, "未登录或token已过期"))
+		return
+	}
+	if roleID == 0 {
+		response.WriteJSON(w, response.OK(monitorAccessData{Allowed: true, Admin: true}))
+		return
+	}
+
+	allowed, err := h.repo.HasMonitorPermission(userID)
+	if err != nil {
+		respondInternalError(w, "monitorAccess: HasMonitorPermission failed", err)
+		return
+	}
+	data := monitorAccessData{Allowed: allowed, Admin: false}
+	if !allowed {
+		data.Reason = "need_admin_grant"
+	}
+	response.WriteJSON(w, response.OK(data))
+}
+
+func (h *Handler) ensureAdminAccess(w http.ResponseWriter, r *http.Request) bool {
+	_, roleID, err := userRoleFromRequest(r)
+	if err != nil {
+		response.WriteJSON(w, response.Err(401, "未登录或token已过期"))
+		return false
+	}
+	if roleID != 0 {
+		response.WriteJSON(w, response.Err(403, "权限不足，仅管理员可操作"))
+		return false
+	}
+	return true
+}
+
+func (h *Handler) ensureMonitoringAccess(w http.ResponseWriter, r *http.Request) bool {
+	userID, roleID, err := userRoleFromRequest(r)
+	if err != nil {
+		response.WriteJSON(w, response.Err(401, "未登录或token已过期"))
+		return false
+	}
+	if roleID == 0 {
+		return true
+	}
+	allowed, err := h.repo.HasMonitorPermission(userID)
+	if err != nil {
+		respondInternalError(w, "ensureMonitoringAccess: HasMonitorPermission failed", err)
+		return false
+	}
+	if !allowed {
+		response.WriteJSON(w, response.Err(403, "权限不足：当前账户非管理员，且未被授予监控权限。请联系管理员在用户管理中授权监控权限。"))
+		return false
+	}
+	return true
+}
+
+// accessibleTunnelIDSet 返回某用户可达的隧道 ID 集合，与用户隧道列表
+// userTunnelVisibleList 同口径（ListUserAccessibleTunnels：
+// user_tunnel.status=1 且 tunnel.status=1）。
+func (h *Handler) accessibleTunnelIDSet(userID int64) (map[int64]bool, error) {
+	items, err := h.repo.ListUserAccessibleTunnels(userID)
+	if err != nil {
+		return nil, err
+	}
+	set := make(map[int64]bool, len(items))
+	for _, item := range items {
+		if id := asInt64(item["id"], 0); id > 0 {
+			set[id] = true
+		}
+	}
+	return set, nil
+}
+
+// monitorTunnelScope 解析调用方在监控隧道面的可见范围：管理员返回
+// (nil, true, true)，nil 集合表示不收窄；非管理员返回其可达隧道 ID
+// 集合。ok=false 时已回执（401 / -2），调用方直接 return——授权边界
+// 不 fail-open，集合查询失败不回落全量。
+func (h *Handler) monitorTunnelScope(w http.ResponseWriter, r *http.Request) (set map[int64]bool, isAdmin bool, ok bool) {
+	userID, roleID, err := userRoleFromRequest(r)
+	if err != nil {
+		response.WriteJSON(w, response.Err(401, "未登录或token已过期"))
+		return nil, false, false
+	}
+	if roleID == 0 {
+		return nil, true, true
+	}
+	set, err = h.accessibleTunnelIDSet(userID)
+	if err != nil {
+		respondInternalError(w, "monitorTunnelScope: accessibleTunnelIDSet failed", err)
+		return nil, false, false
+	}
+	return set, false, true
+}
+
+// ensureMonitorTunnelVisible 校验调用方对某条隧道的监控可见性：
+// 管理员恒可见；非管理员仅限其可达隧道，不可见时回执 403「无权限」
+// （与 user_subscription.go、user_inbound.go 等用户面所有权拒绝同
+// 形态），返回 false。
+func (h *Handler) ensureMonitorTunnelVisible(w http.ResponseWriter, r *http.Request, tunnelID int64) bool {
+	set, isAdmin, ok := h.monitorTunnelScope(w, r)
+	if !ok {
+		return false
+	}
+	if isAdmin || set[tunnelID] {
+		return true
+	}
+	response.WriteJSON(w, response.Err(403, "无权限"))
+	return false
+}
+
+func (h *Handler) monitorPermissionList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+	if !h.ensureAdminAccess(w, r) {
+		return
+	}
+
+	items, err := h.repo.ListMonitorPermissions()
+	if err != nil {
+		respondInternalError(w, "monitorPermissionList: ListMonitorPermissions failed", err)
+		return
+	}
+	response.WriteJSON(w, response.OK(items))
+}
+
+type monitorPermissionMutationRequest struct {
+	UserID int64 `json:"userId"`
+}
+
+func (h *Handler) monitorPermissionAssign(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+	if !h.ensureAdminAccess(w, r) {
+		return
+	}
+
+	var req monitorPermissionMutationRequest
+	if err := decodeJSON(r.Body, &req); err != nil {
+		response.WriteJSON(w, response.ErrDefault("请求参数错误"))
+		return
+	}
+	if req.UserID <= 0 {
+		response.WriteJSON(w, response.ErrDefault("无效的用户ID"))
+		return
+	}
+
+	u, err := h.repo.GetUserByID(req.UserID)
+	if err != nil {
+		respondInternalError(w, "monitorPermissionAssign: GetUserByID failed", err)
+		return
+	}
+	if u == nil {
+		response.WriteJSON(w, response.ErrDefault("用户不存在"))
+		return
+	}
+
+	if err := h.repo.InsertMonitorPermission(req.UserID, time.Now().UnixMilli()); err != nil {
+		respondInternalError(w, "monitorPermissionAssign: InsertMonitorPermission failed", err)
+		return
+	}
+	response.WriteJSON(w, response.OKEmpty())
+}
+
+func (h *Handler) monitorPermissionRemove(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+	if !h.ensureAdminAccess(w, r) {
+		return
+	}
+
+	var req monitorPermissionMutationRequest
+	if err := decodeJSON(r.Body, &req); err != nil {
+		response.WriteJSON(w, response.ErrDefault("请求参数错误"))
+		return
+	}
+	if req.UserID <= 0 {
+		response.WriteJSON(w, response.ErrDefault("无效的用户ID"))
+		return
+	}
+
+	if err := h.repo.DeleteMonitorPermission(req.UserID); err != nil {
+		respondInternalError(w, "monitorPermissionRemove: DeleteMonitorPermission failed", err)
+		return
+	}
+	response.WriteJSON(w, response.OKEmpty())
+}

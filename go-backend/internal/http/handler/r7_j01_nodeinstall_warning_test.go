@@ -1,0 +1,154 @@
+package handler
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"go-backend/internal/store/repo"
+)
+
+// R7-J-01 (non-BC parts only): when nodeInstall generates a command whose
+// agent address is ws:// (plaintext), the API response must carry an
+// explicit plaintext warning in the envelope "warning" field, and the
+// generated command string itself must stay byte-identical to the
+// pre-fix behaviour. Part 1 (changing the bare-value default scheme to
+// wss) was DECLINED by the user's 2026-10-29 decision ("do not change
+// the default; warning + copy only"): the residual risk — a bare
+// stored value plus a plain-http admin session can still generate a
+// ws:// command for a TLS panel, now with an explicit plaintext
+// warning at generation time — is user-accepted, so the last test in
+// this file LOCKS the current normalizeNodeInstallAddr behaviour.
+// 后续批次注记（GATE-FIX）：B3-01 起安装命令的地址/secret 参数经
+// shellQuoteForInstall 单引号引用（裁定本体），下文地址断言已按
+// 引号形态更新；明文 warning 口径不变。
+
+type r7J01Envelope struct {
+	Code    int                 `json:"code"`
+	Msg     string              `json:"msg"`
+	Data    nodeInstallResponse `json:"data"`
+	Warning string              `json:"warning"`
+}
+
+func r7J01CallNodeInstall(t *testing.T, panelAddr string) r7J01Envelope {
+	t.Helper()
+	t.Setenv("OVO_FETCH_PRIVATE_ALLOWLIST", "127.0.0.0/8")
+	clearReleasesCacheForTest(t)
+	r, err := repo.Open(t.TempDir() + "/r7j01.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = r.Close() })
+	now := time.Now().UnixMilli()
+	if err := r.DB().Exec(`
+		INSERT INTO node(name, secret, server_ip, server_ip_v4, server_ip_v6, port, interface_name, version, http, tls, socks, created_time, updated_time, status, tcp_listen_addr, udp_listen_addr, inx)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "r7j01-node", "0123456789abcdef0123456789abcdef", "10.90.80.72", "10.90.80.72", "", "31000-31099", "", "v1", 1, 1, 1, now, now, 1, "[::]", "[::]", 0).Error; err != nil {
+		t.Fatalf("insert node: %v", err)
+	}
+	nodeID := mustLastInsertID(t, r, "r7j01-node")
+	if err := r.DB().Exec(`INSERT INTO vite_config(name, value, time) VALUES(?, ?, ?)`, "ip", panelAddr, now).Error; err != nil {
+		t.Fatalf("seed vite_config ip: %v", err)
+	}
+	// 1.7.7：github_proxy_enabled 设置已整体移除，无需再写配置关代理；
+	// 路线由 swapGitHubBasesForTest 钉为直连-only。
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		// 2.1.22：镜像预热走 API 取数（tags JSON → assets/<id>），
+		// 与版本发现的列表 JSON 共用本 stub。
+		if ghMirrorAPITestServe(w, req) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `[{"tag_name":"1.7.2","name":"x","draft":false,"prerelease":false}]`)
+	}))
+	t.Cleanup(api.Close)
+	swapGitHubBasesForTest(t, api.URL, api.URL)
+	// nodeInstall 成功后会触发安装资产预热（preheatInstallReleaseAssets）：
+	// 资产基址一并钉到本地 stub＋隔离缓存＋结束前排空（GATE F3），
+	// 否则预热会对真实 github.com 下载整包并跨用例泄漏。
+	swapGHMirrorBases(t, api.URL)
+
+	h := New(r, "test-jwt-secret")
+	raw, _ := json.Marshal(map[string]interface{}{"id": nodeID, "channel": "stable"})
+	// Plain http management request, untrusted remote: panelRequestScheme
+	// resolves to "http" (the 2026-10-29 incident shape).
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/node/install", bytes.NewReader(raw))
+	res := httptest.NewRecorder()
+	h.nodeInstall(res, req)
+	var env r7J01Envelope
+	if err := json.NewDecoder(res.Body).Decode(&env); err != nil {
+		t.Fatalf("decode nodeInstall response: %v", err)
+	}
+	if env.Code != 0 {
+		t.Fatalf("nodeInstall must succeed, got code=%d msg=%s", env.Code, env.Msg)
+	}
+	return env
+}
+
+func TestR7J01PlaintextInstallCarriesWarning(t *testing.T) {
+	// Incident cell A: bare stored address + plain http management
+	// request -> ws:// command (behaviour unchanged in this batch) AND
+	// an explicit plaintext warning in the response envelope.
+	env := r7J01CallNodeInstall(t, "z.example.invalid")
+	if !strings.Contains(env.Data.Command, "-a 'ws://z.example.invalid'") {
+		t.Fatalf("command must keep the ws:// agent address in this batch, got %q", env.Data.Command)
+	}
+	if env.Warning == "" {
+		t.Fatalf("ws:// install command must carry an explicit plaintext warning, got empty warning (cmd=%q)", env.Data.Command)
+	}
+	if !strings.Contains(env.Warning, "明文") || !strings.Contains(env.Warning, "ws://") {
+		t.Fatalf("warning must name the plaintext ws:// scheme, got %q", env.Warning)
+	}
+	if !strings.Contains(env.Warning, "https://") {
+		t.Fatalf("warning must point at the https:// fix for TLS panels, got %q", env.Warning)
+	}
+}
+
+func TestR7J01ExplicitPlaintextInstallCarriesWarning(t *testing.T) {
+	// Incident cell B: explicit ws:// stored value -> warning as well.
+	env := r7J01CallNodeInstall(t, "ws://z.example.invalid")
+	if !strings.Contains(env.Data.Command, "-a 'ws://z.example.invalid'") {
+		t.Fatalf("command must keep the ws:// agent address, got %q", env.Data.Command)
+	}
+	if env.Warning == "" {
+		t.Fatalf("explicit ws:// install must carry a plaintext warning")
+	}
+}
+
+func TestR7J01TLSInstallHasNoWarning(t *testing.T) {
+	env := r7J01CallNodeInstall(t, "https://z.example.invalid")
+	if !strings.Contains(env.Data.Command, "-a 'wss://z.example.invalid'") {
+		t.Fatalf("https stored address must generate wss://, got %q", env.Data.Command)
+	}
+	if env.Warning != "" {
+		t.Fatalf("wss:// install must not carry a plaintext warning, got %q", env.Warning)
+	}
+}
+
+// TestR7J01NormalizeDefaultUnchanged locks the behaviour the user
+// chose to keep (2026-10-29: the bare-value default change was
+// declined, warning + copy only): normalizeNodeInstallAddr
+// (bare-value default + explicit-scheme handling) is byte-for-byte
+// identical to baseline 69bfcc4. Changing any case here re-opens a
+// decision the user has already made.
+func TestR7J01NormalizeDefaultUnchanged(t *testing.T) {
+	cases := []struct{ addr, scheme, want string }{
+		{"z.example.invalid", "http", "ws://z.example.invalid"},
+		{"z.example.invalid", "https", "wss://z.example.invalid"},
+		{"z.example.invalid:443", "http", "ws://z.example.invalid:443"},
+		{"http://z.example.invalid", "https", "ws://z.example.invalid"},
+		{"ws://z.example.invalid", "https", "ws://z.example.invalid"},
+		{"https://z.example.invalid", "http", "wss://z.example.invalid"},
+		{"wss://z.example.invalid", "http", "wss://z.example.invalid"},
+	}
+	for _, tc := range cases {
+		if got := normalizeNodeInstallAddr(tc.addr, tc.scheme); got != tc.want {
+			t.Errorf("normalizeNodeInstallAddr(%q, %q) = %q, want %q (user-declined default change: default must stay unchanged)", tc.addr, tc.scheme, got, tc.want)
+		}
+	}
+}

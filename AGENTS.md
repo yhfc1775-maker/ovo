@@ -1,0 +1,66 @@
+# AGENTS
+
+OVO — traffic forwarding panel: Go admin API + Vite/React UI + Go agent.
+
+## Structure
+
+| Dir | Role | Entry |
+|-----|------|-------|
+| `go-backend/` | Admin API (GORM + SQLite/PG, net/http) | `cmd/paneld/main.go` |
+| `go-gost/` | Forwarding agent (forked GOST) | `main.go` |
+| `go-gost/x/` | Protocol handlers/dialers/listeners (own module) | — |
+| `vite-frontend/` | React dashboard (shadcn bridge + Tailwind v4) | `src/App.tsx` |
+| `doc/` | User docs (VitePress, deployed to GitHub Pages) | `.vitepress/config.mts` |
+
+`go-gost/go.mod` uses `replace github.com/go-gost/x => ./x`.
+
+## Commands
+
+```bash
+# Backend
+(cd go-backend && go run ./cmd/paneld)        # SERVER_ADDR defaults to :6365
+(cd go-backend && make build)
+(cd go-backend && go test ./...)
+
+# Frontend
+(cd vite-frontend && pnpm install)
+(cd vite-frontend && pnpm run dev)             # host 0.0.0.0:3000
+(cd vite-frontend && pnpm run build)           # tsc && vite build
+(cd vite-frontend && pnpm run lint)            # eslint --fix (no typecheck command)
+
+# Agent
+(cd go-gost && go run .)
+
+# Docs
+(cd doc && npm ci && npm run dev)            # npm run build -> doc/.vitepress/dist
+```
+
+## Conventions
+
+- **Auth**: raw JWT in `Authorization` header — **no `Bearer` prefix** (both frontend and backend).
+- **API envelope**: all responses `{code, msg, data, ts}` (code 0 = success).
+- **Frontend UI**: import from `src/shadcn-bridge/heroui/*`, never `@heroui/*` or `@nextui-org/*`.
+- **Tailwind theme**: `globals.css` must import `tailwind-theme.pcss` or semantic classes break.
+- **Backend DB**: handlers use Repository methods, never `repo.DB()` directly.
+- **GORM models**: always define `TableName()` (GORM pluralizes by default).
+- **GORM tags**: no `type:jsonb` or `type:serial` (SQLite incompatible).
+- **Go versions**: `go.mod` says 1.25.0 for all three modules; CI builds with 1.25 (aligned 2026-10-19, was 1.23).
+
+## Anti-patterns
+
+- `install.sh` / `panel_install.sh`: `REPO` must stay `yhfc1775-maker/ovo` (this is a fork; all deployment URLs point to this repo, not upstream). The release job rewrites `REPO`, the version and `PINNED_VERSION` in the release copies, so don't hand-edit those for a release.
+- Don't edit `go-gost/x/internal/util/grpc/proto/*.pb.go` (generated).
+- Don't add frontend tests (no Vitest/Jest configured). Sole exception: the minimal `node:test` runner for `src/pages/forward/import-format.test.ts` only (D-7; CI runs it via `pnpm run test`).
+- Don't reintroduce `@heroui/*` or `@nextui-org/*` packages.
+
+## Testing
+
+- Backend: `(cd go-backend && go test ./...)` — includes contract tests in `tests/contract/`.
+- Frontend: no test infrastructure.
+- CI runs a group of sixteen PostgreSQL contract tests (`TestPostgres*`): env var `OVO_POSTGRES_TEST_DSN`. <!-- [K11-COUNT:testpostgres=16] count is mechanically reconciled against the code by scripts/check-doc-consistency.sh item 10; update number and marker together when TestPostgres* cases change -->
+
+## Build quirks
+
+- `vite-frontend` uses `rolldown-vite` (Rust bundler), not standard Vite.
+- `vite.config.ts`: build section sets only `outDir: "dist"` and `sourcemap: false`; no `minify`/`treeshake` overrides — compression is whatever rolldown-vite defaults to, verify from `vite build` output.
+- CI builds `go-gost` with `CGO_ENABLED=0` then compresses with UPX `--best --lzma`.

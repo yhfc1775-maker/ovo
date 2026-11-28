@@ -1,0 +1,170 @@
+package handler
+
+import (
+	"strings"
+	"testing"
+	"time"
+
+	"go-backend/internal/store/model"
+	"go-backend/internal/store/repo"
+)
+
+func seedRelayTargetNode(t *testing.T, r *repo.Repository, name, ip string) int64 {
+	t.Helper()
+	now := time.Now().UnixMilli()
+	// 夹具节点报当前 agent 版本：V1-01 版本门与 DBL mark 门均以 2.1.13 为界，
+	// 'v1' 不是真实 agent 版本串，会被两门 fail-closed 拦在下发之前。
+	// （门禁自身的版本用例在 nft_isolation_gate_test.go 内显式改写版本，不受此影响。）
+	if err := r.DB().Exec(`
+		INSERT INTO node(name, secret, server_ip, server_ip_v4, server_ip_v6, port, interface_name, version, http, tls, socks, created_time, updated_time, status, tcp_listen_addr, udp_listen_addr, inx)
+		VALUES(?, ?, ?, ?, '', '30000-30010', '', '2.1.13', 0, 0, 0, ?, ?, 0, '[::]', '[::]', 0)`, name, name+"-secret", ip, ip, now, now).Error; err != nil {
+		t.Fatal(err)
+	}
+	var id int64
+	if err := r.DB().Raw(`SELECT id FROM node WHERE name = ?`, name).Scan(&id).Error; err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func seedRelayTargetTunnel(t *testing.T, r *repo.Repository, name string, entry int64, exitPort int, exits ...int64) int64 {
+	t.Helper()
+	now := time.Now().UnixMilli()
+	if err := r.DB().Exec(`
+		INSERT INTO tunnel(name, traffic_ratio, type, protocol, flow, created_time, updated_time, status, in_ip, inx)
+		VALUES(?, 1.0, 2, 'tcp', 99999, ?, ?, 1, NULL, 0)`, name, now, now).Error; err != nil {
+		t.Fatal(err)
+	}
+	var id int64
+	if err := r.DB().Raw(`SELECT id FROM tunnel WHERE name = ?`, name).Scan(&id).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := r.DB().Exec(`INSERT INTO chain_tunnel(tunnel_id, chain_type, node_id, port, strategy, inx, protocol) VALUES(?, 1, ?, NULL, 'round', 1, 'tcp')`, id, entry).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, exit := range exits {
+		// AUDIT-R1 (TST-004): 出口端口按隧道区分。chain_tunnel(node_id,port) 唯一索引
+		//（批次 4，符合 §1.1 冲突域=同节点+同端口）下，多条隧道不可共用同一出口端口。
+		if err := r.DB().Exec(`INSERT INTO chain_tunnel(tunnel_id, chain_type, node_id, port, strategy, inx, protocol) VALUES(?, 3, ?, ?, 'round', 1, 'tcp')`, id, exit, exitPort).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	return id
+}
+
+// A tunnel exiting on another node (front → IX → landing) dials the landing
+// node's public address, and the whitelist must admit the exit node.
+func TestRelayTargetTunnelThroughIX(t *testing.T) {
+	r, err := repo.Open(t.TempDir() + "/relay-target.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = r.Close() })
+	h := New(r, "unit-test-secret")
+
+	front := seedRelayTargetNode(t, r, "front", "198.51.100.1")
+	ix := seedRelayTargetNode(t, r, "ix", "198.51.100.2")
+	landing := seedRelayTargetNode(t, r, "landing", "203.0.113.10")
+
+	viaIX := &tunnelRecord{ID: seedRelayTargetTunnel(t, r, "via-ix", front, 31000, ix), Type: 2}
+	direct := &tunnelRecord{ID: seedRelayTargetTunnel(t, r, "direct", front, 31001, landing), Type: 2}
+	mixed := &tunnelRecord{ID: seedRelayTargetTunnel(t, r, "mixed", front, 31002, landing, ix), Type: 2}
+
+	public := &model.NodeInbound{NodeID: landing, Listen: "::", Port: 443}
+	local := &model.NodeInbound{NodeID: landing, Listen: "127.0.0.1", Port: 444}
+	imported := &model.NodeInbound{Listen: "198.51.100.9", Port: 8388}
+
+	cases := []struct {
+		name    string
+		row     *model.NodeInbound
+		tunnel  *tunnelRecord
+		want    string
+		wantErr string
+	}{
+		{"via IX dials the public address", public, viaIX, "203.0.113.10:443", ""},
+		{"exit on landing dials locally", public, direct, "127.0.0.1:443", ""},
+		{"loopback inbound via IX", local, viaIX, "", "只监听本机"},
+		{"loopback inbound exiting on landing", local, direct, "127.0.0.1:444", ""},
+		{"landing mixed with other exits", public, mixed, "", "只能有这一个出口"},
+		{"imported node via IX", imported, viaIX, "198.51.100.9:8388", ""},
+		{"imported node via any tunnel", imported, direct, "198.51.100.9:8388", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := h.relayTarget(tc.row, tc.tunnel)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("want error %q, got %q %v", tc.wantErr, got, err)
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("got %q %v, want %q", got, err, tc.want)
+			}
+		})
+	}
+
+	dialers, err := h.relayDialerNodeIDs(viaIX.ID, 2)
+	if err != nil || len(dialers) != 1 || dialers[0] != ix {
+		t.Fatalf("tunnel forwards reach the landing node from the exit: %v %v", dialers, err)
+	}
+	dialers, err = h.relayDialerNodeIDs(viaIX.ID, 1)
+	if err != nil || len(dialers) != 1 || dialers[0] != front {
+		t.Fatalf("port forwards reach the landing node from the entry: %v %v", dialers, err)
+	}
+}
+
+// OPEN-13: relayTarget ignored the inbound's share-address mode and
+// always dialed the landing node's IPv4 first. With mode ipv6 on a
+// dual-stack node whose IPv4 is unreachable from the entry, the relay
+// dialed the dead IPv4 and failed. The target must follow the mode:
+// ipv6 dials the v6 address, custom dials the configured share host,
+// auto keeps the old ServerIP -> v4 -> v6 order, and a mode with no
+// usable address refuses instead of silently falling back to the
+// wrong family.
+func TestRelayTargetRespectsShareAddressMode(t *testing.T) {
+	r, err := repo.Open(t.TempDir() + "/relay-target-share.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = r.Close() })
+	h := New(r, "unit-test-secret")
+
+	front := seedRelayTargetNode(t, r, "front-s", "198.51.100.1")
+	ix := seedRelayTargetNode(t, r, "ix-s", "198.51.100.2")
+	landing := seedRelayTargetNode(t, r, "landing-s", "203.0.113.10")
+	if err := r.DB().Exec(`UPDATE node SET server_ip_v6 = ? WHERE id = ?`, "2001:db8::10", landing).Error; err != nil {
+		t.Fatal(err)
+	}
+	v4only := seedRelayTargetNode(t, r, "landing-v4only", "203.0.113.11")
+
+	viaIX := &tunnelRecord{ID: seedRelayTargetTunnel(t, r, "via-ix-s", front, 31010, ix), Type: 2}
+
+	cases := []struct {
+		name    string
+		row     *model.NodeInbound
+		want    string
+		wantErr string
+	}{
+		{"ipv6 mode dials the v6 address, not the dead v4", &model.NodeInbound{NodeID: landing, Listen: "::", Port: 443, ShareAddressMode: "ipv6"}, "[2001:db8::10]:443", ""},
+		{"ipv4 mode dials the v4 address", &model.NodeInbound{NodeID: landing, Listen: "::", Port: 443, ShareAddressMode: "ipv4"}, "203.0.113.10:443", ""},
+		{"custom mode dials the configured share host", &model.NodeInbound{NodeID: landing, Listen: "::", Port: 443, ShareAddressMode: "custom", ShareHost: "share.example.com"}, "share.example.com:443", ""},
+		{"auto mode keeps the old ServerIP-first order", &model.NodeInbound{NodeID: landing, Listen: "::", Port: 443, ShareAddressMode: "auto"}, "203.0.113.10:443", ""},
+		{"unset mode keeps the old ServerIP-first order", &model.NodeInbound{NodeID: landing, Listen: "::", Port: 443}, "203.0.113.10:443", ""},
+		{"ipv6 mode with no v6 address refuses, never falls back to v4", &model.NodeInbound{NodeID: v4only, Listen: "::", Port: 443, ShareAddressMode: "ipv6"}, "", "落地节点没有可用地址"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := h.relayTarget(tc.row, viaIX)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("want error %q, got %q %v", tc.wantErr, got, err)
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("got %q %v, want %q", got, err, tc.want)
+			}
+		})
+	}
+}

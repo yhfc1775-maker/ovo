@@ -1,0 +1,226 @@
+# AI Skill 使用指南
+
+让大模型直接操作 OVO 面板的技能包。支持 OpenCode、OpenClaw、Claude Code 等工具。
+
+## 安装
+
+### 方式 1: Release 资产（推荐）
+
+```bash
+mkdir -p ~/.agents/skills/ovo-api && curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/ovo-skill-api-2.1.34.tgz -o /tmp/ovo-skill-api-2.1.34.tgz && curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/ovo-skill-api-2.1.34.tgz.sha256 -o /tmp/ovo-skill-api-2.1.34.tgz.sha256 && (cd /tmp && sha256sum -c ovo-skill-api-2.1.34.tgz.sha256) && tar -xzf /tmp/ovo-skill-api-2.1.34.tgz -C ~/.agents/skills/ovo-api --strip-components=1
+```
+
+也可以在 GitHub Releases 页面下载 `ovo-skill-api-2.1.34.tgz` 后本地安装。
+
+postinstall 脚本会自动链接到 `~/.agents/skills/ovo-api/`。
+
+### 方式 2: 手动链接
+
+```bash
+# 从 OVO 源码
+cd /path/to/ovo
+mkdir -p ~/.agents/skills
+ln -sf $(pwd)/skills/ovo-api ~/.agents/skills/
+
+# 或从 GitHub
+git clone https://github.com/yhfc1775-maker/ovo.git
+cd ovo
+ln -sf $(pwd)/skills/ovo-api ~/.agents/skills/
+```
+
+## 配置
+
+设置环境变量：
+
+```bash
+export OVO_BASE_URL="https://your-panel.example.com"
+export OVO_USERNAME="admin"
+export OVO_PASSWORD="your-password"
+```
+
+或使用凭证文件：
+
+```bash
+mkdir -p ~/.ovo
+cat > ~/.ovo/.env << 'EOF'
+export OVO_BASE_URL="https://panel.example.com"
+export OVO_USERNAME="admin"
+export OVO_PASSWORD="your-password"
+EOF
+chmod 600 ~/.ovo/.env
+source ~/.ovo/.env
+```
+
+---
+
+## 工具接入方法
+
+### OpenCode
+
+OpenCode 是命令行 AI 编程助手，支持通过 skills 扩展能力。
+
+**安装 skill:**
+```bash
+mkdir -p ~/.agents/skills/ovo-api && curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/ovo-skill-api-2.1.34.tgz -o /tmp/ovo-skill-api-2.1.34.tgz && curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/ovo-skill-api-2.1.34.tgz.sha256 -o /tmp/ovo-skill-api-2.1.34.tgz.sha256 && (cd /tmp && sha256sum -c ovo-skill-api-2.1.34.tgz.sha256) && tar -xzf /tmp/ovo-skill-api-2.1.34.tgz -C ~/.agents/skills/ovo-api --strip-components=1
+```
+
+**使用:**
+```bash
+export OVO_BASE_URL="https://panel.example.com"
+export OVO_USERNAME="admin"
+export OVO_PASSWORD="your-password"
+
+opencode
+```
+
+**示例对话:**
+```
+你: 查看我的转发列表
+你: 创建一个转发到 203.0.113.100:80 使用隧道 1
+你: 检查节点状态
+你: 查看流量使用情况
+```
+
+---
+
+### OpenClaw
+
+OpenClaw 同样支持 skills 机制。
+
+**安装 skill:**
+```bash
+mkdir -p ~/.agents/skills/ovo-api && curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/ovo-skill-api-2.1.34.tgz -o /tmp/ovo-skill-api-2.1.34.tgz && curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/ovo-skill-api-2.1.34.tgz.sha256 -o /tmp/ovo-skill-api-2.1.34.tgz.sha256 && (cd /tmp && sha256sum -c ovo-skill-api-2.1.34.tgz.sha256) && tar -xzf /tmp/ovo-skill-api-2.1.34.tgz -C ~/.agents/skills/ovo-api --strip-components=1
+```
+
+# 或手动链接
+mkdir -p ~/.openclaw/skills
+ln -sf /path/to/ovo/skills/ovo-api ~/.openclaw/skills/ovo-api
+```
+
+**使用:**
+```bash
+openclaw
+
+>>> 查看所有节点状态
+>>> 给用户 alice 分配 50GB 流量
+>>> 导出系统备份
+```
+
+---
+
+### Claude Code
+
+Claude Code 是 Anthropic 官方的命令行工具，支持通过 CLAUDE.md 扩展。
+
+#### 方式 1: 项目级 CLAUDE.md
+
+在项目根目录创建 `CLAUDE.md`：
+
+```markdown
+# OVO API Skill
+
+你可以通过 REST API 操作 OVO 面板。
+
+## 环境变量
+- OVO_BASE_URL: 面板地址
+- OVO_USERNAME: 用户名
+- OVO_PASSWORD: 密码
+
+## 认证规则
+- Authorization 头使用原始 JWT token，不加 "Bearer " 前缀
+- 所有 API 使用 POST 方法
+
+## 常用 API
+
+### 登录获取 token
+POST /api/v1/user/login
+{"username": "...", "password": "..."}
+
+### 查看转发列表
+POST /api/v1/forward/list
+Authorization: <token>
+{}
+
+### 创建转发
+POST /api/v1/forward/create
+{"name": "xxx", "tunnelId": 1, "remoteAddr": "1.2.3.4:80"}
+
+### 查看节点
+POST /api/v1/node/list
+{}
+```
+
+**使用:**
+```bash
+cd /path/to/your/project
+claude
+```
+
+#### 方式 2: 全局 CLAUDE.md
+
+```bash
+mkdir -p ~/.claude
+cat > ~/.claude/CLAUDE.md << 'EOF'
+# OVO Panel Operations
+
+使用 OVO REST API 操作流量转发面板。
+
+环境变量: OVO_BASE_URL, OVO_USERNAME, OVO_PASSWORD
+调用方式: curl -X POST "$OVO_BASE_URL/api/v1/..." -H "Authorization: $TOKEN"
+注意: Authorization 不要加 Bearer 前缀
+EOF
+```
+
+#### 方式 3: 复制 SKILL.md
+
+```bash
+cat ~/.agents/skills/ovo-api/SKILL.md >> ~/.claude/CLAUDE.md
+```
+
+**示例对话:**
+```
+>>> 帮我查看 OVO 面板上有哪些节点
+>>> 创建一个名为 test 的转发，目标地址 203.0.113.100:80
+>>> 查看我的流量使用情况
+```
+
+---
+
+## API 覆盖
+
+| 模块 | 操作 |
+|------|------|
+| 认证 | 登录、Token 管理 |
+| 用户 | 增删改查、流量重置、密码 |
+| 节点 | 增删改查、安装、升级、状态 |
+| 隧道 | 增删改查、用户分配 |
+| 转发 | 增删改查、暂停/恢复、诊断 |
+| 限速 | 增删改查 |
+| 内核 | 能力矩阵、安装、版本、启停、日志 |
+| 入站 | 增删改查、导入、分享、分流、中转线路 |
+| 订阅 | 增删改查、订阅源、按订阅分配、公开拉取、流量统计（`/api/v1/subscription/traffic`、`/api/v1/user/subscription/traffic`） |
+| 监控 | 节点/隧道指标、服务监控、监控权限 |
+| Passkey | 登录、注册、列表、删除 |
+| 系统 | 版本、存储、检查更新、面板自升级、通知测试 |
+| 备份 | 导出/导入 |
+
+## 安全提示
+
+- ⚠️ 环境变量在进程列表中可见
+- 使用 `~/.ovo/.env` 文件并设置 `chmod 600`
+- 添加 `export HISTIGNORE="*OVO_PASSWORD*"` 防止密码进入历史记录
+- Token 仅在会话内存中缓存，不写入磁盘
+
+## 发布
+
+技能包随 OVO 产品版本一起发布，不单独打 tag：推送**纯数字 tag**（与产品版本相同，如 `2.1.34`）会触发产品构建，发版流水线（`.github/workflows/docker-build.yml`）在 create-release 里自动把技能包打成 tgz 并作为 Release 资产上传，不再经过 npm。版本号不由流水线改写：发版提交须先把三处字面量（`skills/ovo-api/SKILL.md`、`skills/ovo-api/package.json` 与本文示例）人工 bump 到待发版本；发版流水线在打 tgz 前断言 package.json 的版本与 tag 一致，不一致即中止发布——漏 bump 不会再静默发出 SKILL.md 与包版本错位的包。
+
+```bash
+# 随产品版本发布（示例）
+git tag 2.1.34
+git push --tags
+```
+
+注意：不要再使用 `skill-v<版本>` 形式的 tag——现行流水线的触发器只认纯数字 tag，`skill-v*` 不会触发任何发布。仓库内 `skills/ovo-api/SKILL.md`、`skills/ovo-api/package.json` 与本文示例的版本号字面量应保持一致（`scripts/check-doc-consistency.sh` 会校验）。
+
+技能包的下载地址就是该版本的 Release 资产，例如 `https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/ovo-skill-api-2.1.34.tgz`，公开下载，并按上方安装命令校验配套的 `.sha256`。

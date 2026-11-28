@@ -1,0 +1,182 @@
+package relay
+
+import (
+	"bytes"
+	"encoding/binary"
+	"errors"
+	"io"
+	"math"
+	"net"
+	"syscall"
+)
+
+type tcpConn struct {
+	net.Conn
+	wbuf bytes.Buffer
+}
+
+func (c *tcpConn) Read(b []byte) (n int, err error) {
+	return c.Conn.Read(b)
+}
+
+func (c *tcpConn) Write(b []byte) (n int, err error) {
+	if c.wbuf.Len() > 0 {
+		// The cached response header rides ahead of b on the
+		// wire; only the flushed bytes that carried b count
+		// toward n. This used to report len(b) unconditionally
+		// ("force byte length consistent"): a flush that blocked
+		// to its deadline on a dead client and moved nothing
+		// still credited Transport's progress tracker with a
+		// full chunk, and io.CopyBuffer dropped the unwritten
+		// bytes believing they had been written. Report only
+		// what actually crossed.
+		headerLen := c.wbuf.Len()
+		c.wbuf.Write(b) // append the data to the cached header
+		written, werr := c.wbuf.WriteTo(c.Conn)
+		if n = int(written) - headerLen; n < 0 {
+			n = 0
+		}
+		return n, werr
+	}
+	return c.Conn.Write(b)
+}
+
+// flushHeader writes the cached response header to the wire now
+// instead of waiting for the first payload byte in this direction
+// (F-212-B mirror gate): a peer connector in eager (nodelay) mode
+// drains this response inside its Connect call, before any payload
+// can flow, so deferring the header to the first Write deadlocked
+// establishment whenever the far side was waiting for it — the
+// target's first byte (which would have flushed it) itself depends
+// on payload that cannot be sent until Connect returns. Callers
+// flush synchronously right after caching, before the conn enters
+// Transport, so no locking against Write is needed.
+func (c *tcpConn) flushHeader() error {
+	if c.wbuf.Len() > 0 {
+		_, err := c.wbuf.WriteTo(c.Conn)
+		return err
+	}
+	return nil
+}
+
+var errHalfCloseNotSupported = errors.New("half-close not supported by the underlying connection")
+
+// CloseWrite forwards a half-close to the wrapped conn when it
+// supports one. This wrapper heads the relay session stack, so
+// without the forwarding Transport's half-close propagation
+// silently no-ops on every relay session: the peer never learns
+// the stream ended, both hops park on Read, and the FIN'd leg
+// lingers in CLOSE-WAIT (package K census). An unflushed header
+// in wbuf means no payload ever crossed in this direction; the
+// FIN alone terminates the peer's wait either way, so plain
+// delegation is sufficient.
+func (c *tcpConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return errHalfCloseNotSupported
+}
+
+func (c *tcpConn) CloseRead() error {
+	if cr, ok := c.Conn.(interface{ CloseRead() error }); ok {
+		return cr.CloseRead()
+	}
+	return errHalfCloseNotSupported
+}
+
+var errSyscallConnNotSupported = errors.New("syscall conn not supported by the underlying connection")
+
+// SyscallConn forwards the raw socket to the wrapped conn. This
+// wrapper heads the relay session stack, so without the
+// forwarding the reaper's TCP_INFO probe and linger-0 teardown
+// (internal/net) cannot resolve through it and relay sessions
+// would silently lose both.
+func (c *tcpConn) SyscallConn() (syscall.RawConn, error) {
+	if sc, ok := c.Conn.(syscall.Conn); ok {
+		return sc.SyscallConn()
+	}
+	return nil, errSyscallConnNotSupported
+}
+
+type udpConn struct {
+	net.Conn
+	wbuf bytes.Buffer
+	rbuf []byte // unread remainder of the current frame
+}
+
+// Read returns the payload of one B-frame per call; a remainder that
+// does not fit the caller's buffer is retained for the next Read
+// instead of being discarded (stream face, see connector/relay).
+func (c *udpConn) Read(b []byte) (n int, err error) {
+	if len(c.rbuf) > 0 {
+		n = copy(b, c.rbuf)
+		c.rbuf = c.rbuf[n:]
+		return n, nil
+	}
+
+	var bb [2]byte
+	_, err = io.ReadFull(c.Conn, bb[:])
+	if err != nil {
+		return
+	}
+
+	dlen := int(binary.BigEndian.Uint16(bb[:]))
+	if len(b) >= dlen {
+		return io.ReadFull(c.Conn, b[:dlen])
+	}
+	buf := make([]byte, dlen)
+	_, err = io.ReadFull(c.Conn, buf)
+	if err != nil {
+		return
+	}
+	n = copy(b, buf)
+	c.rbuf = append(c.rbuf, buf[n:dlen]...)
+
+	return
+}
+
+func (c *udpConn) Write(b []byte) (n int, err error) {
+	if len(b) > math.MaxUint16 {
+		err = errors.New("write: data maximum exceeded")
+		return
+	}
+
+	// OPEN-4: the tcpConn twin was fixed to report only what
+	// actually crossed; this udpConn kept the same forged count
+	// (pre-set n = len(b), returned whatever the flush did).
+	// Only the flushed bytes that carried this frame count
+	// toward n; the 2-byte length prefix and the cached
+	// response header are not payload.
+	if c.wbuf.Len() > 0 {
+		headerLen := c.wbuf.Len() + 2
+		var bb [2]byte
+		binary.BigEndian.PutUint16(bb[:], uint16(len(b)))
+		c.wbuf.Write(bb[:])
+		c.wbuf.Write(b) // append the data to the cached header
+		written, werr := c.wbuf.WriteTo(c.Conn)
+		if n = int(written) - headerLen; n < 0 {
+			n = 0
+		}
+		return n, werr
+	}
+
+	var bb [2]byte
+	binary.BigEndian.PutUint16(bb[:], uint16(len(b)))
+	if _, err = c.Conn.Write(bb[:]); err != nil {
+		return 0, err
+	}
+	return c.Conn.Write(b)
+}
+
+// flushHeader writes the cached response header to the wire now
+// instead of piggybacking it on the first framed datagram in this
+// direction — the udpConn counterpart of tcpConn.flushHeader
+// (F-212-B mirror gate). The cached header is a bare relay
+// response; data frames keep their length prefixes either way.
+func (c *udpConn) flushHeader() error {
+	if c.wbuf.Len() > 0 {
+		_, err := c.wbuf.WriteTo(c.Conn)
+		return err
+	}
+	return nil
+}
