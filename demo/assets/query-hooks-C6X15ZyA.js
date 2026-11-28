@@ -1,0 +1,1 @@
+import{t as e}from"./useQuery-BJYLMIDW.js";import{Vn as t,Xn as n,an as r}from"./index-C2GsK3Bk.js";const i=[`forwards`],a=[`tunnels`],o=[`speedLimits`];function s(){return e({queryKey:i,queryFn:()=>r()})}function c(){return e({queryKey:a,queryFn:()=>n()})}function l(){return e({queryKey:o,queryFn:()=>t()})}export{c as i,s as n,l as r,i as t};
