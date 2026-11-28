@@ -455,6 +455,22 @@ func validateProxyCredentials(p Proxy) error {
 			return errors.New("Mieru transport 仅支持 TCP / UDP")
 		}
 
+		mtu, present, exact := p.exactInt("mtu")
+		if present && (!exact || mtu < 1280 || mtu > 1500) {
+			return errors.New("Mieru MTU 应在 1280-1500 之间")
+		}
+		options := Settings{MTU: mtu, MieruMultiplexing: p.str("multiplexing"), MieruHandshakeMode: p.str("handshake-mode")}
+		if err := normalizeMieruOptions(&options); err != nil {
+			return err
+		}
+		p["mtu"] = options.MTU
+		p["multiplexing"] = options.MieruMultiplexing
+		if options.MieruHandshakeMode == MieruHandshakeStandard {
+			delete(p, "handshake-mode")
+		} else {
+			p["handshake-mode"] = options.MieruHandshakeMode
+		}
+
 	case "ss":
 		// R4X-001: cipher 名一处 ToLower 收口（四格式三入口全经
 		// finishProxy 到此，与 ss 链接 parseSSURI 既有口径对齐），
@@ -1704,7 +1720,7 @@ func singboxToProxy(o Proxy, byTag map[string]Proxy) (Proxy, error) {
 // accepts; the name-split scan below uses it to find the real "="
 // separator when the node name itself contains "=".
 var surgeProxyTypes = map[string]bool{
-	"ss": true, "shadowsocks": true, "vmess": true, "trojan": true,
+	"ss": true, "shadowsocks": true, "vmess": true, "vless": true, "trojan": true,
 	"snell": true, "hysteria2": true, "tuic": true, "tuic-v5": true,
 	"anytls": true, "socks5": true, "socks5-tls": true,
 	"http": true, "https": true,
@@ -2018,9 +2034,11 @@ func parseMieruURI(rest string) (Proxy, error) {
 	}
 	p["transport"] = tr
 	if mtuStr := strings.TrimSpace(q.Get("mtu")); mtuStr != "" {
-		if mtu, err := strconv.Atoi(mtuStr); err == nil && mtu >= 1280 && mtu <= 1500 {
-			p["mtu"] = mtu
+		mtu, err := strconv.Atoi(mtuStr)
+		if err != nil || mtu < 1280 || mtu > 1500 {
+			return nil, errors.New("Mieru MTU 应在 1280-1500 之间")
 		}
+		p["mtu"] = mtu
 	}
 	p.set("multiplexing", strings.TrimSpace(q.Get("multiplexing")))
 	if hm := strings.TrimSpace(q.Get("handshake-mode")); hm != "" && hm != MieruHandshakeStandard {

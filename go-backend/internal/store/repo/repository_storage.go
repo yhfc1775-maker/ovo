@@ -1,11 +1,15 @@
 package repo
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
+	"syscall"
+	"time"
 
 	"gorm.io/gorm"
 )
@@ -120,33 +124,97 @@ func (r *Repository) IncrementalVacuumSQLite(pages int64) error {
 	if r == nil || r.db == nil {
 		return errors.New("repository not initialized")
 	}
+	return r.IncrementalVacuumSQLiteContext(context.Background(), pages)
+}
+
+// IncrementalVacuumSQLiteContext releases the connection after each page and
+// yields every 16 pages. Online callers supply both a page cap and a deadline.
+func (r *Repository) IncrementalVacuumSQLiteContext(ctx context.Context, pages int64) error {
+	if r == nil || r.db == nil {
+		return errors.New("repository not initialized")
+	}
 	const maxPagesPerPass = 65536
 	if pages > maxPagesPerPass {
 		pages = maxPagesPerPass
 	}
 	for i := int64(0); i < pages; i++ {
-		if err := r.db.Exec("PRAGMA incremental_vacuum(1)").Error; err != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if i > 0 && i%16 == 0 {
+			timer := time.NewTimer(time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
+		if err := r.db.WithContext(ctx).Exec("PRAGMA incremental_vacuum(1)").Error; err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// VacuumSQLite fully rewrites the database file, returning all
-// freelist space. It first requests INCREMENTAL auto_vacuum on
-// the connection, so the rewrite also migrates a legacy
-// auto_vacuum=NONE file to INCREMENTAL (the mode takes effect
-// through the VACUUM itself). It briefly blocks the single
-// connection; callers gate it on a large reclaimable amount and
-// a minimum interval (see the ingestion prune cycle).
-func (r *Repository) VacuumSQLite() error {
+// VacuumSQLite is reserved for an explicitly configured maintenance window.
+// glebarez/go-sqlite propagates context cancellation to sqlite3_interrupt;
+// cancellation is cooperative, not a hard wall-clock bound on filesystem I/O.
+// Callers must budget it before entering; do not detach it into a goroutine.
+func (r *Repository) VacuumSQLite(ctx context.Context) error {
 	if r == nil || r.db == nil {
 		return errors.New("repository not initialized")
 	}
-	if err := r.db.Exec("PRAGMA auto_vacuum=INCREMENTAL").Error; err != nil {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return r.db.Exec("VACUUM").Error
+	if r.db.Dialector.Name() != "sqlite" {
+		return errors.New("VACUUM maintenance requires SQLite")
+	}
+	if err := r.checkSQLiteVacuumSpace(); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := r.db.WithContext(ctx).Exec("PRAGMA auto_vacuum=INCREMENTAL").Error; err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	err := r.db.WithContext(ctx).Exec("VACUUM").Error
+	if err != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
+}
+
+// SQLite can need twice the database size in additional free space for its
+// temporary copy and rollback/WAL. Check both filesystems, fail closed on an
+// unknown size/space result, and leave the original database in place.
+// https://www.sqlite.org/lang_vacuum.html#how_vacuum_works
+func (r *Repository) checkSQLiteVacuumSpace() error {
+	if r.dbPath == "" || r.dbPath == ":memory:" {
+		return nil
+	}
+	size, err := sqliteDatabaseFileSize(r.dbPath)
+	if err != nil {
+		return err
+	}
+	if size > math.MaxInt64/2 {
+		return errors.New("SQLite VACUUM size exceeds space budget")
+	}
+	for _, dir := range []string{filepath.Dir(r.dbPath), os.TempDir()} {
+		var st syscall.Statfs_t
+		if err := syscall.Statfs(dir, &st); err != nil {
+			return fmt.Errorf("SQLite VACUUM space check: %w", err)
+		}
+		if st.Bsize <= 0 || st.Bavail < uint64(2*size)/uint64(st.Bsize)+1 {
+			return errors.New("SQLite VACUUM needs free disk space for its temporary copy and rollback")
+		}
+	}
+	return nil
 }
 
 // ensureSQLiteIncrementalVacuum puts a brand-new database file

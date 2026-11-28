@@ -724,7 +724,7 @@ func (h *Handler) kernelInstall(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.applyKernel(k.ID, true); err != nil {
-		if info.Type == kernel.TypeMieru && strings.Contains(err.Error(), "未知内核") {
+		if info.Type == kernel.TypeMieru && strings.Contains(err.Error(), "不支持的内核类型") {
 			err = errors.New("节点 Agent 暂不支持 Mieru，请先升级到包含本次 Mieru 移植的 Agent")
 		}
 
@@ -1074,7 +1074,15 @@ func (h *Handler) inboundList(w http.ResponseWriter, r *http.Request) {
 		response.WriteJSON(w, response.ErrDefault("请求失败"))
 		return
 	}
-	rows, err := h.repo.ListNodeInbounds()
+	var req struct {
+		Current int `json:"current"`
+		Size    int `json:"size"`
+	}
+	if err := decodeJSON(r.Body, &req); err != nil && err != io.EOF {
+		response.WriteJSON(w, response.ErrDefault("请求参数错误"))
+		return
+	}
+	rows, err := h.repo.ListNodeInbounds(req.Current, req.Size)
 	if err != nil {
 		respondInternalError(w, "inboundList", err)
 		return
@@ -1106,7 +1114,19 @@ func (h *Handler) inboundList(w http.ResponseWriter, r *http.Request) {
 	for _, k := range kernels {
 		kernelByID[k.ID] = k
 	}
-	nodes := make(map[int64]*model.Node)
+	nodeIDs := make([]int64, 0, len(rows))
+	seenNodes := make(map[int64]bool, len(rows))
+	for _, row := range rows {
+		if row.CompanionOf <= 0 && !seenNodes[row.NodeID] {
+			seenNodes[row.NodeID] = true
+			nodeIDs = append(nodeIDs, row.NodeID)
+		}
+	}
+	nodes, err := h.repo.ListInboundNodes(nodeIDs)
+	if err != nil {
+		respondInternalError(w, "inboundList: nodes", err)
+		return
+	}
 	sourceNames := map[int64]string{}
 	if sources, err := h.repo.ListRemoteSources(); err == nil {
 		for _, s := range sources {
@@ -1116,6 +1136,24 @@ func (h *Handler) inboundList(w http.ResponseWriter, r *http.Request) {
 	names := make(map[int64]string, len(rows))
 	for _, row := range rows {
 		names[row.ID] = row.Name
+	}
+	if req.Current > 0 && req.Size > 0 {
+		ids := make([]int64, 0, len(rows))
+		seen := make(map[int64]bool)
+		for _, row := range rows {
+			if row.OutboundID != 0 && !seen[row.OutboundID] {
+				seen[row.OutboundID] = true
+				ids = append(ids, row.OutboundID)
+			}
+		}
+		targets, err := h.repo.ListInboundNames(ids)
+		if err != nil {
+			respondInternalError(w, "inboundList: outbound names", err)
+			return
+		}
+		for id, name := range targets {
+			names[id] = name
+		}
 	}
 	// Companion inbounds are system-managed derived rows: they never
 	// appear in the list; their origins report meteringActive instead.
@@ -1150,11 +1188,7 @@ func (h *Handler) inboundList(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			log.Printf("kernel: %v", err)
 		}
-		node, ok := nodes[row.NodeID]
-		if !ok {
-			node, _ = h.repo.GetNodeByID(row.NodeID)
-			nodes[row.NodeID] = node
-		}
+		node := nodes[row.NodeID]
 		k := kernelByID[row.KernelID]
 		v := inboundView{
 			ID:                  row.ID,

@@ -239,12 +239,17 @@ func deleteNodeKernelsTx(tx *gorm.DB, nodeID int64) error {
 	return tx.Where("node_id = ?", nodeID).Delete(&model.NodeKernel{}).Error
 }
 
-func (r *Repository) ListNodeInbounds() ([]model.NodeInbound, error) {
+func (r *Repository) ListNodeInbounds(page ...int) ([]model.NodeInbound, error) {
 	if r == nil || r.db == nil {
 		return nil, errors.New("repository not initialized")
 	}
 	var rows []model.NodeInbound
-	return rows, r.db.Order("inx ASC, id ASC").Find(&rows).Error
+	q := r.db.Order("inx ASC, id ASC")
+	if len(page) == 2 && page[0] > 0 && page[1] > 0 {
+		// Hidden companion rows must not consume a visible page slot.
+		q = q.Where("companion_of <= 0 OR companion_of IS NULL")
+	}
+	return rows, applyListPage(q, page).Find(&rows).Error
 }
 
 // ListNodeInboundRelays returns all inbound-relay links.

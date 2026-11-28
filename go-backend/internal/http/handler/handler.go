@@ -1098,7 +1098,17 @@ func (h *Handler) nodeList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	items, err := h.repo.ListNodes()
+	var req struct {
+		Current int `json:"current"`
+		Size    int `json:"size"`
+	}
+	if err := decodeJSON(r.Body, &req); err != nil && err != io.EOF {
+		response.WriteJSON(w, response.ErrDefault("请求参数错误"))
+		return
+	}
+	// Zero parameters preserve the legacy full list; explicit pages are
+	// selected in SQL before metadata enrichment, with a maximum size of 500.
+	items, err := h.repo.ListNodesPage(req.Current, req.Size)
 	if err != nil {
 		respondInternalError(w, "nodeList", err)
 		return
@@ -1108,7 +1118,31 @@ func (h *Handler) nodeList(w http.ResponseWriter, r *http.Request) {
 	h.attachNodeUninstallStates(items)
 	h.attachConnlogMarkStates(items)
 	h.attachNodeMetricStaleness(items)
-	h.attachNodeNicShared(items)
+	if req.Current > 0 && req.Size > 0 {
+		ids := make([]int64, 0, len(items))
+		for _, item := range items {
+			ids = append(ids, asInt64(item["id"], 0))
+		}
+		peers, err := h.repo.ListNodeNICPeers(ids)
+		if err != nil {
+			respondInternalError(w, "nodeList: NIC peers", err)
+			return
+		}
+		h.attachNodeNicShared(peers)
+		byID := make(map[int64]interface{}, len(peers))
+		for _, peer := range peers {
+			if shared, ok := peer["nicSharedWith"]; ok {
+				byID[asInt64(peer["id"], 0)] = shared
+			}
+		}
+		for _, item := range items {
+			if shared, ok := byID[asInt64(item["id"], 0)]; ok {
+				item["nicSharedWith"] = shared
+			}
+		}
+	} else {
+		h.attachNodeNicShared(items)
+	}
 	for _, item := range items {
 		verification, ok := item["upgradeVerification"].(map[string]interface{})
 		id, _ := item["id"].(int64)

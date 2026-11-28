@@ -1,6 +1,7 @@
 package repo
 
 import (
+	"context"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -98,7 +99,7 @@ func TestSQLiteReclaimVacuumLegacyNoneMode(t *testing.T) {
 	if stats.FreelistCount == 0 {
 		t.Fatal("freelist = 0 after delete-all on legacy database")
 	}
-	if err := r.VacuumSQLite(); err != nil {
+	if err := r.VacuumSQLite(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	after, err := r.SQLiteSpaceStats()
