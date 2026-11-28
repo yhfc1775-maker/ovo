@@ -182,6 +182,11 @@ func inboundEligibleForMux(in kernel.Inbound, kernelType string, mux *model.Node
 		kernelType == kernel.TypeXray && networkHasTCP(in.Network())
 }
 
+// errNoFreeMuxPort is the fixed literal returned when the loopback
+// MuxPort range is exhausted; callers may errors.Is-check it to keep
+// the user-facing message while repo errors stay server-side only.
+var errNoFreeMuxPort = errors.New("未找到可用的复用内部端口")
+
 func (h *Handler) pickFreeMuxPort(nodeID, excludeInboundID int64, extraForbidden ...int) (int, error) {
 	used := make(map[int]bool)
 	for _, p := range extraForbidden {
@@ -240,7 +245,7 @@ func (h *Handler) pickFreeMuxPort(nodeID, excludeInboundID int64, extraForbidden
 			return port, nil
 		}
 	}
-	return 0, errors.New("未找到可用的复用内部端口")
+	return 0, errNoFreeMuxPort
 }
 
 func (h *Handler) buildNodePortMuxView(nodeID int64) (nodePortMuxView, error) {
@@ -317,12 +322,22 @@ func (h *Handler) nodePortMuxGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := h.kernelNodeEligible(req.NodeID); err != nil {
-		response.WriteJSON(w, response.ErrDefault(err.Error()))
+		if errors.Is(err, errKernelNodeNotFound) {
+			response.WriteJSON(w, response.ErrDefault("节点不存在"))
+			return
+		}
+		if errors.Is(err, errKernelNodeNftables) {
+			response.WriteJSON(w, response.ErrDefault("nftables 模式节点不支持部署内核"))
+			return
+		}
+		log.Printf("nodePortMuxGet: kernelNodeEligible failed: %v", err)
+		response.WriteJSON(w, response.ErrDefault("Internal error"))
 		return
 	}
 	view, err := h.buildNodePortMuxView(req.NodeID)
 	if err != nil {
-		response.WriteJSON(w, response.Err(-2, err.Error()))
+		log.Printf("nodePortMuxGet: buildNodePortMuxView failed: %v", err)
+		response.WriteJSON(w, response.Err(-2, "Internal error"))
 		return
 	}
 	response.WriteJSON(w, response.OK(view))
@@ -335,7 +350,8 @@ func (h *Handler) nodePortMuxList(w http.ResponseWriter, r *http.Request) {
 	}
 	rows, err := h.repo.ListNodePortMuxes()
 	if err != nil {
-		response.WriteJSON(w, response.Err(-2, err.Error()))
+		log.Printf("nodePortMuxList: ListNodePortMuxes failed: %v", err)
+		response.WriteJSON(w, response.Err(-2, "Internal error"))
 		return
 	}
 	out := make([]nodePortMuxView, 0, len(rows))
@@ -372,7 +388,16 @@ func (h *Handler) nodePortMuxSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := h.kernelNodeEligible(req.NodeID); err != nil {
-		response.WriteJSON(w, response.ErrDefault(err.Error()))
+		if errors.Is(err, errKernelNodeNotFound) {
+			response.WriteJSON(w, response.ErrDefault("节点不存在"))
+			return
+		}
+		if errors.Is(err, errKernelNodeNftables) {
+			response.WriteJSON(w, response.ErrDefault("nftables 模式节点不支持部署内核"))
+			return
+		}
+		log.Printf("nodePortMuxSave: kernelNodeEligible failed: %v", err)
+		response.WriteJSON(w, response.ErrDefault("Internal error"))
 		return
 	}
 
@@ -436,12 +461,14 @@ func (h *Handler) nodePortMuxSave(w http.ResponseWriter, r *http.Request) {
 
 	prevMux, err := h.repo.GetNodePortMux(req.NodeID)
 	if err != nil {
-		response.WriteJSON(w, response.Err(-2, err.Error()))
+		log.Printf("nodePortMuxSave: GetNodePortMux failed: %v", err)
+		response.WriteJSON(w, response.Err(-2, "Internal error"))
 		return
 	}
 	kernels, err := h.repo.ListNodeKernels(req.NodeID)
 	if err != nil {
-		response.WriteJSON(w, response.Err(-2, err.Error()))
+		log.Printf("nodePortMuxSave: ListNodeKernels failed: %v", err)
+		response.WriteJSON(w, response.Err(-2, "Internal error"))
 		return
 	}
 	kernelTypeByID := make(map[int64]string, len(kernels))
@@ -450,7 +477,8 @@ func (h *Handler) nodePortMuxSave(w http.ResponseWriter, r *http.Request) {
 	}
 	inbounds, err := h.repo.ListNodeInboundsByNode(req.NodeID)
 	if err != nil {
-		response.WriteJSON(w, response.Err(-2, err.Error()))
+		log.Printf("nodePortMuxSave: ListNodeInboundsByNode failed: %v", err)
+		response.WriteJSON(w, response.Err(-2, "Internal error"))
 		return
 	}
 
@@ -460,10 +488,12 @@ func (h *Handler) nodePortMuxSave(w http.ResponseWriter, r *http.Request) {
 
 	if req.Enabled {
 		if occ, err := h.repo.NodeForwardOrTunnelPortRangeOccupant(req.NodeID, port, port); err != nil {
-			response.WriteJSON(w, response.Err(-2, err.Error()))
+			log.Printf("nodePortMuxSave: NodeForwardOrTunnelPortRangeOccupant failed: %v", err)
+			response.WriteJSON(w, response.Err(-2, "Internal error"))
 			return
 		} else if occ != "" {
-			response.WriteJSON(w, response.ErrDefault(fmt.Sprintf("端口 %d 已被%s占用", port, occ)))
+			log.Printf("nodePortMuxSave: port %d occupied by %s", port, occ)
+			response.WriteJSON(w, response.ErrDefault(fmt.Sprintf("端口 %d 已被其他服务占用", port)))
 			return
 		}
 
@@ -510,7 +540,12 @@ func (h *Handler) nodePortMuxSave(w http.ResponseWriter, r *http.Request) {
 					var perr error
 					mp, perr = h.pickFreeMuxPort(req.NodeID, row.ID, forbidden...)
 					if perr != nil {
-						response.WriteJSON(w, response.ErrDefault(perr.Error()))
+						if errors.Is(perr, errNoFreeMuxPort) {
+							response.WriteJSON(w, response.ErrDefault("未找到可用的复用内部端口"))
+							return
+						}
+						log.Printf("nodePortMuxSave: pickFreeMuxPort failed: %v", perr)
+						response.WriteJSON(w, response.ErrDefault("Internal error"))
 						return
 					}
 					allocated = append(allocated, mp)
@@ -588,12 +623,14 @@ func (h *Handler) nodePortMuxSave(w http.ResponseWriter, r *http.Request) {
 
 	for inboundID, upd := range muxPortUpdates {
 		if err := h.repo.SetNodeInboundMuxState(inboundID, upd.port, upd.acceptProxy, now); err != nil {
-			response.WriteJSON(w, response.Err(-2, err.Error()))
+			log.Printf("nodePortMuxSave: SetNodeInboundMuxState failed: %v", err)
+			response.WriteJSON(w, response.Err(-2, "Internal error"))
 			return
 		}
 	}
 	if err := h.repo.UpsertNodePortMux(muxRecord); err != nil {
-		response.WriteJSON(w, response.Err(-2, err.Error()))
+		log.Printf("nodePortMuxSave: UpsertNodePortMux failed: %v", err)
+		response.WriteJSON(w, response.Err(-2, "Internal error"))
 		return
 	}
 
@@ -637,7 +674,8 @@ func (h *Handler) nodePortMuxSave(w http.ResponseWriter, r *http.Request) {
 
 	view, err := h.buildNodePortMuxView(req.NodeID)
 	if err != nil {
-		response.WriteJSON(w, response.Err(-2, err.Error()))
+		log.Printf("nodePortMuxSave: buildNodePortMuxView failed: %v", err)
+		response.WriteJSON(w, response.Err(-2, "Internal error"))
 		return
 	}
 	if len(warnings) > 0 {

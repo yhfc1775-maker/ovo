@@ -1635,7 +1635,8 @@ func (h *Handler) inboundSave(w http.ResponseWriter, r *http.Request, update boo
 	mux, merr := h.repo.GetNodePortMux(row.NodeID)
 	if merr != nil {
 		releasePortAlloc()
-		response.WriteJSON(w, response.Err(-2, merr.Error()))
+		log.Printf("inboundSave: GetNodePortMux failed: %v", merr)
+		response.WriteJSON(w, response.Err(-2, "Internal error"))
 		return
 	}
 	willMux := inboundEligibleForMux(in, k.KernelType, mux)
@@ -1726,7 +1727,12 @@ func (h *Handler) inboundSave(w http.ResponseWriter, r *http.Request, update boo
 			mp, merr := h.pickFreeMuxPort(row.NodeID, row.ID, in.Port)
 			if merr != nil {
 				releasePortAlloc()
-				response.WriteJSON(w, response.ErrDefault(merr.Error()))
+				if errors.Is(merr, errNoFreeMuxPort) {
+					response.WriteJSON(w, response.ErrDefault("未找到可用的复用内部端口"))
+					return
+				}
+				log.Printf("inboundSave: pickFreeMuxPort failed: %v", merr)
+				response.WriteJSON(w, response.ErrDefault("Internal error"))
 				return
 			}
 			row.MuxPort = mp

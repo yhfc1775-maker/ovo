@@ -3,6 +3,9 @@ package handler
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -143,5 +146,157 @@ func TestBuildKernelAndPortMuxPayloads(t *testing.T) {
 	}
 	if len(gotVless.Allow) == 0 {
 		t.Fatalf("expected whitelist Allow entries on muxed vless route, got %+v", gotVless)
+	}
+}
+
+// 443 端口复用：三个管理端点（get/list/save）必须可达且按契约返回。
+// get/list 只读仓储，不碰 agent；save 用“关闭”路径测（已有复用行
+// 但未启用时不下发、不调内核），同样不碰 agent。
+func TestNodePortMuxHandlers(t *testing.T) {
+	r, err := repo.Open(t.TempDir() + "/mux-handlers.db")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer r.Close()
+
+	now := time.Now().UnixMilli()
+	nodeA := seedRelayTargetNode(t, r, "mux-handlers-a", "203.0.113.11")
+	k := &model.NodeKernel{
+		NodeID:      nodeA,
+		KernelType:  kernel.TypeXray,
+		Version:     "latest",
+		Status:      kernelStatusRunning,
+		Enabled:     1,
+		CreatedTime: now,
+		UpdatedTime: now,
+	}
+	if err := r.CreateNodeKernel(k); err != nil {
+		t.Fatalf("create kernel: %v", err)
+	}
+	in := kernel.Inbound{
+		Protocol: kernel.ProtocolVLESS,
+		Listen:   "::",
+		Port:     443,
+		Security: kernel.Security{Type: kernel.SecurityReality, SNI: "www.microsoft.com"},
+	}
+	if err := kernel.Normalize(kernel.TypeXray, &in); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	row := model.NodeInbound{
+		KernelID:       k.ID,
+		NodeID:         nodeA,
+		Name:           "VLESS 443",
+		Protocol:       in.Protocol,
+		Listen:         in.Listen,
+		Port:           in.Port,
+		MuxPort:        45443,
+		RelayWhitelist: 1,
+		WhitelistExtra: "198.51.100.1/32",
+		Enabled:        1,
+		CreatedTime:    now,
+		UpdatedTime:    now,
+	}
+	if err := applyInboundToModel(in, &row); err != nil {
+		t.Fatalf("applyInboundToModel: %v", err)
+	}
+	if err := r.CreateNodeInbound(&row); err != nil {
+		t.Fatalf("create inbound: %v", err)
+	}
+	rulesJSON, _ := json.Marshal([]muxExternalRule{
+		{SNI: "panel.example.com", Target: "127.0.0.1:8443", ProxyProtocol: true, Remark: "panel"},
+	})
+	if err := r.UpsertNodePortMux(&model.NodePortMux{
+		NodeID:         nodeA,
+		Enabled:        1,
+		Listen:         "::",
+		Port:           443,
+		Rules:          string(rulesJSON),
+		FallbackTarget: "127.0.0.1:8443",
+		FallbackProxy:  0,
+		Status:         kernelStatusPending,
+		CreatedTime:    now,
+		UpdatedTime:    now,
+	}); err != nil {
+		t.Fatalf("upsert mux A: %v", err)
+	}
+
+	nodeB := seedRelayTargetNode(t, r, "mux-handlers-b", "203.0.113.12")
+	if err := r.UpsertNodePortMux(&model.NodePortMux{
+		NodeID:         nodeB,
+		Enabled:        0,
+		Listen:         "::",
+		Port:           443,
+		Rules:          "[]",
+		FallbackTarget: "",
+		FallbackProxy:  0,
+		Status:         kernelStatusStopped,
+		CreatedTime:    now,
+		UpdatedTime:    now,
+	}); err != nil {
+		t.Fatalf("upsert mux B: %v", err)
+	}
+
+	h := New(r, "test-jwt-secret")
+
+	call := func(handler func(http.ResponseWriter, *http.Request), body string) (int, map[string]interface{}) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/node/port-mux/x", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+		var env map[string]interface{}
+		if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+			t.Fatalf("decode envelope: %v (body %q)", err, rec.Body.String())
+		}
+		code, _ := env["code"].(float64)
+		return int(code), env
+	}
+
+	// get：参数错时拒绝；正确时返回 A 的复用视图。
+	if code, _ := call(h.nodePortMuxGet, `{"nodeId": 0}`); code == 0 {
+		t.Fatalf("get with nodeId 0 must fail, got code 0")
+	}
+	code, env := call(h.nodePortMuxGet, fmt.Sprintf(`{"nodeId": %d}`, nodeA))
+	if code != 0 {
+		t.Fatalf("get A: code=%d env=%v", code, env)
+	}
+	data, _ := env["data"].(map[string]interface{})
+	if data == nil {
+		t.Fatalf("get A: missing data: %v", env)
+	}
+	if enabled, _ := data["enabled"].(bool); !enabled {
+		t.Fatalf("get A: expected enabled=true: %v", data)
+	}
+	if port, _ := data["port"].(float64); int(port) != 443 {
+		t.Fatalf("get A: expected port 443: %v", data)
+	}
+	inbounds, _ := data["inbounds"].([]interface{})
+	if len(inbounds) != 1 {
+		t.Fatalf("get A: expected 1 muxed inbound: %v", data)
+	}
+	if sni, _ := inbounds[0].(map[string]interface{})["sni"].(string); sni != "www.microsoft.com" {
+		t.Fatalf("get A: unexpected inbound sni: %v", inbounds)
+	}
+
+	// list：返回两条复用记录。
+	code, env = call(h.nodePortMuxList, "")
+	if code != 0 {
+		t.Fatalf("list: code=%d env=%v", code, env)
+	}
+	list, _ := env["data"].([]interface{})
+	if len(list) != 2 {
+		t.Fatalf("list: expected 2 mux rows, got %d: %v", len(list), env)
+	}
+
+	// save：关闭路径（B 未启用）只写库不下发，返回 code 0。
+	code, env = call(h.nodePortMuxSave, fmt.Sprintf(`{"nodeId": %d, "enabled": false, "listen": "::", "port": 443, "rules": [], "fallbackTarget": "", "fallbackProxy": false}`, nodeB))
+	if code != 0 {
+		t.Fatalf("save B: code=%d env=%v", code, env)
+	}
+	saved, err := r.GetNodePortMux(nodeB)
+	if err != nil || saved == nil {
+		t.Fatalf("save B: read back: saved=%v err=%v", saved, err)
+	}
+	if saved.Enabled != 0 || saved.Port != 443 {
+		t.Fatalf("save B: unexpected row: %+v", saved)
 	}
 }
