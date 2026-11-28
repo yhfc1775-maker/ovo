@@ -1,7 +1,7 @@
 # Agent (node) image: the container install form of the node agent.
 # Built and pushed by the docker-build workflow as ovo-agent alongside
 # the panel images; the script install form does not use this image.
-FROM golang:1.25-bookworm@sha256:3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437 AS builder
+FROM golang:1.27-bookworm@sha256:ce59b41415e2524ae99926fe1f37ce48ba8c194dcbd2a56a65436cdcefa2bd34 AS builder
 WORKDIR /src
 
 COPY go.mod go.sum ./
