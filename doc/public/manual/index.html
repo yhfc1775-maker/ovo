@@ -298,7 +298,7 @@ body.locked{overflow:hidden}
       </div>
     </section>
     <section class="features">
-      <div class="feature"><h3>节点搭建</h3><p>节点页装 Xray / sing-box 内核，用模板新建入站——VLESS + Reality + Vision 一类组合保存即下发生效。</p></div>
+      <div class="feature"><h3>节点搭建</h3><p>节点页装 Xray / sing-box 内核，用模板新建入站——VLESS 加密（ENC）一类组合保存即下发生效。</p></div>
       <div class="feature"><h3>中转转发</h3><p>端口转发开箱即用；隧道转发支持转发链，一跳一跳把流量送到出口节点，负载策略有主备 / 轮询 / 随机三档。</p></div>
       <div class="feature"><h3>链式代理</h3><p>链在服务器侧拼：隧道转发链逐跳接力，入站出站按出站配置再拨下一跳，按场景选一种。</p></div>
       <div class="feature"><h3>导入节点</h3><p>别处搭好的节点用分享链接或订阅导入面板，照样能对接中转、进自己的订阅。</p></div>
@@ -332,7 +332,7 @@ body.locked{overflow:hidden}
 <ol class="steps">
   <li><b class="st">安装面板</b>在一台服务器上装好面板，浏览器打开面板地址，用默认管理员账号登录后<strong>立即修改密码</strong>。安装命令是演示写法，见 <a href="#/guide/install">安装部署</a>。</li>
   <li><b class="st">添加节点</b>先在 <a href="#/guide/config">网站配置</a> 里确认面板后端地址，再到<strong>节点</strong>页新建节点，把生成的安装命令拿到目标服务器上执行，等节点状态变为<strong>在线</strong>。见 <a href="#/guide/nodes">搭建节点</a>。</li>
-  <li><b class="st">新建入站</b>在节点上安装 Xray 或 sing-box 内核，再<strong>新建入站</strong>（例如 VLESS + Reality + Vision），点「创建并下发」后入站即出现在落地列表里。见 <a href="#/guide/inbound">新建入站</a>。</li>
+  <li><b class="st">新建入站</b>在节点上安装 Xray 或 sing-box 内核，再<strong>新建入站</strong>（例如 VLESS 加密（ENC）），点「创建并下发」后入站即出现在落地列表里。见 <a href="#/guide/inbound">新建入站</a>。</li>
   <li><b class="st">对接中转（可选）</b>流量不想从落地机直出时，到<strong>中转</strong>页建隧道：只换入口用端口转发，要多跳链路用隧道转发。见 <a href="#/guide/relay">对接中转</a>。</li>
   <li><b class="st">建订阅并导入客户端</b>到<strong>订阅</strong>页新建订阅，在订阅详情里复制链接或选客户端一键导入。见 <a href="#/guide/subscription">订阅设置</a> 与 <a href="#/guide/sub-clients">导入到客户端</a>。</li>
 </ol>
@@ -473,36 +473,36 @@ curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/panel_
 <div class="page" data-page="inbound">
 <div class="doc-wrap"><article class="doc">
 <h1>新建入站</h1>
-<p>入站是节点对外提供服务的入口：选一个节点 + 内核，定协议、传输与安全组合，点「创建并下发」后客户端就能连。本章用实测建出的 <strong>演示-VLESS（VLESS + TCP + Reality + Vision，端口 52668，节点 r5-node-0241）</strong>为例，一步一步走完。</p>
+<p>入站是节点对外提供服务的入口：选一个节点 + 内核，定协议、传输与安全组合，点「创建并下发」后客户端就能连。本章用实测建出的 <strong>演示-VLESS（VLESS + TCP + ENC（IEPL专用），端口 52668，节点 r5-node-0241）</strong>为例，一步一步走完。</p>
 <h2>创建步骤</h2>
 <ol class="steps">
-  <li><b class="st">打开新建入站</b>落地页右上角点<strong>新建入站</strong>。弹窗顶部写明：留空的 UUID、密码、密钥会自动生成，端口留空则随机分配。</li>
-  <li><b class="st">选模板</b>弹窗上半部是现成模板：<strong>VLESS + Reality + Vision</strong>（推荐：无需域名和证书，抗探测）、VLESS + XHTTP + Reality、Shadowsocks 2022、Trojan + TLS（自签）、VMess + WS + TLS 等。示例选第一个。</li>
-  <li><b class="st">填名称与端口</b>名称填 <code>演示-VLESS</code>（模板已自动带出「VLESS + Reality + Vision」前缀，名称栏实际为「VLESS + Reality + Vision演示-VLESS」）；端口可以留空随机（从 [20000,60000) 里取），也可以自己指定（只检查是否与已有端口冲突，并放行防火墙）。</li>
-  <li><b class="st">按需展开高级设置</b>模板只定大方向，协议 / 传输 / 安全等字段都在高级设置里，展开可查看或修改，逐项见下节；普通直连场景可以先全部留默认。</li>
-  <li><b class="st">点「创建并下发」</b>面板把配置下发到节点内核，成功后回到落地列表核对。</li>
+  <li><b class="st">打开新建入站</b>节点页右上角点<strong>新建入站</strong>。弹窗顶部写明：留空的 UUID、密码、密钥会自动生成，端口留空则随机分配。</li>
+  <li><b class="st">选预设</b>点红色「<strong>IEPL专用</strong>」标签，一键套用纯 ENC 预设（VLESS / TCP / 安全无、ENC 开、ML-KEM-768 认证、xorpub 外观、无 SNI，并勾选空闲超时「不限」）。备选是 Shadowsocks 2022。不要选 VLESS + Reality + Vision 模板——Reality 是 TLS，走 IX 中转会断。</li>
+  <li><b class="st">填名称与端口</b>名称填 <code>演示-VLESS</code>；端口可以留空随机（从 [20000,60000) 里取），也可以自己指定（只检查是否与已有端口冲突，并放行防火墙）。</li>
+  <li><b class="st">按需展开高级设置</b>预设只定大方向，协议 / 传输 / 安全等字段都在高级设置里，展开可查看或修改，逐项见下节；普通直连场景可以先全部留默认。</li>
+  <li><b class="st">点「创建并下发」</b>面板把配置下发到节点内核，成功后回到入站列表核对。</li>
   <li><b class="st">回列表核对</b>新入站应出现在列表里：名称、协议组合、端口、所属节点、启用开关都对上，再去 <a href="#/guide/subscription">订阅</a> 里看它是否已被订阅收录。</li>
 </ol>
 <figure>
-  <img src="images/manual-07.jpg" alt="真实面板截图：新建入站弹窗已选 VLESS 加 Reality 加 Vision 模板（标注推荐：无需域名和证书，抗探测），名称已填 VLESS + Reality + Vision演示-VLESS，端口留空随机，下方是折叠的高级设置">
-  <figcaption><b>新建入站：选好模板、填好名称</b> —— 模板区选中「VLESS + Reality + Vision」，名称栏为「VLESS + Reality + Vision演示-VLESS」（模板自动带出的前缀 + 追加的「演示-VLESS」），端口留空随机；弹窗底部提示“已套用「VLESS + Reality + Vision」：协议、传输与安全等字段在高级设置中，展开可查看或修改”（实拍 · 094 测试面板，演示数据已清理）。</figcaption>
+  <img src="images/manual-07.jpg" alt="真实面板截图：新建入站弹窗已点红色 IEPL专用标签套用纯 ENC 预设，名称已填演示-VLESS，端口已填 52668，高级设置已展开，协议 VLESS、传输 TCP、安全 无，认证 ML-KEM-768、外观 xorpub">
+  <figcaption><b>新建入站：选好模板、填好名称</b> —— 已点红色「IEPL专用」标签套用纯 ENC 预设，名称栏为「演示-VLESS」，端口已填 52668；高级设置已展开：协议 VLESS、传输 TCP、安全 无，VLESS 加密（ENC）开关开启，认证 ML-KEM-768、外观 xorpub（实拍 · 094 测试面板，演示数据已清理）。</figcaption>
 </figure>
 <figure>
-  <img src="images/manual-08.jpg" alt="真实面板截图：落地页入站列表有 1 个入站，VLESS + Reality + Vision演示-VLESS，VLESS 加 TCP 加 Reality 加 Vision，端口 52668，节点 r5-node-0241，上传下载 0 B，启用开关开启">
-  <figcaption><b>建好的入站出现在列表里</b> —— 落地页顶部显示“入站 1”：<strong>VLESS + Reality + Vision演示-VLESS · VLESS + TCP + Reality + Vision · 52668 · r5-node-0241</strong>，右侧启用开关已打开。列表同页还有「订阅」与「订阅源」两个标签（实拍 · 094 测试面板；该演示入站拍摄后已删除）。</figcaption>
+  <img src="images/manual-08.jpg" alt="真实面板截图：节点页入站列表有 1 个入站，演示-VLESS，VLESS 加 TCP 加 ENC（IEPL专用），端口 52668，节点 r5-node-0241，上传下载 0 B，启用开关开启">
+  <figcaption><b>建好的入站出现在列表里</b> —— 节点页顶部显示“入站 1”：<strong>演示-VLESS · VLESS + TCP + ENC（IEPL专用）· 52668 · r5-node-0241</strong>，右侧启用开关已打开。列表同页还有「订阅」与「订阅源」两个标签（实拍 · 094 测试面板；该演示入站拍摄后已删除）。</figcaption>
 </figure>
 <h2>高级设置逐项说明</h2>
 <p>展开高级设置后，字段分三段：协议与凭据、网络与超时、中转相关。先看协议段的要点：</p>
 <div class="table-wrap"><table>
   <tr><th>字段</th><th>说明</th></tr>
-  <tr><td>协议 / 传输 / 安全</td><td>模板套用的组合在这里落成具体字段，可手动改（如 VLESS / TCP / Reality）。</td></tr>
+  <tr><td>协议 / 传输 / 安全</td><td>预设套用的组合在这里落成具体字段，可手动改（如 VLESS / TCP / ENC）。</td></tr>
   <tr><td>UUID</td><td>VLESS / VMess 的用户凭据，留空自动生成。</td></tr>
-  <tr><td>XTLS Vision</td><td>flow 选 Vision（如 <code>xtls-rprx-vision</code>）可降低特征、提升性能，示例模板默认带。</td></tr>
-  <tr><td>VLESS 加密（ENC）</td><td>VLESS 的加密选项，按客户端支持情况选；不确定就保持模板默认。</td></tr>
-  <tr><td>Reality 伪装域名</td><td>Reality 借用的目标站点，<strong>默认 www.amd.com</strong>；要换成你实际可达、支持 TLS 的站点。</td></tr>
-  <tr><td>最低客户端版本</td><td><strong>保持 1.0.0</strong>。Xray 新版默认的 26.3.27 会导致 Clash / Mihomo 连不上——这是实测踩过的坑，别改高。</td></tr>
+  <tr><td>XTLS Vision</td><td>flow 选 Vision（如 <code>xtls-rprx-vision</code>）可降低特征、提升性能；本示例（IEPL专用纯 ENC 预设）不开启流控。</td></tr>
+  <tr><td>VLESS 加密（ENC）</td><td>VLESS 的加密选项；本示例已开启（IEPL专用纯 ENC 预设：ML-KEM-768 认证、xorpub 外观）。</td></tr>
+  <tr><td>Reality 伪装域名</td><td>仅 Reality 模板时出现：Reality 借用的目标站点，<strong>默认 www.amd.com</strong>；要换成你实际可达、支持 TLS 的站点。</td></tr>
+  <tr><td>最低客户端版本</td><td>仅 Reality 模板时出现：<strong>保持 1.0.0</strong>。Xray 新版默认的 26.3.27 会导致 Clash / Mihomo 连不上——这是实测踩过的坑，别改高。</td></tr>
 </table></div>
-<div class="callout danger"><span class="t">实测坑：最低客户端版本别改高</span><p>把最低客户端版本抬到 Xray 新版默认的 <code>26.3.27</code> 后，Clash / Mihomo 客户端会直接连不上这个入站。保持 <code>1.0.0</code> 最稳妥。</p></div>
+<div class="callout danger"><span class="t">实测坑（Reality 模板）：最低客户端版本别改高</span><p>把最低客户端版本抬到 Xray 新版默认的 <code>26.3.27</code> 后，Clash / Mihomo 客户端会直接连不上这个入站。保持 <code>1.0.0</code> 最稳妥。</p></div>
 <h3>网络与超时</h3>
 <div class="table-wrap"><table>
   <tr><th>字段</th><th>说明</th></tr>
