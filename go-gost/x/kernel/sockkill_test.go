@@ -495,8 +495,8 @@ func TestKillMarkedSocketsForUsersCgnatPeerCollision(t *testing.T) {
 // R5 Item 1 (round 3): the inbound socket of an IPv4 client on a
 // dual-stack `::` Xray listener is rendered by `ss -tne` as
 // `[::ffff:127.0.0.1]:28416 ↔ [::ffff:127.0.0.1]:55040` (live R5c
-// 2026-11-23: `[::ffff:100.78.20.94]:28415 ↔
-// [::ffff:100.78.20.94]:58684`), while the kill map records the
+// 2026-11-23: `[::ffff:100.64.0.94]:28415 ↔
+// [::ffff:100.64.0.94]:58684`), while the kill map records the
 // peer as the access line prints it (bare `127.0.0.1:55040`). Old
 // code missed it twice: addrPortField never matched the bracketed
 // mapped form (dots inside the brackets), and the peer comparison
@@ -512,7 +512,7 @@ func TestNormAddrPort(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"127.0.0.1:55040", "127.0.0.1:55040"},
 		{"[::ffff:127.0.0.1]:55040", "127.0.0.1:55040"},
-		{"[::ffff:100.78.20.94]:58684", "100.78.20.94:58684"},
+		{"[::ffff:100.64.0.94]:58684", "100.64.0.94:58684"},
 		{"[2600:1f13:14d:a300:7913:f273:997e:c8b8]:39226", "[2600:1f13:14d:a300:7913:f273:997e:c8b8]:39226"},
 		{"*:28416", ""},
 		{"???", ""},

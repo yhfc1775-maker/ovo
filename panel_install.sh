@@ -2469,6 +2469,17 @@ is_own_panel_container() {
   panel_image_ref_owned "$image"
 }
 
+# A running container is directory-local evidence only when Compose recorded
+# the same working directory on that container.  A global probe can find an
+# unrelated deployment and must never prove ownership of the caller's cwd.
+panel_container_belongs_to_deploy_dir() {
+  local dir="$1" container="$2" expected label
+  [[ -n "$dir" && -n "$container" && -d "$dir" ]] || return 1
+  expected=$(cd "$dir" 2>/dev/null && pwd -P) || return 1
+  label=$(get_container_compose_label "$container" "com.docker.compose.project.working_dir")
+  [[ -n "$label" && "$label" == "$expected" ]]
+}
+
 # 从一行 image: 行文本中提取字段值（去首尾空白、引号与行尾注释）。
 panel_compose_image_value() {
   local value="$1"
@@ -2772,7 +2783,8 @@ detect_panel_backend_container() {
 # 镜像来源部署仍可经环境变量显式指定后端容器名放行（resolve 的
 # backend_explicit 逃生口，不经本判定）。
 panel_deploy_dir_is_ours() {
-  if [[ -n "${2:-}" ]] && is_own_panel_container "$2"; then
+  if [[ -n "${2:-}" ]] && is_own_panel_container "$2" \
+    && panel_container_belongs_to_deploy_dir "$1" "$2"; then
     return 0
   fi
   if is_own_panel_deploy_dir "$1"; then
@@ -6102,6 +6114,26 @@ migrate_to_postgres() {
       echo "   如确为本面板部署（例如改用了自建镜像），请用 PANEL_BACKEND_CONTAINER=<后端容器名> 显式指定后重试。"
       return 1
     fi
+  fi
+
+  # A migration stops the deployed services and changes the database backend.
+  # Require an explicit confirmation after the directory ownership gate and
+  # before any compose download, backup, volume or container operation.
+  echo "⚠️ 即将把 SQLite 数据迁移到 PostgreSQL：迁移会停止面板服务并切换数据库，确认切换后不可由本脚本撤销；失败时脚本会按快照回滚。"
+  local migrate_confirm="${PANEL_MIGRATE_CONFIRM:-}"
+  if [[ "$migrate_confirm" != "1" ]]; then
+    if [[ ! -t 0 ]]; then
+      echo "❌ 迁移需要交互确认；非交互运行请先设置 PANEL_MIGRATE_CONFIRM=1 明确确认后重试，未做任何修改"
+      return 1
+    fi
+    read -r -p "确认停止服务并将 SQLite 迁移到 PostgreSQL 吗？不可逆切换点在确认后开始 (y/N): " migrate_confirm || migrate_confirm=""
+    if [[ "$migrate_confirm" != "y" && "$migrate_confirm" != "Y" ]]; then
+      echo "❌ 未确认，迁移取消，未做任何修改"
+      PANEL_OP_CANCELLED="1"
+      return 0
+    fi
+  else
+    echo "✅ 已收到显式迁移确认，继续执行"
   fi
 
   if [[ ! -f "docker-compose.yml" ]]; then

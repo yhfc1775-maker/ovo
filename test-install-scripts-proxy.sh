@@ -88,6 +88,10 @@ load_script_without_main() {
   sed '/^# 执行主函数$/,$d' "$script_path" > "$temp_file"
   VERSION="v-test"
   source "$temp_file"
+  # Migration tests explicitly opt in to the confirmation prompt; individual
+  # refusal tests unset this variable to exercise the fail-closed path.
+  PANEL_MIGRATE_CONFIRM=1
+  export PANEL_MIGRATE_CONFIRM
   rm -f "$temp_file"
 }
 
@@ -11379,13 +11383,17 @@ test_panel_ownership_predicates_matrix() (
   FIXTURE_CONTAINER_IMAGE=""
   docker() {
     if [[ "$1" == "inspect" && "$2" == "-f" ]]; then
-      printf '%s\n' "$FIXTURE_CONTAINER_IMAGE"
+      case "$3" in
+        *working_dir*) printf '%s\n' "${FIXTURE_DIR:-}" ;;
+        *) printf '%s\n' "$FIXTURE_CONTAINER_IMAGE" ;;
+      esac
       return 0
     fi
     return 0
   }
 
   ours_rc() {
+    FIXTURE_DIR="$1"
     if panel_deploy_dir_is_ours "$1" "${2:-ovo-panel-backend}" >/dev/null 2>&1; then echo 0; else echo 1; fi
   }
   foreign_rc() {
@@ -11527,6 +11535,73 @@ OVO_INSTANCE=b2' '-')
   a32n=$(printf 'a%.0s' $(seq 1 32))
   d=$(mk_fixture "PANEL_BACKEND_CONTAINER=ovo-panel-backend-$a32n" '-')
   assert_equals "0" "$(ours_rc "$d")" "B2-03: a 32-char instance suffix must still prove ownership"
+)
+
+# P1-2：异目录 nginx 形态与全局旧容器探针并存时，迁移只能看调用目录；
+# 另外，归属已证时也必须在任何停服/下载/写入前得到迁移确认。
+test_panel_migrate_foreign_directory_is_rejected_without_side_effects() (
+  set -euo pipefail
+  load_script_without_main "$ROOT_DIR/panel_install.sh"
+  unset PANEL_MIGRATE_CONFIRM PANEL_BACKEND_CONTAINER PANEL_DEPLOY_DIR
+  local dir rc="0" side_effects
+  dir=$(mktemp -d)
+  printf 'DB_TYPE=sqlite\nOVO_SQLITE_VOLUME=nonexistent-foreign-vol\n' > "$dir/.env"
+  cat > "$dir/docker-compose.yml" <<'EOF'
+services:
+  backend:
+    image: nginx:latest
+  frontend:
+    image: nginx:latest
+EOF
+  side_effects=$(mktemp)
+  check_docker() { DOCKER_CMD=fixture_compose; return 0; }
+  fixture_compose() { printf 'compose %s\n' "$*" >> "$side_effects"; return 0; }
+  docker() {
+    case "$1" in
+      ps) printf 'flmx-panel-backend\n' ;;
+      inspect)
+        case "$*" in
+          *working_dir*) printf '/other/deployment\n' ;;
+          *Config.Image*) printf 'ghcr.io/iiiiiiiii7125-art/flmx-panel-backend:2.1.29\n' ;;
+        esac
+        ;;
+      *) printf 'docker %s\n' "$*" >> "$side_effects" ;;
+    esac
+  }
+  ( cd "$dir" && migrate_to_postgres > migrate.log 2>&1 ) || rc="$?"
+  assert_equals "1" "$rc" "P1-2: foreign directory migration must refuse before confirmation"
+  grep -q '归属无法证实\|不属于本面板' "$dir/migrate.log" || fail "P1-2: refusal must name the directory ownership failure"
+  [[ ! -s "$side_effects" ]] || fail "P1-2: refused migration must not invoke compose, volume, image or container side effects"
+  if panel_deploy_dir_is_ours "$dir" flmx-panel-backend; then
+    fail "P1-2: a global legacy container image must not prove ownership of another directory"
+  fi
+  if ! is_foreign_panel_deploy_dir "$dir"; then
+    fail "P1-2: nginx-only fixture must be classified as foreign"
+  fi
+)
+
+test_panel_migrate_requires_explicit_confirmation() (
+  set -euo pipefail
+  load_script_without_main "$ROOT_DIR/panel_install.sh"
+  unset PANEL_MIGRATE_CONFIRM PANEL_BACKEND_CONTAINER PANEL_DEPLOY_DIR
+  local dir rc="0" side_effects
+  dir=$(mktemp -d)
+  printf 'DB_TYPE=sqlite\nPOSTGRES_DB=flux_panel\nPOSTGRES_USER=flux_panel\nPOSTGRES_PASSWORD=test-pg-pass\n' > "$dir/.env"
+  cat > "$dir/docker-compose.yml" <<'EOF'
+services:
+  backend:
+    image: ghcr.io/yhfc1775-maker/ovo-flux-panel-backend:v-test
+  frontend:
+    image: ghcr.io/yhfc1775-maker/ovo-vite-frontend:v-test
+EOF
+  side_effects=$(mktemp)
+  check_docker() { DOCKER_CMD=fixture_compose; return 0; }
+  fixture_compose() { printf 'compose %s\n' "$*" >> "$side_effects"; return 0; }
+  docker() { return 0; }
+  ( cd "$dir" && migrate_to_postgres > migrate.log 2>&1 ) || rc="$?"
+  assert_equals "1" "$rc" "P1-2: migration without confirmation must fail closed"
+  grep -q '需要交互确认' "$dir/migrate.log" || fail "P1-2: missing confirmation must be named"
+  [[ ! -s "$side_effects" ]] || fail "P1-2: confirmation refusal must not invoke compose"
 )
 
 # AI-01: resolve（update/uninstall 共用入口）对他方部署必须在守卫处
@@ -15677,6 +15752,8 @@ test_panel_migrate_postgres_rollbacks
 test_panel_migrate_rollback_cleans_gost_migrate_db
 test_panel_migrate_waits_use_deployment_container_names
 test_panel_ownership_predicates_matrix
+test_panel_migrate_foreign_directory_is_rejected_without_side_effects
+test_panel_migrate_requires_explicit_confirmation
 test_panel_resolve_refuses_foreign_panel_deployment
 test_panel_resolve_accepts_instance_deployment
 test_panel_migrate_guard_precedes_download

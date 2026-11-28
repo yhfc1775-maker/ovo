@@ -33,7 +33,7 @@ Every remaining source occurrence is enumerated in `rename-evidence/remaining-na
 | Lesson | Applied change / evidence |
 |---|---|
 | M-01 | Go and shell image ownership share the new-prefix + paired-legacy rules. Both legacy probes are reachable. Original prefix-only ownership reproduces red after changing REPO; the three-generation regression passes green. |
-| M-02 | Resolution tested from deployment cwd without export, with explicit `PANEL_BACKEND_CONTAINER`, and from an arbitrary directory without keys, for update/uninstall/migrate resolution gates in every generation. |
+| M-02 | 094 实测中，cwd 不 export、显式 `PANEL_BACKEND_CONTAINER`、任意目录三种变体的 resolve 均通过：`.env` 键、Compose 标签和全局探针共同指向该部署；该结果只适用于该 094 夹具，不推广为任意环境保证。文档继续保留显式 export 形式作为最稳妥写法。 |
 | M-03 | Repository is public. Three public GHCR packages are required; `scripts/verify-ovo-access.sh` checks anonymous pull tokens, and the publishing workflow checks each pushed package anonymously before release. Package visibility must be changed in package settings: the proposed visibility REST path returns 404 and no documented REST/GraphQL mutation was found. |
 | M-04 | Remove deployment PAT loading/persistence and Docker login fallback; retain local image-inspect guards. Update public-download and fail-before-config-write tests. |
 | M-05 | Import the public manual at `doc/public/manual/index.html`; its embedded screenshots are extracted byte-for-byte into adjacent image files (hash ledger retained). |
@@ -57,7 +57,7 @@ Every remaining source occurrence is enumerated in `rename-evidence/remaining-na
 
 Detailed results, command identities and selected red/green evidence are in `rename-evidence/validation.md` and adjacent artifacts. No production host or 094 test machine was accessed. The handler raw-error gates establish their measured coverage; the previously untraced family of 180 sites is not claimed individually reviewed.
 
-The shell suite defines and calls 331 cases. Run it as the ordinary user with passwordless sudo for self-update fixtures; four root/filesystem-only cases are additionally executed as root in isolation. A blanket root run cannot exercise the non-root gate in this VM because its home path is not traversable by nobody; its failure is retained as diagnostic evidence, and all four missing root cases are run separately without skipping. Alpine OpenRC lifecycle runs in the pinned Alpine container.
+The shell suite defines and calls 333 cases. Run it as the ordinary user with passwordless sudo for self-update fixtures; four root/filesystem-only cases are additionally executed as root in isolation. A blanket root run cannot exercise the non-root gate in this VM because its home path is not traversable by nobody; its failure is retained as diagnostic evidence, and all four missing root cases are run separately without skipping. Alpine OpenRC lifecycle runs in the pinned Alpine container.
 
 Three-generation stubs exercise deployment selection and the shared resolution gates, ownership, key migration and direct agent migration/rollback. They do not claim real Docker/Compose destructive update, uninstall or PostgreSQL migration against a live deployment. Those live gates remain Muse's pre-merge duty.
 
@@ -65,7 +65,7 @@ Three-generation stubs exercise deployment selection and the shared resolution g
 
 1. Prepare isolated flux, flmx and ovo deployment forms. The flmx fixture must use container `flmx-panel-backend`, image `ghcr.io/iiiiiiiii7125-art/flmx-panel-backend:2.1.29`, and the old Compose working-directory/project/service labels. Record the equivalent triple for flux and ovo.
 2. For each, test menu 2 update, menu 3 uninstall selection/confirmation gate, and menu 4 migration selection/confirmation gate. Confirm foreign deployments and both mismatched prefix/name pairs are refused. Preserve real data backups and verify rollback before accepting the rename.
-3. Repeat each selection gate in all M-02 forms: cwd with no export; explicit export; arbitrary directory with no identity keys. Before live confirmation, documentation retains the explicit export form, e.g. `cd /root/flmx-panel && PANEL_BACKEND_CONTAINER=flmx-panel-backend ./panel_install.sh`.
+3. Repeat each selection gate in all M-02 forms: cwd without export, explicit export, and arbitrary directory. The 094 fixture passed all three because its `.env` key, Compose labels and global probe all matched; record that as fixture-specific evidence only. Documentation retains the explicit export form as the safest invocation, e.g. `cd /root/flmx-panel && PANEL_BACKEND_CONTAINER=flmx-panel-backend ./panel_install.sh`.
 4. Compare the remote PR head tree to the recorded snapshot tree. Merge only with squash or fast-forward; main must then have two commits and the expected tree. Codex does not merge, tag, release or delete the branch.
 
 ## Snapshot handoff

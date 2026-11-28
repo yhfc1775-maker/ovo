@@ -1,78 +1,93 @@
 path	line	exception	context
-AUDIT-REPORT-2.1.28-STRICT-R1.md	1	history	# FLMX 2.1.28 严格全量复审 R1（2026-11-25）
-AUDIT-REPORT-2.1.28-STRICT-R1.md	52	history	- 安装套件：`PATH=/tmp/flmx-sqlite-tools:/usr/bin:/bin FLMX_SUITE_SKIP_ROOT_SELF_UPDATE=1 bash test-install-scripts-proxy.sh` PASS。root-only、`/etc/docker` IPv6 写入腿按脚本显式 skip；其余 SQLite 迁移 preprocessing/reconcile 已实际运行。
-AUDIT-REPORT-2.1.28-STRICT-R1.md	55	history	- PostgreSQL：无服务、无 `FLMX_POSTGRES_TEST_DSN`；16 个 `TestPostgres*` 本轮按设计 skip，不称 PG 通过。VitePress build 未运行，因为 `doc/node_modules` 不存在；文档 consistency 已运行。
-AUDIT-REPORT-2.1.28-STRICT-R2.md	1	history	# FLMX 2.1.28 严格全量复审 R2 补证
+AUDIT-REPORT-2.1.28-STRICT-R1.md	1	E5/history	# FLMX 2.1.28 严格全量复审 R1（2026-11-25）
+AUDIT-REPORT-2.1.28-STRICT-R1.md	52	E1/history	- 安装套件：`PATH=/tmp/flmx-sqlite-tools:/usr/bin:/bin FLMX_SUITE_SKIP_ROOT_SELF_UPDATE=1 bash test-install-scripts-proxy.sh` PASS。root-only、`/etc/docker` IPv6 写入腿按脚本显式 skip；其余 SQLite 迁移 preprocessing/reconcile 已实际运行。
+AUDIT-REPORT-2.1.28-STRICT-R1.md	55	E1/history	- PostgreSQL：无服务、无 `FLMX_POSTGRES_TEST_DSN`；16 个 `TestPostgres*` 本轮按设计 skip，不称 PG 通过。VitePress build 未运行，因为 `doc/node_modules` 不存在；文档 consistency 已运行。
+AUDIT-REPORT-2.1.28-STRICT-R2.md	1	E5/history	# FLMX 2.1.28 严格全量复审 R2 补证
 AUDIT-REPORT-2.1.28-STRICT-R2.md	7	history	- 仓库：`iiiiiiiii7125-art/flmx-max`；分支：`audit/20261125-full-v2`；PR #35 -> `main`。
-AUDIT-REPORT-2.1.28.md	1	history	# FLMX 2.1.28 全量审计、修复与复审
+AUDIT-REPORT-2.1.28.md	1	E5/history	# FLMX 2.1.28 全量审计、修复与复审
 AUDIT-REPORT-2.1.28.md	7	history	- 仓库 `iiiiiiiii7125-art/flmx-max`，分支 `audit/20261125-full-v2`。
-AUDIT-REPORT-2.1.28.md	59	history	- Backend：`go test ./... -count=1 -timeout=30m -json`（网络隔离 overlay）最终 19 个有测试包通过，2 个无测试或设计跳过；3691 PASS、0 FAIL、18 SKIP。16 个 PostgreSQL 契约因未设置 `FLMX_POSTGRES_TEST_DSN` 按设计跳过，未冒称 PG 已验证。`go vet ./...` 通过。
-AUDIT-REPORT-2.1.30.md	1	history	# FLMX 2.1.30 全量审计、修复、优化与复审
+AUDIT-REPORT-2.1.28.md	59	E1/history	- Backend：`go test ./... -count=1 -timeout=30m -json`（网络隔离 overlay）最终 19 个有测试包通过，2 个无测试或设计跳过；3691 PASS、0 FAIL、18 SKIP。16 个 PostgreSQL 契约因未设置 `FLMX_POSTGRES_TEST_DSN` 按设计跳过，未冒称 PG 已验证。`go vet ./...` 通过。
+AUDIT-REPORT-2.1.30.md	1	E5/history	# FLMX 2.1.30 全量审计、修复、优化与复审
 AUDIT-REPORT-2.1.30.md	7	history	PR：`https://github.com/iiiiiiiii7125-art/flmx-max/pull/38`，分支 `audit/20261126-full`，复审起点为 `eae3cd8a`。本次修复继续提交到同一分支，未重建分支、未改基线。
 AUDIT-REPORT-2.1.30.md	9	history	旧权限阻塞证据 `audit-evidence/20261126-full/final-facts/push-blocked.json` 原样保留为历史记录，不表示当前 PR 仍未创建。此次另建的 flmx-manual 手册审计 PR #1 与本 PR 独立，只包含手册审计报告。
 AUDIT-REPORT-2.1.30.md	33	history	| REG-DOC-2130 / P1 | `skills/flmx-api/references/nodes.md:5` | `2bcfc4c6` |
-AUDIT-REPORT-2.1.30.md	275	history	18 个 backend SKIP 是 16 个原生 PG 合同、1 个 nft 语义检查、1 个无法隔离 `/opt/flmx-panel` 的旧部署目录夹具；x SKIP 为真实 nft 双 agent 隔离。PG v3 的问题已用实际生产分支 SQL + SQLite 目录形状 fixture 证明并修复，但原生迁移/列语义仍未验证；SS UDP-over-TCP 双向 1000B 的现有本地加密合同通过，不能替代 Hy2/TUIC/Naive/AnyTLS 原生多用户。生产 reject RST 拆线速度、IL-NEW-02/03 真机、GHCR/真实 Docker、硬件 Passke
-AUDIT-REPORT-2.1.31.md	1	history	# FLMX 全量审计、修复、优化与复审（2.1.31）
-AUDIT-REPORT-2.1.31.md	209	history	| R18-A3-02 | 源码/锚点 1 项；所列契约 1 项；如 `test_install_flmx_agent_menu_reads_panel_addr_before_routes` | 当前源码及所列本地契约通过 |
-AUDIT-REPORT-2.1.31.md	213	history	| R18-A3-06 | 源码/锚点 1 项；所列契约 1 项；如 `test_uninstall_flmx_agent_host_cleanup_reports_failures_r18_a3_06` | 当前源码及所列本地契约通过 |
-AUDIT-REPORT-2.1.31.md	215	history	| R18-A3-08 | 源码/锚点 1 项；所列契约 1 项；如 `test_write_flmx_agent_config_creates_0600` | 当前源码及所列本地契约通过 |
+AUDIT-REPORT-2.1.30.md	275	E11/history	18 个 backend SKIP 是 16 个原生 PG 合同、1 个 nft 语义检查、1 个无法隔离 `/opt/flmx-panel` 的旧部署目录夹具；x SKIP 为真实 nft 双 agent 隔离。PG v3 的问题已用实际生产分支 SQL + SQLite 目录形状 fixture 证明并修复，但原生迁移/列语义仍未验证；SS UDP-over-TCP 双向 1000B 的现有本地加密合同通过，不能替代 Hy2/TUIC/Naive/AnyTLS 原生多用户。生产 reject RST 拆线速度、IL-NEW-02/03 真机、GHCR/真实 Docker、硬件 Passke
+AUDIT-REPORT-2.1.31.md	1	E5/history	# FLMX 全量审计、修复、优化与复审（2.1.31）
+AUDIT-REPORT-2.1.31.md	209	E1/E12/history	| R18-A3-02 | 源码/锚点 1 项；所列契约 1 项；如 `test_install_flmx_agent_menu_reads_panel_addr_before_routes` | 当前源码及所列本地契约通过 |
+AUDIT-REPORT-2.1.31.md	213	E1/E12/history	| R18-A3-06 | 源码/锚点 1 项；所列契约 1 项；如 `test_uninstall_flmx_agent_host_cleanup_reports_failures_r18_a3_06` | 当前源码及所列本地契约通过 |
+AUDIT-REPORT-2.1.31.md	215	E1/E12/history	| R18-A3-08 | 源码/锚点 1 项；所列契约 1 项；如 `test_write_flmx_agent_config_creates_0600` | 当前源码及所列本地契约通过 |
 AUDIT-REPORT-2.1.31.md	530	history	- **历史 Extra PROXY 文档缺口**：运行保护与测试仍在；`skills/flmx-api/references/inbounds.md` 的说明缺口按用户已知可保留 P3 登记，本报告补当前保护证据，不擅自重写既有用法文档。
-FIX-REPORT-20261126-UPGRADE-RELIABILITY.md	50	history	| 脚本交接期保护 | agent 升级/回退除原串行队列外，还检查现有 `/run/flmx-agent-upgrade.lock`，拒绝执行期内第二个生命周期操作；立即重启使用同一守卫和新鲜锁规则 | `download-and-active-lock-red.log` | `agent-final2.log`、`restart-guard-final.log`、`race-agent.log` |
-FIX-REPORT-20261126-UPGRADE-RELIABILITY.md	97	history	- `/etc/flmx_agent/flmx_agent` → flmx_agent；`/etc/flux_agent/flux_agent` → flux_agent。非 systemd、缺工具、手动安装或无法识别的二进制名明确拒绝，不去猜另一安装的服务。
-FIX-REPORT-20261126-UPGRADE-RELIABILITY.md	120	history	2. PostgreSQL 的 16 个 TestPostgres 合同测试因未配置 `FLMX_POSTGRES_TEST_DSN` 而跳过，见 `postgres-availability.log`。新增列、条件 Upsert、世代 CAS 在 SQLite 实测；PG 不能宣称实测通过。
+FIX-REPORT-20261126-UPGRADE-RELIABILITY.md	50	E12/history	| 脚本交接期保护 | agent 升级/回退除原串行队列外，还检查现有 `/run/flmx-agent-upgrade.lock`，拒绝执行期内第二个生命周期操作；立即重启使用同一守卫和新鲜锁规则 | `download-and-active-lock-red.log` | `agent-final2.log`、`restart-guard-final.log`、`race-agent.log` |
+FIX-REPORT-20261126-UPGRADE-RELIABILITY.md	97	E1/E12/history	- `/etc/flmx_agent/flmx_agent` → flmx_agent；`/etc/flux_agent/flux_agent` → flux_agent。非 systemd、缺工具、手动安装或无法识别的二进制名明确拒绝，不去猜另一安装的服务。
+FIX-REPORT-20261126-UPGRADE-RELIABILITY.md	120	E1/history	2. PostgreSQL 的 16 个 TestPostgres 合同测试因未配置 `FLMX_POSTGRES_TEST_DSN` 而跳过，见 `postgres-availability.log`。新增列、条件 Upsert、世代 CAS 在 SQLite 实测；PG 不能宣称实测通过。
 NOTES.md	8	history	- Agent：拒绝面板传入的 `downloadUrl`，用编译期常量 `iiiiiiiii7125-art/flmx-max` 本地拼 URL
-NOTES.md	34	history	- 状态：**已实现**（独立 `flmx_quota` 表、conntrack 按原始端口 drop 已建立连接、block-before-reconcile、孤儿清扫俱在）；2026-11-05 全量审计已在真机 netns 实证暂停/恢复全链通过，本条关闭。旧「需规则逻辑/需 root 测试」记录过期。
+NOTES.md	34	E1/E10/history	- 状态：**已实现**（独立 `flmx_quota` 表、conntrack 按原始端口 drop 已建立连接、block-before-reconcile、孤儿清扫俱在）；2026-11-05 全量审计已在真机 netns 实证暂停/恢复全链通过，本条关闭。旧「需规则逻辑/需 root 测试」记录过期。
+RENAME-REPORT.md	15	E1/E1–E13/report	| E1 | Canonical keys are `OVO_*`. Backend and agent readers fall back to `FLMX_*` only when the current key is absent, including an explicitly empty current value taking precedence. Shell startup imports legacy environment keys; `.env` uses the same read order. Both identity migration paths rename
+RENAME-REPORT.md	16	E1–E13/report/E2	| E2 | Keep the independent sing-box fork repository, its original whitelist entry, `1.14.4-flmx1` and other fork suffixes, `IsForkVersion`, and all three suffix regexes. |
+RENAME-REPORT.md	20	E1/E1–E13/report/E6	| E6 | Preserve `flmx:user-mark-v2:`, `flmx:clash-api-v1:`, `flmx:node-secret-v1:`, advisory lock `flmx:name:`, and persisted `flmx_traffic_`/`flmx_connlog_` spool names. |
+RENAME-REPORT.md	21	E1–E13/report/E7	| E7 | Preserve deployed HMAC domains `flmx-kcp-key`, `flmx-ss-upsk`, `flmx-scoped-sub-v1`, `flmx-inbound-import-preview-v1`. |
+RENAME-REPORT.md	22	E1–E13/report/E5/E8	| E8 | Issue `ovo-subsig-v3`; verify previous flmx v3 through `subURLSigV3FlmxForToken`, then earlier formats. The flmx fallback respects `flowV1LegacySunset` (2027-02-02). |
+RENAME-REPORT.md	23	E1–E13/report/E9	| E9 | Panel accepts `X-Ovo-Seq`, `X-Flmx-Seq`, `X-Flvx-Seq`, in that order. Agent sends `X-Ovo-Seq` and `X-Flmx-Seq`. |
+RENAME-REPORT.md	24	E10/E1–E13/report/E5	| E10 | Historical flmx plain and isolated nft tables are recognized for migration. Agent persists a separate `RenameMigrated` flag after a successful atomic apply. Panel cleanup requires existing ownership proof, and targets this install's previous derived table names. Fresh installs do not claim f
+RENAME-REPORT.md	25	E1–E13/report/E5	| E11 | `LEGACY` flux and `LEGACY2` flmx deployment identities are recognized. Image ownership requires the old owner paired with the explicit legacy image-name set. Old owner + new name and foreign owner + old name are rejected. Go and shell container rename predicates cover empty, flux and flmx de
+RENAME-REPORT.md	26	E1–E13/report/E5	| E12 | Add the complete flmx agent helper family and direct flmx→ovo migration, alongside flux→ovo. Footprints are frozen before migration; flmx is attempted before flux. Snapshots fail closed, and rollback restores the old unit bytes and layout. The flmx rollback service template matches the basel
+RENAME-REPORT.md	41	E1–E13/report/E5	| M-07 | Add the flmx migration slot and helper family from the flux structure, with rollback template checked against the original current service. |
+RENAME-REPORT.md	50	E1–E13/report	| M-16 | Freeze current/flmx/flux agent footprints in install and update; migrate each old generation directly, with a fail-closed occupied-target check. |
+RENAME-REPORT.md	66	E11/E1–E13/report/E5	1. Prepare isolated flux, flmx and ovo deployment forms. The flmx fixture must use container `flmx-panel-backend`, image `ghcr.io/iiiiiiiii7125-art/flmx-panel-backend:2.1.29`, and the old Compose working-directory/project/service labels. Record the equivalent triple for flux and ovo.
+RENAME-REPORT.md	68	E11/E1–E13/report	3. Repeat each selection gate in all M-02 forms: cwd with no export; explicit export; arbitrary directory with no identity keys. Before live confirmation, documentation retains the explicit export form, e.g. `cd /root/flmx-panel && PANEL_BACKEND_CONTAINER=flmx-panel-backend ./panel_install.sh`.
 doc/audit/S-flmx-rename.md	1	history	# S 改名：FLVX → FLMX（含仓库 flvx-max → flmx-max）（2026-10-20，版本 1.0.24）
 doc/audit/S-flmx-rename.md	10	history	  notify.go:118）现行值 FLVX-MAX → FLMX；Passkey RPDisplayName（passkey.go:62）
-doc/audit/S-flmx-rename.md	13	history	- User-Agent `flvx-panel/1.0` → `flmx-panel/1.0`（secure_fetch.go:258）
+doc/audit/S-flmx-rename.md	13	E11/history	- User-Agent `flvx-panel/1.0` → `flmx-panel/1.0`（secure_fetch.go:258）
 doc/audit/S-flmx-rename.md	14	history	- `FLVX-PING` 探测载荷 → `FLMX-PING`（接收方不校验内容）
 doc/audit/S-flmx-rename.md	16	history	  → iiiiiiiii7125-art/flmx-max（测试 system_upgrade_test.go 同步）
-doc/audit/S-flmx-rename.md	19	history	- 环境变量 6 个运行时 + 1 个测试专用：FLMX_TRUSTED_PROXY_HOPS、
-doc/audit/S-flmx-rename.md	20	history	  FLMX_FETCH_ALLOW_PRIVATE_NETWORKS、FLMX_FETCH_PRIVATE_ALLOWLIST、
-doc/audit/S-flmx-rename.md	21	history	  FLMX_FEDERATION_TRUSTED_PROXIES、FLMX_WEBAUTHN_ORIGIN（后端）；
-doc/audit/S-flmx-rename.md	22	history	  FLMX_KERNEL_DIR（agent）；FLVX_POSTGRES_TEST_DSN（CI/测试，直接改名）
-doc/audit/S-flmx-rename.md	23	history	- 订阅签名：新增 `flmx-subsig-v3` 生成新链接；校验 v3→v2→v1 三代通吃
-doc/audit/S-flmx-rename.md	26	history	- agent seq 文件 `flvx_agent_seq.json` → `flmx_agent_seq.json`，新文件缺失时
+doc/audit/S-flmx-rename.md	19	E1/history	- 环境变量 6 个运行时 + 1 个测试专用：FLMX_TRUSTED_PROXY_HOPS、
+doc/audit/S-flmx-rename.md	20	E1/history	  FLMX_FETCH_ALLOW_PRIVATE_NETWORKS、FLMX_FETCH_PRIVATE_ALLOWLIST、
+doc/audit/S-flmx-rename.md	21	E1/history	  FLMX_FEDERATION_TRUSTED_PROXIES、FLMX_WEBAUTHN_ORIGIN（后端）；
+doc/audit/S-flmx-rename.md	22	E1/E10/history	  FLMX_KERNEL_DIR（agent）；FLVX_POSTGRES_TEST_DSN（CI/测试，直接改名）
+doc/audit/S-flmx-rename.md	23	E8/history	- 订阅签名：新增 `flmx-subsig-v3` 生成新链接；校验 v3→v2→v1 三代通吃
+doc/audit/S-flmx-rename.md	25	E9/history	- 流量上报头：agent 双发 `X-Flmx-Seq` + `X-Flvx-Seq`；面板先读新头回退旧头
+doc/audit/S-flmx-rename.md	26	E1/E12/history	- agent seq 文件 `flvx_agent_seq.json` → `flmx_agent_seq.json`，新文件缺失时
 doc/audit/S-flmx-rename.md	28	history	- 内核用户标识：渲染改 `u%d@flmx` / `flmx-u%d`（users.go:17,163），流量
-doc/audit/S-flmx-rename.md	29	history	  归属解析双认 flmx/flmx 两种前缀，过渡期新旧配置并存不丢账
-doc/audit/S-flmx-rename.md	32	history	- nft 表：面板 `inet flvx` → `inet flmx`、节点 `flvx_kernel` → `flmx_kernel`；
+doc/audit/S-flmx-rename.md	29	E5/history	  归属解析双认 flmx/flmx 两种前缀，过渡期新旧配置并存不丢账
+doc/audit/S-flmx-rename.md	32	E1/E10/history	- nft 表：面板 `inet flvx` → `inet flmx`、节点 `flvx_kernel` → `flmx_kernel`；
 doc/audit/S-flmx-rename.md	34	history	- sysctl 调优文件 `/etc/sysctl.d/99-flvx-tuning.conf` → `99-flmx-tuning.conf`，
-doc/audit/S-flmx-rename.md	35	history	  写入时顺带删除旧文件（99-flmx 字典序在前，残留旧文件会静默覆盖新值）
-doc/audit/S-flmx-rename.md	36	history	- 部署目录探测：`/opt/flmx-panel` 优先、`/opt/flvx-panel` 兜底
-doc/audit/S-flmx-rename.md	38	history	- 升级状态文件 `.flvx_upgrade_status.json` → `.flmx_upgrade_status.json`
+doc/audit/S-flmx-rename.md	35	E2/E5/history	  写入时顺带删除旧文件（99-flmx 字典序在前，残留旧文件会静默覆盖新值）
+doc/audit/S-flmx-rename.md	36	E11/history	- 部署目录探测：`/opt/flmx-panel` 优先、`/opt/flvx-panel` 兜底
+doc/audit/S-flmx-rename.md	38	E1/history	- 升级状态文件 `.flvx_upgrade_status.json` → `.flmx_upgrade_status.json`
 doc/audit/S-flmx-rename.md	40	history	- GH 镜像缓存目录 `flvx-github-cache` → `flmx-github-cache`（旧缓存孤儿无害）
 doc/audit/S-flmx-rename.md	41	history	- 升级 helper 临时名 `flvx-upgrade-helper-%d` → `flmx-…`
 doc/audit/S-flmx-rename.md	52	history	  与兜底（现行 FLVX-MAX → FLMX）、version-footer 页脚字样、config.tsx 文案、
-doc/audit/S-flmx-rename.md	53	history	  主题元数据（FLVX Team/Community → FLMX Team/Community）、package.json 包名
+doc/audit/S-flmx-rename.md	53	E5/history	  主题元数据（FLVX Team/Community → FLMX Team/Community）、package.json 包名
 doc/audit/S-flmx-rename.md	54	history	- 仓库 URL：.env.production:1 与 site.ts:33 → flmx-max（GitHub 重定向兜底）
 doc/audit/S-flmx-rename.md	55	history	- 转发导入格式判别符 `"flvx"` → `"flmx"` + UI 标签（判别符从不写入导出
-doc/audit/S-flmx-rename.md	59	history	- 全部 flvx* 键改 flmx*；其中主题两键（`flvx:theme` 三处耦合含 index.html
+doc/audit/S-flmx-rename.md	59	E5/history	- 全部 flvx* 键改 flmx*；其中主题两键（`flvx:theme` 三处耦合含 index.html
 doc/audit/S-flmx-rename.md	72	history	  doc 全部链接、VitePress base `/flvx-max/` → `/flmx-max/`；
-doc/audit/S-flmx-rename.md	75	history	  `flmx-flux-panel-backend` / `flmx-vite-frontend`（docker-build.yml 的
-doc/audit/S-flmx-rename.md	78	history	- compose 容器侧部署路径 `/opt/flvx-panel` → `/opt/flmx-panel`
-doc/audit/S-flmx-rename.md	81	history	- compose 的 Passkey 环境透传改双名：`FLMX_WEBAUTHN_ORIGIN`（带旧名
+doc/audit/S-flmx-rename.md	75	E11/history	  `flmx-flux-panel-backend` / `flmx-vite-frontend`（docker-build.yml 的
+doc/audit/S-flmx-rename.md	78	E11/history	- compose 容器侧部署路径 `/opt/flvx-panel` → `/opt/flmx-panel`
+doc/audit/S-flmx-rename.md	81	E1/history	- compose 的 Passkey 环境透传改双名：`FLMX_WEBAUTHN_ORIGIN`（带旧名
 doc/audit/S-flmx-rename.md	83	history	- 技能包：目录 skills/flvx-api → skills/flmx-api，包名 @flvx/skill-api →
 doc/audit/S-flmx-rename.md	84	history	  @flmx/skill-api，publish-skill.yml 路径同步；包内与 doc/ai-skill.md 的
-doc/audit/S-flmx-rename.md	85	history	  `FLVX_*` 示例环境变量、~/.flvx 目录约定同步改 FLMX_*/~/.flmx（纯文档）
+doc/audit/S-flmx-rename.md	85	E1/history	  `FLVX_*` 示例环境变量、~/.flvx 目录约定同步改 FLMX_*/~/.flmx（纯文档）
 doc/audit/S-flmx-rename.md	86	history	- doc/package.json 名 flvx-docs → flmx-docs；tests/e2e 的说明文字与包名
-doc/audit/S-flmx-rename.md	97	history	文案批量替换一度把 5 处 `config.GetEnvAny("FLMX_*", "FLVX_*")` 的旧名兜底
-doc/audit/S-flmx-rename.md	111	history	`FLVX_VERIFY_DOWNLOADS` 改双读（`${FLMX_VERIFY_DOWNLOADS:-${FLVX_…:-1}}`，
-doc/audit/S-flmx-rename.md	113	history	UA 描述 `flvx-panel/1.0` → `flmx-panel/1.0`；nodes.md 的调优文件名、
-doc/guide/install.md	200	E10	- **nft 表名按安装根派生、不是任意一个固定名**：默认脚本形态（内核根 `/etc/ovo_agent/kernels`）与容器形态都用 `ovo_kernel_<该根路径 sha256 前 8 位十六进制>`，不再用 plain `ovo_kernel`；改名前旧根（`/etc/flux_agent/kernels`）用 `flmx_kernel_legacy`；自定义 `OVO_KERNEL_DIR` 或挪位安装的根同样按路径哈希。旧名 `flvx_kernel` 与 plain `flmx_kernel` 只在一次性升级迁移时删（升级后首次成功同步，且该 agent 此前确有成功
-doc/guide/install.md	215	E12	**怎么读结果**：监听端口里出现 `6365`/`6366`（或你改过的面板端口）说明该机已有面板在跑；`/etc/ovo_agent`、`/etc/flmx_agent` 或 `/etc/flux_agent` 存在说明已有 agent——再按上一节查它 `config.json` 里的 `addr` 归属；`/etc/gost` 存在说明有旧式 gost 形态；`ovo_kernel*` / `ovo_quota*` 表存在说明已有 agent 或面板侧 nft 规则在用这台机器。以上任一项命中，都不要直接装：先按上一节做归属判定，或把端口/实例错开。
+doc/audit/S-flmx-rename.md	97	E1/history	文案批量替换一度把 5 处 `config.GetEnvAny("FLMX_*", "FLVX_*")` 的旧名兜底
+doc/audit/S-flmx-rename.md	111	E1/history	`FLVX_VERIFY_DOWNLOADS` 改双读（`${FLMX_VERIFY_DOWNLOADS:-${FLVX_…:-1}}`，
+doc/audit/S-flmx-rename.md	113	E11/history	UA 描述 `flvx-panel/1.0` → `flmx-panel/1.0`；nodes.md 的调优文件名、
+doc/guide/install.md	200	E1/E10	- **nft 表名按安装根派生、不是任意一个固定名**：默认脚本形态（内核根 `/etc/ovo_agent/kernels`）与容器形态都用 `ovo_kernel_<该根路径 sha256 前 8 位十六进制>`，不再用 plain `ovo_kernel`；改名前旧根（`/etc/flux_agent/kernels`）用 `flmx_kernel_legacy`；自定义 `OVO_KERNEL_DIR` 或挪位安装的根同样按路径哈希。旧名 `flvx_kernel` 与 plain `flmx_kernel` 只在一次性升级迁移时删（升级后首次成功同步，且该 agent 此前确有成功
+doc/guide/install.md	215	E1/E12	**怎么读结果**：监听端口里出现 `6365`/`6366`（或你改过的面板端口）说明该机已有面板在跑；`/etc/ovo_agent`、`/etc/flmx_agent` 或 `/etc/flux_agent` 存在说明已有 agent——再按上一节查它 `config.json` 里的 `addr` 归属；`/etc/gost` 存在说明有旧式 gost 形态；`ovo_kernel*` / `ovo_quota*` 表存在说明已有 agent 或面板侧 nft 规则在用这台机器。以上任一项命中，都不要直接装：先按上一节做归属判定，或把端口/实例错开。
 doc/guide/nodes.md	20	E2	| sing-box | 默认 fork 版 `1.14.4-flmx1`（含 UDP 队列修复），可指定 | 从 GitHub Release 下载，用 Release 资产的 SHA256 校验；上游版仍可选，但缺该修复 |
-doc/guide/nodes.md	429	E10	**在节点机上用安装脚本卸载（脚本形态）**：登录节点机重新下载安装脚本、选「3. 卸载」，清理范围与面板自卸载一致：停掉并禁用 agent 服务；赶在删安装目录之前按调优备份与面③ 快照恢复调优前的系统参数（sysctl 原值写回、整形前队列回放）；删除调优留在宿主机上的文件——第二代四面文件：内核参数 `/etc/sysctl.d/99-network-performance.conf`、limits `/etc/security/limits.d/99-network-performance.conf`、BBR `/etc/sysctl.d/10-bbr.conf`、RPS 助手脚本 `
-doc/guide/postgresql.md	344	E5	新部署缺省库名和用户名为 `ovo_panel`，对账 scratch 库为 `ovo_reconcile_scratch`。旧部署继续使用 `.env` 和 `DATABASE_URL` 的实际值（包括 `flmx_panel`）；身份升级只迁移键名，不改名或迁移现库。
+doc/guide/nodes.md	429	E1/E10	**在节点机上用安装脚本卸载（脚本形态）**：登录节点机重新下载安装脚本、选「3. 卸载」，清理范围与面板自卸载一致：停掉并禁用 agent 服务；赶在删安装目录之前按调优备份与面③ 快照恢复调优前的系统参数（sysctl 原值写回、整形前队列回放）；删除调优留在宿主机上的文件——第二代四面文件：内核参数 `/etc/sysctl.d/99-network-performance.conf`、limits `/etc/security/limits.d/99-network-performance.conf`、BBR `/etc/sysctl.d/10-bbr.conf`、RPS 助手脚本 `
+doc/guide/postgresql.md	344	E1	新部署缺省库名和用户名为 `ovo_panel`，对账 scratch 库为 `ovo_reconcile_scratch`。旧部署继续使用 `.env` 和 `DATABASE_URL` 的实际值（包括 `flmx_panel`）；身份升级只迁移键名，不改名或迁移现库。
+doc/guide/upgrade.md	60	E11/E5	**存量部署的容器改名（脚本升级流内默认执行）**：改名前部署的面板，容器名仍是旧名（flux 世代：后端 `flux-panel-backend`、PostgreSQL `flux-panel-postgres`、前端 `vite-frontend`；flmx 世代：后端 `flmx-panel-backend`、PostgreSQL `flmx-panel-postgres`、前端 `flmx-vite-frontend`，以及 `flmx-flux-panel-backend`），或部署 `.env` 里缺 `PANEL_BACKEND_CONTAINER` / `PANEL_FRONT
 doc/guide/upgrade.md	276	E1	当前产品环境键为 `OVO_*`；仅在当前键缺失时兼容读取 `FLMX_*`，升级时同批迁移键名，值保持原样。版本读序为 `OVO_VERSION > FLMX_VERSION`，写面同值双写这两键。`FLVX_*` 的旧双读自 2.0.0 起退场，`FLUX_*` 也不再读取或写入，下面列出退场键与当前替代键。
 doc/guide/upgrade.md	305	E11	当前仓库与镜像归属为 `yhfc1775-maker/ovo`。升级识别 flux（`flux-panel-backend`、`flux-panel-postgres`、`vite-frontend`）和 flmx（`flmx-panel-backend`、`flmx-panel-postgres`、`flmx-panel-frontend`）两代旧部署。旧镜像必须属于 `ghcr.io/iiiiiiiii7125-art/` 且名称命中旧名白名单；新镜像前缀为 `ghcr.io/yhfc1775-maker/`。
 doc/guide/upgrade.md	307	E1	当前环境键按 `OVO_* > FLMX_*` 读取，仅在 OVO 键缺失时回退；`FLUX_*` 与 `FLVX_*` 不恢复读取。版本读取同序，版本写面同时写 `OVO_VERSION` 与 `FLMX_VERSION`。身份迁移在回滚备份之后把旧键名和容器身份改为 ovo；值、安装 UUID、存量卷名、网络、数据库名和用户名保留。健康检查失败时恢复旧配置。新装 PostgreSQL 缺省身份为 `ovo_panel`；存量值以 `.env` / `DATABASE_URL` 为准。
 doc/guide/upgrade.md	309	E11	旧部署维护命令的三代桩验证及 094 实跑计划见仓库 `RENAME-REPORT.md`。切换命令在实跑确认前使用显式形式，例如：`cd /root/flmx-panel && PANEL_BACKEND_CONTAINER=flmx-panel-backend ./panel_install.sh`。菜单 2 更新、菜单 3 卸载门、菜单 4 迁移门均须由 Muse 在合并前复核。
-go-backend/internal/app/app.go	45	E5	 if password == "" || password == "flux_panel_change_me" || password == "flmx_panel_change_me" || password == "ovo_panel_change_me" || password == "postgres" {
-go-backend/internal/config/env.go	5	E1	// Getenv reads OVO first, then FLMX only when the current key is absent.
+go-backend/internal/app/app.go	45	E1	 if password == "" || password == "flux_panel_change_me" || password == "flmx_panel_change_me" || password == "ovo_panel_change_me" || password == "postgres" {
+go-backend/internal/config/env.go	5	E5	// Getenv reads OVO first, then FLMX only when the current key is absent.
 go-backend/internal/envcompat/env.go	13	E1	  return os.Getenv("FLMX_" + strings.TrimPrefix(name, "OVO_"))
 go-backend/internal/envcompat/env_test.go	10	E1	 const legacy = "FLMX_ENV_COMPAT_TEST"
-go-backend/internal/http/handler/agent_stop_audit_test.go	25	E12	LEGACY2_INSTALL_DIR="$AUDIT_DIR/flmx_agent"
-go-backend/internal/http/handler/agent_stop_audit_test.go	40	E12	legacy_flmx_agent_service_exists() { return 1; }
+go-backend/internal/http/handler/agent_stop_audit_test.go	25	E1/E12	LEGACY2_INSTALL_DIR="$AUDIT_DIR/flmx_agent"
+go-backend/internal/http/handler/agent_stop_audit_test.go	40	E1/E12	legacy_flmx_agent_service_exists() { return 1; }
 go-backend/internal/http/handler/fix_b_version_ux_test.go	15	E2	// 身份——fork 1.14.4-flmx1 与上游 1.14.4 底版相同但不是同一版本，
 go-backend/internal/http/handler/fix_b_version_ux_test.go	26	E2	  {"fork reinstall is same", false, "1.14.4-flmx1", "1.14.4-flmx1", "已安装该版本 1.14.4-flmx1，本次未重新下载"},
 go-backend/internal/http/handler/fix_b_version_ux_test.go	27	E2	  {"fork to upstream is a change", false, "1.14.4-flmx1", "1.14.4", ""},
@@ -107,14 +122,15 @@ go-backend/internal/http/handler/fork_plumbing_test.go	201	E2	 stubReleaseTagAPI
 go-backend/internal/http/handler/fork_plumbing_test.go	203	E2	 mock.setApplyVersion("sing-box version 1.14.4-flmx1 linux/amd64")
 go-backend/internal/http/handler/fork_plumbing_test.go	207	E2	 code, msg := postKernelInstall(t, h, nodeID, kernel.TypeSingbox, "1.14.4-flmx1")
 go-backend/internal/http/handler/fork_plumbing_test.go	215	E2	 if after.Version != "1.14.4-flmx1" || !strings.Contains(after.InstalledVersion, "1.14.4-flmx1") {
-go-backend/internal/http/handler/gh_mirror.go	143	E1,E2	  "iiiiiiiii7125-art/sing-box":   true, // FLMX fork 仓（默认源，见 kernel.SingboxForkRepo）
+go-backend/internal/http/handler/gh_mirror.go	143	E2/E5	  "iiiiiiiii7125-art/sing-box":   true, // FLMX fork 仓（默认源，见 kernel.SingboxForkRepo）
 go-backend/internal/http/handler/github_token_test.go	10	E1	 t.Setenv("FLMX_GITHUB_TOKEN", "synthetic-legacy")
+go-backend/internal/http/handler/handler.go	1759	E9	 for _, hdr := range []string{"X-Ovo-Seq", "X-Flmx-Seq", "X-Flvx-Seq"} {
 go-backend/internal/http/handler/kernel.go	602	E2	 // tag 时 latest 会漂离已核实的 1.14.4-flmx1；fork 安装只接受具体
 go-backend/internal/http/handler/kernel.go	3045	E2	 // (1.14.4-flmx1) or "upstream" for the rollback release
 go-backend/internal/http/handler/kernel.go	3126	E2	// version 1.14.4-flmx1 linux/amd64"），须先取其版本 token 再比；
 go-backend/internal/http/handler/kernel.go	3129	E2	// fork 1.14.4-flmx1 时换装上游 1.14.4 会命中，回执谎报"已安装该
-go-backend/internal/http/handler/kernel.go	3146	E2	// version and the -flmx* suffix, so a fork build and its upstream
-go-backend/internal/http/handler/kernel.go	3165	E2	// forkVersionSuffix returns the -flmx* suffix of a version token
+go-backend/internal/http/handler/kernel.go	3146	E2/E5	// version and the -flmx* suffix, so a fork build and its upstream
+go-backend/internal/http/handler/kernel.go	3165	E2/E5	// forkVersionSuffix returns the -flmx* suffix of a version token
 go-backend/internal/http/handler/kernel.go	3177	E2	// 数字点分段加可选后缀（"1.14.4-flmx1"、"26.11.9"、
 go-backend/internal/http/handler/kernel.go	3184	E2	// ("sing-box version 1.14.4-flmx1 linux/amd64", "Xray 26.11.9
 go-backend/internal/http/handler/kernel.go	3320	E2	 // 发现 1：sing-box 的版本列表同时含 fork 构建（1.14.4-flmx1）
@@ -131,21 +147,22 @@ go-backend/internal/http/handler/kernel_install_kver_test.go	169	E2	// Fork 版�
 go-backend/internal/http/handler/kernel_install_kver_test.go	172	E2	 stubReleaseTagAPI(t, map[string]int{"v1.14.4-flmx1": http.StatusOK})
 go-backend/internal/http/handler/kernel_install_kver_test.go	188	E2	 code, msg := postKernelInstall(t, h, nodeID, kernel.TypeSingbox, "1.14.4-flmx1")
 go-backend/internal/http/handler/kernel_install_kver_test.go	199	E2	 if after.Version != "1.14.4-flmx1" {
-go-backend/internal/http/handler/mutations.go	1	E6/E7 invariant comment	// NEVER rename the flmx cryptographic domains or persisted spool prefixes: deployed values depend on them.
+go-backend/internal/http/handler/mutations.go	1	E5/E6/E7 invariant comment	// NEVER rename the flmx cryptographic domains or persisted spool prefixes: deployed values depend on them.
 go-backend/internal/http/handler/mutations.go	10154	E7	 fmt.Fprintf(mac, "flmx-kcp-key|%d", scopeID)
 go-backend/internal/http/handler/ovo_generation_test.go	14	E11	  "ghcr.io/iiiiiiiii7125-art/flmx-panel-backend:2.1.29",
 go-backend/internal/http/handler/ovo_generation_test.go	23	E11	  "ghcr.io/other/flmx-panel-backend:2.1.29",
 go-backend/internal/http/handler/ovo_generation_test.go	33	E11	 for _, generation := range []string{"flux", "flmx", "ovo"} {
 go-backend/internal/http/handler/ovo_generation_test.go	51	E1	 raw := []byte("FLMX_INSTALL_ID='unchanged-uuid'\nFLMX_NETWORK=existing-network\nFLMX_ADMIN_PASSWORD='literal $ value'\nOVO_NETWORK=current-network\nFLMX_VERSION=2.1.29\n")
 go-backend/internal/http/handler/ovo_generation_test.go	53	E1	 for _, want := range []string{"OVO_INSTALL_ID='unchanged-uuid'", "OVO_ADMIN_PASSWORD='literal $ value'", "OVO_NETWORK=current-network", "FLMX_VERSION=2.1.29", "OVO_VERSION=2.1.29"} {
-go-backend/internal/http/handler/ovo_generation_test.go	67	E5	 env := map[string]string{"DATABASE_URL": "postgresql://flmx%5Fpanel:test-pass@postgres:5432/flmx_panel?sslmode=disable"}
+go-backend/internal/http/handler/ovo_generation_test.go	67	E1	 env := map[string]string{"DATABASE_URL": "postgresql://flmx%5Fpanel:test-pass@postgres:5432/flmx_panel?sslmode=disable"}
 go-backend/internal/http/handler/ovo_generation_test.go	68	E11	 got, err := resolvePgSnapshotIdentity(env, "flmx-panel-postgres", map[string]string{envKeyPostgresUser: "ovo_panel", envKeyPostgresDB: "ovo_panel"})
-go-backend/internal/http/handler/ovo_generation_test.go	69	E5	 if err != nil || got.user != "flmx_panel" || got.db != "flmx_panel" {
+go-backend/internal/http/handler/ovo_generation_test.go	69	E1	 if err != nil || got.user != "flmx_panel" || got.db != "flmx_panel" {
 go-backend/internal/http/handler/ovo_generation_test.go	74	E11	 got, err = resolvePgSnapshotIdentity(env, "flmx-panel-postgres", nil)
-go-backend/internal/http/handler/ovo_generation_test.go	85	E5	   content := "PANEL_IDENTITY_RENAME=" + enabled + "\nDATABASE_URL=postgresql://flmx%5Fpanel:test-pass@postgres:5432/flmx_panel?sslmode=disable\nPANEL_POSTGRES_CONTAINER=flux-panel-postgres\n"
-go-backend/internal/http/handler/ovo_generation_test.go	99	E5	   if got[envKeyPostgresUser] != "flmx_panel" || got[envKeyPostgresDB] != "flmx_panel" || got["DATABASE_URL"] != "postgresql://flmx%5Fpanel:test-pass@postgres:5432/flmx_panel?sslmode=disable" {
-go-backend/internal/http/handler/rename_compat_test.go	76	E11	  t.Fatal("flmx v3 signature must survive rename")
-go-backend/internal/http/handler/rename_compat_test.go	79	E11	  t.Fatal("flmx v3 fallback must respect retirement")
+go-backend/internal/http/handler/ovo_generation_test.go	85	E1	   content := "PANEL_IDENTITY_RENAME=" + enabled + "\nDATABASE_URL=postgresql://flmx%5Fpanel:test-pass@postgres:5432/flmx_panel?sslmode=disable\nPANEL_POSTGRES_CONTAINER=flux-panel-postgres\n"
+go-backend/internal/http/handler/ovo_generation_test.go	99	E1	   if got[envKeyPostgresUser] != "flmx_panel" || got[envKeyPostgresDB] != "flmx_panel" || got["DATABASE_URL"] != "postgresql://flmx%5Fpanel:test-pass@postgres:5432/flmx_panel?sslmode=disable" {
+go-backend/internal/http/handler/rename_compat_test.go	73	E8	 old := h.subURLSigV3FlmxForToken(token, uid)
+go-backend/internal/http/handler/rename_compat_test.go	76	E5	  t.Fatal("flmx v3 signature must survive rename")
+go-backend/internal/http/handler/rename_compat_test.go	79	E5	  t.Fatal("flmx v3 fallback must respect retirement")
 go-backend/internal/http/handler/subscription_capability.go	22	E7	 fmt.Fprintf(mac, "flmx-scoped-sub-v1:%d:%d:%s", userID, sub.ID, sub.Token)
 go-backend/internal/http/handler/system_upgrade.go	413	E1	 // Current key wins; the envcompat reader falls back to FLMX_VERSION only when absent.
 go-backend/internal/http/handler/system_upgrade.go	414	E1	 // FLUX_VERSION remains retired. Both update paths write OVO_VERSION and FLMX_VERSION.
@@ -158,7 +175,7 @@ go-backend/internal/http/handler/system_upgrade.go	1515	E1	  {envKeyFLMXVersion,
 go-backend/internal/http/handler/system_upgrade.go	1536	E1	 envKeyFLMXVersion    = "FLMX_VERSION"
 go-backend/internal/http/handler/system_upgrade.go	1668	E1	  if strings.HasPrefix(key, "FLMX_") {
 go-backend/internal/http/handler/system_upgrade.go	1669	E1	   current := "OVO_" + strings.TrimPrefix(key, "FLMX_")
-go-backend/internal/http/handler/system_upgrade.go	2528	E11	 // flmx identities are the defaults used by 2.1.32 and earlier.
+go-backend/internal/http/handler/system_upgrade.go	2528	E5	 // flmx identities are the defaults used by 2.1.32 and earlier.
 go-backend/internal/http/handler/system_upgrade.go	2530	E11	  {envKeyPanelBackendContainer, legacyPanelBackendContainer, "flmx-panel-backend", newPanelBackendContainer + suffix},
 go-backend/internal/http/handler/system_upgrade.go	2531	E11	  {envKeyPanelFrontendContainer, legacyPanelFrontendContainer, "flmx-panel-frontend", newPanelFrontendContainer + suffix},
 go-backend/internal/http/handler/system_upgrade.go	2532	E11	  {envKeyPanelPostgresContainer, legacyPanelPostgresContainer, "flmx-panel-postgres", newPanelPostgresContainer + suffix},
@@ -200,7 +217,10 @@ go-backend/internal/http/handler/system_upgrade_version_dualwrite_test.go	40	E1	
 go-backend/internal/http/handler/system_upgrade_version_dualwrite_test.go	42	E1	  {"both keys", "OVO_VERSION=1.0.0\nFLMX_VERSION=1.0.0\n"},
 go-backend/internal/http/handler/system_upgrade_version_dualwrite_test.go	62	E1	   if values[envKeyOVOVersion] != "1.9.9" || values[envKeyFLMXVersion] != "1.9.9" {
 go-backend/internal/http/handler/system_upgrade_version_dualwrite_test.go	64	E1	     values[envKeyOVOVersion], values[envKeyFLMXVersion], data)
+go-backend/internal/http/handler/user_inbound.go	59	E8	// subURLSigV3FlmxForToken verifies links issued by the previous generation.
+go-backend/internal/http/handler/user_inbound.go	60	E8	func (h *Handler) subURLSigV3FlmxForToken(token string, userID int64) string {
 go-backend/internal/http/handler/user_inbound.go	62	E8	 fmt.Fprintf(mac, "flmx-subsig-v3:%s:%d", token, userID)
+go-backend/internal/http/handler/user_inbound.go	104	E8	 if old := h.subURLSigV3FlmxForToken(token, userID); now.Before(flowV1LegacySunset) && subtle.ConstantTimeCompare([]byte(sig), []byte(old)) == 1 {
 go-backend/internal/http/handler/version_strict_units_r2_test.go	31	E2	  // Fork 格：只剥 "-flmx<数字>" 后缀（1.14.4-flmx1 按 1.14.4
 go-backend/internal/http/handler/version_strict_units_r2_test.go	33	E2	  {"1.14.4-flmx1", false},    // fork 构建达 1.14 门
 go-backend/internal/http/handler/version_strict_units_r2_test.go	34	E2	  {"v1.14.4-flmx1", false},   // v 前缀 + fork 后缀同判
@@ -213,14 +233,14 @@ go-backend/internal/http/handler/version_strict_units_r2_test.go	87	E2	  {"25.6.
 go-backend/internal/kernel/capabilities.go	14	E2	// 扩到 1024（1.14.4-flmx1）。面板侧全部 sing-box 默认面（下载 URL、
 go-backend/internal/kernel/capabilities.go	19	E2	// singboxForkSuffixPattern 是 fork 构建的版本后缀（1.14.4-flmx1）：
 go-backend/internal/kernel/capabilities.go	22	E2	var singboxForkSuffixPattern = regexp.MustCompile(`^-flmx[0-9A-Za-z]*$`)
-go-backend/internal/kernel/capabilities.go	25	E1,E2	// FLMX fork build (发现 1)：fork 构建带 "-flmx*" 后缀
+go-backend/internal/kernel/capabilities.go	25	E2/E5	// FLMX fork build (发现 1)：fork 构建带 "-flmx*" 后缀
 go-backend/internal/kernel/capabilities.go	26	E2	// （1.14.4-flmx1）；裸底版（1.14.4）是回滚用的上游构建，不含入站
 go-backend/internal/kernel/capabilities.go	37	E2	// v1.14.4-flmx1 tag。latest 哨兵不得漂向它之外的 tag（见
 go-backend/internal/kernel/capabilities.go	39	E2	const SingboxForkVersion = "1.14.4-flmx1"
 go-backend/internal/kernel/capabilities.go	165	E2	// (SingboxForkRepo), whose 1.14.4-flmx1 build carries the enlarged
-go-backend/internal/kernel/credentials.go	1	E6/E7 invariant comment	// NEVER rename the flmx cryptographic domains or persisted spool prefixes: deployed values depend on them.
+go-backend/internal/kernel/credentials.go	1	E5/E6/E7 invariant comment	// NEVER rename the flmx cryptographic domains or persisted spool prefixes: deployed values depend on them.
 go-backend/internal/kernel/credentials.go	229	E7	 fmt.Fprintf(mac, "flmx-ss-upsk|%d|%s", subID, method)
-go-backend/internal/kernel/fork_version_test.go	5	E2	// 发现 1：fork 构建与上游构建的区分——IsForkVersion 只认 "-flmx*"
+go-backend/internal/kernel/fork_version_test.go	5	E2/E5	// 发现 1：fork 构建与上游构建的区分——IsForkVersion 只认 "-flmx*"
 go-backend/internal/kernel/fork_version_test.go	12	E2	  {"1.14.4-flmx1", true},
 go-backend/internal/kernel/fork_version_test.go	13	E2	  {"v1.14.4-flmx1", true},
 go-backend/internal/kernel/fork_version_test.go	16	E2	  {"1.14.5-flmx1", true},
@@ -229,7 +249,7 @@ go-backend/internal/kernel/kernel_test.go	317	E2	 if sf["url"] != "https://githu
 go-backend/internal/kernel/markbase_test.go	23	E6	 // Pinned literals (SHA-256("flmx:user-mark-v2:"+secret), first byte).
 go-backend/internal/kernel/ss_inplace_test.go	342	E2	  {TypeSingbox, "1.14.4-flmx1", testSSMethod256, ""}, // fork suffix stripped
 go-backend/internal/kernel/ss_metering_test.go	26	E7	 mac.Write([]byte("flmx-ss-upsk|101|2022-blake3-aes-128-gcm"))
-go-backend/internal/kernel/users.go	1	E6/E7 invariant comment	// NEVER rename the flmx cryptographic domains or persisted spool prefixes: deployed values depend on them.
+go-backend/internal/kernel/users.go	1	E5/E6/E7 invariant comment	// NEVER rename the flmx cryptographic domains or persisted spool prefixes: deployed values depend on them.
 go-backend/internal/kernel/users.go	297	E2	// comparison: fork builds ("-flmx<数字>", e.g. 1.14.4-flmx1 count as
 go-backend/internal/kernel/users.go	301	E2	var inplaceForkSuffixPattern = regexp.MustCompile(`^-flmx[0-9A-Za-z]*$`)
 go-backend/internal/kernel/users.go	370	E6	// secret instead — the first byte of SHA-256("flmx:user-mark-v2:"+
@@ -237,39 +257,39 @@ go-backend/internal/kernel/users.go	406	E6	const markBaseDomain = "flmx:user-mar
 go-backend/internal/kernel/users.go	410	E6	// SHA-256("flmx:user-mark-v2:"+secret) in bits 16-23 (E-01). The
 go-backend/internal/kernel/users.go	449	E6	const clashAPIPortDomain = "flmx:clash-api-v1:"
 go-backend/internal/kernel/users.go	463	E6	// bytes of SHA-256("flmx:clash-api-v1:"+secret), mapped into
-go-backend/internal/runtime/nftables/fix_c3_01_test.go	9	E10	// like the main table. The old plain shared table flmx_quota let
-go-backend/internal/runtime/nftables/fix_c3_01_test.go	18	E10	 if def == "flmx_quota" {
-go-backend/internal/runtime/nftables/fix_c3_01_test.go	45	E10	 if strings.Contains(table, "table inet flmx_quota {") {
-go-backend/internal/runtime/nftables/fix_c3_01_test.go	69	E10	 if strings.Contains(cmd, "list table inet flmx_quota {") || strings.Contains(cmd, "delete table inet flmx_quota") {
-go-backend/internal/runtime/nftables/fix_c3_01_test.go	83	E10	 if strings.Contains(cmd, "list table inet flmx_quota >/dev/null 2>&1") {
-go-backend/internal/runtime/nftables/fix_c3_01_test.go	86	E10	 if strings.Contains(cmd, "list set inet flmx_quota ") {
-go-backend/internal/runtime/nftables/fix_c3_01_test.go	108	E10	 if !strings.Contains(cmd, "nft delete element inet flmx_quota blocked_ports '{ 20001 }'") {
-go-backend/internal/runtime/nftables/fix_c3_01_test.go	125	E10	 if strings.Contains(cmd, "delete table inet flmx_quota\n") || strings.Contains(cmd, "delete table inet flmx_quota ") && !strings.Contains(cmd, "delete table inet ovo_quota_16477688") {
-go-backend/internal/runtime/nftables/fix_c3_01_test.go	143	E10	 if strings.Contains(cmd, "flmx_quota blocked_ports") || strings.Contains(cmd, "flmx_quota ") && !strings.Contains(cmd, "ovo_quota_16477688") {
+go-backend/internal/runtime/nftables/fix_c3_01_test.go	9	E1/E10	// like the main table. The old plain shared table flmx_quota let
+go-backend/internal/runtime/nftables/fix_c3_01_test.go	18	E1/E10	 if def == "flmx_quota" {
+go-backend/internal/runtime/nftables/fix_c3_01_test.go	45	E1/E10	 if strings.Contains(table, "table inet flmx_quota {") {
+go-backend/internal/runtime/nftables/fix_c3_01_test.go	69	E1/E10	 if strings.Contains(cmd, "list table inet flmx_quota {") || strings.Contains(cmd, "delete table inet flmx_quota") {
+go-backend/internal/runtime/nftables/fix_c3_01_test.go	83	E1/E10	 if strings.Contains(cmd, "list table inet flmx_quota >/dev/null 2>&1") {
+go-backend/internal/runtime/nftables/fix_c3_01_test.go	86	E1/E10	 if strings.Contains(cmd, "list set inet flmx_quota ") {
+go-backend/internal/runtime/nftables/fix_c3_01_test.go	108	E1/E10	 if !strings.Contains(cmd, "nft delete element inet flmx_quota blocked_ports '{ 20001 }'") {
+go-backend/internal/runtime/nftables/fix_c3_01_test.go	125	E1/E10	 if strings.Contains(cmd, "delete table inet flmx_quota\n") || strings.Contains(cmd, "delete table inet flmx_quota ") && !strings.Contains(cmd, "delete table inet ovo_quota_16477688") {
+go-backend/internal/runtime/nftables/fix_c3_01_test.go	143	E1/E10	 if strings.Contains(cmd, "flmx_quota blocked_ports") || strings.Contains(cmd, "flmx_quota ") && !strings.Contains(cmd, "ovo_quota_16477688") {
 go-backend/internal/runtime/nftables/fix_r1_c3_01_test.go	79	E10	 if !strings.Contains(cmd, "'delete table inet flmx'") || !strings.Contains(cmd, "'delete table inet flvx'") {
-go-backend/internal/runtime/nftables/fix_r1_c3_03_test.go	13	E10	// every element of the plain flmx_quota set into this install's
-go-backend/internal/runtime/nftables/fix_r1_c3_03_test.go	41	E10	  "list table inet flmx_quota ",
-go-backend/internal/runtime/nftables/fix_r1_c3_03_test.go	42	E10	  "list set inet flmx_quota ",
-go-backend/internal/runtime/nftables/fix_r1_c3_03_test.go	43	E10	  "add element inet flmx_quota ",
-go-backend/internal/runtime/nftables/fix_r1_c3_03_test.go	44	E10	  "delete table inet flmx_quota",
-go-backend/internal/runtime/nftables/fix_r1_c3_03_test.go	60	E10	 if strings.Contains(cmd, "flmx_quota blocked_ports") {
-go-backend/internal/runtime/nftables/fix_r1_c3_03_test.go	73	E10	  "nft delete element inet flmx_quota blocked_ports '{ 20001 }'",
-go-backend/internal/runtime/nftables/pause_filter.go	28	E10	 legacyPauseTableName = "flmx_quota"
-go-backend/internal/runtime/nftables/pause_filter.go	98	E10	 return r.run(ctx, cfg, buildSetBlockedCommand(nftBinary(cfg), r.pauseTableName(), port, blocked, cleanupLegacy, "flmx_quota_"+tableNameSuffix(r.instance, r.installID), "flmx_quota_"+tableNameSuffix(r.instance, "")))
-go-backend/internal/runtime/nftables/pause_filter_test.go	147	E10	 withElems := []byte(`{"nftables": [{"metainfo": {"version": "1.0.6", "json_schema_version": 1}}, {"set": {"family": "inet", "table": "flmx_quota", "name": "blocked_ports", "handle": 2, "type": "inet_service", "elem": [45002, 45001]}}]}`)
-go-backend/internal/runtime/nftables/pause_filter_test.go	156	E10	 emptySet := []byte(`{"nftables": [{"metainfo": {"version": "1.0.6"}}, {"set": {"family": "inet", "table": "flmx_quota", "name": "blocked_ports", "handle": 2, "type": "inet_service"}}]}`)
-go-backend/internal/runtime/nftables/pause_filter_test.go	169	E10	 interval := []byte(`{"nftables": [{"set": {"family": "inet", "table": "flmx_quota", "name": "blocked_ports", "type": "inet_service", "elem": [{"range": [45001, 45010]}]}}]}`)
+go-backend/internal/runtime/nftables/fix_r1_c3_03_test.go	13	E1/E10	// every element of the plain flmx_quota set into this install's
+go-backend/internal/runtime/nftables/fix_r1_c3_03_test.go	41	E1/E10	  "list table inet flmx_quota ",
+go-backend/internal/runtime/nftables/fix_r1_c3_03_test.go	42	E1/E10	  "list set inet flmx_quota ",
+go-backend/internal/runtime/nftables/fix_r1_c3_03_test.go	43	E1/E10	  "add element inet flmx_quota ",
+go-backend/internal/runtime/nftables/fix_r1_c3_03_test.go	44	E1/E10	  "delete table inet flmx_quota",
+go-backend/internal/runtime/nftables/fix_r1_c3_03_test.go	60	E1/E10	 if strings.Contains(cmd, "flmx_quota blocked_ports") {
+go-backend/internal/runtime/nftables/fix_r1_c3_03_test.go	73	E1/E10	  "nft delete element inet flmx_quota blocked_ports '{ 20001 }'",
+go-backend/internal/runtime/nftables/pause_filter.go	28	E1/E10	 legacyPauseTableName = "flmx_quota"
+go-backend/internal/runtime/nftables/pause_filter.go	98	E1/E10	 return r.run(ctx, cfg, buildSetBlockedCommand(nftBinary(cfg), r.pauseTableName(), port, blocked, cleanupLegacy, "flmx_quota_"+tableNameSuffix(r.instance, r.installID), "flmx_quota_"+tableNameSuffix(r.instance, "")))
+go-backend/internal/runtime/nftables/pause_filter_test.go	147	E1/E10	 withElems := []byte(`{"nftables": [{"metainfo": {"version": "1.0.6", "json_schema_version": 1}}, {"set": {"family": "inet", "table": "flmx_quota", "name": "blocked_ports", "handle": 2, "type": "inet_service", "elem": [45002, 45001]}}]}`)
+go-backend/internal/runtime/nftables/pause_filter_test.go	156	E1/E10	 emptySet := []byte(`{"nftables": [{"metainfo": {"version": "1.0.6"}}, {"set": {"family": "inet", "table": "flmx_quota", "name": "blocked_ports", "handle": 2, "type": "inet_service"}}]}`)
+go-backend/internal/runtime/nftables/pause_filter_test.go	169	E1/E10	 interval := []byte(`{"nftables": [{"set": {"family": "inet", "table": "flmx_quota", "name": "blocked_ports", "type": "inet_service", "elem": [{"range": [45001, 45010]}]}}]}`)
 go-backend/internal/runtime/nftables/renderer.go	20	E11	 plainTableName = "flmx"
-go-backend/internal/runtime/nftables/runner.go	192	E10	 command := buildApplyCommand(nftBinary(cfg), table, script, migratePlain, "flmx_"+tableNameSuffix(r.instance, r.installID), "flmx_"+tableNameSuffix(r.instance, ""))
-go-backend/internal/runtime/nftables/runner.go	225	E10	  previous = append(previous, "flmx_"+strings.TrimPrefix(table, "ovo_"))
+go-backend/internal/runtime/nftables/runner.go	192	E1	 command := buildApplyCommand(nftBinary(cfg), table, script, migratePlain, "flmx_"+tableNameSuffix(r.instance, r.installID), "flmx_"+tableNameSuffix(r.instance, ""))
+go-backend/internal/runtime/nftables/runner.go	225	E1/E10	  previous = append(previous, "flmx_"+strings.TrimPrefix(table, "ovo_"))
 go-backend/internal/runtime/nftables/runner_test.go	129	E11	    flmx|flvx) exit 0 ;;
 go-backend/internal/runtime/nftables/runner_test.go	151	E10	 want := "delete table inet flmx\ndelete table inet flvx\n" + script + "\n"
 go-backend/internal/runtime/nftables/runner_test.go	168	E11	    flmx|flvx) exit 0 ;;
-go-backend/internal/security/node_secret.go	1	E6/E7 invariant comment	// NEVER rename the flmx cryptographic domains or persisted spool prefixes: deployed values depend on them.
+go-backend/internal/security/node_secret.go	1	E5/E6/E7 invariant comment	// NEVER rename the flmx cryptographic domains or persisted spool prefixes: deployed values depend on them.
 go-backend/internal/security/node_secret.go	12	E6	// "flmx:node-secret-v1:" + 明文，hex 64 位）。选用确定性哈希而非
 go-backend/internal/security/node_secret.go	23	E6	const nodeSecretHashDomain = "flmx:node-secret-v1:"
 go-backend/internal/security/node_secret_test.go	9	E6	// 的唯一存储形态：SHA-256（域分隔 "flmx:node-secret-v1:" + 明文，
-go-backend/internal/store/repo/pg_name_lock.go	1	E6/E7 invariant comment	// NEVER rename the flmx cryptographic domains or persisted spool prefixes: deployed values depend on them.
+go-backend/internal/store/repo/pg_name_lock.go	1	E5/E6/E7 invariant comment	// NEVER rename the flmx cryptographic domains or persisted spool prefixes: deployed values depend on them.
 go-backend/internal/store/repo/pg_name_lock.go	48	E6	 return tx.Exec("SELECT pg_advisory_xact_lock(hashtext(?))", "flmx:name:"+scope+":"+name).Error
 go-backend/tests/contract/kernel_share_contract_test.go	353	E2	 // 入口即拒；此处点名 fork 版 1.14.4-flmx1，落库即该版本。空版本
 go-backend/tests/contract/kernel_share_contract_test.go	363	E2	 kernelContractPost(t, router, admin, "/api/v1/kernel/install", `{"nodeId":`+jsonInt64(nodeID)+`,"kernelType":"singbox","version":"1.14.4-flmx1"}`)
@@ -279,206 +299,213 @@ go-backend/tests/contract/kernel_share_contract_test.go	435	E2	 // 走严格比�
 go-backend/tests/contract/kernel_share_contract_test.go	444	E2	 kernelContractPost(t, router, admin, "/api/v1/kernel/install", `{"nodeId":`+n+`,"kernelType":"singbox","version":"1.14.4-flmx1"}`)
 go-gost/x/envcompat/env.go	13	E1	  return os.Getenv("FLMX_" + strings.TrimPrefix(name, "OVO_"))
 go-gost/x/envcompat/env_test.go	10	E1	 const legacy = "FLMX_ENV_COMPAT_TEST"
-go-gost/x/kernel/fix_c3_06_test.go	13	E10	// flmx_kernel_legacy on uninstall, silently dropping its inbound
-go-gost/x/kernel/fix_c3_06_test.go	42	E10	 if strings.Contains(script, "delete table inet flmx_kernel_legacy\n") {
-go-gost/x/kernel/manager.go	37	E12	const legacy2BaseDir = "/etc/flmx_agent/kernels"
-go-gost/x/kernel/manager.go	203	E12	  case scriptLayoutDirName, legacyScriptLayoutDirName, "flmx_agent":
+go-gost/x/kernel/fix_c3_06_test.go	13	E1/E10	// flmx_kernel_legacy on uninstall, silently dropping its inbound
+go-gost/x/kernel/fix_c3_06_test.go	42	E1/E10	 if strings.Contains(script, "delete table inet flmx_kernel_legacy\n") {
+go-gost/x/kernel/manager.go	37	E1/E12	const legacy2BaseDir = "/etc/flmx_agent/kernels"
+go-gost/x/kernel/manager.go	203	E1/E12	  case scriptLayoutDirName, legacyScriptLayoutDirName, "flmx_agent":
 go-gost/x/kernel/manager.go	1731	E2	//     ("1.0.0", "1.14.4-flmx1", "2.9.6"); the deliberate strictness
-go-gost/x/kernel/markbase_test.go	129	E10	table inet flmx_kernel_legacy {
-go-gost/x/kernel/nft.go	24	E10	const prevNftTable = "flmx_kernel"
-go-gost/x/kernel/nft.go	36	E10	const legacyAgentNFTTable = "flmx_kernel_legacy"
-go-gost/x/kernel/nft_isolation_test.go	46	E10	 if got := nftTableForBaseDir(legacyBaseDir); got != "flmx_kernel_legacy" {
-go-gost/x/kernel/nft_isolation_test.go	280	E10	 for _, bare := range []string{"delete table inet ovo_kernel\n", "delete table inet flvx_kernel\n", "delete table inet flmx_kernel_legacy\n"} {
-go-gost/x/kernel/nft_isolation_test.go	289	E10	// deletes the leftover flmx_kernel_legacy table. It must not be
-go-gost/x/kernel/nft_isolation_test.go	316	E10	 for _, want := range []string{"delete table inet " + n.tableName() + "\n", "delete table inet flvx_kernel\n", "delete table inet flmx_kernel_legacy\n", "delete table inet ovo_hop_probe\n"} {
-go-gost/x/kernel/nft_isolation_test.go	515	E10	 f.tables[prevNftTable] = "table inet flmx_kernel {\n}\n"
-go-gost/x/kernel/nft_isolation_test.go	536	E10	// flmx_kernel_legacy), so its syncs must not touch the plain
+go-gost/x/kernel/markbase_test.go	129	E1/E10	table inet flmx_kernel_legacy {
+go-gost/x/kernel/nft.go	24	E1/E10	const prevNftTable = "flmx_kernel"
+go-gost/x/kernel/nft.go	36	E1/E10	const legacyAgentNFTTable = "flmx_kernel_legacy"
+go-gost/x/kernel/nft_isolation_test.go	46	E1/E10	 if got := nftTableForBaseDir(legacyBaseDir); got != "flmx_kernel_legacy" {
+go-gost/x/kernel/nft_isolation_test.go	280	E1/E10	 for _, bare := range []string{"delete table inet ovo_kernel\n", "delete table inet flvx_kernel\n", "delete table inet flmx_kernel_legacy\n"} {
+go-gost/x/kernel/nft_isolation_test.go	289	E1/E10	// deletes the leftover flmx_kernel_legacy table. It must not be
+go-gost/x/kernel/nft_isolation_test.go	316	E1/E10	 for _, want := range []string{"delete table inet " + n.tableName() + "\n", "delete table inet flvx_kernel\n", "delete table inet flmx_kernel_legacy\n", "delete table inet ovo_hop_probe\n"} {
+go-gost/x/kernel/nft_isolation_test.go	515	E1/E10	 f.tables[prevNftTable] = "table inet flmx_kernel {\n}\n"
+go-gost/x/kernel/nft_isolation_test.go	536	E1/E10	// flmx_kernel_legacy), so its syncs must not touch the plain
 go-gost/x/kernel/r6_binprune_test.go	43	E2	  {"1.14.4-flmx1", true},
 go-gost/x/kernel/types.go	106	E6	 // the first byte of SHA-256("flmx:user-mark-v2:"+node secret)
-go-gost/x/service/connlog_spool.go	1	E6/E7 invariant comment	// NEVER rename the flmx cryptographic domains or persisted spool prefixes: deployed values depend on them.
-go-gost/x/service/connlog_spool.go	25	E6	//     （TrafficSpoolIdentity 同源派生，前缀 flmx_connlog_）：换面
-go-gost/x/service/connlog_spool.go	120	E6	 return fmt.Sprintf("flmx_connlog_%x.json", sha256.Sum256([]byte(identity)))
-go-gost/x/service/traffic_spool.go	1	E6/E7 invariant comment	// NEVER rename the flmx cryptographic domains or persisted spool prefixes: deployed values depend on them.
-go-gost/x/service/traffic_spool.go	69	E6	 return fmt.Sprintf("flmx_traffic_%x.json", sha256.Sum256([]byte(identity)))
-go-gost/x/service/traffic_spool.go	132	E6	  if entry.IsDir() || !strings.HasPrefix(name, "flmx_traffic_") || !strings.HasSuffix(name, ".json") {
-go-gost/x/service/traffic_spool.go	158	E6	// 存档，返回实际删除的文件名。识别口径与孤儿扫描一致（flmx_traffic_
-go-gost/x/service/traffic_spool.go	173	E6	  if entry.IsDir() || !strings.HasPrefix(name, "flmx_traffic_") || !strings.Contains(name, ".rejected-") || !strings.HasSuffix(name, ".json") {
-go-gost/x/service/traffic_spool.go	220	E6	  if entry.IsDir() || !strings.HasPrefix(name, "flmx_traffic_") || !strings.HasSuffix(name, ".json") {
-go-gost/x/service/traffic_spool_backoff_test.go	48	E6	 m := newBackoffTestManager(t, filepath.Join(t.TempDir(), "flmx_traffic_backoff.json"))
-go-gost/x/service/traffic_spool_backoff_test.go	92	E6	 m := newBackoffTestManager(t, filepath.Join(dir, "flmx_traffic_dead.json"))
-go-gost/x/service/traffic_spool_backoff_test.go	168	E6	 m := newBackoffTestManager(t, filepath.Join(dir, "flmx_traffic_ttl.json"))
-go-gost/x/service/traffic_spool_backoff_test.go	209	E6	 m := newBackoffTestManager(t, filepath.Join(t.TempDir(), "flmx_traffic_recover.json"))
-go-gost/x/service/traffic_spool_backoff_test.go	248	E6	 m := newBackoffTestManager(t, filepath.Join(t.TempDir(), "flmx_traffic_legacy.json"))
-go-gost/x/service/traffic_spool_identity_test.go	18	E6	 const want = "flmx_traffic_9c7fe79f025a358a21ffca758fcb6dab37fcbe7ec44ca5801ea350eec6b6ce67.json"
-go-gost/x/service/traffic_spool_orphan_sweep_test.go	45	E6	 emptyAged := writeOrphanSpool(t, dir, "flmx_traffic_empty.json", nil, aged, now)
-go-gost/x/service/traffic_spool_orphan_sweep_test.go	46	E6	 pendingAged := writeOrphanSpool(t, dir, "flmx_traffic_pending.json", func(s *trafficSpoolState) {
-go-gost/x/service/traffic_spool_orphan_sweep_test.go	49	E6	 bufferedAged := writeOrphanSpool(t, dir, "flmx_traffic_buffered.json", func(s *trafficSpoolState) {
-go-gost/x/service/traffic_spool_orphan_sweep_test.go	52	E6	 retryAged := writeOrphanSpool(t, dir, "flmx_traffic_retry.json", func(s *trafficSpoolState) {
-go-gost/x/service/traffic_spool_orphan_sweep_test.go	55	E6	 emptyYoung := writeOrphanSpool(t, dir, "flmx_traffic_young.json", nil, 24*time.Hour, now)
-go-gost/x/service/traffic_spool_orphan_sweep_test.go	56	E6	 ownPath := writeOrphanSpool(t, dir, "flmx_traffic_own.json", nil, aged, now)
-go-gost/x/service/traffic_spool_orphan_sweep_test.go	58	E6	 corrupt := writeSpoolDirFile(t, dir, "flmx_traffic_corrupt.json", aged, now) // "{}" is not a valid spool
-go-gost/x/service/traffic_spool_orphan_sweep_test.go	59	E6	 archive := writeSpoolDirFile(t, dir, "flmx_traffic_x.json.rejected-stream-1.json", aged, now)
-go-gost/x/service/traffic_spool_orphan_sweep_test.go	62	E6	 if len(removed) != 1 || removed[0] != "flmx_traffic_empty.json" {
-go-gost/x/service/traffic_spool_rejected_test.go	50	E6	 old := writeSpoolDirFile(t, dir, "flmx_traffic_a.json.rejected-stream-1.json", 31*24*time.Hour, now)
-go-gost/x/service/traffic_spool_rejected_test.go	51	E6	 fresh := writeSpoolDirFile(t, dir, "flmx_traffic_a.json.rejected-stream-2.json", time.Hour, now)
-go-gost/x/service/traffic_spool_rejected_test.go	52	E6	 orphan := writeSpoolDirFile(t, dir, "flmx_traffic_b.json", 90*24*time.Hour, now)
-go-gost/x/service/traffic_spool_rejected_test.go	56	E6	 if len(removed) != 1 || removed[0] != "flmx_traffic_a.json.rejected-stream-1.json" {
-go-gost/x/service/traffic_spool_rejected_test.go	72	E6	  paths[i] = writeSpoolDirFile(t, dir, fmt.Sprintf("flmx_traffic_a.json.rejected-s-%03d.json", i), time.Duration(total-i)*time.Minute, now)
-go-gost/x/socket/uninstall.go	37	E12	 return name == agentInstallName || name == "flmx_agent" || name == legacyAgentInstallName
-go-gost/x/socket/websocket_reporter.go	2416	E12	  return "", fmt.Errorf("无法识别的 agent 安装：%s（面板升级/回退只支持 ovo_agent/flmx_agent/flux_agent 安装）", exe)
+go-gost/x/service/connlog_spool.go	1	E5/E6/E7 invariant comment	// NEVER rename the flmx cryptographic domains or persisted spool prefixes: deployed values depend on them.
+go-gost/x/service/connlog_spool.go	25	E1/E6	//     （TrafficSpoolIdentity 同源派生，前缀 flmx_connlog_）：换面
+go-gost/x/service/connlog_spool.go	120	E1/E6	 return fmt.Sprintf("flmx_connlog_%x.json", sha256.Sum256([]byte(identity)))
+go-gost/x/service/traffic_reporter.go	521	E9	 // 改名过渡：seq 头双发（新头 X-Ovo-Seq + 上一代 X-Flmx-Seq），
+go-gost/x/service/traffic_reporter.go	531	E9	  map[string]string{"X-Ovo-Seq": seqStr, "X-Flmx-Seq": seqStr},
+go-gost/x/service/traffic_spool.go	1	E5/E6/E7 invariant comment	// NEVER rename the flmx cryptographic domains or persisted spool prefixes: deployed values depend on them.
+go-gost/x/service/traffic_spool.go	69	E1/E6	 return fmt.Sprintf("flmx_traffic_%x.json", sha256.Sum256([]byte(identity)))
+go-gost/x/service/traffic_spool.go	132	E1/E6	  if entry.IsDir() || !strings.HasPrefix(name, "flmx_traffic_") || !strings.HasSuffix(name, ".json") {
+go-gost/x/service/traffic_spool.go	158	E1/E6	// 存档，返回实际删除的文件名。识别口径与孤儿扫描一致（flmx_traffic_
+go-gost/x/service/traffic_spool.go	173	E1/E6	  if entry.IsDir() || !strings.HasPrefix(name, "flmx_traffic_") || !strings.Contains(name, ".rejected-") || !strings.HasSuffix(name, ".json") {
+go-gost/x/service/traffic_spool.go	220	E1/E6	  if entry.IsDir() || !strings.HasPrefix(name, "flmx_traffic_") || !strings.HasSuffix(name, ".json") {
+go-gost/x/service/traffic_spool_backoff_test.go	48	E1/E6	 m := newBackoffTestManager(t, filepath.Join(t.TempDir(), "flmx_traffic_backoff.json"))
+go-gost/x/service/traffic_spool_backoff_test.go	92	E1/E6	 m := newBackoffTestManager(t, filepath.Join(dir, "flmx_traffic_dead.json"))
+go-gost/x/service/traffic_spool_backoff_test.go	168	E1/E6	 m := newBackoffTestManager(t, filepath.Join(dir, "flmx_traffic_ttl.json"))
+go-gost/x/service/traffic_spool_backoff_test.go	209	E1/E6	 m := newBackoffTestManager(t, filepath.Join(t.TempDir(), "flmx_traffic_recover.json"))
+go-gost/x/service/traffic_spool_backoff_test.go	248	E1/E6	 m := newBackoffTestManager(t, filepath.Join(t.TempDir(), "flmx_traffic_legacy.json"))
+go-gost/x/service/traffic_spool_identity_test.go	18	E1/E6	 const want = "flmx_traffic_9c7fe79f025a358a21ffca758fcb6dab37fcbe7ec44ca5801ea350eec6b6ce67.json"
+go-gost/x/service/traffic_spool_orphan_sweep_test.go	45	E1/E6	 emptyAged := writeOrphanSpool(t, dir, "flmx_traffic_empty.json", nil, aged, now)
+go-gost/x/service/traffic_spool_orphan_sweep_test.go	46	E1/E6	 pendingAged := writeOrphanSpool(t, dir, "flmx_traffic_pending.json", func(s *trafficSpoolState) {
+go-gost/x/service/traffic_spool_orphan_sweep_test.go	49	E1/E6	 bufferedAged := writeOrphanSpool(t, dir, "flmx_traffic_buffered.json", func(s *trafficSpoolState) {
+go-gost/x/service/traffic_spool_orphan_sweep_test.go	52	E1/E6	 retryAged := writeOrphanSpool(t, dir, "flmx_traffic_retry.json", func(s *trafficSpoolState) {
+go-gost/x/service/traffic_spool_orphan_sweep_test.go	55	E1/E6	 emptyYoung := writeOrphanSpool(t, dir, "flmx_traffic_young.json", nil, 24*time.Hour, now)
+go-gost/x/service/traffic_spool_orphan_sweep_test.go	56	E1/E6	 ownPath := writeOrphanSpool(t, dir, "flmx_traffic_own.json", nil, aged, now)
+go-gost/x/service/traffic_spool_orphan_sweep_test.go	58	E1/E6	 corrupt := writeSpoolDirFile(t, dir, "flmx_traffic_corrupt.json", aged, now) // "{}" is not a valid spool
+go-gost/x/service/traffic_spool_orphan_sweep_test.go	59	E1/E6	 archive := writeSpoolDirFile(t, dir, "flmx_traffic_x.json.rejected-stream-1.json", aged, now)
+go-gost/x/service/traffic_spool_orphan_sweep_test.go	62	E1/E6	 if len(removed) != 1 || removed[0] != "flmx_traffic_empty.json" {
+go-gost/x/service/traffic_spool_rejected_test.go	50	E1/E6	 old := writeSpoolDirFile(t, dir, "flmx_traffic_a.json.rejected-stream-1.json", 31*24*time.Hour, now)
+go-gost/x/service/traffic_spool_rejected_test.go	51	E1/E6	 fresh := writeSpoolDirFile(t, dir, "flmx_traffic_a.json.rejected-stream-2.json", time.Hour, now)
+go-gost/x/service/traffic_spool_rejected_test.go	52	E1/E6	 orphan := writeSpoolDirFile(t, dir, "flmx_traffic_b.json", 90*24*time.Hour, now)
+go-gost/x/service/traffic_spool_rejected_test.go	56	E1/E6	 if len(removed) != 1 || removed[0] != "flmx_traffic_a.json.rejected-stream-1.json" {
+go-gost/x/service/traffic_spool_rejected_test.go	72	E1/E6	  paths[i] = writeSpoolDirFile(t, dir, fmt.Sprintf("flmx_traffic_a.json.rejected-s-%03d.json", i), time.Duration(total-i)*time.Minute, now)
+go-gost/x/socket/uninstall.go	37	E1/E12	 return name == agentInstallName || name == "flmx_agent" || name == legacyAgentInstallName
+go-gost/x/socket/websocket_reporter.go	2416	E1/E12	  return "", fmt.Errorf("无法识别的 agent 安装：%s（面板升级/回退只支持 ovo_agent/flmx_agent/flux_agent 安装）", exe)
 install.sh	93	E1	    FLMX_GITHUB_TOKEN) continue ;;
 install.sh	94	E1	    FLMX_*) current_key="OVO_${legacy_key#FLMX_}"
-install.sh	230	E11	# flmx defaults were used by 2.1.32 and earlier; retain them only for recognition and direct migration.
-install.sh	231	E12	LEGACY2_INSTALL_DIR="/etc/flmx_agent"
-install.sh	232	E1,E12	LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE="/etc/systemd/system/flmx_agent.service"
-install.sh	233	E1,E12	LEGACY_FLMX_AGENT_OPENRC_SERVICE_FILE="/etc/init.d/flmx_agent"
-install.sh	234	E1,E12	LEGACY_FLMX_AGENT_OPENRC_PIDFILE="${LEGACY_FLMX_AGENT_OPENRC_PIDFILE:-/run/flmx_agent.pid}"
-install.sh	293	E10	OVO_AGENT_NFT_TABLES="ovo_kernel flmx_kernel flvx_kernel ovo_hop_probe flmx_hop_probe"
-install.sh	1695	E12	  [[ -e "$dir/config.json" || -e "$dir/ovo_agent" || -e "$dir/flmx_agent" || -e "$dir/flux_agent" || -e "$dir/gost.json" ]]
+install.sh	230	E5	# flmx defaults were used by 2.1.32 and earlier; retain them only for recognition and direct migration.
+install.sh	231	E1/E12	LEGACY2_INSTALL_DIR="/etc/flmx_agent"
+install.sh	232	E1/E12	LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE="/etc/systemd/system/flmx_agent.service"
+install.sh	233	E1/E12	LEGACY_FLMX_AGENT_OPENRC_SERVICE_FILE="/etc/init.d/flmx_agent"
+install.sh	234	E1/E12	LEGACY_FLMX_AGENT_OPENRC_PIDFILE="${LEGACY_FLMX_AGENT_OPENRC_PIDFILE:-/run/flmx_agent.pid}"
+install.sh	293	E1/E10	OVO_AGENT_NFT_TABLES="ovo_kernel flmx_kernel flvx_kernel ovo_hop_probe flmx_hop_probe"
+install.sh	1695	E1/E12	  [[ -e "$dir/config.json" || -e "$dir/ovo_agent" || -e "$dir/flmx_agent" || -e "$dir/flux_agent" || -e "$dir/gost.json" ]]
 install.sh	2806	E11	# Previous-generation (flmx) helpers.
-install.sh	2807	E1,E12	LEGACY_FLMX_AGENT_LOGROTATE_FILE="${LEGACY_FLMX_AGENT_LOGROTATE_FILE:-/etc/logrotate.d/flmx_agent}"
-install.sh	2808	E12	legacy_flmx_agent_service_exists() {
-install.sh	2813	E1	      [[ -f "$LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE" ]] || \
-install.sh	2814	E12	        systemctl list-units --full -all 2>/dev/null | grep -Fq "flmx_agent.service"
-install.sh	2817	E1	      [[ -f "$LEGACY_FLMX_AGENT_OPENRC_SERVICE_FILE" ]]
-install.sh	2823	E12	stop_legacy_flmx_agent_service() {
-install.sh	2828	E12	      systemctl stop flmx_agent 2>/dev/null
-install.sh	2831	E12	      rc-service flmx_agent stop 2>/dev/null
-install.sh	2837	E12	disable_legacy_flmx_agent_service() {
-install.sh	2842	E12	      systemctl disable flmx_agent 2>/dev/null || true
-install.sh	2845	E12	      rc-update del flmx_agent default 2>/dev/null || true
-install.sh	2851	E12	remove_legacy_flmx_agent_service() {
-install.sh	2856	E1	      rm -f "$LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE"
-install.sh	2857	E1	      rm -rf "${LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE}.d"
-install.sh	2861	E1	      rm -f "$LEGACY_FLMX_AGENT_OPENRC_SERVICE_FILE"
-install.sh	2867	E12	legacy_flmx_agent_service_file_path() {
-install.sh	2871	E1	    systemd) printf '%s' "$LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE" ;;
-install.sh	2872	E1	    openrc) printf '%s' "$LEGACY_FLMX_AGENT_OPENRC_SERVICE_FILE" ;;
-install.sh	2877	E12	write_legacy_flmx_agent_service() {
-install.sh	2886	E1	      mkdir -p "$(dirname "$LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE")"
-install.sh	2887	E1	      cat > "$LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE" <<EOF
-install.sh	2894	E12	ExecStart=$LEGACY2_INSTALL_DIR/flmx_agent
-install.sh	2923	E12	# journalctl -u flmx_agent. The binary additionally appends startup
-install.sh	2927	E12	SyslogIdentifier=flmx_agent
-install.sh	2934	E1	      mkdir -p "$(dirname "$LEGACY_FLMX_AGENT_OPENRC_SERVICE_FILE")"
-install.sh	2938	E1	      if ! cat > "$LEGACY_FLMX_AGENT_OPENRC_SERVICE_FILE" <<EOF
-install.sh	2941	E12	name="flmx_agent"
-install.sh	2943	E12	command="$LEGACY2_INSTALL_DIR/flmx_agent"
-install.sh	2946	E1	pidfile="$LEGACY_FLMX_AGENT_OPENRC_PIDFILE"
-install.sh	2949	E12	output_log="/var/log/flmx_agent.log"
-install.sh	2950	E12	error_log="/var/log/flmx_agent.err.log"
-install.sh	2957	E1	        echo "❌ 写入 OpenRC 服务文件失败: $LEGACY_FLMX_AGENT_OPENRC_SERVICE_FILE" >&2
-install.sh	2960	E1	      chmod +x "$LEGACY_FLMX_AGENT_OPENRC_SERVICE_FILE" || { echo "❌ 设置 OpenRC 服务文件可执行权限失败: $LEGACY_FLMX_AGENT_OPENRC_SERVICE_FILE" >&2; return 1; }
-install.sh	2961	E12	      write_legacy_flmx_agent_logrotate_config
-install.sh	2967	E12	enable_and_start_legacy_flmx_agent_service() {
-install.sh	2973	E12	      systemctl enable flmx_agent
-install.sh	2975	E12	      systemctl reset-failed flmx_agent 2>/dev/null || true
-install.sh	2976	E12	      systemctl start flmx_agent
-install.sh	2979	E12	      rc-update add flmx_agent default
-install.sh	2980	E12	      rc-service flmx_agent start
-install.sh	2986	E12	legacy_flmx_agent_service_is_active() {
-install.sh	2991	E12	      systemctl is-active --quiet flmx_agent
-install.sh	2994	E12	      rc-service flmx_agent status >/dev/null 2>&1
-install.sh	3000	E12	legacy_flmx_agent_main_pid() {
-install.sh	3005	E12	      systemctl show -p MainPID --value flmx_agent 2>/dev/null
-install.sh	3010	E1	      cat "${LEGACY_FLMX_AGENT_OPENRC_PIDFILE}" 2>/dev/null
-install.sh	3016	E12	legacy_flmx_agent_health_ok() {
-install.sh	3020	E12	  p1=$(legacy_flmx_agent_main_pid) || p1=""
-install.sh	3022	E12	  if ! legacy_flmx_agent_service_is_active; then
-install.sh	3026	E12	  p2=$(legacy_flmx_agent_main_pid) || p2=""
-install.sh	3028	E12	  if ! legacy_flmx_agent_service_is_active; then
-install.sh	3035	E12	legacy_flmx_agent_service_status_hint() {
-install.sh	3040	E12	      echo "systemctl status flmx_agent --no-pager"
-install.sh	3043	E12	      echo "rc-service flmx_agent status"
-install.sh	3049	E12	migrate_legacy_flmx_agent_install() {
-install.sh	3059	E12	  legacy_unit_file=$(legacy_flmx_agent_service_file_path || true)
-install.sh	3060	E12	  if legacy_flmx_agent_service_exists; then
-install.sh	3064	E12	  # 快照置空、迁移照常继续，此后回滚落到 write_legacy_flmx_agent_
-install.sh	3083	E12	  rollback_legacy_flmx_agent_migration() {
-install.sh	3090	E12	      [[ -f "$INSTALL_DIR/ovo_agent" ]] && mv -f "$INSTALL_DIR/ovo_agent" "$INSTALL_DIR/flmx_agent"
-install.sh	3091	E12	      [[ -f "$INSTALL_DIR/ovo_agent.old" ]] && mv -f "$INSTALL_DIR/ovo_agent.old" "$INSTALL_DIR/flmx_agent.old"
-install.sh	3092	E12	      [[ -f "$INSTALL_DIR/ovo_agent.old.meta" ]] && mv -f "$INSTALL_DIR/ovo_agent.old.meta" "$INSTALL_DIR/flmx_agent.old.meta"
-install.sh	3093	E12	      [[ -f "$INSTALL_DIR/ovo_agent.bak" ]] && mv -f "$INSTALL_DIR/ovo_agent.bak" "$INSTALL_DIR/flmx_agent.bak"
-install.sh	3108	E12	      write_legacy_flmx_agent_service || return 1
-install.sh	3110	E12	    enable_and_start_legacy_flmx_agent_service || return 1
-install.sh	3112	E12	    legacy_flmx_agent_health_ok
-install.sh	3116	E12	    stop_legacy_flmx_agent_service || { echo "❌ 存量服务停止失败，安装目录和服务文件已保留"; return 1; }
-install.sh	3117	E12	    disable_legacy_flmx_agent_service
-install.sh	3119	E12	  remove_legacy_flmx_agent_service
-install.sh	3124	E12	      if rollback_legacy_flmx_agent_migration; then
-install.sh	3125	E12	        echo "↩️ 已自动回滚：存量目录未迁移，旧服务（flmx_agent）已恢复运行"
-install.sh	3127	E12	        echo "❌ 自动回滚亦失败：存量目录仍在 $LEGACY2_INSTALL_DIR 未迁移，但旧服务未能恢复，请人工执行 $(legacy_flmx_agent_service_status_hint) 排查"
-install.sh	3137	E12	  [[ -f "$INSTALL_DIR/flmx_agent" ]] && mv -f "$INSTALL_DIR/flmx_agent" "$INSTALL_DIR/ovo_agent"
-install.sh	3138	E12	  [[ -f "$INSTALL_DIR/flmx_agent.old" ]] && mv -f "$INSTALL_DIR/flmx_agent.old" "$INSTALL_DIR/ovo_agent.old"
-install.sh	3139	E12	  [[ -f "$INSTALL_DIR/flmx_agent.old.meta" ]] && mv -f "$INSTALL_DIR/flmx_agent.old.meta" "$INSTALL_DIR/ovo_agent.old.meta"
-install.sh	3140	E12	  [[ -f "$INSTALL_DIR/flmx_agent.bak" ]] && mv -f "$INSTALL_DIR/flmx_agent.bak" "$INSTALL_DIR/ovo_agent.bak"
-install.sh	3141	E12	  rm -f "$INSTALL_DIR"/.flmx_agent.upgrade-* "$INSTALL_DIR"/.flmx_agent.rollback-* "$INSTALL_DIR"/.flmx_agent.upgrade-rollback-* "$INSTALL_DIR/flmx_agent.new"
-install.sh	3160	E12	  if rollback_legacy_flmx_agent_migration; then
-install.sh	3162	E12	    echo "↩️ 已自动回滚：旧布局与旧服务（flmx_agent）已恢复运行，迁移可稍后重试"
-install.sh	3165	E12	    echo "❌ 自动回滚亦失败：节点当前离线，请人工处理（旧服务状态：$(legacy_flmx_agent_service_status_hint)；新服务状态：$(ovo_agent_service_status_hint)）"
-install.sh	3171	E12	write_legacy_flmx_agent_logrotate_config() {
-install.sh	3172	E1	  mkdir -p "$(dirname "$LEGACY_FLMX_AGENT_LOGROTATE_FILE")" || {
-install.sh	3176	E1	  cat > "$LEGACY_FLMX_AGENT_LOGROTATE_FILE" <<'LOGROTATE_EOF' || {
-install.sh	3177	E12	# flmx_agent OpenRC logs: output_log/error_log are appended by
-install.sh	3179	E12	/var/log/flmx_agent.log /var/log/flmx_agent.err.log {
-install.sh	3228	E12	    migrate_legacy_flmx_agent_install || return 1
-install.sh	3564	E12	    migrate_legacy_flmx_agent_install || return 1
-install.sh	4080	E1	    dir=$(grep -hoE 'FLMX_KERNEL_DIR=[^[:space:]]+' $files 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d "\"'")
-install.sh	4089	E1	  if [[ -z "$dir" ]]; then dir=$(configured_kernel_dir_for "$LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE"); fi
-install.sh	4165	E1	  if [[ -e "$LEGACY_FLMX_AGENT_LOGROTATE_FILE" ]]; then
-install.sh	4166	E1	    rm -f "$LEGACY_FLMX_AGENT_LOGROTATE_FILE" || failures=$((failures + 1))
-install.sh	4169	E12	  for base in "ovo_agent.log" "ovo_agent.err.log" "flmx_agent.log" "flmx_agent.err.log" "flux_agent.log" "flux_agent.err.log"; do
-install.sh	4244	E12	  if legacy_flmx_agent_service_exists; then
-install.sh	4246	E12	    stop_legacy_flmx_agent_service || { echo "❌ 存量服务停止失败，安装目录和服务文件已保留"; return 1; }
-install.sh	4247	E12	    disable_legacy_flmx_agent_service
-install.sh	4280	E1	  if [[ -f "$LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE" || -f "$LEGACY_FLMX_AGENT_OPENRC_SERVICE_FILE" || -d "${LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE}.d" ]]; then
-install.sh	4281	E12	    remove_legacy_flmx_agent_service
-install.sh	4301	E11	    echo "🧹 删除 flmx 世代安装目录: $LEGACY2_INSTALL_DIR"
-install.sh	4324	E1	    "$LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE" "${LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE}.d" \
-install.sh	4325	E1	    "$LEGACY_FLMX_AGENT_OPENRC_SERVICE_FILE" \
+install.sh	2807	E1/E12	LEGACY_FLMX_AGENT_LOGROTATE_FILE="${LEGACY_FLMX_AGENT_LOGROTATE_FILE:-/etc/logrotate.d/flmx_agent}"
+install.sh	2808	E1/E12	legacy_flmx_agent_service_exists() {
+install.sh	2813	E1/E12	      [[ -f "$LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE" ]] || \
+install.sh	2814	E1/E12	        systemctl list-units --full -all 2>/dev/null | grep -Fq "flmx_agent.service"
+install.sh	2817	E1/E12	      [[ -f "$LEGACY_FLMX_AGENT_OPENRC_SERVICE_FILE" ]]
+install.sh	2823	E1/E12	stop_legacy_flmx_agent_service() {
+install.sh	2828	E1/E12	      systemctl stop flmx_agent 2>/dev/null
+install.sh	2831	E1/E12	      rc-service flmx_agent stop 2>/dev/null
+install.sh	2837	E1/E12	disable_legacy_flmx_agent_service() {
+install.sh	2842	E1/E12	      systemctl disable flmx_agent 2>/dev/null || true
+install.sh	2845	E1/E12	      rc-update del flmx_agent default 2>/dev/null || true
+install.sh	2851	E1/E12	remove_legacy_flmx_agent_service() {
+install.sh	2856	E1/E12	      rm -f "$LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE"
+install.sh	2857	E1/E12	      rm -rf "${LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE}.d"
+install.sh	2861	E1/E12	      rm -f "$LEGACY_FLMX_AGENT_OPENRC_SERVICE_FILE"
+install.sh	2867	E1/E12	legacy_flmx_agent_service_file_path() {
+install.sh	2871	E1/E12	    systemd) printf '%s' "$LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE" ;;
+install.sh	2872	E1/E12	    openrc) printf '%s' "$LEGACY_FLMX_AGENT_OPENRC_SERVICE_FILE" ;;
+install.sh	2877	E1/E12	write_legacy_flmx_agent_service() {
+install.sh	2886	E1/E12	      mkdir -p "$(dirname "$LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE")"
+install.sh	2887	E1/E12	      cat > "$LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE" <<EOF
+install.sh	2889	E1/E12	Description=Flmx_agent Proxy Service
+install.sh	2894	E1/E12	ExecStart=$LEGACY2_INSTALL_DIR/flmx_agent
+install.sh	2923	E1/E12	# journalctl -u flmx_agent. The binary additionally appends startup
+install.sh	2927	E1/E12	SyslogIdentifier=flmx_agent
+install.sh	2934	E1/E12	      mkdir -p "$(dirname "$LEGACY_FLMX_AGENT_OPENRC_SERVICE_FILE")"
+install.sh	2938	E1/E12	      if ! cat > "$LEGACY_FLMX_AGENT_OPENRC_SERVICE_FILE" <<EOF
+install.sh	2941	E1/E12	name="flmx_agent"
+install.sh	2942	E1/E12	description="Flmx_agent Proxy Service"
+install.sh	2943	E1/E12	command="$LEGACY2_INSTALL_DIR/flmx_agent"
+install.sh	2946	E1/E12	pidfile="$LEGACY_FLMX_AGENT_OPENRC_PIDFILE"
+install.sh	2949	E1/E12	output_log="/var/log/flmx_agent.log"
+install.sh	2950	E1/E12	error_log="/var/log/flmx_agent.err.log"
+install.sh	2957	E1/E12	        echo "❌ 写入 OpenRC 服务文件失败: $LEGACY_FLMX_AGENT_OPENRC_SERVICE_FILE" >&2
+install.sh	2960	E1/E12	      chmod +x "$LEGACY_FLMX_AGENT_OPENRC_SERVICE_FILE" || { echo "❌ 设置 OpenRC 服务文件可执行权限失败: $LEGACY_FLMX_AGENT_OPENRC_SERVICE_FILE" >&2; return 1; }
+install.sh	2961	E1/E12	      write_legacy_flmx_agent_logrotate_config
+install.sh	2967	E1/E12	enable_and_start_legacy_flmx_agent_service() {
+install.sh	2973	E1/E12	      systemctl enable flmx_agent
+install.sh	2975	E1/E12	      systemctl reset-failed flmx_agent 2>/dev/null || true
+install.sh	2976	E1/E12	      systemctl start flmx_agent
+install.sh	2979	E1/E12	      rc-update add flmx_agent default
+install.sh	2980	E1/E12	      rc-service flmx_agent start
+install.sh	2986	E1/E12	legacy_flmx_agent_service_is_active() {
+install.sh	2991	E1/E12	      systemctl is-active --quiet flmx_agent
+install.sh	2994	E1/E12	      rc-service flmx_agent status >/dev/null 2>&1
+install.sh	3000	E1/E12	legacy_flmx_agent_main_pid() {
+install.sh	3005	E1/E12	      systemctl show -p MainPID --value flmx_agent 2>/dev/null
+install.sh	3010	E1/E12	      cat "${LEGACY_FLMX_AGENT_OPENRC_PIDFILE}" 2>/dev/null
+install.sh	3016	E1/E12	legacy_flmx_agent_health_ok() {
+install.sh	3020	E1/E12	  p1=$(legacy_flmx_agent_main_pid) || p1=""
+install.sh	3022	E1/E12	  if ! legacy_flmx_agent_service_is_active; then
+install.sh	3026	E1/E12	  p2=$(legacy_flmx_agent_main_pid) || p2=""
+install.sh	3028	E1/E12	  if ! legacy_flmx_agent_service_is_active; then
+install.sh	3035	E1/E12	legacy_flmx_agent_service_status_hint() {
+install.sh	3040	E1/E12	      echo "systemctl status flmx_agent --no-pager"
+install.sh	3043	E1/E12	      echo "rc-service flmx_agent status"
+install.sh	3049	E1/E12	migrate_legacy_flmx_agent_install() {
+install.sh	3059	E1/E12	  legacy_unit_file=$(legacy_flmx_agent_service_file_path || true)
+install.sh	3060	E1/E12	  if legacy_flmx_agent_service_exists; then
+install.sh	3064	E1/E12	  # 快照置空、迁移照常继续，此后回滚落到 write_legacy_flmx_agent_
+install.sh	3083	E1/E12	  rollback_legacy_flmx_agent_migration() {
+install.sh	3090	E1/E12	      [[ -f "$INSTALL_DIR/ovo_agent" ]] && mv -f "$INSTALL_DIR/ovo_agent" "$INSTALL_DIR/flmx_agent"
+install.sh	3091	E1/E12	      [[ -f "$INSTALL_DIR/ovo_agent.old" ]] && mv -f "$INSTALL_DIR/ovo_agent.old" "$INSTALL_DIR/flmx_agent.old"
+install.sh	3092	E1/E12	      [[ -f "$INSTALL_DIR/ovo_agent.old.meta" ]] && mv -f "$INSTALL_DIR/ovo_agent.old.meta" "$INSTALL_DIR/flmx_agent.old.meta"
+install.sh	3093	E1/E12	      [[ -f "$INSTALL_DIR/ovo_agent.bak" ]] && mv -f "$INSTALL_DIR/ovo_agent.bak" "$INSTALL_DIR/flmx_agent.bak"
+install.sh	3108	E1/E12	      write_legacy_flmx_agent_service || return 1
+install.sh	3110	E1/E12	    enable_and_start_legacy_flmx_agent_service || return 1
+install.sh	3112	E1/E12	    legacy_flmx_agent_health_ok
+install.sh	3116	E1/E12	    stop_legacy_flmx_agent_service || { echo "❌ 存量服务停止失败，安装目录和服务文件已保留"; return 1; }
+install.sh	3117	E1/E12	    disable_legacy_flmx_agent_service
+install.sh	3119	E1/E12	  remove_legacy_flmx_agent_service
+install.sh	3124	E1/E12	      if rollback_legacy_flmx_agent_migration; then
+install.sh	3125	E1/E12	        echo "↩️ 已自动回滚：存量目录未迁移，旧服务（flmx_agent）已恢复运行"
+install.sh	3127	E1/E12	        echo "❌ 自动回滚亦失败：存量目录仍在 $LEGACY2_INSTALL_DIR 未迁移，但旧服务未能恢复，请人工执行 $(legacy_flmx_agent_service_status_hint) 排查"
+install.sh	3137	E1/E12	  [[ -f "$INSTALL_DIR/flmx_agent" ]] && mv -f "$INSTALL_DIR/flmx_agent" "$INSTALL_DIR/ovo_agent"
+install.sh	3138	E1/E12	  [[ -f "$INSTALL_DIR/flmx_agent.old" ]] && mv -f "$INSTALL_DIR/flmx_agent.old" "$INSTALL_DIR/ovo_agent.old"
+install.sh	3139	E1/E12	  [[ -f "$INSTALL_DIR/flmx_agent.old.meta" ]] && mv -f "$INSTALL_DIR/flmx_agent.old.meta" "$INSTALL_DIR/ovo_agent.old.meta"
+install.sh	3140	E1/E12	  [[ -f "$INSTALL_DIR/flmx_agent.bak" ]] && mv -f "$INSTALL_DIR/flmx_agent.bak" "$INSTALL_DIR/ovo_agent.bak"
+install.sh	3141	E1/E12	  rm -f "$INSTALL_DIR"/.flmx_agent.upgrade-* "$INSTALL_DIR"/.flmx_agent.rollback-* "$INSTALL_DIR"/.flmx_agent.upgrade-rollback-* "$INSTALL_DIR/flmx_agent.new"
+install.sh	3160	E1/E12	  if rollback_legacy_flmx_agent_migration; then
+install.sh	3162	E1/E12	    echo "↩️ 已自动回滚：旧布局与旧服务（flmx_agent）已恢复运行，迁移可稍后重试"
+install.sh	3165	E1/E12	    echo "❌ 自动回滚亦失败：节点当前离线，请人工处理（旧服务状态：$(legacy_flmx_agent_service_status_hint)；新服务状态：$(ovo_agent_service_status_hint)）"
+install.sh	3171	E1/E12	write_legacy_flmx_agent_logrotate_config() {
+install.sh	3172	E1/E12	  mkdir -p "$(dirname "$LEGACY_FLMX_AGENT_LOGROTATE_FILE")" || {
+install.sh	3176	E1/E12	  cat > "$LEGACY_FLMX_AGENT_LOGROTATE_FILE" <<'LOGROTATE_EOF' || {
+install.sh	3177	E1/E12	# flmx_agent OpenRC logs: output_log/error_log are appended by
+install.sh	3179	E1/E12	/var/log/flmx_agent.log /var/log/flmx_agent.err.log {
+install.sh	3228	E1/E12	    migrate_legacy_flmx_agent_install || return 1
+install.sh	3564	E1/E12	    migrate_legacy_flmx_agent_install || return 1
+install.sh	4080	E1/E10	    dir=$(grep -hoE 'FLMX_KERNEL_DIR=[^[:space:]]+' $files 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d "\"'")
+install.sh	4089	E1/E12	  if [[ -z "$dir" ]]; then dir=$(configured_kernel_dir_for "$LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE"); fi
+install.sh	4165	E1/E12	  if [[ -e "$LEGACY_FLMX_AGENT_LOGROTATE_FILE" ]]; then
+install.sh	4166	E1/E12	    rm -f "$LEGACY_FLMX_AGENT_LOGROTATE_FILE" || failures=$((failures + 1))
+install.sh	4169	E1/E12	  for base in "ovo_agent.log" "ovo_agent.err.log" "flmx_agent.log" "flmx_agent.err.log" "flux_agent.log" "flux_agent.err.log"; do
+install.sh	4244	E1/E12	  if legacy_flmx_agent_service_exists; then
+install.sh	4246	E1/E12	    stop_legacy_flmx_agent_service || { echo "❌ 存量服务停止失败，安装目录和服务文件已保留"; return 1; }
+install.sh	4247	E1/E12	    disable_legacy_flmx_agent_service
+install.sh	4280	E1/E12	  if [[ -f "$LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE" || -f "$LEGACY_FLMX_AGENT_OPENRC_SERVICE_FILE" || -d "${LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE}.d" ]]; then
+install.sh	4281	E1/E12	    remove_legacy_flmx_agent_service
+install.sh	4301	E5	    echo "🧹 删除 flmx 世代安装目录: $LEGACY2_INSTALL_DIR"
+install.sh	4324	E1/E12	    "$LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE" "${LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE}.d" \
+install.sh	4325	E1/E12	    "$LEGACY_FLMX_AGENT_OPENRC_SERVICE_FILE" \
 panel_install.sh	13	E1	    FLMX_GITHUB_TOKEN) continue ;;
 panel_install.sh	14	E1	    FLMX_*) current_key="OVO_${legacy_key#FLMX_}"
-panel_install.sh	281	E11	# flmx names are the defaults used by 2.1.32 and earlier; new deployments use ovo.
+panel_install.sh	281	E5	# flmx names are the defaults used by 2.1.32 and earlier; new deployments use ovo.
 panel_install.sh	282	E11	LEGACY2_PANEL_BACKEND_CONTAINER="flmx-panel-backend"
 panel_install.sh	283	E11	LEGACY2_PANEL_POSTGRES_CONTAINER="flmx-panel-postgres"
 panel_install.sh	284	E11	LEGACY2_PANEL_FRONTEND_CONTAINER="flmx-panel-frontend"
 panel_install.sh	2291	E1	  if [[ "$key" == OVO_* && -f "$file" ]] && ! grep -qE "^[[:space:]]*${key}[[:space:]]*=" "$file"; then key="FLMX_${key#OVO_}"; fi
 panel_install.sh	2460	E11	        flmx-panel-backend|flmx-panel-postgres|flmx-panel-frontend|flmx-flux-panel-backend|flmx-vite-frontend|flux-panel-backend|flux-panel-postgres|vite-frontend) return 0 ;;
-panel_install.sh	2724	E11	  # Probe flux first, then flmx. Both paths must remain reachable.
-panel_install.sh	3297	E1	      if (k ~ /^FLMX_/) {
-panel_install.sh	3298	E1	        n=k; sub(/^FLMX_/, "OVO_", n)
-panel_install.sh	3299	E1	        if (k == "FLMX_VERSION") print $0
-panel_install.sh	3300	E1	        if (!present[n]) { sub(/FLMX_/, "OVO_"); print }
-panel_install.sh	4317	E11	  for name in ovo-panel-backend ovo-panel-postgres ovo-vite-frontend flmx-panel-backend flmx-panel-postgres flmx-panel-frontend flmx-flux-panel-backend flmx-vite-frontend flvx-flux-panel-backend; do
-panel_install.sh	4624	E1	  sed -i 's/${FLMX_/${OVO_/g' "$UPDATE_COMPOSE_CANDIDATE" || return 1
-panel_install.sh	4631	E1	  upsert_env_var .env FLMX_VERSION "$LATEST_VERSION" || return 1
-panel_install.sh	5569	E1	FLMX_VERSION=$RESOLVED_VERSION
-scripts/check-ovo-rename.sh	12	E11	  for ref in ghcr.io/yhfc1775-maker/ovo-panel-backend:2.1.34 ghcr.io/iiiiiiiii7125-art/flux-panel-backend:2.1.29 ghcr.io/iiiiiiiii7125-art/flmx-panel-backend:2.1.29 ghcr.io/iiiiiiiii7125-art/flmx-flux-panel-backend:2.1.29 ghcr.io/iiiiiiiii7125-art/flmx-vite-frontend:2.1.29; do
-scripts/check-ovo-rename.sh	15	E11	  for ref in ghcr.io/iiiiiiiii7125-art/ovo-panel-backend:2.1.34 ghcr.io/other/flmx-panel-backend:2.1.29 ghcr.io/iiiiiiiii7125-art/unrelated:2.1.29; do
-scripts/check-ovo-rename.sh	20	E11	for generation in flux flmx ovo; do
-scripts/check-ovo-rename.sh	26	E11	      flmx) backend=flmx-panel-backend; frontend=flmx-panel-frontend; pg=flmx-panel-postgres; owner=iiiiiiiii7125-art ;;
-scripts/check-ovo-rename.sh	44	E1	FLMX_VERSION=2.1.29
-scripts/check-ovo-rename.sh	45	E1	FLMX_INSTALL_ID=preserved-uuid
-scripts/check-ovo-rename.sh	46	E1	FLMX_SQLITE_VOLUME=existing-sqlite
-scripts/check-ovo-rename.sh	47	E1	FLMX_POSTGRES_VOLUME=existing-pg
-scripts/check-ovo-rename.sh	48	E1	FLMX_NETWORK=existing-network
-scripts/check-ovo-rename.sh	91	E1	    if grep -q '^FLMX_INSTALL_ID=' .env; then fail 'old key was not migrated'; fi
-scripts/check-ovo-rename.sh	98	E11	for generation in flux flmx; do
-scripts/check-ovo-rename.sh	103	E12	      INSTALL_DIR="$dir/ovo_agent"; LEGACY_INSTALL_DIR="$dir/flux_agent"; LEGACY2_INSTALL_DIR="$dir/flmx_agent"
-scripts/check-ovo-rename.sh	106	E1	      LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE="$dir/flmx.service"; LEGACY_FLMX_AGENT_OPENRC_SERVICE_FILE="$dir/flmx.init"
-scripts/check-ovo-rename.sh	108	E1,E12	      case "$generation" in flux) old="$LEGACY_INSTALL_DIR"; unit="$LEGACY_FLUX_AGENT_SYSTEMD_SERVICE_FILE"; migration=migrate_legacy_agent_install ;; flmx) old="$LEGACY2_INSTALL_DIR"; unit="$LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE"; migration=migrate_legacy_flmx_agent_install ;; esac
-scripts/check-ovo-rename.sh	114	E1,E12	      legacy_flmx_agent_service_exists() { [[ -f "$LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE" ]]; }
-scripts/check-ovo-rename.sh	117	E12	      legacy_flux_agent_health_ok() { return 0; }; legacy_flmx_agent_health_ok() { return 0; }
-scripts/check-ovo-rename.sh	133	E1	  printf 'Environment=OVO_KERNEL_DIR=/current/kernels\nEnvironment=FLMX_KERNEL_DIR=/previous/kernels\n' > "$unit"
-scripts/check-ovo-rename.sh	135	E1	  printf 'Environment=FLMX_KERNEL_DIR=/previous/kernels\n' > "$unit"
-scripts/check-ovo-rename.sh	142	E5	  printf 'DATABASE_URL=postgresql://flmx%%5Fpanel:test-pass@postgres:5432/flmx_panel?sslmode=disable\n' > .env
-scripts/check-ovo-rename.sh	143	E11	  PANEL_POSTGRES_CONTAINER=flmx-panel-postgres
-scripts/check-ovo-rename.sh	145	E5	  [[ "$(panel_postgres_url_identity POSTGRES_USER)" == flmx_panel ]] || fail 'URL user decoding'
-scripts/check-ovo-rename.sh	146	E5	  [[ "$(panel_postgres_url_identity POSTGRES_DB)" == flmx_panel ]] || fail 'URL database decoding'
-scripts/check-ovo-rename.sh	148	E5	  [[ "$(get_env_var POSTGRES_USER)" == flmx_panel && "$(get_env_var POSTGRES_DB)" == flmx_panel ]] || fail 'existing PostgreSQL identity changed'
-test-install-scripts-proxy.sh	26	E12	  [[ -d "$root/etc/flmx_agent" ]] && hits="$hits $root/etc/flmx_agent"
-test-install-scripts-proxy.sh	27	E12	  [[ -f "$root/etc/systemd/system/flmx_agent.service" ]] && hits="$hits $root/etc/systemd/system/flmx_agent.service"
-test-install-scripts-proxy.sh	28	E12	  [[ -f "$root/etc/init.d/flmx_agent" ]] && hits="$hits $root/etc/init.d/flmx_agent"
-test-install-scripts-proxy.sh	9510	E11	    *"ghcr.io/iiiiiiiii7125-art/flmx-flux-panel-backend:1.9.9"*) ;;
+panel_install.sh	2735	E11	  # Probe flux first, then flmx. Both paths must remain reachable.
+panel_install.sh	3309	E1	      if (k ~ /^FLMX_/) {
+panel_install.sh	3310	E1	        n=k; sub(/^FLMX_/, "OVO_", n)
+panel_install.sh	3311	E1	        if (k == "FLMX_VERSION") print $0
+panel_install.sh	3312	E1	        if (!present[n]) { sub(/FLMX_/, "OVO_"); print }
+panel_install.sh	4329	E11	  for name in ovo-panel-backend ovo-panel-postgres ovo-vite-frontend flmx-panel-backend flmx-panel-postgres flmx-panel-frontend flmx-flux-panel-backend flmx-vite-frontend flvx-flux-panel-backend; do
+panel_install.sh	4636	E1	  sed -i 's/${FLMX_/${OVO_/g' "$UPDATE_COMPOSE_CANDIDATE" || return 1
+panel_install.sh	4643	E1	  upsert_env_var .env FLMX_VERSION "$LATEST_VERSION" || return 1
+panel_install.sh	5581	E1	FLMX_VERSION=$RESOLVED_VERSION
+scripts/check-ovo-rename.sh	14	E11	  for ref in ghcr.io/yhfc1775-maker/ovo-panel-backend:2.1.34 ghcr.io/iiiiiiiii7125-art/flux-panel-backend:2.1.29 ghcr.io/iiiiiiiii7125-art/flmx-panel-backend:2.1.29 ghcr.io/iiiiiiiii7125-art/flmx-flux-panel-backend:2.1.29 ghcr.io/iiiiiiiii7125-art/flmx-vite-frontend:2.1.29; do
+scripts/check-ovo-rename.sh	17	E11	  for ref in ghcr.io/iiiiiiiii7125-art/ovo-panel-backend:2.1.34 ghcr.io/other/flmx-panel-backend:2.1.29 ghcr.io/iiiiiiiii7125-art/unrelated:2.1.29; do
+scripts/check-ovo-rename.sh	22	E5	for generation in flux flmx ovo; do
+scripts/check-ovo-rename.sh	28	E11	      flmx) backend=flmx-panel-backend; frontend=flmx-panel-frontend; pg=flmx-panel-postgres; owner=iiiiiiiii7125-art ;;
+scripts/check-ovo-rename.sh	46	E1	FLMX_VERSION=2.1.29
+scripts/check-ovo-rename.sh	47	E1	FLMX_INSTALL_ID=preserved-uuid
+scripts/check-ovo-rename.sh	48	E1	FLMX_SQLITE_VOLUME=existing-sqlite
+scripts/check-ovo-rename.sh	49	E1	FLMX_POSTGRES_VOLUME=existing-pg
+scripts/check-ovo-rename.sh	50	E1	FLMX_NETWORK=existing-network
+scripts/check-ovo-rename.sh	93	E1	    if grep -q '^FLMX_INSTALL_ID=' .env; then fail 'old key was not migrated'; fi
+scripts/check-ovo-rename.sh	100	E11	for generation in flux flmx; do
+scripts/check-ovo-rename.sh	105	E1/E12	      INSTALL_DIR="$dir/ovo_agent"; LEGACY_INSTALL_DIR="$dir/flux_agent"; LEGACY2_INSTALL_DIR="$dir/flmx_agent"
+scripts/check-ovo-rename.sh	108	E1/E12	      LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE="$dir/flmx.service"; LEGACY_FLMX_AGENT_OPENRC_SERVICE_FILE="$dir/flmx.init"
+scripts/check-ovo-rename.sh	110	E1/E12	      case "$generation" in flux) old="$LEGACY_INSTALL_DIR"; unit="$LEGACY_FLUX_AGENT_SYSTEMD_SERVICE_FILE"; migration=migrate_legacy_agent_install ;; flmx) old="$LEGACY2_INSTALL_DIR"; unit="$LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE"; migration=migrate_legacy_flmx_agent_install ;; esac
+scripts/check-ovo-rename.sh	116	E1/E12	      legacy_flmx_agent_service_exists() { [[ -f "$LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE" ]]; }
+scripts/check-ovo-rename.sh	119	E1/E12	      legacy_flux_agent_health_ok() { return 0; }; legacy_flmx_agent_health_ok() { return 0; }
+scripts/check-ovo-rename.sh	135	E1/E10	  printf 'Environment=OVO_KERNEL_DIR=/current/kernels\nEnvironment=FLMX_KERNEL_DIR=/previous/kernels\n' > "$unit"
+scripts/check-ovo-rename.sh	137	E1/E10	  printf 'Environment=FLMX_KERNEL_DIR=/previous/kernels\n' > "$unit"
+scripts/check-ovo-rename.sh	144	E1	  printf 'DATABASE_URL=postgresql://flmx%%5Fpanel:test-pass@postgres:5432/flmx_panel?sslmode=disable\n' > .env
+scripts/check-ovo-rename.sh	145	E11	  PANEL_POSTGRES_CONTAINER=flmx-panel-postgres
+scripts/check-ovo-rename.sh	147	E1	  [[ "$(panel_postgres_url_identity POSTGRES_USER)" == flmx_panel ]] || fail 'URL user decoding'
+scripts/check-ovo-rename.sh	148	E1	  [[ "$(panel_postgres_url_identity POSTGRES_DB)" == flmx_panel ]] || fail 'URL database decoding'
+scripts/check-ovo-rename.sh	150	E1	  [[ "$(get_env_var POSTGRES_USER)" == flmx_panel && "$(get_env_var POSTGRES_DB)" == flmx_panel ]] || fail 'existing PostgreSQL identity changed'
+test-install-scripts-proxy.sh	26	E1/E12	  [[ -d "$root/etc/flmx_agent" ]] && hits="$hits $root/etc/flmx_agent"
+test-install-scripts-proxy.sh	27	E1/E12	  [[ -f "$root/etc/systemd/system/flmx_agent.service" ]] && hits="$hits $root/etc/systemd/system/flmx_agent.service"
+test-install-scripts-proxy.sh	28	E1/E12	  [[ -f "$root/etc/init.d/flmx_agent" ]] && hits="$hits $root/etc/init.d/flmx_agent"
+test-install-scripts-proxy.sh	9514	E11	    *"ghcr.io/iiiiiiiii7125-art/flmx-flux-panel-backend:1.9.9"*) ;;
+test-install-scripts-proxy.sh	11561	E11	      ps) printf 'flmx-panel-backend\n' ;;
+test-install-scripts-proxy.sh	11565	E11	          *Config.Image*) printf 'ghcr.io/iiiiiiiii7125-art/flmx-panel-backend:2.1.29\n' ;;
+test-install-scripts-proxy.sh	11575	E11	  if panel_deploy_dir_is_ours "$dir" flmx-panel-backend; then
 vite-frontend/src/pages/inbound/kernel-panel.tsx	56	E2	  // Fork 构建带 "-flmx1" 后缀（1.14.4-flmx1）：后缀须保留，否则
 vite-frontend/src/pages/inbound/kernel-panel.tsx	69	E2	  // 相同（1.14.4-flmx1 / 1.14.4），来源由后端 /kernel/versions

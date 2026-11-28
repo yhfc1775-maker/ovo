@@ -74,7 +74,7 @@ const nftCollectLastErrorMaxLen = 500
 
 // nftWsReadErrorPrefix marks a failure recorded by the WS
 // kernel-table path (R3A-NEW-1): the SSH forward-table path and the
-// WS kernel-table path read DIFFERENT tables (ovo vs ovo_kernel_*),
+// WS kernel-table path read DIFFERENT tables (ovo_<hash> vs ovo_kernel_*),
 // so their failures are independent signals sharing one health row.
 // The prefix on the error text is only the provenance of that one
 // failure round — the streak's composition is stored durably in

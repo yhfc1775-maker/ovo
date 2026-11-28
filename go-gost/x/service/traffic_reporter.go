@@ -518,7 +518,7 @@ func sendBatchTrafficReportWithSeq(ctx context.Context, reportItems []TrafficRep
 		return false, err
 	}
 
-	// 改名过渡：seq 头双发（新头 X-Ovo-Seq + 旧头 X-Flvx-Seq），
+	// 改名过渡：seq 头双发（新头 X-Ovo-Seq + 上一代 X-Flmx-Seq），
 	// 新旧面板都能读到，去重逻辑不受版本错位影响。
 	seqStr := fmt.Sprintf("%d", seq)
 	return postJSONWithFallbackAndHeaders(

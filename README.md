@@ -48,11 +48,6 @@
 curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/panel_install.sh -o panel_install.sh && curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/panel_install.sh.sha256 -o panel_install.sh.sha256 && sha256sum -c panel_install.sh.sha256 && bash panel_install.sh
 ```
 
-国内机器 GitHub 直连慢的话，可以让 API 请求走代理加速下载（代理会收到你的 token 并转发给 GitHub API；脚本与校验文件都经代理取回，`sha256sum -c` 仍会在执行前校验，校验不一致时失败并中止，不要绕过校验执行）：
-
-```bash
-```
-
 选 `1. 安装面板`，完成后访问 `http://服务器IP:6366`，默认账号 `admin@user`，密码没有固定默认值：新装播种时由后端生成随机初始密码（或采用部署时指定的环境变量 `OVO_ADMIN_PASSWORD` 的值），从安装完成输出或一次性文件 `initial-admin-password.txt` 查看，只用于首次登录，登录后会被强制修改密码。
 
 菜单另有 `配置域名反向代理（自动 HTTPS）`，输入域名即可自动签发证书并反代面板。
