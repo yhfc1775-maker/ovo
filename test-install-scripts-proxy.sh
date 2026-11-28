@@ -13708,6 +13708,221 @@ EOF
   grep -q '^POSTGRES_USER=flux_panel$' "$work2/.env" || fail "RR4-F7-03: with a pre-existing postgres volume, a missing POSTGRES_USER must fall back to the legacy name the volume was initialized with"
 )
 
+# F03：扩展 PR #15 audit/evidence/dual-agent-probe.sh.txt。真实入口、
+# 目录迁移、unit 快照/回滚、归属守卫；服务管理和健康检查用桩，下载
+# 边界返回失败以停在迁移之后。只证明文件与服务操作计划，不代表
+# 真实进程双在线或面板连接已验证。每例都重定向全部目录/unit。
+run_agent_coexistence_case() (
+  set -euo pipefail
+  local entry="$1" manager="$2" scenario="$3" root layout
+  root=$(mktemp -d)
+  trap 'rm -rf "$root"' EXIT
+  load_script_without_main "$ROOT_DIR/install.sh"
+  layout="$root/layout"
+  mkdir -p "$layout" "$root/running"
+  INSTALL_DIR="$layout/ovo_agent"
+  LEGACY_INSTALL_DIR="$layout/flux_agent"
+  LEGACY2_INSTALL_DIR="$layout/flmx_agent"
+  OVO_AGENT_SYSTEMD_SERVICE_FILE="$layout/ovo.service"
+  OVO_AGENT_OPENRC_SERVICE_FILE="$layout/ovo.init"
+  LEGACY_FLUX_AGENT_SYSTEMD_SERVICE_FILE="$layout/flux.service"
+  LEGACY_FLUX_AGENT_OPENRC_SERVICE_FILE="$layout/flux.init"
+  LEGACY_FLMX_AGENT_SYSTEMD_SERVICE_FILE="$layout/flmx.service"
+  LEGACY_FLMX_AGENT_OPENRC_SERVICE_FILE="$layout/flmx.init"
+  OVO_AGENT_LOGROTATE_FILE="$root/ovo.logrotate"
+  OVO_AGENT_OPENRC_PIDFILE="$root/ovo.pid"
+  SERVICE_MANAGER="$manager"
+  SERVER_ADDR="wss://f03.example"
+  SECRET="fixture-secret"
+  unset OVO_AGENT_TAKEOVER OVO_AGENT_FORCE_REINSTALL
+  : > "$root/calls"
+
+  local expected=flux flux_version=2.10.0 flmx_version=2.9.0
+  local refuse="" current="" rollback="" stale_stop_failure=""
+  case "$scenario" in
+    flux-live) touch "$root/running/flux_agent"; flux_version=1.0 ;;
+    flmx-live) touch "$root/running/flmx_agent"; expected=flmx; flmx_version=1.0 ;;
+    inactive-flux-newer) : ;;
+    inactive-flmx-newer) expected=flmx; flmx_version=2.11.0 ;;
+    both-active-newer) touch "$root/running/flux_agent" "$root/running/flmx_agent" ;;
+    one-readable) flux_version=unreadable; expected=flmx ;;
+    unreadable) flux_version=unreadable; flmx_version=unreadable; refuse=1 ;;
+    equal) flmx_version=2.10.0; refuse=1 ;;
+    both-active-equal)
+      touch "$root/running/flux_agent" "$root/running/flmx_agent"
+      flmx_version=2.10.0; refuse=1 ;;
+    current-flux-active) current=1; refuse=1; touch "$root/running/flux_agent" ;;
+    current-flmx-active) current=1; refuse=1; touch "$root/running/flmx_agent" ;;
+    current-inactive) current=1; expected=current ;;
+    guard-flux|guard-flmx) refuse=1 ;;
+    snapshot-flux|health-flux) rollback=1; touch "$root/running/flux_agent" ;;
+    snapshot-flmx|health-flmx) rollback=1; expected=flmx; touch "$root/running/flmx_agent" ;;
+    stale-stop-failure)
+      stale_stop_failure=1; touch "$root/running/flux_agent" "$root/running/flmx_agent" ;;
+    single-flux) touch "$root/running/flux_agent" ;;
+    single-flmx) expected=flmx; touch "$root/running/flmx_agent" ;;
+    *) fail "F03: unknown scenario $scenario" ;;
+  esac
+
+  local generation dir binary unit version
+  for generation in flux flmx; do
+    [[ "$scenario" != single-flux || "$generation" != flmx ]] || continue
+    [[ "$scenario" != single-flmx || "$generation" != flux ]] || continue
+    if [[ "$generation" == flux ]]; then
+      dir="$LEGACY_INSTALL_DIR"; binary=flux_agent; version="$flux_version"
+    else
+      dir="$LEGACY2_INSTALL_DIR"; binary=flmx_agent; version="$flmx_version"
+    fi
+    mkdir -p "$dir"
+    printf '#!/bin/bash\nprintf "gost v%s (fixture)\\n"\n' "$version" > "$dir/$binary"
+    chmod +x "$dir/$binary"
+    printf '{"addr":"%s","secret":"kept-%s"}\n' "$SERVER_ADDR" "$generation" > "$dir/config.json"
+    printf '%s-state\n' "$generation" > "$dir/state"
+    unit=$("legacy_${generation}_agent_service_file_path")
+    printf 'hand-edited %s unit\n' "$generation" > "$unit"
+    chmod +x "$unit"
+  done
+  if [[ -n "$current" ]]; then
+    mkdir -p "$INSTALL_DIR"
+    printf '#!/bin/bash\necho "gost 2.12.0"\n' > "$INSTALL_DIR/ovo_agent"
+    chmod +x "$INSTALL_DIR/ovo_agent"
+    printf '{"addr":"%s"}\n' "$SERVER_ADDR" > "$INSTALL_DIR/config.json"
+  fi
+  case "$scenario" in
+    guard-flux) printf '{"addr":"wss://other.example"}\n' > "$LEGACY_INSTALL_DIR/config.json" ;;
+    guard-flmx) printf '{"addr":"wss://other.example"}\n' > "$LEGACY2_INSTALL_DIR/config.json" ;;
+  esac
+  command cp -a "$layout" "$root/before"
+  if [[ "$expected" != current ]]; then
+    if [[ "$expected" == flux ]]; then dir="$LEGACY_INSTALL_DIR"; else dir="$LEGACY2_INSTALL_DIR"; fi
+    command cp "$dir/${expected}_agent" "$root/binary.before"
+    command cp "$dir/config.json" "$root/config.before"
+  fi
+
+  # 只替换外部依赖；真实的 active/exists/stop/disable/remove helpers
+  # 通过下面两个 init 桩执行，按运行态文件判定、记录完整操作顺序。
+  fixture_service_action() {
+    local action="$1" service="$2"
+    printf '%s %s\n' "$action" "$service" >> "$root/calls"
+    case "$action" in
+      status) [[ -f "$root/running/$service" ]]; return ;;
+      stop)
+        [[ -z "$stale_stop_failure" || "$service" != flmx_agent ]] || return 1
+        rm -f "$root/running/$service" ;;
+      start) touch "$root/running/$service" ;;
+    esac
+    return 0
+  }
+  systemctl() {
+    case "$1" in
+      is-active) fixture_service_action status "${!#}" ;;
+      list-units) return 0 ;;
+      *) fixture_service_action "$1" "${2:-}" ;;
+    esac
+  }
+  rc-service() { fixture_service_action "$2" "$1"; }
+  rc-update() {
+    case "$1" in
+      del) fixture_service_action disable "$2" ;;
+      add) fixture_service_action enable "$2" ;;
+    esac
+  }
+  sleep() { :; }
+  ensure_small_host_swap() { :; }
+  check_and_install_tcpkill() { :; }
+  ensure_download_url_initialized() { RESOLVED_VERSION=9.9.9; DOWNLOAD_URL=fixture; }
+  download_agent_binary() { echo download >> "$root/calls"; return 1; }
+  ovo_agent_health_ok() {
+    echo 'health ovo_agent' >> "$root/calls"
+    [[ "$scenario" != health-* ]]
+  }
+  legacy_flux_agent_health_ok() { :; }
+  legacy_flmx_agent_health_ok() { :; }
+  cp() {
+    if [[ "$scenario" == snapshot-* && "${1:-}" == -p ]]; then return 1; fi
+    command cp "$@"
+  }
+
+  local rc=0 label="$entry/$manager/$scenario"
+  "$entry" > "$root/result.log" 2>&1 || rc=$?
+  assert_equals 1 "$rc" "F03 $label: refusal or download boundary must return failure"
+  if [[ -n "$refuse" || -n "$rollback" ]]; then
+    diff -r "$root/before" "$layout" >/dev/null || fail "F03 $label: both layouts and units must remain byte-identical"
+    if grep -q '^download$' "$root/calls"; then fail "F03 $label: must abort before downloading"; fi
+    if [[ -n "$refuse" || "$scenario" == snapshot-* ]]; then
+      if grep -Eq '^(stop|disable|start|enable) ' "$root/calls"; then
+        fail "F03 $label: refusal/snapshot failure must precede all service mutations"
+      fi
+    else
+      grep -q '已自动回滚' "$root/result.log" || fail "F03 $label: real migration must roll back"
+      if [[ "$expected" == flux ]]; then generation=flmx; else generation=flux; fi
+      if grep -Eq "^(stop|disable) ${generation}_agent$" "$root/calls"; then
+        fail "F03 $label: failed live migration must never clean stale"
+      fi
+    fi
+    case "$scenario" in
+      unreadable|equal|both-active-equal|current-*)
+        grep -Fq "$LEGACY_INSTALL_DIR" "$root/result.log" || fail "F03 $label: refusal must name flux dir"
+        grep -Fq "$LEGACY2_INSTALL_DIR" "$root/result.log" || fail "F03 $label: refusal must name flmx dir"
+        grep -q '请.*备份' "$root/result.log" || fail "F03 $label: refusal must give recovery steps"
+        if [[ -n "$current" ]]; then
+          grep -Fq "$INSTALL_DIR" "$root/result.log" || fail "F03 $label: refusal must name current dir"
+        fi ;;
+    esac
+    return 0
+  fi
+
+  if [[ "$expected" == current ]]; then
+    diff -r "$root/before" "$layout" >/dev/null || fail "F03 $label: all existing layouts must be preserved"
+    grep -q '原样保留' "$root/result.log" || fail "F03 $label: skipped legacy dirs must be named"
+    if grep -Eq '^(stop|disable|start|enable) ' "$root/calls"; then fail "F03 $label: no legacy migration allowed"; fi
+  else
+    diff -q "$root/binary.before" "$INSTALL_DIR/ovo_agent" >/dev/null || fail "F03 $label: selected generation must migrate"
+    diff -q "$root/config.before" "$INSTALL_DIR/config.json" >/dev/null || fail "F03 $label: live config must survive verbatim"
+    assert_equals "${expected}-state" "$(cat "$INSTALL_DIR/state")" "F03 $label: live state must survive"
+    if [[ "$manager" == systemd ]]; then unit="$OVO_AGENT_SYSTEMD_SERVICE_FILE"; else unit="$OVO_AGENT_OPENRC_SERVICE_FILE"; fi
+    [[ -f "$unit" ]] || fail "F03 $label: current unit must exist"
+    if [[ -n "$stale_stop_failure" ]]; then
+      diff -r "$root/before/flmx_agent" "$LEGACY2_INSTALL_DIR" >/dev/null || fail "F03 $label: failed stale stop must retain its dir"
+      unit=$(legacy_flmx_agent_service_file_path)
+      diff -q "$root/before/${unit##*/}" "$unit" >/dev/null || fail "F03 $label: failed stale stop must retain unit"
+      if grep -q '^download$' "$root/calls"; then fail "F03 $label: failed stale stop must abort update"; fi
+      return 0
+    fi
+    [[ ! -e "$LEGACY_INSTALL_DIR" && ! -e "$LEGACY2_INSTALL_DIR" ]] || fail "F03 $label: legacy dirs must be gone"
+    for generation in flux flmx; do
+      [[ ! -e "$("legacy_${generation}_agent_service_file_path")" ]] || fail "F03 $label: legacy unit must be removed"
+      if [[ "$scenario" != single-* ]]; then
+        grep -Fxq "stop ${generation}_agent" "$root/calls" || fail "F03 $label: must stop each old service"
+        grep -Fxq "disable ${generation}_agent" "$root/calls" || fail "F03 $label: must disable each old service"
+      fi
+    done
+    if [[ "$scenario" != single-* ]]; then
+      if [[ "$expected" == flux ]]; then generation=flmx; dir="$LEGACY2_INSTALL_DIR"; else generation=flux; dir="$LEGACY_INSTALL_DIR"; fi
+      grep -Fq "$dir" "$root/result.log" || fail "F03 $label: stale cleanup must name dir"
+      grep -Fq "stale 服务 ${generation}_agent" "$root/result.log" || fail "F03 $label: stale cleanup must name service"
+      awk -v stale="${generation}_agent" '/^health ovo_agent$/ {healthy=1} $0 == "stop " stale && !healthy {exit 1}' "$root/calls" || fail "F03 $label: cleanup must follow successful live health check"
+    fi
+  fi
+  grep -Fxq download "$root/calls" || fail "F03 $label: must continue to the normal download boundary"
+)
+
+test_agent_legacy_coexistence() (
+  local entry manager scenario count=0
+  for entry in update_ovo_agent install_ovo_agent; do
+    for manager in systemd openrc; do
+      for scenario in flux-live flmx-live inactive-flux-newer inactive-flmx-newer \
+        both-active-newer one-readable unreadable equal both-active-equal \
+        current-flux-active current-flmx-active current-inactive guard-flux guard-flmx \
+        snapshot-flux snapshot-flmx health-flux health-flmx stale-stop-failure single-flux single-flmx; do
+        run_agent_coexistence_case "$entry" "$manager" "$scenario"
+        count=$((count + 1))
+      done
+    done
+  done
+  echo "F03 coexistence probes passed ($count cases: real install/update and migrations, systemd/OpenRC stubs)"
+)
+
 # RN-2 接缝：存量旧布局（LEGACY_INSTALL_DIR＋旧二进制名＋旧服务
 # 文件）在位时，菜单更新入口必须先整体迁移到新布局再走完更新：
 # 目录搬移、二进制改新名、配置逐字不变、新 unit 只写新名、旧
@@ -15941,6 +16156,7 @@ test_panel_migrate_placeholder_password_sentinels
 test_panel_migrate_volume_split_and_rollback_cleanup
 test_panel_migrate_reconciles_row_counts
 test_panel_migrate_source_volume_live_read_wins
+test_agent_legacy_coexistence
 test_update_ovo_agent_migrates_legacy_layout
 test_migrate_legacy_agent_rolls_back_on_failure
 test_panel_update_volume_key_conflict_live_read_wins
