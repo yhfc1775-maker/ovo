@@ -5,6 +5,9 @@ import (
 	"log"
 	"sort"
 	"time"
+
+	"go-backend/internal/kernel"
+	"go-backend/internal/store/repo"
 )
 
 // F2-PORT-01：live socket 探针（面板侧）。
@@ -31,8 +34,9 @@ import (
 
 // livePortProbeTarget 是一台节点上待探的端口段集。
 type livePortProbeTarget struct {
-	NodeID int64
-	Spans  []portSpan
+	NodeID  int64
+	Spans   []portSpan
+	Network string // Empty means both protocols (allocators, forwards and tunnels).
 }
 
 // checkLivePortsOccupied 逐节点探 live 占用，返回首个占用文案；
@@ -58,13 +62,26 @@ func (h *Handler) checkLivePortsOccupied(targets []livePortProbeTarget) string {
 			continue
 		}
 		var probe struct {
-			Listening []int `json:"listening"`
+			Listening []int  `json:"listening"`
+			TCP       *[]int `json:"tcp"`
+			UDP       *[]int `json:"udp"`
 		}
 		if err := remarshal(res.Data, &probe); err != nil {
 			log.Printf("F2-PORT-01 live port probe decode failed node_id=%d err=%v", t.NodeID, err)
 			continue
 		}
-		for _, p := range probe.Listening {
+		listening := probe.Listening
+		// Both fields must be present. Legacy or partial reports retain the
+		// union's fail-closed behavior, including an explicit null field.
+		if probe.TCP != nil && probe.UDP != nil {
+			switch t.Network {
+			case "tcp":
+				listening = *probe.TCP
+			case "udp":
+				listening = *probe.UDP
+			}
+		}
+		for _, p := range listening {
 			for _, sp := range t.Spans {
 				if p < sp.lo || p > sp.hi {
 					continue
@@ -312,4 +329,23 @@ func (h *Handler) tunnelOwnLivePorts(tunnelID int64, oldChainRows []chainNodeRec
 		}
 	}
 	return own, true
+}
+
+// On update subtract only the old listener on the same network. Changing
+// TCP to UDP (or adding UDP) must still probe the newly requested network.
+func inboundLivePortTargets(nodeID int64, in kernel.Inbound, old *kernel.Inbound) []livePortProbeTarget {
+	var targets []livePortProbeTarget
+	for _, network := range []string{"tcp", "udp"} {
+		if !repo.PortNetworksOverlap(repo.InboundPortNetwork(in), network) {
+			continue
+		}
+		spans := inboundSpans(in)
+		if old != nil && repo.PortNetworksOverlap(repo.InboundPortNetwork(*old), network) {
+			spans = subtractPortSpans(spans, inboundSpans(*old))
+		}
+		if len(spans) > 0 {
+			targets = append(targets, livePortProbeTarget{NodeID: nodeID, Spans: spans, Network: network})
+		}
+	}
+	return targets
 }

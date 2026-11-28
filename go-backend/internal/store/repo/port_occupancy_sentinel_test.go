@@ -6,6 +6,7 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -42,6 +43,13 @@ var k9PortDecisionPoints = []struct {
 	{"repository_control.go", "HasOtherForwardOnNodePortTx", "NodePortOccupiedTx"},
 	{"repository_control.go", "NodePortOccupiedForTunnelTx", "NodePortOccupiedTx"},
 	{"repository_kernel.go", "NodePortRangeOccupant", "NodePortRangeOccupancyTx"},
+	{"repository_kernel.go", "NodePortRangeOccupantExcluding", "NodePortRangeOccupancyTx"},
+	{"repository_kernel.go", "NodeForwardOrTunnelPortRangeOccupant", "NodePortRangeOccupancyTx"},
+	{"repository_port_occupancy.go", "NodePortOccupantTx", "NodePortRangeOccupancyTx"},
+	{"repository_port_occupancy.go", "NodePortOccupiedTx", "NodePortOccupantTx"},
+	{"repository.go", "importForwards", "NodePortOccupantTx"},
+	{"repository.go", "importTunnels", "NodePortOccupantTx"},
+	{"repository_inbound_backup.go", "importInbounds", "NodePortOccupantTx"},
 	{"repository_backup_precheck.go", "precheckBackupPortConflicts", "NodePortOccupantTx"},
 	{"repository_nft_pending_delete.go", "FindOtherForwardOnNodePortTx", "NodePortOccupantTx"},
 	// R1C-02 补登：此前未锁的真实决策/消费点。
@@ -287,5 +295,92 @@ func TestK9PortOccupancySentinel(t *testing.T) {
 		if k9DecisionShaped(fn.decl) {
 			t.Fatalf("P01-001 sentinel: handler %s::%s contains a hand-rolled node+port occupancy query over the shared port tables; route it through the repo unified predicate in repository_port_occupancy.go or register an exemption with rationale", fn.file, fn.name)
 		}
+	}
+}
+
+// Leg 6: mechanically closed caller inventory. Additions AND removals must
+// update this list; every edge is a real AST call (comments cannot satisfy it).
+var k9OccupancyCallers = map[string]bool{
+	"internal/http/handler/kernel.go::damagedInboundHopConflict->inboundSpans":                                 true,
+	"internal/http/handler/kernel.go::inboundPortConflict->NodePortRangeOccupant":                              true,
+	"internal/http/handler/kernel.go::inboundPortConflict->NodePortRangeOccupantExcluding":                     true,
+	"internal/http/handler/kernel.go::inboundPortConflict->inboundSpans":                                       true,
+	"internal/http/handler/kernel.go::inboundSave->checkLivePortsOccupied":                                     true,
+	"internal/http/handler/kernel.go::inboundSave->probeForwardEntryPortLive":                                  true,
+	"internal/http/handler/kernel_mux.go::nodePortMuxSave->NodeForwardOrTunnelPortRangeOccupant":               true,
+	"internal/http/handler/kernel_mux.go::pickFreeMuxPort->NodeForwardOrTunnelPortRangeOccupant":               true,
+	"internal/http/handler/kernel_relay.go::createRelayForward->probeForwardEntryPortLive":                     true,
+	"internal/http/handler/mutations.go::createForwardWithPortRetry->probeForwardEntryPortLive":                true,
+	"internal/http/handler/mutations.go::detachedSegmentPortConflictError->NodePortOccupantTx":                 true,
+	"internal/http/handler/mutations.go::reuseOrRepickTunnelSegmentPort->TunnelChainPortReusableTx":            true,
+	"internal/http/handler/mutations.go::tunnelCreate->checkLivePortsOccupied":                                 true,
+	"internal/http/handler/mutations.go::tunnelUpdate->checkLivePortsOccupied":                                 true,
+	"internal/http/handler/mutations.go::validateTunnelEntryInPortTx->NodePortOccupantTx":                      true,
+	"internal/http/handler/port_live_probe.go::inboundLivePortTargets->inboundSpans":                           true,
+	"internal/http/handler/port_live_probe.go::probeForwardEntryPortLive->checkLivePortsOccupied":              true,
+	"internal/store/repo/repository.go::importForwards->NodePortOccupantTx":                                    true,
+	"internal/store/repo/repository.go::importTunnels->NodePortOccupantTx":                                     true,
+	"internal/store/repo/repository_backup_precheck.go::precheckBackupPortConflicts->NodePortOccupantTx":       true,
+	"internal/store/repo/repository_control.go::HasOtherForwardOnNodePortTx->NodePortOccupiedTx":               true,
+	"internal/store/repo/repository_control.go::NodePortOccupiedForTunnelTx->NodePortOccupiedTx":               true,
+	"internal/store/repo/repository_inbound_backup.go::importInbounds->NodePortOccupantTx":                     true,
+	"internal/store/repo/repository_kernel.go::NodeForwardOrTunnelPortRangeOccupant->NodePortRangeOccupancyTx": true,
+	"internal/store/repo/repository_kernel.go::NodePortOccupant->NodePortRangeOccupant":                        true,
+	"internal/store/repo/repository_kernel.go::NodePortRangeOccupant->NodePortRangeOccupancyTx":                true,
+	"internal/store/repo/repository_kernel.go::NodePortRangeOccupantExcluding->NodePortRangeOccupancyTx":       true,
+	"internal/store/repo/repository_mutations.go::GetUsedPortsOnNodeAsMap->UsedPortsOnNodeTx":                  true,
+	"internal/store/repo/repository_mutations.go::pickNodePortTx->UsedPortsOnNodeTx":                           true,
+	"internal/store/repo/repository_nft_pending_delete.go::FindOtherForwardOnNodePortTx->NodePortOccupantTx":   true,
+	"internal/store/repo/repository_port_occupancy.go::ListUsedPortsOnNode->UsedPortsOnNodeTx":                 true,
+	"internal/store/repo/repository_port_occupancy.go::NodePortOccupantTx->NodePortRangeOccupancyTx":           true,
+	"internal/store/repo/repository_port_occupancy.go::NodePortOccupiedTx->NodePortOccupantTx":                 true,
+	"internal/store/repo/repository_port_occupancy.go::TunnelChainPortReusableTx->NodePortOccupiedTx":          true,
+}
+
+func k9OccupancyCallerEdges(funcs []k9Func, dir string) map[string]bool {
+	watched := map[string]bool{}
+	for _, name := range strings.Fields("inboundSpans NodePortRangeOccupancyTx NodePortOccupant NodePortOccupantTx NodePortOccupiedTx UsedPortsOnNodeTx NodePortRangeOccupant NodePortRangeOccupantExcluding NodeForwardOrTunnelPortRangeOccupant TunnelChainPortReusableTx checkLivePortsOccupied probeForwardEntryPortLive") {
+		watched[name] = true
+	}
+	edges := map[string]bool{}
+	for _, fn := range funcs {
+		ast.Inspect(fn.decl.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			callee := k9CallName(call.Fun)
+			if watched[callee] {
+				edges[dir+"/"+fn.file+"::"+fn.name+"->"+callee] = true
+			}
+			return true
+		})
+	}
+	return edges
+}
+
+func k9CallerDifference(want, actual map[string]bool) []string {
+	var difference []string
+	for edge := range want {
+		if !actual[edge] {
+			difference = append(difference, "missing: "+edge)
+		}
+	}
+	for edge := range actual {
+		if !want[edge] {
+			difference = append(difference, "unregistered: "+edge)
+		}
+	}
+	sort.Strings(difference)
+	return difference
+}
+
+func TestK9OccupancyCallerClosure(t *testing.T) {
+	actual := k9OccupancyCallerEdges(k9LoadDirFuncs(t, "."), "internal/store/repo")
+	for edge := range k9OccupancyCallerEdges(k9LoadDirFuncs(t, filepath.Join("..", "..", "http", "handler")), "internal/http/handler") {
+		actual[edge] = true
+	}
+	if diff := k9CallerDifference(k9OccupancyCallers, actual); len(diff) > 0 {
+		t.Fatalf("occupancy caller inventory differs:\n%s", strings.Join(diff, "\n"))
 	}
 }

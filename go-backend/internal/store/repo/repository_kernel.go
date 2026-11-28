@@ -483,8 +483,8 @@ func listNodeInboundPortsTx(tx *gorm.DB, nodeID int64, excludeInboundID int64) (
 }
 
 // NodePortOccupant names what already uses port on a node, or "" when free.
-func (r *Repository) NodePortOccupant(nodeID int64, port int, excludeInboundID int64) (string, error) {
-	return r.NodePortRangeOccupant(nodeID, port, port, excludeInboundID)
+func (r *Repository) NodePortOccupant(nodeID int64, port int, excludeInboundID int64, network ...string) (string, error) {
+	return r.NodePortRangeOccupant(nodeID, port, port, excludeInboundID, network...)
 }
 
 // ListNodeInboundsByNode returns every inbound on a node (all kernels).
@@ -502,7 +502,7 @@ func (r *Repository) ListNodeInboundsByNode(nodeID int64) ([]model.NodeInbound, 
 // four-source predicate (NodePortRangeOccupancyTx); this function only
 // maps sources to display names, keeping the historical precedence
 // (inbound → forward → tunnel, with the companion special case).
-func (r *Repository) NodePortRangeOccupant(nodeID int64, lo, hi int, excludeInboundID int64) (string, error) {
+func (r *Repository) NodePortRangeOccupant(nodeID int64, lo, hi int, excludeInboundID int64, network ...string) (string, error) {
 	if r == nil || r.db == nil {
 		return "", errors.New("repository not initialized")
 	}
@@ -510,7 +510,7 @@ func (r *Repository) NodePortRangeOccupant(nodeID int64, lo, hi int, excludeInbo
 	if excludeInboundID > 0 {
 		excl.InboundIDs = []int64{excludeInboundID}
 	}
-	occ, err := r.NodePortRangeOccupancyTx(r.db, nodeID, lo, hi, excl)
+	occ, err := r.NodePortRangeOccupancyTx(r.db, nodeID, lo, hi, excl, network...)
 	if err != nil {
 		return "", err
 	}
@@ -542,11 +542,11 @@ func (r *Repository) NodePortRangeOccupant(nodeID int64, lo, hi int, excludeInbo
 // inbound IDs to exclude (NodePortRangeOccupant takes only one). The
 // port-mux conflict check uses it to ignore the other muxed inbounds
 // sharing the mux port while still reporting any other occupant.
-func (r *Repository) NodePortRangeOccupantExcluding(nodeID int64, lo, hi int, excludeInboundIDs []int64) (string, error) {
+func (r *Repository) NodePortRangeOccupantExcluding(nodeID int64, lo, hi int, excludeInboundIDs []int64, network ...string) (string, error) {
 	if r == nil || r.db == nil {
 		return "", errors.New("repository not initialized")
 	}
-	occ, err := r.NodePortRangeOccupancyTx(r.db, nodeID, lo, hi, PortExclusions{InboundIDs: excludeInboundIDs})
+	occ, err := r.NodePortRangeOccupancyTx(r.db, nodeID, lo, hi, PortExclusions{InboundIDs: excludeInboundIDs}, network...)
 	if err != nil {
 		return "", err
 	}

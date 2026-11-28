@@ -144,6 +144,17 @@ func TestK9UnifiedOccupancySeesAllSources(t *testing.T) {
 				t.Fatalf("P01-001: NodePortRangeOccupant = %q, want %q", name, tc.wantRangeName)
 			}
 
+			// Leg 6 closes the mux wrappers over the same unified sources.
+			excludingName, err := r.NodePortRangeOccupantExcluding(k9NodeID, k9Port, k9Port, nil)
+			if err != nil || excludingName != tc.wantRangeName {
+				t.Fatalf("NodePortRangeOccupantExcluding = %q, %v", excludingName, err)
+			}
+			narrow, err := r.NodeForwardOrTunnelPortRangeOccupant(k9NodeID, k9Port, k9Port)
+			wantNarrow := tc.wantSource != PortSourceInbound
+			if err != nil || (narrow != "") != wantNarrow {
+				t.Fatalf("mux narrow wrapper = %q, %v; want occupied=%v", narrow, err, wantNarrow)
+			}
+
 			conflict, err := r.FindOtherForwardOnNodePort(k9NodeID, k9Port, 0)
 			if err != nil {
 				t.Fatalf("FindOtherForwardOnNodePort: %v", err)
