@@ -42,7 +42,7 @@ func TestHistCR068DamagedRowHopRangeStillConflicts(t *testing.T) {
 	histCSeedDamagedHopRow(t, r, nodeID, `{"portHopping":"21000-22000"}`, `{corrupt`)
 
 	// Direct: overlapping hop range 21500-21600 must report a conflict.
-	msg, err := h.inboundPortConflict(nodeID, kernel.Inbound{Protocol: kernel.ProtocolShadowsocks, Port: 24000, Settings: kernel.Settings{PortHopping: "21500-21600"}}, 0)
+	msg, err := h.inboundPortConflict(nodeID, "", kernel.Inbound{Protocol: kernel.ProtocolShadowsocks, Port: 24000, Settings: kernel.Settings{PortHopping: "21500-21600"}}, 0)
 	if err != nil {
 		t.Fatalf("overlapping hop range must report a conflict, not an error: %v", err)
 	}
@@ -51,7 +51,7 @@ func TestHistCR068DamagedRowHopRangeStillConflicts(t *testing.T) {
 	}
 
 	// Control: a non-overlapping hop range must not be blamed on the row.
-	msg, err = h.inboundPortConflict(nodeID, kernel.Inbound{Protocol: kernel.ProtocolShadowsocks, Port: 24001, Settings: kernel.Settings{PortHopping: "23000-24000"}}, 0)
+	msg, err = h.inboundPortConflict(nodeID, "", kernel.Inbound{Protocol: kernel.ProtocolShadowsocks, Port: 24001, Settings: kernel.Settings{PortHopping: "23000-24000"}}, 0)
 	if err != nil {
 		t.Fatalf("non-overlapping check must not error: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestHistCR068UnrecoverableDamagedRowFailsClosed(t *testing.T) {
 	// Settings itself corrupt: hop range unrecoverable.
 	histCSeedDamagedHopRow(t, r, nodeID, `{corrupt`, `{corrupt`)
 
-	_, err = h.inboundPortConflict(nodeID, kernel.Inbound{Protocol: kernel.ProtocolShadowsocks, Port: 24000, Settings: kernel.Settings{PortHopping: "21500-21600"}}, 0)
+	_, err = h.inboundPortConflict(nodeID, "", kernel.Inbound{Protocol: kernel.ProtocolShadowsocks, Port: 24000, Settings: kernel.Settings{PortHopping: "21500-21600"}}, 0)
 	var blocked *inboundConflictBlockedError
 	if !errors.As(err, &blocked) {
 		t.Fatalf("unrecoverable damaged row must fail closed with inboundConflictBlockedError, got %v", err)

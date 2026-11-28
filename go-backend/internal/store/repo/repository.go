@@ -565,6 +565,7 @@ func autoMigrateAll(db *gorm.DB) error {
 		&model.NodeTunnelTLS{},
 		&model.NodeKernel{},
 		&model.NodeInbound{},
+		&model.NodePortMux{},
 		&model.NodeInboundCounter{},
 		&model.NodeInboundRelay{},
 		&model.UserInbound{},

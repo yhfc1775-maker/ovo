@@ -61,6 +61,8 @@ import type {
   InboundRelayApiItem,
   SubInfoApiData,
   NodeRoute,
+  NodePortMuxApiData,
+  NodePortMuxSavePayload,
   LatencyTrend,
   RelayLatency,
 } from "./types";
@@ -1061,6 +1063,18 @@ export const controlKernel = (
   Network.post("/kernel/control", { id, action, force }, { timeout: 330_000 });
 export const getKernelLogs = (id: number) =>
   Network.post<KernelStateApiData>("/kernel/logs", { id });
+export const getNodePortMux = (nodeId: number) =>
+  Network.post<NodePortMuxApiData>("/node/port-mux/get", { nodeId });
+export const getNodePortMuxList = () =>
+  Network.post<NodePortMuxApiData[]>("/node/port-mux/list");
+export const saveNodePortMux = (data: NodePortMuxSavePayload, kernelCount = 1) =>
+  Network.post<NodePortMuxApiData>(
+    "/node/port-mux/save",
+    data,
+    // B11-001 家族（R2-K2）：保存尾部对受影响内核逐个下发（去重），
+    // 每次带 300s 条件界，按内核数放宽（登记表 T072）。
+    { timeout: batchCallTimeoutKernelApply(kernelCount) },
+  );
 export const getInboundList = () =>
   Network.post<InboundApiItem[]>("/inbound/list");
 export const createInbound = (data: InboundMutationPayload, idemKey?: string) =>

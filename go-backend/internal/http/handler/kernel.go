@@ -1631,7 +1631,7 @@ func (h *Handler) inboundSave(w http.ResponseWriter, r *http.Request, update boo
 			respondChainValidationError(w, "inboundSave", err)
 			return
 		}
-		if msg, err := h.inboundPortConflict(row.NodeID, in, row.ID); err != nil {
+		if msg, err := h.inboundPortConflict(row.NodeID, k.KernelType, in, row.ID); err != nil {
 			releasePortAlloc()
 			// R-068：损坏行无法恢复时的 fail-closed 拒绝须点名该行，
 			// 不走吞文案的通用 Internal error。
@@ -1661,6 +1661,30 @@ func (h *Handler) inboundSave(w http.ResponseWriter, r *http.Request, update boo
 		}
 		response.WriteJSON(w, response.ErrDefault(lastInboundPortErr.Error()))
 		return
+	}
+
+	// 443 端口复用：本入站是否进复用表（Xray + TCP + 在复用端口上）。
+	// wasMuxed 记更新前的复用态——端口移出复用也要同步一次复用表。
+	// 读错不吞：复用态不明时整单拒绝，绝不把复用入站静默存成直连。
+	mux, merr := h.repo.GetNodePortMux(row.NodeID)
+	if merr != nil {
+		releasePortAlloc()
+		log.Printf("inboundSave: GetNodePortMux failed: %v", merr)
+		response.WriteJSON(w, response.Err(-2, "Internal error"))
+		return
+	}
+	willMux := inboundEligibleForMux(in, k.KernelType, mux)
+	wasMuxed := update && row.MuxPort > 0
+	if willMux {
+		if relays, rerr := h.repo.ListInboundRelays(row.ID); rerr == nil {
+			for _, rel := range relays {
+				if rel.Managed == 1 && rel.ForwardExists {
+					releasePortAlloc()
+					response.WriteJSON(w, response.ErrDefault(fmt.Sprintf("入站「%s」已有托管转发，暂不支持端口复用（中继连接无 SNI 可分流）", row.Name)))
+					return
+				}
+			}
+		}
 	}
 
 	if err := applyInboundToModel(in, &row); err != nil {
@@ -1728,6 +1752,28 @@ func (h *Handler) inboundSave(w http.ResponseWriter, r *http.Request, update boo
 	if row.AcceptProxyProtocol == 1 {
 		// Clients cannot speak PROXY protocol, so direct access stops working.
 		row.RelayOnly = 1
+	}
+	// 443 端口复用：复用中的 Xray 入站由分流器发 PROXY 头，必须接头。
+	// 写在 RelayOnly 强制之后——复用的 1 是分流器驱动的，不触发中继
+	// 强制；退出复用时恢复直连监听（MuxPort 清零，PROXY 开关回用户值）。
+	if willMux {
+		if row.MuxPort <= 0 || row.MuxPort == in.Port {
+			mp, merr := h.pickFreeMuxPort(row.NodeID, row.ID, in.Port)
+			if merr != nil {
+				releasePortAlloc()
+				if errors.Is(merr, errNoFreeMuxPort) {
+					response.WriteJSON(w, response.ErrDefault("未找到可用的复用内部端口"))
+					return
+				}
+				log.Printf("inboundSave: pickFreeMuxPort failed: %v", merr)
+				response.WriteJSON(w, response.ErrDefault("Internal error"))
+				return
+			}
+			row.MuxPort = mp
+		}
+		row.AcceptProxyProtocol = 1
+	} else {
+		row.MuxPort = 0
 	}
 	row.RelayWhitelist = boolToInt(req.RelayWhitelist)
 	row.WhitelistExtra = strings.Join(allowExtra, ", ")
@@ -1870,6 +1916,12 @@ func (h *Handler) inboundSave(w http.ResponseWriter, r *http.Request, update boo
 			warnings = append([]string{"下发到节点失败: " + err.Error()}, warnings...)
 		}
 	}
+	// 443 端口复用：入站进出复用表后同步一次 agent 的路由表。
+	if willMux || wasMuxed {
+		if err := h.syncNodePortMuxIfEnabled(row.NodeID); err != nil {
+			warnings = append(warnings, "下发端口复用配置失败: "+err.Error())
+		}
+	}
 	if update {
 		warnings = append(warnings, h.applyChainReferrers(row.ID)...)
 	}
@@ -1911,7 +1963,7 @@ func (h *Handler) pickFreeInboundPortExcluding(nodeID, excludeInboundID int64, e
 		if exclude[port] {
 			return true, nil
 		}
-		msg, err := h.inboundPortConflict(nodeID, kernel.Inbound{Port: port}, excludeInboundID)
+		msg, err := h.inboundPortConflict(nodeID, "", kernel.Inbound{Port: port}, excludeInboundID)
 		return msg != "", err
 	})
 }
@@ -2009,9 +2061,47 @@ func damagedInboundHopConflict(row model.NodeInbound, spans []portSpan) (string,
 
 // inboundPortConflict describes the first clash between the ports an
 // inbound needs and what already runs on the node ("" when there is none).
-func (h *Handler) inboundPortConflict(nodeID int64, in kernel.Inbound, excludeInboundID int64) (string, error) {
+// Multiple SNI-bearing Xray TCP inbounds may share the node's configured
+// NodePortMux port when their SNIs are distinct (443 port reuse); the
+// mux's own loopback ports are treated as occupied spans.
+func (h *Handler) inboundPortConflict(nodeID int64, kernelType string, in kernel.Inbound, excludeInboundID int64) (string, error) {
+	// 复用态不明时整单拒绝：静默按无复用算会把复用入站误判成端口冲突
+	// 或放行 SNI 冲突。
+	mux, err := h.repo.GetNodePortMux(nodeID)
+	if err != nil {
+		return "", err
+	}
+	muxEnabled := mux != nil && mux.Enabled == 1 && mux.Port > 0
+	// willMux mirrors inboundEligibleForMux for the *new* inbound: only an
+	// Xray TCP inbound on the mux port can share it.
+	willMux := muxEnabled && kernelType == kernel.TypeXray && in.Port == mux.Port && networkHasTCP(in.Network())
+	muxedInboundIDs := make([]int64, 0)
+	if muxEnabled {
+		if rows, err := h.repo.ListNodeInboundsByNode(nodeID); err == nil {
+			for _, row := range rows {
+				if row.ID != excludeInboundID && row.MuxPort > 0 {
+					muxedInboundIDs = append(muxedInboundIDs, row.ID)
+				}
+			}
+		}
+	}
+
 	spans := inboundSpans(in)
 	for _, sp := range spans {
+		if willMux && sp.lo == mux.Port && sp.hi == mux.Port {
+			// The mux port itself: only non-muxed occupants conflict.
+			// Every other muxed inbound on this port is behind the same
+			// mux and shares it by SNI.
+			excl := append(append([]int64{}, muxedInboundIDs...), excludeInboundID)
+			occ, err := h.repo.NodePortRangeOccupantExcluding(nodeID, sp.lo, sp.hi, excl)
+			if err != nil {
+				return "", err
+			}
+			if occ != "" {
+				return fmt.Sprintf("%s 已被%s占用", sp, occ), nil
+			}
+			continue
+		}
 		occ, err := h.repo.NodePortRangeOccupant(nodeID, sp.lo, sp.hi, excludeInboundID)
 		if err != nil {
 			return "", err
@@ -2048,6 +2138,31 @@ func (h *Handler) inboundPortConflict(nodeID int64, in kernel.Inbound, excludeIn
 	if err != nil {
 		return "", err
 	}
+	// A muxed inbound must carry a TLS SNI the mux can route on, and its
+	// SNI must not collide with another muxed inbound or an external rule.
+	if willMux {
+		inSNI := inboundMuxSNI(in)
+		if inSNI == "" {
+			return fmt.Sprintf("服务器已开启端口 %d 复用，TCP 入站需配置 TLS / Reality / ShadowTLS 的 SNI 域名", mux.Port), nil
+		}
+		for _, ext := range parseMuxRulesJSON(mux.Rules) {
+			if normalizeMuxSNI(ext.SNI) == inSNI {
+				return fmt.Sprintf("SNI「%s」与端口复用的外部规则冲突", inSNI), nil
+			}
+		}
+		for _, row := range others {
+			if row.ID == excludeInboundID || row.MuxPort <= 0 {
+				continue
+			}
+			other, err := inboundFromModel(row)
+			if err != nil {
+				continue
+			}
+			if inboundMuxSNI(other) == inSNI {
+				return fmt.Sprintf("SNI「%s」与入站「%s」冲突", inSNI, row.Name), nil
+			}
+		}
+	}
 	for _, row := range others {
 		if row.ID == excludeInboundID {
 			continue
@@ -2069,7 +2184,14 @@ func (h *Handler) inboundPortConflict(nodeID int64, in kernel.Inbound, excludeIn
 			return "", &inboundConflictBlockedError{msg: fmt.Sprintf("入站「%s」（ID %d）数据损坏，无法校验端口冲突：%v；请先修复或删除该入站后再创建", row.Name, row.ID, err)}
 		}
 		// Listen ports were checked by the query above; compare the rest.
-		for _, os := range inboundSpans(other)[1:] {
+		// A muxed inbound's loopback port is an occupied span too, but only
+		// for TCP inbounds: the MuxPort is a TCP loopback listener, so a
+		// UDP hop range landing on the same number does not conflict.
+		otherSpans := inboundSpans(other)[1:]
+		if row.MuxPort > 0 && networkHasTCP(in.Network()) {
+			otherSpans = append(otherSpans, portSpan{row.MuxPort, row.MuxPort, "复用内部端口"})
+		}
+		for _, os := range otherSpans {
 			for _, sp := range spans {
 				if sp.overlaps(os) {
 					return fmt.Sprintf("%s 与入站「%s」的%s 冲突", sp, row.Name, os), nil
@@ -2765,6 +2887,9 @@ type agentKernelStatus struct {
 	// MissingLogsFor mirrors the agent's Status signal (F2-23):
 	// the requested kernel type has no instance on the node.
 	MissingLogsFor string `json:"missingLogsFor,omitempty"`
+	// Mux mirrors the agent's Status.Mux (443 port reuse); nil when the
+	// agent predates mux support.
+	Mux *agentMuxState `json:"mux,omitempty"`
 }
 
 func remarshal(in interface{}, out interface{}) error {
@@ -2817,6 +2942,14 @@ func (h *Handler) buildKernelApplyPayloadWith(k *model.NodeKernel, realmOverride
 		return h.buildRealmApplyPayload(k, info, realmOverride)
 	}
 	rows, err := h.repo.ListNodeInboundsByKernel(k.ID)
+	if err != nil {
+		return nil, "", err
+	}
+	// 443 端口复用：复用中的入站改走回环监听（见下方循环内 muxed
+	// 分支），公网 443 由分流器接管；白名单改由分流器在真实客户
+	// IP 上执行，nft 不再对该入站下 allow。读错不吞：复用态不明
+	// 时整单拒绝，绝不把复用入站渲染成公网直连。
+	mux, err := h.repo.GetNodePortMux(k.NodeID)
 	if err != nil {
 		return nil, "", err
 	}
@@ -2880,6 +3013,14 @@ func (h *Handler) buildKernelApplyPayloadWith(k *model.NodeKernel, realmOverride
 		in, err := inboundFromModel(row)
 		if err != nil {
 			return nil, "", err
+		}
+		// 443 端口复用：复用中的入站只在回环上监听（MuxPort），公网
+		// 端口由分流器接管；分流器发 PROXY 头带真实客户 IP，入站
+		// 的 AcceptProxyProtocol 开关（inboundSave 置 1）接头。
+		muxed := mux != nil && mux.Enabled == 1 && row.MuxPort > 0 && inboundEligibleForMux(in, k.KernelType, mux)
+		if muxed {
+			in.Listen = "127.0.0.1"
+			in.Port = row.MuxPort
 		}
 		// 下发前复检：组合必须在内核 catalog 内，历史脏数据不得被渲染层静默降级。
 		if !kernel.ComboSupported(renderType, in.Protocol, in.Transport.Type, in.Security.Type) {
@@ -2949,7 +3090,10 @@ func (h *Handler) buildKernelApplyPayloadWith(k *model.NodeKernel, realmOverride
 		if werr != nil {
 			return nil, "", werr
 		}
-		if effWhitelist {
+		// 复用中的入站不下 nft allow：分流器已在真实客户 IP 上
+		// 执行白名单；nft 只会看到回环对端 127.0.0.1，下 allow
+		// 会把所有直连拦掉（见 buildNodePortMuxPayload 的 Allow）。
+		if effWhitelist && !muxed {
 			// R3X-015：白名单的链式拨号节点查询失败则整单中止，不
 			// 下发少算拨号节点的白名单。
 			if chainIx == nil {
@@ -3989,6 +4133,13 @@ func (h *Handler) applyKernelWithMode(kernelID int64, install bool, realmOverrid
 	if settleCounters && h.importTailBatchDepth.Load() == 0 {
 		h.settleKernelCountersAfterApply(k.NodeID)
 	}
+	// 443 端口复用：Xray 内核下发成功后，若节点开了端口复用，把
+	// 最新的路由表补推给 agent（入站增删改走入站保存面显式同步，
+	// 这里是安装/重启/drift 重推等旁路的安全网）。非 Xray 内核的
+	// 入站不进复用表，无需同步。
+	if k.KernelType == kernel.TypeXray {
+		_ = h.syncNodePortMuxIfEnabled(k.NodeID)
+	}
 	return nil
 }
 
@@ -4156,6 +4307,11 @@ func (h *Handler) pollNodeKernels(nodeID int64, evenIfNone bool) kernelPollOutco
 	// 询钉定，见 FIX-BASELINE 注释）。
 	h.ingestKernelCounters(nodeID, status, now)
 	h.ingestNodeNftablesStatus(nodeID, status)
+	// 443 端口复用对账：agent 上报的 Mux 状态与面板记录漂移时补推，
+	// 面板已关但 agent 仍在跑的孤儿 mux 停掉（见 kernel_mux.go）。
+	if mux, merr := h.repo.GetNodePortMux(nodeID); merr == nil {
+		h.reconcilePolledNodePortMux(nodeID, mux, status.Mux, now)
+	}
 	// R3A-NEW-1/C NEW-1：agent 计数表丢失的 WS 面——表丢时 agent
 	// 的 ConfigHash 不变，drift 对账看不出；ingest 又静默跳过空
 	// 计数，故此处单独处理：记一轮采集失败（与 SSH 路共用阈值＋

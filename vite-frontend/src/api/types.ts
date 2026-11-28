@@ -1269,3 +1269,45 @@ export interface LatencyTrend {
   until: number;
   points: LatencyTrendPoint[];
 }
+
+export interface NodePortMuxRule {
+  sni: string;
+  target: string;
+  proxyProtocol?: boolean;
+  remark?: string;
+}
+
+export interface NodePortMuxInboundBinding {
+  id: number;
+  name: string;
+  kernelType: string;
+  protocol: string;
+  sni: string;
+  muxPort: number;
+  enabled: boolean;
+}
+
+export interface NodePortMuxApiData {
+  nodeId: number;
+  enabled: boolean;
+  listen: string;
+  port: number;
+  rules: NodePortMuxRule[];
+  fallbackTarget: string;
+  fallbackProxy: boolean;
+  status: string;
+  lastError: string;
+  synced: boolean;
+  updatedTime: number;
+  inbounds: NodePortMuxInboundBinding[];
+}
+
+export interface NodePortMuxSavePayload {
+  nodeId: number;
+  enabled: boolean;
+  listen: string;
+  port: number;
+  rules: NodePortMuxRule[];
+  fallbackTarget: string;
+  fallbackProxy: boolean;
+}

@@ -256,7 +256,7 @@ func (r *Repository) exportInbounds() (*model.InboundsBackup, error) {
 		out.Inbounds = append(out.Inbounds, model.InboundBackup{
 			ID: i.ID, KernelID: i.KernelID, NodeID: i.NodeID, Name: i.Name, Protocol: i.Protocol,
 			Listen: i.Listen, Port: i.Port, Transport: i.Transport, Security: i.Security,
-			Settings: i.Settings, Extra: i.Extra, ShareHost: i.ShareHost, ShareAddressMode: i.ShareAddressMode, Remark: i.Remark,
+			Settings: i.Settings, Extra: i.Extra, ShareHost: i.ShareHost, ShareAddressMode: i.ShareAddressMode, MuxPort: i.MuxPort, Remark: i.Remark,
 			RelayOnly: i.RelayOnly, AcceptProxyProtocol: i.AcceptProxyProtocol,
 			RelayWhitelist: i.RelayWhitelist, WhitelistExtra: i.WhitelistExtra, Enabled: i.Enabled,
 			UploadBytes: i.UploadBytes, DownloadBytes: i.DownloadBytes, Inx: i.Inx,
@@ -264,6 +264,18 @@ func (r *Repository) exportInbounds() (*model.InboundsBackup, error) {
 			OutboundIPStrategy: i.OutboundIPStrategy, MeteringEnabled: i.MeteringEnabled,
 			SSSubscriptionUsers: i.SSSubscriptionUsers,
 			ConnIdleSeconds:     i.ConnIdleSeconds,
+		})
+	}
+
+	var portMuxes []model.NodePortMux
+	if err := r.db.Order("node_id ASC").Find(&portMuxes).Error; err != nil {
+		return nil, err
+	}
+	for _, m := range portMuxes {
+		out.PortMuxes = append(out.PortMuxes, model.NodePortMuxBackup{
+			NodeID: m.NodeID, Enabled: m.Enabled, Listen: m.Listen, Port: m.Port,
+			Rules: m.Rules, FallbackTarget: m.FallbackTarget, FallbackProxy: m.FallbackProxy,
+			CreatedTime: m.CreatedTime,
 		})
 	}
 
@@ -1242,7 +1254,7 @@ func (r *Repository) importInbounds(tx *gorm.DB, b *model.InboundsBackup, now in
 		item := model.NodeInbound{
 			ID: i.ID, KernelID: i.KernelID, NodeID: i.NodeID, Name: i.Name, Protocol: protocol,
 			Listen: listen, Port: i.Port, Transport: healedTransport, Security: healedSecurity,
-			Settings: healedSettings, Extra: i.Extra, ShareHost: shareHost, ShareAddressMode: shareMode, Remark: i.Remark,
+			Settings: healedSettings, Extra: i.Extra, ShareHost: shareHost, ShareAddressMode: shareMode, MuxPort: i.MuxPort, Remark: i.Remark,
 			RelayOnly: i.RelayOnly, AcceptProxyProtocol: i.AcceptProxyProtocol,
 			RelayWhitelist: i.RelayWhitelist, WhitelistExtra: whitelistExtra, Enabled: enabled,
 			UploadBytes: clampImportedCounter(rep, fmt.Sprintf("入站 #%d（%q）", i.ID, i.Name), "uploadBytes", i.UploadBytes), DownloadBytes: clampImportedCounter(rep, fmt.Sprintf("入站 #%d（%q）", i.ID, i.Name), "downloadBytes", i.DownloadBytes), Inx: i.Inx,
@@ -1255,7 +1267,7 @@ func (r *Repository) importInbounds(tx *gorm.DB, b *model.InboundsBackup, now in
 			Columns: []clause.Column{{Name: "id"}},
 			DoUpdates: clause.AssignmentColumns([]string{
 				"kernel_id", "node_id", "name", "protocol", "listen", "port", "transport", "security",
-				"settings", "extra", "share_host", "share_address_mode", "remark", "relay_only", "accept_proxy_protocol",
+				"settings", "extra", "share_host", "share_address_mode", "mux_port", "remark", "relay_only", "accept_proxy_protocol",
 				"relay_whitelist", "whitelist_extra", "enabled", "upload_bytes", "download_bytes",
 				"inx", "updated_time", "source_id", "outbound_id", "split_rules", "outbound_ip_strategy",
 				"metering_enabled", "ss_subscription_users", "companion_of", "conn_idle_seconds",
@@ -1281,6 +1293,38 @@ func (r *Repository) importInbounds(tx *gorm.DB, b *model.InboundsBackup, now in
 		if forceDisableSnell {
 			counts.snellInboundsDisabled++
 			snellInboundIdentities = append(snellInboundIdentities, fmt.Sprintf("#%d %s", i.ID, i.Name))
+		}
+	}
+	// 443 端口复用：复用配置随备份往返。Status 与哈希是运行时态，
+	// 不带：恢复后 enabled=1 的行从 pending 起，由面板重推复用
+	// 表收敛；未启用的行停在 stopped。入站的 MuxPort 已随上面
+	// 的入站段恢复，复用表本身在这里补上。
+	for _, pm := range b.PortMuxes {
+		listen := pm.Listen
+		if listen == "" {
+			listen = "::"
+		}
+		port := pm.Port
+		if port <= 0 {
+			port = 443
+		}
+		status := "stopped"
+		if pm.Enabled == 1 {
+			status = "pending"
+		}
+		item := model.NodePortMux{
+			NodeID: pm.NodeID, Enabled: pm.Enabled, Listen: listen, Port: port,
+			Rules: pm.Rules, FallbackTarget: pm.FallbackTarget, FallbackProxy: pm.FallbackProxy,
+			Status: status, CreatedTime: pm.CreatedTime, UpdatedTime: now,
+		}
+		if err := tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "node_id"}},
+			DoUpdates: clause.AssignmentColumns([]string{
+				"enabled", "listen", "port", "rules", "fallback_target", "fallback_proxy",
+				"status", "last_error", "config_hash", "applied_hash", "updated_time",
+			}),
+		}).Create(&item).Error; err != nil {
+			return inboundImportCounts{}, err
 		}
 	}
 	if counts.snellInboundsDisabled > 0 {

@@ -124,6 +124,9 @@ User request → Check env vars → Auto-login if needed → Call API → Return
 | "升级节点" | `/api/v1/node/upgrade` | [nodes](references/nodes.md) |
 | "轮换节点 secret" | `/api/v1/node/rotate-secret` | [nodes](references/nodes.md) |
 | "清除终态升级核验记录" | `/api/v1/node/upgrade-verification/clear` | [nodes](references/nodes.md) |
+| "查看 443 端口复用配置" | `/api/v1/node/port-mux/get` | [nodes](references/nodes.md) |
+| "查看端口复用列表" | `/api/v1/node/port-mux/list` | [nodes](references/nodes.md) |
+| "保存 443 端口复用配置" | `/api/v1/node/port-mux/save` | [nodes](references/nodes.md) |
 | "创建隧道" / "新建隧道" | `/api/v1/tunnel/create` | [tunnels](references/tunnels.md) |
 | "分配隧道给用户" | `/api/v1/tunnel/user/assign` | [tunnels](references/tunnels.md) |
 | "创建转发" / "新建转发" / "添加转发" | `/api/v1/forward/create` | [forwards](references/forwards.md) |

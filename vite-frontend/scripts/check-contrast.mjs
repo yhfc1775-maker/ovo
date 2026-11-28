@@ -2016,6 +2016,7 @@ const DEFAULT_700_FILE_PINS = {
   "pages/dashboard/admin-overview.tsx": 1, // bg-tray 芯片
   "pages/forward.tsx": 5, // glass-inset 地址钮 ×4＋inset 页眉组标题 ×1
   "pages/node/node-row.tsx": 4, // bg-tray 芯片 hover ×2＋glass-inset 信息盒 ×2
+  "pages/node/port-mux-modal.tsx": 7, // 443 复用弹框次级小字 ×7
 };
 {
   const d700Hex = tokens["--default-700"];
@@ -2535,6 +2536,7 @@ const SOLID_FILL_PINS_DEFAULT_100 = {
   "pages/node/monitor-view.tsx": 5,
   "pages/node/node-live-stats.tsx": 1,
   "pages/node/node-row.tsx": 1, // X06 恢复的本月流量上下行分段进度条轨道
+  "pages/node/port-mux-modal.tsx": 3, // 443 复用弹框：规则行与 JSON 预览底
   "pages/node/tune-modal.tsx": 1,
   "pages/subscription/traffic-stats.tsx": 1,
   "pages/subscription.tsx": 1,
