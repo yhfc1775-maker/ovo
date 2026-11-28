@@ -19,7 +19,7 @@ ARG TARGETARCH
 ARG VERSION=dev
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} env ${TARGETARCH:+GOARCH=${TARGETARCH}} go build -ldflags="-s -w -X main.version=${VERSION}" -o /out/ovo-agent .
 
-FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
+FROM debian:bookworm-slim@sha256:e67eeead736ff7bbe258ef088bff683635c561b1fcfefad0806c1df4ab49ce0e
 # Runtime tools the agent shells out to:
 #   nft (nftables)     kernel nftables rules
 #   modprobe (kmod)    tuning module loads
