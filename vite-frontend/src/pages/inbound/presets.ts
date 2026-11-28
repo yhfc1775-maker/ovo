@@ -15,6 +15,7 @@ export const PROTOCOL_LABELS: Record<string, string> = {
   tuic: "TUIC v5",
   anytls: "AnyTLS",
   snell: "Snell",
+  mieru: "Mieru",
   naive: "NaïveProxy",
 };
 
@@ -22,9 +23,23 @@ export const KERNEL_LABELS: Record<string, string> = {
   xray: "Xray",
   singbox: "sing-box",
   snell: "Snell",
+  mieru: "Mieru",
+};
+
+export const MIERU_MUX_LABELS: Record<string, string> = {
+  MULTIPLEXING_OFF: "关闭 (OFF)",
+  MULTIPLEXING_LOW: "低 (LOW，默认)",
+  MULTIPLEXING_MIDDLE: "中 (MIDDLE)",
+  MULTIPLEXING_HIGH: "高 (HIGH)",
+};
+
+export const MIERU_HANDSHAKE_LABELS: Record<string, string> = {
+  HANDSHAKE_STANDARD: "标准 1-RTT（默认）",
+  HANDSHAKE_NO_WAIT: "0-RTT 免等待 (NO_WAIT)",
 };
 
 export const TRANSPORT_LABELS: Record<string, string> = {
+  udp: "UDP",
   tcp: "TCP",
   ws: "WebSocket",
   grpc: "gRPC",
@@ -81,6 +96,9 @@ export interface InboundForm {
   backendPort: number;
   portHopping: string;
   username: string;
+  mieruMtu: string;
+  mieruMultiplexing: string;
+  mieruHandshakeMode: string;
   transportType: string;
   path: string;
   host: string;
@@ -243,6 +261,25 @@ export const PRESETS: Preset[] = [
     needsDomain: true,
     certMode: "acme",
   },
+  {
+    key: "mieru-tcp",
+    label: "Mieru (TCP)",
+    description:
+      "高强度加密防探测，无需域名和证书；支持 Mihomo / Stash / Mieru 客户端",
+    kernel: "mieru",
+    protocol: "mieru",
+    transport: "tcp",
+    security: "none",
+  },
+  {
+    key: "mieru-udp",
+    label: "Mieru (UDP)",
+    description: "基于 UDP 的 Mieru，无需域名和证书；弱网/丢包环境下延迟更低",
+    kernel: "mieru",
+    protocol: "mieru",
+    transport: "udp",
+    security: "none",
+  },
 ];
 
 /** Presets the given kernel can serve with its exact transport + security. */
@@ -285,6 +322,9 @@ export function emptyForm(
     backendPort: 0,
     portHopping: "",
     username: "",
+    mieruMtu: "",
+    mieruMultiplexing: "MULTIPLEXING_LOW",
+    mieruHandshakeMode: "HANDSHAKE_STANDARD",
     transportType: "tcp",
     path: "",
     host: "",
@@ -490,6 +530,9 @@ export function formFromItem(item: InboundApiItem): InboundForm {  return {
     backendPort: item.settings.backendPort ?? 0,
     portHopping: item.settings.portHopping ?? "",
     username: item.settings.username ?? "",
+    mieruMtu: item.protocol === "mieru" && item.settings.mtu ? String(item.settings.mtu) : "",
+    mieruMultiplexing: item.settings.mieruMultiplexing || "MULTIPLEXING_LOW",
+    mieruHandshakeMode: item.settings.mieruHandshakeMode || "HANDSHAKE_STANDARD",
     transportType: item.transport.type || "tcp",
     path: item.transport.path ?? "",
     host: item.transport.host ?? "",
@@ -559,6 +602,7 @@ export function splitPayload(
 
 export const uuidProtocols = ["vless", "vmess", "tuic"];
 export const passwordProtocols = [
+  "mieru",
   "trojan",
   "shadowsocks",
   "hysteria2",
@@ -598,6 +642,9 @@ export function toPayload(form: InboundForm): InboundMutationPayload {
     listen: form.listen.trim(),
     port: form.port.trim() ? Number(form.port) : 0,
     settings: {
+      mtu: form.protocol === "mieru" && form.mieruMtu.trim() ? Number(form.mieruMtu) : undefined,
+      mieruMultiplexing: form.protocol === "mieru" ? form.mieruMultiplexing : undefined,
+      mieruHandshakeMode: form.protocol === "mieru" ? form.mieruHandshakeMode : undefined,
       uuid: usesUUID ? form.uuid.trim() : undefined,
       flow:
         visionAllowed(form) && form.flowVision ? "xtls-rprx-vision" : undefined,
@@ -623,7 +670,7 @@ export function toPayload(form: InboundForm): InboundMutationPayload {
           ? form.portHopping.trim() || undefined
           : undefined,
       username:
-        form.protocol === "naive"
+        (form.protocol === "naive" || form.protocol === "mieru")
           ? form.username.trim() || undefined
           : undefined,
     },

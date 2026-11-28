@@ -1,6 +1,13 @@
 package repo
 
-import "gorm.io/gorm"
+import (
+	"errors"
+	"math"
+	"sort"
+
+	"go-backend/internal/store/model"
+	"gorm.io/gorm"
+)
 
 // inListChunkSize 是「ID 集合 → 单个 IN ?」类查询的统一分块大小。
 //
@@ -56,4 +63,92 @@ func chunkInt64IDs(ids []int64) [][]int64 {
 		chunks = append(chunks, ids[start:end])
 	}
 	return chunks
+}
+
+// applyListPage retains the legacy all-rows response unless both parameters
+// are positive. Explicit pages are capped at the shared 500-row query bound.
+func applyListPage(q *gorm.DB, page []int) *gorm.DB {
+	if len(page) != 2 || page[0] <= 0 || page[1] <= 0 {
+		return q
+	}
+	size := page[1]
+	if size > inListChunkSize {
+		size = inListChunkSize
+	}
+	if page[0]-1 > math.MaxInt/size {
+		return q.Where("1 = 0")
+	}
+	return q.Limit(size).Offset((page[0] - 1) * size)
+}
+
+// ListInboundNodes includes all fields used by share-address selection.
+// Missing nodes are omitted; a failed batch must not be presented as missing.
+func (r *Repository) ListInboundNodes(ids []int64) (map[int64]*model.Node, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	out := make(map[int64]*model.Node, len(ids))
+	for _, chunk := range chunkInt64IDs(ids) {
+		var nodes []model.Node
+		if err := r.db.Where("id IN ?", chunk).Find(&nodes).Error; err != nil {
+			return nil, err
+		}
+		for i := range nodes {
+			out[nodes[i].ID] = &nodes[i]
+		}
+	}
+	return out, nil
+}
+
+// Page-local outbound references may point to another page or a hidden row.
+func (r *Repository) ListInboundNames(ids []int64) (map[int64]string, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	out := make(map[int64]string, len(ids))
+	for _, chunk := range chunkInt64IDs(ids) {
+		var rows []model.NodeInbound
+		if err := r.db.Select("id", "name").Where("id IN ?", chunk).Find(&rows).Error; err != nil {
+			return nil, err
+		}
+		for _, row := range rows {
+			out[row.ID] = row.Name
+		}
+	}
+	return out, nil
+}
+
+// ListNodeNICPeers preserves cross-page NIC-sharing markers without loading
+// the full node payload. The normalized address matches nodeListServerIP.
+func (r *Repository) ListNodeNICPeers(ids []int64) ([]map[string]interface{}, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	const address = "LOWER(TRIM(COALESCE(NULLIF(TRIM(server_ip_v4), ''), server_ip)))"
+	byID := make(map[int64]model.Node)
+	for _, chunk := range chunkInt64IDs(ids) {
+		var rows []model.Node
+		keys := r.db.Model(&model.Node{}).Select(address).Where("id IN ?", chunk)
+		if err := r.db.Select("id", "inx", "server_ip", "server_ip_v4").Where(address+" <> '' AND "+address+" IN (?)", keys).Find(&rows).Error; err != nil {
+			return nil, err
+		}
+		for _, row := range rows {
+			byID[row.ID] = row
+		}
+	}
+	rows := make([]model.Node, 0, len(byID))
+	for _, row := range byID {
+		rows = append(rows, row)
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].Inx == rows[j].Inx {
+			return rows[i].ID < rows[j].ID
+		}
+		return rows[i].Inx < rows[j].Inx
+	})
+	out := make([]map[string]interface{}, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, map[string]interface{}{"id": row.ID, "serverIp": row.ServerIP, "serverIpV4": nullableString(row.ServerIPV4)})
+	}
+	return out, nil
 }

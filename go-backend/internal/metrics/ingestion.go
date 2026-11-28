@@ -2,8 +2,10 @@ package metrics
 
 import (
 	"context"
+	"go-backend/internal/envcompat"
 	"log"
 	"math"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -251,7 +253,7 @@ func (s *IngestionService) Start(ctx context.Context) {
 		case <-flushTicker.C:
 			s.flushNodeMetrics()
 		case <-pruneTicker.C:
-			s.pruneMetrics()
+			s.pruneMetricsAtContext(ctx, time.Now())
 		}
 	}
 }
@@ -557,6 +559,10 @@ func (s *IngestionService) connlogRetentionDaysFromConfig() int {
 }
 
 func (s *IngestionService) pruneMetricsAt(now time.Time) {
+	s.pruneMetricsAtContext(context.Background(), now)
+}
+
+func (s *IngestionService) pruneMetricsAtContext(ctx context.Context, now time.Time) {
 	cutoff := now.Add(-time.Duration(s.retentionDaysFromConfig()) * 24 * time.Hour).UnixMilli()
 	if s.repo == nil {
 		return
@@ -596,7 +602,7 @@ func (s *IngestionService) pruneMetricsAt(now time.Time) {
 	if _, err := s.repo.InterruptStaleOpenInboundConnLogs(now.Add(-24 * time.Hour).UnixMilli()); err != nil {
 		log.Printf("connlog prune failed op=inbound_conn_log.stale_open err=%v", err)
 	}
-	s.reclaimSQLiteSpace(now)
+	s.reclaimSQLiteSpaceContext(ctx, now)
 }
 
 // SQLite file reclaim gates (包 K). Prunes bound row counts, but
@@ -612,18 +618,24 @@ const (
 	sqliteFullVacuumMinReclaim = 128 << 20
 	// sqliteFullVacuumMinInterval: and at most once a day, no
 	// matter how much churn the prunes produce.
-	sqliteFullVacuumMinInterval = 24 * time.Hour
+	sqliteFullVacuumMinInterval    = 24 * time.Hour
+	sqliteFullVacuumTimeout        = 30 * time.Second
+	sqliteIncrementalVacuumPages   = 256
+	sqliteIncrementalVacuumTimeout = 100 * time.Millisecond
 )
 
-// reclaimSQLiteSpace returns prune-freed pages to the OS after
-// each hourly prune cycle. INCREMENTAL databases (everything
-// created since this change) take the cheap incremental path;
-// FULL needs nothing (space returns at each commit); legacy NONE
-// databases take the gated full VACUUM, which also migrates the
-// file to the DSN-requested INCREMENTAL mode. Every action is
-// logged — reclaiming space is an identifiable event, never a
-// silent one. Postgres is skipped (its own autovacuum owns this).
+// Full rewrites are opt-in via OVO_SQLITE_MAINTENANCE_WINDOW=HH:MM-HH:MM
+// (UTC, e.g. 01:00-03:00). Empty/invalid/outside windows never start VACUUM.
+// The existing 128 MiB and 24h gates still apply. Incremental reclaim stays
+// online, bounded to 256 single-page statements and 100ms per prune pass.
 func (s *IngestionService) reclaimSQLiteSpace(now time.Time) {
+	s.reclaimSQLiteSpaceContext(context.Background(), now)
+}
+
+func (s *IngestionService) reclaimSQLiteSpaceContext(ctx context.Context, now time.Time) {
+	if ctx.Err() != nil {
+		return
+	}
 	if s == nil || s.repo == nil {
 		return
 	}
@@ -637,7 +649,13 @@ func (s *IngestionService) reclaimSQLiteSpace(now time.Time) {
 	}
 	switch stats.AutoVacuum {
 	case 2: // INCREMENTAL
-		if err := s.repo.IncrementalVacuumSQLite(stats.FreelistCount); err != nil {
+		pages := stats.FreelistCount
+		if pages > sqliteIncrementalVacuumPages {
+			pages = sqliteIncrementalVacuumPages
+		}
+		budget, cancel := context.WithTimeout(ctx, sqliteIncrementalVacuumTimeout)
+		defer cancel()
+		if err := s.repo.IncrementalVacuumSQLiteContext(budget, pages); err != nil {
 			log.Printf("monitoring sqlite reclaim failed mode=incremental_vacuum err=%v", err)
 			return
 		}
@@ -649,13 +667,17 @@ func (s *IngestionService) reclaimSQLiteSpace(now time.Time) {
 		log.Printf("monitoring sqlite reclaim mode=incremental_vacuum reclaimed_bytes=%d freelist_pages_remaining=%d",
 			stats.ReclaimableBytes()-after.ReclaimableBytes(), after.FreelistCount)
 	case 0: // NONE (legacy database)
-		if stats.ReclaimableBytes() < sqliteFullVacuumMinReclaim {
+		// Pruning may have taken time; gate on the actual entry time rather
+		// than a stale prune-cycle timestamp near the end of the window.
+		now = time.Now()
+		budget, ok := sqliteFullVacuumBudget(stats, now, s.lastFullVacuum, envcompat.Getenv("OVO_SQLITE_MAINTENANCE_WINDOW"))
+		if !ok {
+			log.Printf("monitoring sqlite reclaim deferred mode=vacuum reason=threshold_interval_or_maintenance_window")
 			return
 		}
-		if !s.lastFullVacuum.IsZero() && now.Sub(s.lastFullVacuum) < sqliteFullVacuumMinInterval {
-			return
-		}
-		if err := s.repo.VacuumSQLite(); err != nil {
+		maintenance, cancel := context.WithTimeout(ctx, budget)
+		defer cancel()
+		if err := s.repo.VacuumSQLite(maintenance); err != nil {
 			log.Printf("monitoring sqlite reclaim failed mode=vacuum err=%v", err)
 			return
 		}
@@ -670,4 +692,40 @@ func (s *IngestionService) GetLatestMetric(nodeID int64) (*model.NodeMetric, err
 
 func (s *IngestionService) GetMetrics(nodeID int64, startMs, endMs int64) ([]model.NodeMetric, error) {
 	return s.repo.GetNodeMetrics(nodeID, startMs, endMs)
+}
+
+// Budget is capped by both the operation timeout and the remaining window.
+// Equal endpoints are invalid rather than an accidental all-day window.
+func sqliteFullVacuumBudget(stats repo.SQLiteSpaceStats, now, last time.Time, window string) (time.Duration, bool) {
+	if !stats.IsSQLite || stats.AutoVacuum != 0 || stats.ReclaimableBytes() < sqliteFullVacuumMinReclaim || (!last.IsZero() && now.Sub(last) < sqliteFullVacuumMinInterval) {
+		return 0, false
+	}
+	parts := strings.Split(strings.TrimSpace(window), "-")
+	if len(parts) != 2 {
+		return 0, false
+	}
+	start, err1 := time.Parse("15:04", parts[0])
+	end, err2 := time.Parse("15:04", parts[1])
+	if err1 != nil || err2 != nil || start.Equal(end) {
+		return 0, false
+	}
+	n := now.UTC()
+	a := time.Date(n.Year(), n.Month(), n.Day(), start.Hour(), start.Minute(), 0, 0, time.UTC)
+	b := time.Date(n.Year(), n.Month(), n.Day(), end.Hour(), end.Minute(), 0, 0, time.UTC)
+	if !b.After(a) {
+		if n.Before(b) {
+			a = a.Add(-24 * time.Hour)
+		} else {
+			b = b.Add(24 * time.Hour)
+		}
+	}
+	if n.Before(a) || !n.Before(b) {
+		return 0, false
+	}
+	budget := b.Sub(n)
+	if budget > sqliteFullVacuumTimeout {
+		budget = sqliteFullVacuumTimeout
+	}
+	// Do not start with less than five seconds remaining in the window.
+	return budget, budget >= 5*time.Second
 }

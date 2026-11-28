@@ -55,7 +55,7 @@ export default function H5Layout({ children }: { children: React.ReactNode }) {
     },
     {
       path: "/forward",
-      label: "规则",
+      label: "转发",
       icon: (
         <svg className="w-6 h-6" fill="currentColor" viewBox="0 0 20 20">
           <path
@@ -69,7 +69,7 @@ export default function H5Layout({ children }: { children: React.ReactNode }) {
     },
     {
       path: "/node",
-      label: "节点",
+      label: "服务器",
       icon: (
         <svg className="w-6 h-6" fill="currentColor" viewBox="0 0 20 20">
           <path
@@ -83,7 +83,7 @@ export default function H5Layout({ children }: { children: React.ReactNode }) {
     },
     {
       path: "/inbound",
-      label: "落地",
+      label: "节点",
       icon: (
         <svg className="w-6 h-6" fill="currentColor" viewBox="0 0 20 20">
           <path

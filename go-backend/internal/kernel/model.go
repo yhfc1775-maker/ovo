@@ -13,11 +13,14 @@ import (
 )
 
 type Settings struct {
-	UUID     string `json:"uuid,omitempty"`
-	Username string `json:"username,omitempty"` // NaïveProxy
-	Flow     string `json:"flow,omitempty"`
-	Password string `json:"password,omitempty"`
-	Method   string `json:"method,omitempty"`
+	MTU                int    `json:"mtu,omitempty"`
+	MieruMultiplexing  string `json:"mieruMultiplexing,omitempty"`
+	MieruHandshakeMode string `json:"mieruHandshakeMode,omitempty"`
+	UUID               string `json:"uuid,omitempty"`
+	Username           string `json:"username,omitempty"` // NaïveProxy
+	Flow               string `json:"flow,omitempty"`
+	Password           string `json:"password,omitempty"`
+	Method             string `json:"method,omitempty"`
 
 	// Masquerade is the site Hysteria2 serves to non-clients (optional URL).
 	Masquerade string `json:"masquerade,omitempty"`
@@ -189,6 +192,11 @@ func (in Inbound) Tag() string {
 // traffic counters.
 func (in Inbound) Network() string {
 	switch in.Protocol {
+	case ProtocolMieru:
+		if in.Transport.Type == TransportUDP {
+			return "udp"
+		}
+		return "tcp"
 	case ProtocolHysteria2, ProtocolTUIC:
 		return "udp"
 	case ProtocolShadowsocks:
@@ -204,6 +212,13 @@ func (in Inbound) Network() string {
 }
 
 const (
+	DefaultMieruMTU            = 1400
+	MieruMuxOff                = "MULTIPLEXING_OFF"
+	MieruMuxLow                = "MULTIPLEXING_LOW"
+	MieruMuxMiddle             = "MULTIPLEXING_MIDDLE"
+	MieruMuxHigh               = "MULTIPLEXING_HIGH"
+	MieruHandshakeStandard     = "HANDSHAKE_STANDARD"
+	MieruHandshakeNoWait       = "HANDSHAKE_NO_WAIT"
 	FlowVision                 = "xtls-rprx-vision"
 	DefaultRealitySNI          = "www.amd.com"
 	DefaultSSMethod            = "2022-blake3-aes-128-gcm"
@@ -585,11 +600,21 @@ func normalizeSettings(in *Inbound) error {
 	} else {
 		s.EncryptionMode, s.EncryptionSecret = "", ""
 	}
-	if in.Protocol != ProtocolNaive {
+	if in.Protocol != ProtocolMieru {
+		s.MTU = 0
+		s.MieruMultiplexing = ""
+		s.MieruHandshakeMode = ""
+	}
+	if in.Protocol != ProtocolNaive && in.Protocol != ProtocolMieru {
 		s.Username = ""
 	}
 
 	switch in.Protocol {
+	case ProtocolMieru:
+		s.UUID, s.Method, s.Flow = "", "", ""
+		if err := normalizeMieru(s); err != nil {
+			return err
+		}
 	case ProtocolVLESS, ProtocolVMess:
 		if s.UUID == "" {
 			s.UUID = NewUUID()
@@ -972,3 +997,55 @@ func NormalizeAllowEntry(entry string) (string, error) {
 	}
 	return ipnet.String(), nil
 }
+
+func normalizeMieru(s *Settings) error {
+	s.Username = strings.TrimSpace(s.Username)
+	if s.Username == "" {
+		s.Username = "u" + RealityShortID()[:8]
+	}
+	if !mieruUserPattern.MatchString(s.Username) {
+		return errors.New("Mieru 用户名只能包含字母、数字和 ._-@，长度 1-64")
+	}
+	if s.Password == "" {
+		s.Password = RandomPassword()
+	}
+	if len(s.Password) > 64 || strings.ContainsAny(s.Password, " \t\r\n") {
+		return errors.New("Mieru 密码不能包含空白字符，且长度不超过 64 字节")
+	}
+	for _, r := range s.Password {
+		if r < 0x20 || r == 0x7f {
+			return errors.New("Mieru 密码不能包含控制字符")
+		}
+	}
+	return normalizeMieruOptions(s)
+}
+
+func normalizeMieruOptions(s *Settings) error {
+	if s.MTU == 0 {
+		s.MTU = DefaultMieruMTU
+	}
+	if s.MTU < 1280 || s.MTU > 1500 {
+		return errors.New("Mieru MTU 应在 1280-1500 之间")
+	}
+	s.MieruMultiplexing = strings.ToUpper(strings.TrimSpace(s.MieruMultiplexing))
+	if s.MieruMultiplexing == "" {
+		s.MieruMultiplexing = MieruMuxLow
+	}
+	switch s.MieruMultiplexing {
+	case MieruMuxOff, MieruMuxLow, MieruMuxMiddle, MieruMuxHigh:
+	default:
+		return fmt.Errorf("不支持的 Mieru 多路复用等级 %s", s.MieruMultiplexing)
+	}
+	s.MieruHandshakeMode = strings.ToUpper(strings.TrimSpace(s.MieruHandshakeMode))
+	if s.MieruHandshakeMode == "" {
+		s.MieruHandshakeMode = MieruHandshakeStandard
+	}
+	switch s.MieruHandshakeMode {
+	case MieruHandshakeStandard, MieruHandshakeNoWait:
+	default:
+		return fmt.Errorf("不支持的 Mieru 握手模式 %s", s.MieruHandshakeMode)
+	}
+	return nil
+}
+
+var mieruUserPattern = regexp.MustCompile(`^[A-Za-z0-9._@-]{1,64}$`)

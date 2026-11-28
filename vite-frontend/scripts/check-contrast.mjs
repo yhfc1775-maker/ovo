@@ -1328,7 +1328,7 @@ for (const [fg, bg, pinned] of TRAY_HOVER_PAIRS) {
 // 住在 .css 内，天然不在 .ts/.tsx 普查面内。
 const TRAY_PLATE_REGISTERED = [
   "src/pages/inbound/kernel-panel.tsx:392",
-  "src/pages/config.tsx:1213",
+  "src/pages/config.tsx:1214",
 ];
 {
   const foundPlates = [];
@@ -1380,7 +1380,7 @@ const TRAY_PLATE_REGISTERED = [
 const BLACK_SCRIM_REGISTERED = [
   { loc: "src/shadcn-bridge/heroui/modal.tsx:56", token: "bg-black/40", note: "Modal blur 档遮罩" },
   { loc: "src/shadcn-bridge/heroui/modal.tsx:59", token: "bg-black/70", note: "Modal opaque 档遮罩" },
-  { loc: "src/pages/config.tsx:1183", token: "bg-black/70", note: "config 壁纸预览标签芯片（白字）" },
+  { loc: "src/pages/config.tsx:1184", token: "bg-black/70", note: "config 壁纸预览标签芯片（白字）" },
   { loc: "src/components/ui/dialog.tsx:39", token: "bg-black/40", note: "Dialog 遮罩" },
   { loc: "src/layouts/admin.tsx:428", token: "bg-black/40", note: "admin 遮罩" },
   { loc: "src/pages/index.tsx:351", token: "bg-black/60", note: "登录页验证码遮罩" },
@@ -2016,6 +2016,7 @@ const DEFAULT_700_FILE_PINS = {
   "pages/dashboard/admin-overview.tsx": 1, // bg-tray 芯片
   "pages/forward.tsx": 5, // glass-inset 地址钮 ×4＋inset 页眉组标题 ×1
   "pages/node/node-row.tsx": 4, // bg-tray 芯片 hover ×2＋glass-inset 信息盒 ×2
+  "pages/node/port-mux-modal.tsx": 7, // 443 复用弹框次级小字 ×7
 };
 {
   const d700Hex = tokens["--default-700"];
@@ -2535,6 +2536,7 @@ const SOLID_FILL_PINS_DEFAULT_100 = {
   "pages/node/monitor-view.tsx": 5,
   "pages/node/node-live-stats.tsx": 1,
   "pages/node/node-row.tsx": 1, // X06 恢复的本月流量上下行分段进度条轨道
+  "pages/node/port-mux-modal.tsx": 3, // 443 复用弹框：规则行与 JSON 预览底
   "pages/node/tune-modal.tsx": 1,
   "pages/subscription/traffic-stats.tsx": 1,
   "pages/subscription.tsx": 1,

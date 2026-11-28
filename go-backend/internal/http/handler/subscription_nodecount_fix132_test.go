@@ -15,7 +15,7 @@ import (
 // A5-02/BC-11：列表的 NodeCount 按请求的目标格式实际渲染数计。
 // 夹具 3 入站（VLESS Reality、SS2022、Trojan）：
 // 旧口径恒为 3（渲染前计数）；现口径 base64 3 / clash 3 / stash 3 /
-// sing-box 3 / surge 2（vless 不下发）（缺省与非法 format 均回落
+// sing-box 3 / surge 3（移植后包含 VLESS）（缺省与非法 format 均回落
 // base64）。（原夹具的自建 Snell v5/v6 两行已随自建 Snell 入站
 // 整删一并移除；导入 Snell 节点不在 NodeInbound 夹具面内。）
 func TestSubscriptionListNodeCountByFormat(t *testing.T) {
@@ -73,7 +73,7 @@ func TestSubscriptionListNodeCountByFormat(t *testing.T) {
 		`{"format":"clash"}`:    3,
 		`{"format":"stash"}`:    3,
 		`{"format":"singbox"}`:  3,
-		`{"format":"surge"}`:    2, // vless 不下发
+		`{"format":"surge"}`:    3, // VLESS Reality 现在可下发
 		`{"format":"nonsense"}`: 3, // 非法值回落 base64，不整单失败
 	}
 	for body, want := range cases {

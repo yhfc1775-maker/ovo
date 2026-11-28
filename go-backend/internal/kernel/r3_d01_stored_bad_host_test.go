@@ -92,8 +92,7 @@ func TestR3D01StoredLegalHostRenders(t *testing.T) {
 	// Legal controls: the same four cells with a valid Host must keep
 	// rendering on every face that supports the carrier — the fix must
 	// not over-skip. Expectations mirror the R2-L-01 regression test
-	// and the D probe's per-face carrier support (Surge has no VLESS
-	// client; Loon/QX support no http/h2/xhttp carrier; sing-box has
+	// and the D probe's per-face carrier support (Surge supports VLESS; Loon/QX support no http/h2/xhttp carrier; sing-box has
 	// no xhttp transport; the Xray chain refuses http/h2 networks by
 	// design).
 	cells := []struct {
@@ -106,7 +105,7 @@ func TestR3D01StoredLegalHostRenders(t *testing.T) {
 	}{
 		{"ws-lowercase-host", "ws", "ws-opts",
 			Proxy{"headers": Proxy{"host": "example.com"}, "path": "/ws"},
-			true, true, true, false, true, true, true},
+			true, true, true, true, true, true, true},
 		{"http-lowercase-host", "http", "http-opts",
 			Proxy{"headers": Proxy{"host": []interface{}{"example.com"}}, "path": "/h"},
 			true, true, true, false, false, false, false},
@@ -115,7 +114,7 @@ func TestR3D01StoredLegalHostRenders(t *testing.T) {
 			true, true, true, false, false, false, false},
 		{"xhttp-capital-Host", "xhttp", "xhttp-opts",
 			Proxy{"Host": "example.com", "path": "/xhttp", "mode": "auto"},
-			true, false, true, false, false, false, true},
+			true, false, true, true, false, false, true},
 	}
 	for _, c := range cells {
 		t.Run(c.name, func(t *testing.T) {

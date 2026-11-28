@@ -424,7 +424,7 @@ export function ImportModal({
               {!preview ? (
                 <>
                   <Textarea
-                    description="支持：分享链接（ss / vmess / vless / trojan / hysteria2 / tuic / anytls / naive / socks5，每行一个；naive 接受 naive:// 与 naive+https:// 两种写法）、裸格式 地址:端口:用户名:密码（SOCKS5）、base64 订阅、Clash / Mihomo 配置、sing-box 配置、Surge / Loon 节点行，或直接填订阅地址（https://...）。Hysteria2 / TUIC / AnyTLS 作链式中转目标时只能走 sing-box 内核，Xray 会拒绝。"
+                    description="支持：分享链接（ss / vmess / vless / trojan / hysteria2 / tuic / anytls / mierus / naive / socks5，每行一个；naive 接受 naive:// 与 naive+https:// 两种写法）、裸格式 地址:端口:用户名:密码（SOCKS5）、base64 订阅、Clash / Mihomo 配置、sing-box 配置、Surge / Loon 节点行，或直接填订阅地址（https://...）。Hysteria2 / TUIC / AnyTLS 作链式中转目标时只能走 sing-box 内核，Xray 会拒绝。"
                     label="节点或订阅"
                     minRows={5}
                     placeholder={"vless://...\nss://...\n203.0.113.10:1080:用户名:密码\n或 https://订阅地址"}

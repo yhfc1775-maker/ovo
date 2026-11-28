@@ -371,6 +371,8 @@ func chainTargetFromProxy(e Endpoint) (chainTarget, error) {
 	t := chainTarget{Host: p.str("server"), Port: e.Port}
 	unsupported := fmt.Errorf("Xray 无法连接 %s 节点，请改用 sing-box 内核", DescribeProxy(e.Proxy))
 	switch p.Type() {
+	case "mieru":
+		return t, errors.New("Xray 和 sing-box 均不支持以 Mieru 节点作为出站，请选其他节点")
 	case "vless":
 		t.Protocol, t.UUID, t.Flow = "vless", p.str("uuid"), p.str("flow")
 		if enc := p.str("encryption"); enc != "" && enc != "none" {

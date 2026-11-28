@@ -60,7 +60,7 @@ curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/panel_
   - **不要给已部署的实例改实例键**：容器名与数据卷名都由实例键派生，改键等于换了一套新身份——会按新键起新容器、新数据卷，旧卷里的数据不会自动带过来。确需改名按迁移处理：先备份 / 导出旧实例数据，再以新键安装并恢复。
   - 旧版 Compose 模板（资源名写死旧名的版本）不识别实例后缀：装这类版本时脚本会明确告警「实例后缀不生效」，该实例仍用旧缺省名，同机不要再并存第二套该版本部署。
   - **手工拼 Compose 部署必须在 `.env` 写全身份六键**：随版模板里容器/卷/网络名都是 `${PANEL_BACKEND_CONTAINER:-ovo-panel-backend}` 这类带回退值的引用，回退值与脚本安装写入的身份同为 ovo 名；脚本安装时会自动把身份（多实例时含实例后缀）写入部署 `.env`，手工部署漏写则起出来的全是无后缀的回退名资源，两套手工部署同机会直接撞名、不具隔离性。六键清单与各自取值见 postgresql.md §四注记（`PANEL_BACKEND_CONTAINER`、`PANEL_FRONTEND_CONTAINER`、`PANEL_POSTGRES_CONTAINER`、`OVO_SQLITE_VOLUME`、`OVO_POSTGRES_VOLUME`、`OVO_NETWORK`）。自检：在部署目录执行 `grep -cE '^(PANEL_BACKEND_CONTAINER|PANEL_FRONTEND_CONTAINER|PANEL_POSTGRES_CONTAINER|OVO_SQLITE_VOLUME|OVO_POSTGRES_VOLUME|OVO_NETWORK)=' .env`，结果应为 `6`。
-- **自检**：安装后在部署目录执行 `grep OVO_INSTANCE .env` 应能看到实例键；`docker ps` 里该套面板的容器名都应带 `-<实例键>` 后缀；再到该面板的节点页生成一条 Docker 形态安装命令，命令里的容器名应为 `ovo-agent-<实例键>`、数据目录应为 `/etc/ovo_agent-<实例键>`。
+- **自检**：安装后在部署目录执行 `grep OVO_INSTANCE .env` 应能看到实例键；`docker ps` 里该套面板的容器名都应带 `-<实例键>` 后缀；再到该面板的服务器页生成一条 Docker 形态安装命令，命令里的容器名应为 `ovo-agent-<实例键>`、数据目录应为 `/etc/ovo_agent-<实例键>`。
 
 **改名前存量部署的容器名**：全新安装的容器名即为现行名（`ovo-panel-backend`、`ovo-panel-postgres`、`ovo-panel-frontend`）。改名前已部署的实例（旧名为 `flux-panel-backend`、`flux-panel-postgres`、`vite-frontend`）会在**脚本升级时被默认改名**为现行名——只改容器名，不动数据卷、网络与数据；不想改名可在升级前设 `PANEL_IDENTITY_RENAME=0` 关闭。触发条件、动作顺序与自检方法见 [升级 - 脚本升级](./upgrade.md#脚本升级)。
 
@@ -114,7 +114,7 @@ curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/panel_
 ### 用面板生成的命令安装（推荐）
 
 1. **网站配置** 里填好“面板后端地址”，节点通过它回连面板：面板经 HTTPS（Caddy/nginx 反向代理）对外时必须填 `https://域名`（可带端口，与 `panel_install.sh` 配置域名反代时的提示一致），明文面板填 `http://面板IP:6365`。只填裸地址（不带 `https://` / `http://`）时，生成安装命令的连接方式取自你当前访问面板的方式，可能与节点回连面板的方式不一致，请优先写明 scheme；生成结果为明文 `ws://` 时面板会给出显式告警。
-2. **节点** 页新建节点，点击 **安装**，会打开安装命令弹窗，在弹窗里点 **复制** 按钮复制命令（复制按钮失效时可以手动选中命令文本复制）。若生成的命令用的是明文地址（`ws://`），点击安装时面板会先弹出明文告警提示、弹窗顶部也有常驻的告警横幅，确认无误后再复制使用
+2. **服务器** 页新建节点，点击 **安装**，会打开安装命令弹窗，在弹窗里点 **复制** 按钮复制命令（复制按钮失效时可以手动选中命令文本复制）。若生成的命令用的是明文地址（`ws://`），点击安装时面板会先弹出明文告警提示、弹窗顶部也有常驻的告警横幅，确认无误后再复制使用
 3. 到节点服务器上以 root 执行
 
 ### 手动安装
@@ -137,7 +137,7 @@ curl -fsSL https://github.com/yhfc1775-maker/ovo/releases/download/2.1.34/instal
 
 **安装过程中会提示输入：**
 - **服务器地址**: 面板端的通信地址（通常是 `http://<面板IP>:<后端端口>`，例如 `http://1.2.3.4:6365`）。
-- **密钥**: 节点页里该节点的密钥。
+- **密钥**: 服务器页里该节点的密钥。
 
 或者直接使用带参数的命令（适用于自动化部署）：
 

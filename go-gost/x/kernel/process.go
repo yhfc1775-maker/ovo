@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -66,6 +67,7 @@ func (r *logRing) tail(n int) []string {
 // process supervises one kernel binary, restarting it with exponential
 // backoff until stop is called.
 type process struct {
+	env    []string
 	bin    string
 	args   []string
 	dir    string
@@ -182,6 +184,9 @@ func (p *process) supervise() {
 func (p *process) runOnce() error {
 	cmd := exec.Command(p.bin, p.args...)
 	cmd.Dir = p.dir
+	if len(p.env) > 0 {
+		cmd.Env = append(os.Environ(), p.env...)
+	}
 	cmd.SysProcAttr = sysProcAttr()
 	pr, pw := io.Pipe()
 	cmd.Stdout = pw

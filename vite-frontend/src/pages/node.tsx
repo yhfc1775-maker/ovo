@@ -109,6 +109,7 @@ import {
 import { CARD_GRID } from "@/components/info-card";
 import { ViewModeToggle, useViewMode } from "@/components/view-mode";
 import { NodeTuneModal } from "@/pages/node/tune-modal";
+import { NodePortMuxModal } from "@/pages/node/port-mux-modal";
 import { copyWithToast } from "@/utils/clipboard";
 import { freshnessLabel } from "@/utils/traffic";
 import {
@@ -298,6 +299,7 @@ export default function NodePage({
   const [deleteLoading, setDeleteLoading] = useState(false);
   const [rollbackModalOpen, setRollbackModalOpen] = useState(false);
   const [tuneNode, setTuneNode] = useState<Node | null>(null);
+  const [portMuxNode, setPortMuxNode] = useState<Node | null>(null);
   const [nodeToRollback, setNodeToRollback] = useState<Node | null>(null);
   const [nodeToDelete, setNodeToDelete] = useState<Node | null>(null);
   // R2X-045：删节点确认前展示的跨节点引用清单（单删/批删各一份）。
@@ -3331,6 +3333,11 @@ export default function NodePage({
                             disabled: !online,
                             onPress: () => setTuneNode(node),
                           },
+                          {
+                            key: "port-mux",
+                            label: "443 端口复用",
+                            onPress: () => setPortMuxNode(node),
+                          },
                         ]
                       : []),
                     {
@@ -3628,6 +3635,10 @@ export default function NodePage({
       />
 
       <NodeTuneModal node={tuneNode} onClose={() => setTuneNode(null)} />
+      <NodePortMuxModal
+        node={portMuxNode}
+        onClose={() => setPortMuxNode(null)}
+      />
 
       {/* 回退确认模态框 */}
       <RollbackNodeModal

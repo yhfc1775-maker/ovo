@@ -46,7 +46,7 @@ var goldenCommandSet = []string{
 	"AddCLimiters", "AddChains", "AddLimiters", "AddService",
 	"CheckPortListening",
 	"DeleteCLimiters", "DeleteChains", "DeleteLimiters", "DeleteService",
-	"KernelApply", "KernelControl", "KernelStatus",
+	"KernelApply", "KernelControl", "KernelMuxApply", "KernelStatus",
 	"PauseService", "RestartAgent", "ResumeService", "RollbackAgent",
 	"ServiceMonitorCheck", "SetProtocol", "SetRestartSchedule",
 	"SwapInfo", "SwapSet",

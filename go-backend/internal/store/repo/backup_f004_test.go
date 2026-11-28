@@ -190,6 +190,7 @@ func TestBackupTableCoverage(t *testing.T) {
 		"node_inbound":          "inbounds",
 		"node_inbound_relay":    "inbounds",
 		"node_inbound_counter":  "inbounds",
+		"node_port_mux":         "inbounds", // 443 端口复用：复用配置随 InboundsBackup.PortMuxes 往返。
 		"subscription":          "inbounds",
 		"subscription_template": "inbounds",
 		"remote_source":         "inbounds",

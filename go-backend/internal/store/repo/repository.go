@@ -565,6 +565,7 @@ func autoMigrateAll(db *gorm.DB) error {
 		&model.NodeTunnelTLS{},
 		&model.NodeKernel{},
 		&model.NodeInbound{},
+		&model.NodePortMux{},
 		&model.NodeInboundCounter{},
 		&model.NodeInboundRelay{},
 		&model.UserInbound{},
@@ -1448,11 +1449,15 @@ func (r *Repository) AddFlow(forwardID, userID int64, userTunnelID int64, inFlow
 // ─── List Methods (return map[string]interface{}) ────────────────────
 
 func (r *Repository) ListNodes() ([]map[string]interface{}, error) {
+	return r.ListNodesPage(0, 0)
+}
+
+func (r *Repository) ListNodesPage(current, size int) ([]map[string]interface{}, error) {
 	if r == nil || r.db == nil {
 		return nil, errors.New("repository not initialized")
 	}
 	var nodes []model.Node
-	if err := r.db.Order("inx ASC, id ASC").Find(&nodes).Error; err != nil {
+	if err := applyListPage(r.db.Order("inx ASC, id ASC"), []int{current, size}).Find(&nodes).Error; err != nil {
 		return nil, err
 	}
 	nodeIDs := make([]int64, 0, len(nodes))
@@ -7836,23 +7841,37 @@ func (r *Repository) LatestNodeMetricTimes(nodeIDs []int64) (map[int64]int64, er
 	if len(nodeIDs) == 0 {
 		return out, nil
 	}
+	// The requested-ID relation drives one covering-index top-1 seek per
+	// node. GROUP BY MAX would scan every retained sample for each node.
 	type row struct {
-		NodeID int64 `gorm:"column:node_id"`
-		Latest int64 `gorm:"column:latest"`
+		NodeID int64  `gorm:"column:node_id"`
+		Latest *int64 `gorm:"column:latest"`
 	}
-	var rows []row
-	for _, chunk := range chunkInt64IDs(nodeIDs) {
-		var part []row
-		if err := r.db.Table("node_metric").
-			Select("node_id, MAX(timestamp) AS latest").
-			Where("node_id IN ?", chunk).
-			Group("node_id").Scan(&part).Error; err != nil {
+	seen := make(map[int64]bool, len(nodeIDs))
+	ids := make([]int64, 0, len(nodeIDs))
+	for _, id := range nodeIDs {
+		if !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	for _, chunk := range chunkInt64IDs(ids) {
+		selects := make([]string, len(chunk))
+		args := make([]interface{}, len(chunk))
+		for i, id := range chunk {
+			selects[i] = "SELECT CAST(? AS BIGINT) AS node_id"
+			args[i] = id
+		}
+		query := "SELECT requested.node_id, (SELECT timestamp FROM node_metric WHERE node_id = requested.node_id ORDER BY timestamp DESC LIMIT 1) AS latest FROM (" + strings.Join(selects, " UNION ALL ") + ") AS requested"
+		var rows []row
+		if err := r.db.Raw(query, args...).Scan(&rows).Error; err != nil {
 			return nil, err
 		}
-		rows = append(rows, part...)
-	}
-	for _, row := range rows {
-		out[row.NodeID] = row.Latest
+		for _, item := range rows {
+			if item.Latest != nil {
+				out[item.NodeID] = *item.Latest
+			}
+		}
 	}
 	return out, nil
 }

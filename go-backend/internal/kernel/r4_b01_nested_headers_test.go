@@ -151,7 +151,7 @@ func TestR4B01NestedHeadersLegalRenders(t *testing.T) {
 	// Legal controls: the same nested cells with a valid Host must
 	// render exactly like the legal direct-key controls in
 	// TestR3D01StoredLegalHostRenders — every face consistent.
-	// (Surge has no VLESS client; Loon/QX support no h2/xhttp carrier;
+	// (Surge supports VLESS; Loon/QX support no h2/xhttp carrier;
 	// sing-box has no xhttp transport; the Xray chain refuses h2
 	// networks by design.)
 	cells := []struct {
@@ -170,10 +170,10 @@ func TestR4B01NestedHeadersLegalRenders(t *testing.T) {
 			true, true, true, false, false, false, false},
 		{"xhttp-nested-Host", "xhttp", "xhttp-opts",
 			Proxy{"headers": Proxy{"Host": r4B01LegalHost}, "path": "/x", "mode": "auto"},
-			true, false, true, false, false, false, true},
+			true, false, true, true, false, false, true},
 		{"xhttp-nested-host-list", "xhttp", "xhttp-opts",
 			Proxy{"headers": Proxy{"host": []interface{}{r4B01LegalHost}}, "path": "/x", "mode": "auto"},
-			true, false, true, false, false, false, true},
+			true, false, true, true, false, false, true},
 	}
 	for _, c := range cells {
 		t.Run(c.name, func(t *testing.T) {

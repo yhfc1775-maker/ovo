@@ -276,6 +276,39 @@ func proxyURI(e Endpoint) (string, bool) {
 			auth = url.PathEscape(u) + ":" + url.PathEscape(p.str("password")) + "@"
 		}
 		return "socks5://" + auth + hp + frag, true
+	case "mieru":
+		// Official enfein/mieru simple share link (mierus://).
+		host := strings.Trim(e.Host, "[]")
+		if strings.Contains(host, ":") {
+			host = "[" + host + "]"
+		}
+		u := &url.URL{
+			Scheme: "mierus",
+			User:   url.UserPassword(p.str("username"), p.str("password")),
+			Host:   host,
+		}
+		q := url.Values{}
+		q.Set("profile", e.Name)
+		if mtu := p.num("mtu"); mtu > 0 {
+			q.Set("mtu", strconv.Itoa(mtu))
+		}
+		setIf(q, "multiplexing", p.str("multiplexing"))
+		if hm := p.str("handshake-mode"); hm != "" && hm != MieruHandshakeStandard {
+			q.Set("handshake-mode", hm)
+		}
+		setIf(q, "traffic-pattern", p.str("traffic-pattern"))
+		if pr := p.str("port-range"); pr != "" {
+			q.Set("port", pr)
+		} else {
+			q.Set("port", strconv.Itoa(e.Port))
+		}
+		tr := strings.ToUpper(p.str("transport"))
+		if tr == "" {
+			tr = "TCP"
+		}
+		q.Set("protocol", tr)
+		u.RawQuery = q.Encode()
+		return u.String(), true
 	}
 	// Snell and HTTP proxies have no common share link.
 	return "", false
@@ -526,7 +559,13 @@ func proxyClashFor(e Endpoint, mihomo bool) (yamlNode, bool) {
 	// W3/I-008：udp_over_stream 是 sing-box 专有键，Mihomo TUIC 无此
 	// 选项——与 shadow-tls 同口径在本面摘除，不随透传漏进 Clash YAML。
 	delete(p, "udp_over_stream")
+	if p.Type() == "mieru" {
+		delete(p, "mtu")
+	}
 	node := yamlNode{{"name", e.Name}, {"type", p.Type()}, {"server", p.str("server")}, {"port", e.Port}}
+	if p.Type() == "mieru" && p.str("port-range") != "" {
+		node = node[:len(node)-1]
+	}
 	keys := make([]string, 0, len(p))
 	for k := range p {
 		if k != "name" && k != "type" && k != "server" && k != "port" {
@@ -940,6 +979,62 @@ func proxySurge(e Endpoint) (string, bool) {
 			}
 		case "shadow-tls":
 			shadowTLS(po)
+		default:
+			return "", false
+		}
+	case "vless":
+		parts = append(parts, "vless", host, port, "username="+surgeEscape(p.str("uuid")))
+		if f := p.str("flow"); f != "" {
+			parts = append(parts, "flow="+surgeEscape(f))
+		}
+		if hasVLESSEncryption(p) {
+			parts = append(parts, "encryption="+surgeEscape(p.str("encryption")))
+		}
+		if ro := p.sub("reality-opts"); len(ro) > 0 {
+			if sni := p.serverName(); sni != "" {
+				parts = append(parts, "sni="+surgeEscape(sni))
+			}
+			parts = append(parts, "reality-public-key="+surgeEscape(ro.str("public-key")))
+			if sid := ro.str("short-id"); sid != "" {
+				parts = append(parts, "reality-short-id="+surgeEscape(sid))
+			}
+		} else if p.usesTLS() {
+			parts = append(parts, "tls=true")
+			tlsTail()
+			if alpn := p.strs("alpn"); len(alpn) > 0 {
+				parts = append(parts, "alpn="+strings.Join(alpn, ","))
+			}
+		}
+		switch p.network() {
+		case "tcp":
+		case "ws":
+			h, path, _, _ := transportFields(p)
+			parts = append(parts, "ws=true")
+			if p.sub("ws-opts").flag("v2ray-http-upgrade") {
+				parts = append(parts, "ws-http-upgrade=true")
+			}
+			parts = append(parts, "ws-path="+surgeEscape(firstNonEmptyString(path, "/")))
+			if h != "" {
+				parts = append(parts, "ws-headers=Host:"+surgeEscape(h))
+			}
+		case "grpc":
+			if !p.usesTLS() {
+				return "", false
+			}
+			_, _, service, _ := transportFields(p)
+			parts = append(parts, "grpc=true")
+			if service != "" {
+				parts = append(parts, "grpc-service-name="+surgeEscape(service))
+			}
+		case "xhttp":
+			h, path, _, mode := transportFields(p)
+			parts = append(parts, "xhttp=true", "xhttp-path="+surgeEscape(firstNonEmptyString(path, "/")))
+			if h != "" {
+				parts = append(parts, "xhttp-host="+surgeEscape(h))
+			}
+			if mode != "" && mode != defaultXHTTPMode {
+				parts = append(parts, "xhttp-mode="+surgeEscape(mode))
+			}
 		default:
 			return "", false
 		}
