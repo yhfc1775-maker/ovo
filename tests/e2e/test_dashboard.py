@@ -57,14 +57,14 @@ class TestDashboard:
         # Sidebar items are <nav> entries with Chinese labels and onClick
         # navigation (layouts/admin.tsx) — not <a href> links, so locate
         # them by label inside the nav and assert each landing URL.
-        # All four must be admin-visible: /forward ("规则") is
-        # userOnly, so an admin never sees it — use /inbound ("落地")
+        # All four must be admin-visible: /forward ("转发") is
+        # userOnly, so an admin never sees it — use /inbound ("节点")
         # instead. The link expects auto-wait for visibility, and the
         # URL wait below is the real signal that the SPA navigation
         # landed — no networkidle gate.
         nav_items = [
-            ("落地", "/inbound"),
-            ("节点", "/node"),
+            ("节点", "/inbound"),
+            ("服务器", "/node"),
             ("用户", "/user"),
             ("设置", "/config"),
         ]
